@@ -1,5 +1,5 @@
 function spikeHound(varargin)
-% Spike Hound - Scope v1
+% Spike Hound - Scope v1 
 % This is the Scope and Real-Time Analysis Portion of the Spike Hound tool
 % suite
 %
