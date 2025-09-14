@@ -7,7 +7,7 @@ import matplotlib.animation as animation
 
 from daq.simulated_source import SimulatedPhysiologySource
 from daq.soundcard_source import SoundCardSource
-from daq.base_source import Chunk, DeviceInfo
+from daq.base_source import Chunk, DeviceInfo, ChannelInfo
 
 # ---- Configuration ----
 SAMPLE_RATE = 20_000  # Hz (try 48_000 for sound cards)
@@ -21,8 +21,8 @@ NUM_UNITS = 6
 NUM_AUDIO_CHANNELS = 1  # how many input channels to show by default
 
 # Change this single line to switch sources:
-SOURCE_CLASS = SoundCardSource
-# SOURCE_CLASS = SimulatedPhysiologySource
+SOURCE_CLASS = SimulatedPhysiologySource
+# SOURCE_CLASS = SoundCardSource
 DEVICE_ID = None  # Optional: pick a specific device id from list_available_devices()
 
 
@@ -85,7 +85,7 @@ def update_plot(frame, lines):
 
 
 def on_close(event):
-    if sim and sim.is_running():
+    if sim and sim.running:
         sim.stop()
     is_running.clear()
 
@@ -96,7 +96,8 @@ def create_source_and_channels():
     Uses the driver's `list_available_devices()` API to choose a device. If
     `DEVICE_ID` is None, the first device is selected.
     """
-    devices = SOURCE_CLASS.list_available_devices()
+    driver = SOURCE_CLASS()
+    devices = driver.list_available_devices()
     print("Detected devices:")
     for d in devices:
         print(f"  - {d.id}: {d.name}")
@@ -104,36 +105,30 @@ def create_source_and_channels():
         raise RuntimeError('No devices found for selected SOURCE_CLASS.')
     selected: DeviceInfo
     if DEVICE_ID is None:
-        selected = devices[1]
+        if len(devices) > 1:
+            selected = devices[1]
+        else:
+            selected = devices[0]
     else:
         selected = next((d for d in devices if str(d.id) == str(DEVICE_ID)), devices[0])
 
+    # Open the chosen device
+    driver.open(selected.id)
+
+    # Build channels and configure per driver
+    available: list[ChannelInfo] = driver.list_available_channels(selected.id)
+
     if SOURCE_CLASS is SimulatedPhysiologySource:
-        src = SimulatedPhysiologySource(
-            sample_rate=SAMPLE_RATE,
-            chunk_size=CHUNK_SIZE,
-            num_units=NUM_UNITS,
-            device=selected.id,
-        )
-        chans = ['Extracellular Proximal', 'Extracellular Distal', 'Intracellular']
-        for ch in chans:
-            src.add_channel(ch)
-        return src, chans
+        chan_ids = [c.id for c in available]
+        driver.configure(sample_rate=SAMPLE_RATE, channels=chan_ids, chunk_size=CHUNK_SIZE, num_units=NUM_UNITS)
+        return driver, [c.name for c in available]
 
     elif SOURCE_CLASS is SoundCardSource:
-        dev_param = int(selected.id) if str(selected.id).isdigit() else selected.id
-        src = SoundCardSource(
-            sample_rate=SAMPLE_RATE,
-            chunk_size=CHUNK_SIZE,
-            device=dev_param,
-        )
-        avail = src.list_available_channels()
-        if not avail:
+        if not available:
             raise RuntimeError('No input channels available on the selected audio device.')
-        chans = avail[:max(1, NUM_AUDIO_CHANNELS)]
-        for ch in chans:
-            src.add_channel(ch)
-        return src, chans
+        chan_ids = [c.id for c in available[:max(1, NUM_AUDIO_CHANNELS)]]
+        driver.configure(sample_rate=SAMPLE_RATE, channels=chan_ids, chunk_size=CHUNK_SIZE)
+        return driver, [c.name for c in available[:len(chan_ids)]]
 
     else:
         raise ValueError('Unsupported SOURCE_CLASS')
