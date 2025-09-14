@@ -1,128 +1,169 @@
 import time
 import queue
-from collections import deque
+import threading
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+
 from daq.simulated_source import SimulatedPhysiologySource
+from daq.soundcard_source import SoundCardSource
+from daq.base_source import Chunk, DeviceInfo
 
-# --- Configuration ---
-SAMPLE_RATE = 10000  # Hz
-CHUNK_SIZE = 1000      # Samples per chunk
-NUM_CHANNELS = 1     # We'll start with one channel
-PLOT_DURATION_S = 0.1 # How many seconds of data to display on the scope
+# ---- Configuration ----
+SAMPLE_RATE = 20_000  # Hz (try 48_000 for sound cards)
+CHUNK_SIZE = 200      # Frames per chunk
+PLOT_DURATION_S = 0.5 # Display window
 
-# Calculate the total number of samples to store for the plot
-PLOT_SAMPLES = int(PLOT_DURATION_S * SAMPLE_RATE)
+# Simulator control
+NUM_UNITS = 6
 
-# --- Global variables ---
-sim_source = None
-# Use a numpy array as a circular buffer for performance
-data_buffer = np.zeros((PLOT_SAMPLES, NUM_CHANNELS))
-# Create the time vector for the x-axis once
-time_vector = np.linspace(0, PLOT_DURATION_S, PLOT_SAMPLES)
+# Sound card control
+NUM_AUDIO_CHANNELS = 1  # how many input channels to show by default
 
-# --- Matplotlib Setup ---
-fig, ax = plt.subplots()
-# Initialize plot with empty data, it will be populated by the init function
-line, = ax.plot([], [], lw=1)
+# Change this single line to switch sources:
+SOURCE_CLASS = SoundCardSource
+# SOURCE_CLASS = SimulatedPhysiologySource
+DEVICE_ID = None  # Optional: pick a specific device id from list_available_devices()
 
-def init_plot():
-    """Initializes the plot aesthetics and data."""
+
+# ---- App State ----
+sim = None
+active_channels = []
+plot_samples = int(PLOT_DURATION_S * SAMPLE_RATE)
+time_axis = np.linspace(0, PLOT_DURATION_S, plot_samples)
+buf = None
+is_running = threading.Event(); is_running.set()
+
+
+def _determine_ylim():
+    # Sound card audio is typically normalized to [-1, 1]; user wants +-0.5
+    if SOURCE_CLASS is SoundCardSource:
+        return (-0.5, 0.5)
+    # Simulated physiology default range
+    return (-1.5, 1.5)
+
+
+def init_plot(ax, lines):
+    global buf
+    buf = np.zeros((plot_samples, len(active_channels)))
     ax.set_xlim(0, PLOT_DURATION_S)
-    ax.set_ylim(-0.5, 0.5)
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Voltage (V)")
-    ax.set_title("Live Simulated Electrophysiology")
+    ax.set_ylim(*_determine_ylim())
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('Voltage (V)')
+    ax.set_title('SpikeHound – Live Data')
     ax.grid(True)
-    line.set_data(time_vector, data_buffer[:, 0])
-    return line,
+    for i, ln in enumerate(lines):
+        ln.set_data(time_axis, buf[:, i])
+    return lines
 
-def update_plot(frame):
-    """
-    This function is called by FuncAnimation to update the plot.
-    """
-    global data_buffer
-    
-    new_data_chunks = []
-    # Drain the queue of all available data chunks
+
+def update_plot(frame, lines):
+    global buf
+    chunks = []
     while True:
         try:
-            data_chunk = sim_source.data_queue.get_nowait()
-            new_data_chunks.append(data_chunk)
+            ch: Chunk = sim.data_queue.get_nowait()
+            chunks.append(ch)
         except queue.Empty:
-            break # No more data in the queue
-    
-    if not new_data_chunks:
-        return line, # No new data, no need to redraw
+            break
 
-    # Concatenate all new chunks into a single array
-    new_data = np.concatenate(new_data_chunks)
-    num_new_samples = new_data.shape[0]
+    if not chunks:
+        return lines
 
-    # Roll the buffer to the left to make space for the new data
-    data_buffer = np.roll(data_buffer, -num_new_samples, axis=0)
-    # Insert the new data at the end of the buffer
-    data_buffer[-num_new_samples:, :] = new_data
-    
-    # Update the plot line with the new buffer content
-    line.set_ydata(data_buffer[:, 0]) # Plot the first channel
-    
-    return line,
+    new_data = np.concatenate([c.data for c in chunks], axis=0)
+    n_new = new_data.shape[0]
+
+    if n_new >= plot_samples:
+        buf[:, :] = new_data[-plot_samples:, :]
+    else:
+        buf = np.roll(buf, -n_new, axis=0)
+        buf[-n_new:, :] = new_data
+
+    for i, ln in enumerate(lines):
+        ln.set_ydata(buf[:, i])
+    return lines
+
 
 def on_close(event):
-    """Callback function for when the plot window is closed."""
-    print("Plot window closed. Stopping DAQ source...")
-    if sim_source and sim_source.is_running():
-        sim_source.stop()
+    if sim and sim.is_running():
+        sim.stop()
+    is_running.clear()
+
+
+def create_source_and_channels():
+    """Instantiate the selected source and choose default channels.
+
+    Uses the driver's `list_available_devices()` API to choose a device. If
+    `DEVICE_ID` is None, the first device is selected.
+    """
+    devices = SOURCE_CLASS.list_available_devices()
+    print("Detected devices:")
+    for d in devices:
+        print(f"  - {d.id}: {d.name}")
+    if not devices:
+        raise RuntimeError('No devices found for selected SOURCE_CLASS.')
+    selected: DeviceInfo
+    if DEVICE_ID is None:
+        selected = devices[1]
+    else:
+        selected = next((d for d in devices if str(d.id) == str(DEVICE_ID)), devices[0])
+
+    if SOURCE_CLASS is SimulatedPhysiologySource:
+        src = SimulatedPhysiologySource(
+            sample_rate=SAMPLE_RATE,
+            chunk_size=CHUNK_SIZE,
+            num_units=NUM_UNITS,
+            device=selected.id,
+        )
+        chans = ['Extracellular Proximal', 'Extracellular Distal', 'Intracellular']
+        for ch in chans:
+            src.add_channel(ch)
+        return src, chans
+
+    elif SOURCE_CLASS is SoundCardSource:
+        dev_param = int(selected.id) if str(selected.id).isdigit() else selected.id
+        src = SoundCardSource(
+            sample_rate=SAMPLE_RATE,
+            chunk_size=CHUNK_SIZE,
+            device=dev_param,
+        )
+        avail = src.list_available_channels()
+        if not avail:
+            raise RuntimeError('No input channels available on the selected audio device.')
+        chans = avail[:max(1, NUM_AUDIO_CHANNELS)]
+        for ch in chans:
+            src.add_channel(ch)
+        return src, chans
+
+    else:
+        raise ValueError('Unsupported SOURCE_CLASS')
+
 
 def main():
-    """
-    Main entry point for the application.
-    """
-    global sim_source
-    
-    # Define which channels we want to acquire from the start.
-    initial_channels = ['Simulated Extracellular 1']
-    
-    # Instantiate and configure the data source.
-    sim_source = SimulatedPhysiologySource(
-        sample_rate=SAMPLE_RATE, 
-        chunk_size=CHUNK_SIZE
-    )
-    print(sim_source.list_available_channels())
-    sim_source.add_channel(initial_channels[0])
-    
+    global sim, active_channels
 
-    print("--- SpikeHound Live Plotter ---")
-    print(f"Sample Rate: {SAMPLE_RATE} Hz")
-    print(f"Chunk Size: {CHUNK_SIZE} samples")
-    print(f"Data Rate: {SAMPLE_RATE / CHUNK_SIZE} chunks/sec")
-    print(f"Plot Refresh Interval: 50 ms (~20 Hz)")
-    print("---------------------------------\n")
+    sim, active_channels = create_source_and_channels()
 
-    # Start the data acquisition thread
-    sim_source.start()
-    
-    # Connect the close event to our shutdown function
+    sim.start()
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    lines = [ax.plot([], [], lw=1.0, label=ch)[0] for ch in active_channels]
+    ax.legend(loc='upper right')
+
+    init_plot(ax, lines)
     fig.canvas.mpl_connect('close_event', on_close)
-    
-    # Create the animation object. 
-    # interval=50 means the plot will try to refresh every 50ms.
-    # blit=True is a performance optimization.
-    ani = animation.FuncAnimation(
-        fig, 
-        update_plot, 
-        init_func=init_plot, 
-        blit=True, 
-        interval=50,
-        save_count=50 # Internal buffer size for FuncAnimation
-    )
-    
-    # Show the plot. This call is blocking and will run until the window is closed.
-    plt.show()
-    
-    print("Application finished.")
 
-if __name__ == "__main__":
+    _ = animation.FuncAnimation(
+        fig,
+        lambda f: update_plot(f, lines),
+        interval=33,
+        blit=True,
+        cache_frame_data=False,
+    )
+
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == '__main__':
     main()
