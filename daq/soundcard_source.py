@@ -130,7 +130,6 @@ class SoundCardSource(BaseSource):
         self._chan_names: List[str] = []
         self._buf_lock = threading.Lock()
         self._residual = np.zeros((0, 1), dtype=np.float32)
-        self._worker: threading.Thread | None = None
         self._stream = None
 
     # ---------- Required interface --------------------------------------------
@@ -175,7 +174,7 @@ class SoundCardSource(BaseSource):
 
     def _start_impl(self) -> None:
         assert self._device_index is not None and self.config is not None
-        if self._worker and self._worker.is_alive():
+        if self._stream is not None:
             return
 
         def _callback(indata, frames, time_info, status):
@@ -198,24 +197,35 @@ class SoundCardSource(BaseSource):
                     # Emit via base to stamp counters
                     self.emit_array(data_chunk, mono_time=_time.monotonic())
 
-        def _worker_loop():
-            with sd.InputStream(
-                device=self._device_index,
-                channels=self._n_in,
-                samplerate=self.config.sample_rate,
-                blocksize=self.config.chunk_size,
-                dtype=self.dtype,
-                callback=_callback,
-            ):
-                while not self.stop_event.is_set():
-                    _time.sleep(0.05)
-
-        self._worker = threading.Thread(target=_worker_loop, name="SoundCard-Worker", daemon=True)
-        self._worker.start()
+        # Create and start the PortAudio stream; no extra worker thread is needed.
+        self._stream = sd.InputStream(
+            device=self._device_index,
+            channels=self._n_in,
+            samplerate=self.config.sample_rate,
+            blocksize=self.config.chunk_size,
+            dtype=self.dtype,
+            callback=_callback,
+        )
+        self._stream.start()
 
     def _stop_impl(self) -> None:
-        if self._worker and self._worker.is_alive():
-            self._worker.join(timeout=1.0)
+        # Stop and close the PortAudio stream synchronously to release the device.
+        try:
+            if self._stream is not None:
+                try:
+                    self._stream.stop()
+                except Exception:
+                    try:
+                        self._stream.abort()
+                    except Exception:
+                        pass
+                try:
+                    self._stream.close()
+                finally:
+                    self._stream = None
+        finally:
+            with self._buf_lock:
+                self._residual = np.zeros((0, self._n_in if self._n_in else 1), dtype=np.float32)
 
     # ---------- Internals ------------------------------------------------------
 

@@ -21,8 +21,8 @@ NUM_UNITS = 6
 NUM_AUDIO_CHANNELS = 1  # how many input channels to show by default
 
 # Change this single line to switch sources:
-SOURCE_CLASS = SimulatedPhysiologySource
-# SOURCE_CLASS = SoundCardSource
+# SOURCE_CLASS = SimulatedPhysiologySource
+SOURCE_CLASS = SoundCardSource
 DEVICE_ID = None  # Optional: pick a specific device id from list_available_devices()
 
 
@@ -85,9 +85,18 @@ def update_plot(frame, lines):
 
 
 def on_close(event):
-    if sim and sim.running:
-        sim.stop()
-    is_running.clear()
+    # Ensure the source is fully stopped and closed so devices are released
+    global sim
+    try:
+        if sim:
+            if getattr(sim, 'running', False):
+                sim.stop()
+            # Always close to make drivers release OS resources (e.g., microphones)
+            sim.close()
+    except Exception as e:
+        print(f"Error while closing source: {e}")
+    finally:
+        is_running.clear()
 
 
 def create_source_and_channels():
@@ -106,7 +115,7 @@ def create_source_and_channels():
     selected: DeviceInfo
     if DEVICE_ID is None:
         if len(devices) > 1:
-            selected = devices[1]
+            selected = devices[1] # on my system, device 0 is not usable
         else:
             selected = devices[0]
     else:
