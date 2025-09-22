@@ -106,6 +106,12 @@ class BaseSource(ABC):
         source.close()
     """
 
+    @classmethod
+    @abstractmethod
+    def device_class_name(cls) -> str:
+        """Return the human-friendly category name for this driver type."""
+        raise NotImplementedError
+
     # ---- Lifecycle ---------------------------------------------------------
 
     def __init__(self, queue_maxsize: int = 64) -> None:
@@ -460,4 +466,3 @@ class BaseSource(ABC):
             if ch.id == cid:
                 return i
         raise ValueError(f"Channel id {cid} not in available channels.")
-

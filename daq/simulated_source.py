@@ -16,6 +16,11 @@ class SimulatedPhysiologySource(BaseSource):
     synaptic delays, PSP gains) are randomly sampled once at initialization and
     remain fixed throughout the session.
     """
+
+    @classmethod
+    def device_class_name(cls) -> str:
+        return "Simulated"
+
     def __init__(self, queue_maxsize: int = 64) -> None:
         super().__init__(queue_maxsize=queue_maxsize)
         self._noise_level = 0.05

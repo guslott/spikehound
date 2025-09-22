@@ -43,6 +43,10 @@ class SoundCardSource(BaseSource):
     • If no active channels are selected, chunks are not emitted (same contract as others).
     """
 
+    @classmethod
+    def device_class_name(cls) -> str:
+        return "Sound Card"
+
     # ---------- Discovery helpers ---------------------------------------------
 
     def list_available_devices(self) -> List[DeviceInfo]:

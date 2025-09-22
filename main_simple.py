@@ -1,13 +1,16 @@
-import time
 import queue
-import threading
+import sys
+from typing import List
+
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
+import pyqtgraph as pg
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from daq.simulated_source import SimulatedPhysiologySource
 from daq.soundcard_source import SoundCardSource
-from daq.base_source import Chunk, DeviceInfo, ChannelInfo
+from daq.base_source import ChannelInfo
+
+pg.setConfigOptions(antialias=False)
 
 # ---- Configuration ----
 SAMPLE_RATE = 20000  # Hz (try 48000 for sound cards)
@@ -21,153 +24,204 @@ NUM_UNITS = 6
 NUM_AUDIO_CHANNELS = 1  # how many input channels to show by default
 
 # Change this single line to switch sources:
-# SOURCE_CLASS = SimulatedPhysiologySource
-SOURCE_CLASS = SoundCardSource
+SOURCE_CLASS = SimulatedPhysiologySource
+# SOURCE_CLASS = SoundCardSource
 DEVICE_ID = None  # Optional: pick a specific device id from list_available_devices()
 
 
 # ---- App State ----
 sim = None
-active_channels = []
+active_channels: List[str] = []
 plot_samples = int(PLOT_DURATION_S * SAMPLE_RATE)
-time_axis = np.linspace(0, PLOT_DURATION_S, plot_samples)
+time_axis = np.linspace(0, PLOT_DURATION_S, plot_samples, dtype=np.float32)
 buf = None
-is_running = threading.Event(); is_running.set()
 
 
 def _determine_ylim():
-    # Sound card audio is typically normalized to [-1, 1]; user wants +-0.5
+    """Pick a reasonable default vertical range based on the driver."""
     if SOURCE_CLASS is SoundCardSource:
         return (-0.5, 0.5)
-    # Simulated physiology default range
     return (-1.5, 1.5)
 
 
-def init_plot(ax, lines):
-    global buf
-    buf = np.zeros((plot_samples, len(active_channels)))
-    ax.set_xlim(0, PLOT_DURATION_S)
-    ax.set_ylim(*_determine_ylim())
-    ax.set_xlabel('Time (s)')
-    ax.set_ylabel('Voltage (V)')
-    ax.set_title('SpikeHound – Live Data')
-    ax.grid(True)
-    for i, ln in enumerate(lines):
-        ln.set_data(time_axis, buf[:, i])
-    return lines
-
-
-def update_plot(frame, lines):
-    global buf
-    chunks = []
-    while True:
-        try:
-            ch: Chunk = sim.data_queue.get_nowait()
-            chunks.append(ch)
-        except queue.Empty:
-            break
-
-    if not chunks:
-        return lines
-
-    new_data = np.concatenate([c.data for c in chunks], axis=0)
-    n_new = new_data.shape[0]
-
-    if n_new >= plot_samples:
-        buf[:, :] = new_data[-plot_samples:, :]
-    else:
-        buf = np.roll(buf, -n_new, axis=0)
-        buf[-n_new:, :] = new_data
-
-    for i, ln in enumerate(lines):
-        ln.set_ydata(buf[:, i])
-    return lines
-
-
-def on_close(event):
-    # Ensure the source is fully stopped and closed so devices are released
+def stop_source() -> None:
+    """Ensure the active source is stopped and closed."""
     global sim
     try:
         if sim:
-            if getattr(sim, 'running', False):
+            if getattr(sim, "running", False):
                 sim.stop()
-            # Always close to make drivers release OS resources (e.g., microphones)
             sim.close()
-    except Exception as e:
-        print(f"Error while closing source: {e}")
+    except Exception as exc:
+        print(f"Error while closing source: {exc}")
     finally:
-        is_running.clear()
+        sim = None
+
+
+class ScopeWindow(QtWidgets.QMainWindow):
+    """Qt window rendering live data via pyqtgraph."""
+
+    def __init__(self, source, channel_names: List[str], x_axis: np.ndarray, data_buf: np.ndarray) -> None:
+        super().__init__()
+        self._source = source
+        self._channel_names = channel_names
+        self._time_axis = x_axis
+        self._buf = data_buf
+        self._curves = []
+
+        self.setWindowTitle("SpikeHound – Live Data")
+
+        plot = pg.PlotWidget()
+        plot.setBackground("w")
+        plot.showGrid(x=True, y=True, alpha=0.3)
+        plot.setLabel("left", "Voltage", units="V")
+        plot.setLabel("bottom", "Time", units="s")
+        plot.setXRange(0.0, PLOT_DURATION_S, padding=0.0)
+        plot.setYRange(*_determine_ylim())
+        plot.setMouseEnabled(x=False, y=False)
+        plot.enableAutoRange(axis="xy", enable=False)
+
+        plot_item = plot.getPlotItem()
+        if hasattr(plot_item, "setClipToView"):
+            plot_item.setClipToView(True)
+        if hasattr(plot_item, "setDownsampling"):
+            plot_item.setDownsampling(mode="peak")
+
+        self.setCentralWidget(plot)
+        self._plot = plot
+
+        for index, name in enumerate(channel_names):
+            pen = pg.mkPen(color=pg.intColor(index, hues=max(len(channel_names), 1)), width=1.5)
+            curve = plot_item.plot(
+                self._time_axis,
+                self._buf[:, index],
+                pen=pen,
+            )
+            self._curves.append(curve)
+
+        self._timer = QtCore.QTimer(self)
+        self._timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
+        self._timer.setInterval(33)  # ~30 Hz refresh
+        self._timer.timeout.connect(self._update_plot)
+        self._timer.start()
+
+        close_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Close), self)
+        close_shortcut.activated.connect(self.close)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._timer.stop()
+        stop_source()
+        super().closeEvent(event)
+
+    def _update_plot(self) -> None:
+        if not self._curves:
+            return
+
+        chunk_arrays: List[np.ndarray] = []
+        pending = getattr(self._source.data_queue, "qsize", lambda: 0)()
+        if pending == 0:
+            return
+
+        for _ in range(pending):
+            try:
+                chunk = self._source.data_queue.get_nowait()
+            except queue.Empty:
+                break
+            else:
+                data = np.asarray(chunk.data)
+                if data.ndim == 2 and data.size:
+                    chunk_arrays.append(data)
+
+        if not chunk_arrays:
+            return
+
+        new_data = chunk_arrays[0] if len(chunk_arrays) == 1 else np.concatenate(chunk_arrays, axis=0)
+
+        rows, cols = new_data.shape
+        buf_rows, buf_cols = self._buf.shape
+
+        if cols != buf_cols:
+            if cols > buf_cols:
+                new_data = new_data[:, :buf_cols]
+                cols = buf_cols
+            else:
+                padded = np.zeros((rows, buf_cols), dtype=self._buf.dtype)
+                padded[:, :cols] = new_data
+                new_data = padded
+                cols = buf_cols
+
+        if rows >= buf_rows:
+            self._buf[:, :] = new_data[-buf_rows:, :]
+        else:
+            self._buf[:-rows, :] = self._buf[rows:, :]
+            self._buf[-rows:, :] = new_data
+
+        for index, curve in enumerate(self._curves):
+            curve.setData(
+                self._time_axis,
+                self._buf[:, index],
+                skipFiniteCheck=True,
+            )
 
 
 def create_source_and_channels():
-    """Instantiate the selected source and choose default channels.
-
-    Uses the driver's `list_available_devices()` API to choose a device. If
-    `DEVICE_ID` is None, the first device is selected.
-    """
+    """Instantiate the selected source and choose default channels."""
     driver = SOURCE_CLASS()
     devices = driver.list_available_devices()
     print("Detected devices:")
     for d in devices:
         print(f"  - {d.id}: {d.name}")
     if not devices:
-        raise RuntimeError('No devices found for selected SOURCE_CLASS.')
-    selected: DeviceInfo
+        raise RuntimeError("No devices found for selected SOURCE_CLASS.")
+
     if DEVICE_ID is None:
-        if len(devices) > 1:
-            selected = devices[1] # on my system, device 0 is not usable
-        else:
-            selected = devices[0]
+        selected = devices[1] if len(devices) > 1 else devices[0]
     else:
         selected = next((d for d in devices if str(d.id) == str(DEVICE_ID)), devices[0])
 
-    # Open the chosen device
     driver.open(selected.id)
-
-    # Build channels and configure per driver
-    available: list[ChannelInfo] = driver.list_available_channels(selected.id)
+    available: List[ChannelInfo] = driver.list_available_channels(selected.id)
 
     if SOURCE_CLASS is SimulatedPhysiologySource:
         chan_ids = [c.id for c in available]
-        driver.configure(sample_rate=SAMPLE_RATE, channels=chan_ids, chunk_size=CHUNK_SIZE, num_units=NUM_UNITS)
+        driver.configure(
+            sample_rate=SAMPLE_RATE,
+            channels=chan_ids,
+            chunk_size=CHUNK_SIZE,
+            num_units=NUM_UNITS,
+        )
         return driver, [c.name for c in available]
 
-    elif SOURCE_CLASS is SoundCardSource:
+    if SOURCE_CLASS is SoundCardSource:
         if not available:
-            raise RuntimeError('No input channels available on the selected audio device.')
-        chan_ids = [c.id for c in available[:max(1, NUM_AUDIO_CHANNELS)]]
+            raise RuntimeError("No input channels available on the selected audio device.")
+        count = max(1, NUM_AUDIO_CHANNELS)
+        chan_ids = [c.id for c in available[:count]]
         driver.configure(sample_rate=SAMPLE_RATE, channels=chan_ids, chunk_size=CHUNK_SIZE)
         return driver, [c.name for c in available[:len(chan_ids)]]
 
-    else:
-        raise ValueError('Unsupported SOURCE_CLASS')
+    raise ValueError("Unsupported SOURCE_CLASS")
 
 
-def main():
-    global sim, active_channels
+def main() -> None:
+    global sim, active_channels, buf, plot_samples, time_axis
 
     sim, active_channels = create_source_and_channels()
 
+    actual_rate = getattr(getattr(sim, "config", None), "sample_rate", SAMPLE_RATE)
+    plot_samples = int(PLOT_DURATION_S * actual_rate)
+    time_axis = np.linspace(0, PLOT_DURATION_S, plot_samples, dtype=np.float32)
+    buf = np.zeros((plot_samples, len(active_channels)), dtype=np.float32)
+
     sim.start()
 
-    fig, ax = plt.subplots(figsize=(10, 4))
-    lines = [ax.plot([], [], lw=1.0, label=ch)[0] for ch in active_channels]
-    ax.legend(loc='upper right')
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+    window = ScopeWindow(sim, active_channels, time_axis, buf)
+    app.aboutToQuit.connect(stop_source)
+    window.show()
 
-    init_plot(ax, lines)
-    fig.canvas.mpl_connect('close_event', on_close)
-
-    _ = animation.FuncAnimation(
-        fig,
-        lambda f: update_plot(f, lines),
-        interval=33,
-        blit=True,
-        cache_frame_data=False,
-    )
-
-    plt.tight_layout()
-    plt.show()
+    sys.exit(app.exec())
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
