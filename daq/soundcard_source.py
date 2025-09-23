@@ -49,7 +49,8 @@ class SoundCardSource(BaseSource):
 
     # ---------- Discovery helpers ---------------------------------------------
 
-    def list_available_devices(self) -> List[DeviceInfo]:
+    @classmethod
+    def list_available_devices(cls) -> List[DeviceInfo]:
         """Return input-capable audio devices as generic DeviceInfo objects."""
         if sd is None:
             raise RuntimeError(
@@ -260,6 +261,6 @@ class SoundCardSource(BaseSource):
 
     # Optional quick smoke test: prints devices and exits
 if __name__ == "__main__":  # pragma: no cover
-    devs = SoundCardSource().list_available_devices()
+    devs = SoundCardSource.list_available_devices()
     for d in devs:
         print(f"{d.id}: {d.name}")

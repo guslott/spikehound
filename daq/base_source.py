@@ -94,8 +94,8 @@ class BaseSource(ABC):
     Abstract base for all DAQ input sources.
 
     Typical flow:
+        devs = Driver.list_available_devices()
         source = Driver()
-        devs = source.list_available_devices()
         source.open(devs[0].id)
         caps = source.get_capabilities(devs[0].id)
         chans = source.list_available_channels(devs[0].id)
@@ -140,8 +140,9 @@ class BaseSource(ABC):
     # Device enumeration APIs
     # ------------------------
 
+    @classmethod
     @abstractmethod
-    def list_available_devices(self) -> List[DeviceInfo]:
+    def list_available_devices(cls) -> List[DeviceInfo]:
         """Return all input-capable devices visible to the driver."""
         raise NotImplementedError
 

@@ -36,7 +36,8 @@ class SimulatedPhysiologySource(BaseSource):
         self._buffer_margin = 0
 
     # ---- Discovery ------------------------------------------------------------
-    def list_available_devices(self):
+    @classmethod
+    def list_available_devices(cls) -> list[DeviceInfo]:
         return [DeviceInfo(id="sim0", name="Simulated Physiology (virtual)")]
 
     def get_capabilities(self, device_id: str) -> Capabilities:
@@ -60,7 +61,7 @@ class SimulatedPhysiologySource(BaseSource):
         psp_len = int(0.020 * sample_rate)
         t_psp = np.linspace(0, 5, psp_len)
         self._psp_template = t_psp * np.exp(-t_psp)
-        self._psp_template /= max(1e-12, np.max(self._psp_template))
+        self._psp_template /= np.max(self._psp_template)
         self._psp_len = len(self._psp_template)
 
         self._units.clear()

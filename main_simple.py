@@ -166,8 +166,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
 
 def create_source_and_channels():
     """Instantiate the selected source and choose default channels."""
-    driver = SOURCE_CLASS()
-    devices = driver.list_available_devices()
+    devices = SOURCE_CLASS.list_available_devices()
     print("Detected devices:")
     for d in devices:
         print(f"  - {d.id}: {d.name}")
@@ -179,6 +178,7 @@ def create_source_and_channels():
     else:
         selected = next((d for d in devices if str(d.id) == str(DEVICE_ID)), devices[0])
 
+    driver = SOURCE_CLASS()
     driver.open(selected.id)
     available: List[ChannelInfo] = driver.list_available_channels(selected.id)
 
