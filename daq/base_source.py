@@ -23,6 +23,8 @@ from typing import Any, Iterable, List, Literal, Optional, Sequence
 
 import numpy as np
 
+from core import Chunk
+
 
 # ----------------------------
 # Data model (shared contract)
@@ -63,23 +65,6 @@ class ActualConfig:
     chunk_size: int
     latency_s: Optional[float] = None  # If driver reports one
     dtype: str = "float32"
-
-
-@dataclass(frozen=True)
-class Chunk:
-    """
-    Streaming payload emitted by sources.
-    - data shape: (frames, channels) with dtype == config.dtype (float32 recommended)
-    - start_sample: absolute sample index since start() (0 at run start)
-    - seq: monotonically increasing chunk counter (0 at first emitted chunk)
-    - mono_time: host monotonic time when the *first* sample of this chunk corresponds to
-    - device_time: optional device/ADC clock time for the *first* sample (high-accuracy alignment)
-    """
-    start_sample: int
-    mono_time: float
-    seq: int
-    data: np.ndarray
-    device_time: Optional[float] = None
 
 
 # ----------------------------
@@ -321,13 +306,26 @@ class BaseSource(ABC):
         *,
         device_time: Optional[float] = None,
         mono_time: Optional[float] = None,
+        meta: Optional[dict[str, Any]] = None,
     ) -> Chunk:
         """
-        Build and enqueue a Chunk from a (frames, channels) float32 array.
-        - Validates shape/dtype
-        - Stamps seq/start_sample consistently
-        - Applies drop-oldest backpressure policy
-        Returns the Chunk enqueued (for testing or logging).
+        Build and enqueue a Chunk from a (frames, channels) array.
+
+        Parameters
+        ----------
+        data : np.ndarray
+            Samples shaped (frames, channels) as produced by the driver callback.
+        device_time : float | None
+            Optional hardware clock reference for the first frame.
+        mono_time : float | None
+            Override for the host monotonic timestamp; defaults to `time.monotonic()`.
+        meta : dict[str, Any] | None
+            Additional metadata to attach to the chunk (copied before storage).
+
+        Returns
+        -------
+        Chunk
+            The enqueued chunk (useful for testing/logging).
         """
         if self.config is None:
             raise RuntimeError("emit_array() called before configure().")
@@ -356,6 +354,9 @@ class BaseSource(ABC):
                         f"data has {chans} channels, expected {expected_chans}."
                     )
 
+        if frames == 0:
+            raise ValueError("data must contain at least one frame")
+
         # Stamp times/counters
         mono = _time.monotonic() if mono_time is None else mono_time
         with self._state_lock:
@@ -365,12 +366,36 @@ class BaseSource(ABC):
             self._next_start_sample += frames
             self._next_seq += 1
 
+        active_infos = self.get_active_channels()
+        if not active_infos:
+            raise RuntimeError("No active channels configured; cannot emit data.")
+        channel_names = tuple(ch.name for ch in active_infos)
+        unit_candidates = [ch.units for ch in active_infos if ch.units]
+        if unit_candidates:
+            first_unit = unit_candidates[0]
+            units = first_unit if all(u == first_unit for u in unit_candidates) else "mixed"
+        else:
+            units = "unknown"
+
+        samples = np.ascontiguousarray(data.T)
+        samples.setflags(write=False)
+
+        dt = 1.0 / float(self.config.sample_rate)
+        chunk_meta = dict(meta or {})
+        if device_time is not None:
+            chunk_meta.setdefault("device_time", device_time)
+        chunk_meta["start_sample"] = start_sample
+        if not chunk_meta:
+            chunk_meta = None
+
         chunk = Chunk(
-            start_sample=start_sample,
-            mono_time=mono,
+            samples=samples,
+            start_time=mono,
+            dt=dt,
             seq=seq,
-            data=data,
-            device_time=device_time,
+            channel_names=channel_names,
+            units=units,
+            meta=chunk_meta,
         )
         self._safe_put(chunk)
         return chunk

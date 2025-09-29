@@ -24,8 +24,8 @@ NUM_UNITS = 6
 NUM_AUDIO_CHANNELS = 1  # how many input channels to show by default
 
 # Change this single line to switch sources:
-SOURCE_CLASS = SimulatedPhysiologySource
-# SOURCE_CLASS = SoundCardSource
+# SOURCE_CLASS = SimulatedPhysiologySource
+SOURCE_CLASS = SoundCardSource
 DEVICE_ID = None  # Optional: pick a specific device id from list_available_devices()
 
 
@@ -128,9 +128,9 @@ class ScopeWindow(QtWidgets.QMainWindow):
             except queue.Empty:
                 break
             else:
-                data = np.asarray(chunk.data)
-                if data.ndim == 2 and data.size:
-                    chunk_arrays.append(data)
+                samples = np.asarray(chunk.samples)
+                if samples.ndim == 2 and samples.size:
+                    chunk_arrays.append(samples.T)
 
         if not chunk_arrays:
             return

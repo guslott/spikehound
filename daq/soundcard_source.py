@@ -38,7 +38,8 @@ class SoundCardSource(BaseSource):
 
     Notes
     -----
-    • Produces Chunk.data shaped (chunk_size, n_active_channels) to match the simulator.
+    • Driver callbacks deliver arrays shaped (frames, channels); downstream consumers
+      receive `Chunk.samples` shaped (channels, frames).
     • Channel identifiers are simple strings: "In 1", "In 2", ... (1‑based for readability).
     • If no active channels are selected, chunks are not emitted (same contract as others).
     """
