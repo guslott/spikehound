@@ -34,6 +34,10 @@ class SimulatedPhysiologySource(BaseSource):
         self._psp_template = np.zeros(1)
         self._psp_len = 1
         self._buffer_margin = 0
+        self._line_hum_amp = 0.0
+        self._line_hum_freq = 60.0
+        self._line_hum_phase = 0.0
+        self._line_hum_omega = 0.0
 
     # ---- Discovery ------------------------------------------------------------
     @classmethod
@@ -120,6 +124,10 @@ class SimulatedPhysiologySource(BaseSource):
 
     def _configure_impl(self, sample_rate: int, channels, chunk_size: int, **options) -> ActualConfig:
         num_units = int(options.get('num_units', 5))
+        self._line_hum_amp = float(options.get('line_hum_amp', 0.0))
+        self._line_hum_freq = float(options.get('line_hum_freq', 60.0))
+        self._line_hum_phase = 0.0
+        self._line_hum_omega = 0.0 if sample_rate <= 0 else 2.0 * np.pi * (self._line_hum_freq / sample_rate)
         # Build channel list (full device list already cached on open)
         selected = [c for c in self._available_channels if c.id in set(channels)]
         # Initialize unit templates and buffers with the new sample rate
@@ -197,6 +205,12 @@ class SimulatedPhysiologySource(BaseSource):
                             psp = np.convolve(base, self._psp_template, mode='full')[:chunk_size]
                             sig += psp * u['psp_gain']
                         data_chunk[:, col] = -0.070 + sig + np.random.randn(chunk_size) * (self._noise_level * 0.1)
+
+                if self._line_hum_amp != 0.0 and self._line_hum_omega != 0.0:
+                    idx = np.arange(chunk_size, dtype=np.float64)
+                    hum = (self._line_hum_amp * np.sin(self._line_hum_phase + self._line_hum_omega * idx)).astype(np.float32)
+                    data_chunk += hum[:, None]
+                    self._line_hum_phase = (self._line_hum_phase + self._line_hum_omega * chunk_size) % (2.0 * np.pi)
 
                 self.emit_array(data_chunk, mono_time=loop_start)
 
