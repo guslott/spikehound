@@ -1,3 +1,19 @@
+"""Minimal SpikeHound harness that proves the pipeline works end-to-end.
+
+This script is intentionally small and heavily commented so that new
+contributors (or students in the classroom) can read through it and understand
+how the pieces of the architecture fit together:
+
+* A data source (`BaseSource`) feeds raw `Chunk`s into a queue.
+* The `PipelineController` wraps the source, the dispatcher, and the shared
+  queues that the rest of the application will eventually use.
+* The Qt GUI consumes conditioned data from the visualization queue and draws
+  it using PyQtGraph while keeping the GUI thread responsive.
+
+Think of this as a live “smoke test” for the architecture. It deliberately
+trades bells-and-whistles for clarity.
+"""
+
 import queue
 import sys
 from typing import Any, Dict, List
@@ -14,13 +30,16 @@ from daq.soundcard_source import SoundCardSource
 pg.setConfigOptions(antialias=False)
 
 # ---- Configuration ----
+#
+# These knobs let you experiment quickly without touching the core
+# architecture. Feel free to modify them while you explore the harness.
 SAMPLE_RATE = 20000  # Hz (try 48000 for sound cards)
 CHUNK_SIZE = 200      # Frames per chunk
 PLOT_DURATION_S = 0.4 # Display window
 
 # Simulator control
 NUM_UNITS = 6
-SIM_LINE_HUM_AMP = 0.0          # Adjust to inject 60 Hz interference (e.g., 0.05)
+SIM_LINE_HUM_AMP = 0.5          # Adjust to inject 60 Hz interference (e.g., 0.05)
 SIM_LINE_HUM_FREQ = 60.0        # Line interference frequency in Hz
 
 # Sound card control
@@ -63,6 +82,9 @@ def stop_source() -> None:
     global controller
     try:
         if controller:
+            # `shutdown()` stops the dispatcher, source, and clears queues. We do
+            # this here instead of relying on Qt teardown to keep the example
+            # deterministic (especially during testing).
             controller.shutdown()
     except Exception as exc:
         print(f"Error while closing source: {exc}")
@@ -71,7 +93,7 @@ def stop_source() -> None:
 
 
 class ScopeWindow(QtWidgets.QMainWindow):
-    """Qt window rendering live data via pyqtgraph."""
+    """Simple oscilloscope-style window that renders the visualization queue."""
 
     def __init__(
         self,
@@ -86,8 +108,19 @@ class ScopeWindow(QtWidgets.QMainWindow):
         self._time_axis = x_axis
         self._buf = data_buf
         self._curves = []
+        self._last_seq: int | None = None
+        self._last_time: float | None = None
+        self._chunk_rate: float = 0.0
 
         self.setWindowTitle("SpikeHound – Live Data")
+
+        # --- Plot area ----------------------------------------------------
+        # A plain QWidget + layout keeps the structure obvious: plot on top,
+        # status HUD underneath. No fancy Qt Designer pieces required.
+        central = QtWidgets.QWidget(self)
+        layout = QtWidgets.QVBoxLayout(central)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(8)
 
         plot = pg.PlotWidget()
         plot.setBackground("w")
@@ -105,7 +138,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
         if hasattr(plot_item, "setDownsampling"):
             plot_item.setDownsampling(mode="peak")
 
-        self.setCentralWidget(plot)
+        layout.addWidget(plot)
         self._plot = plot
 
         for index, name in enumerate(channel_names):
@@ -117,9 +150,27 @@ class ScopeWindow(QtWidgets.QMainWindow):
             )
             self._curves.append(curve)
 
+        # --- Status HUD ---------------------------------------------------
+        # Lightweight, text-only indicators that show the health of the demo
+        # pipeline (sample rate, chunk rate, queue depth, drops). Students get
+        # immediate feedback if they shrink queue sizes or overwhelm the GUI.
+        status_row = QtWidgets.QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(12)
+        self._status_labels: Dict[str, QtWidgets.QLabel] = {}
+        for key in ("sr", "chunk", "queues", "drops"):
+            label = QtWidgets.QLabel("…", self)
+            label.setStyleSheet("color: #333; font-size: 11px;")
+            status_row.addWidget(label)
+            self._status_labels[key] = label
+        status_row.addStretch(1)
+        layout.addLayout(status_row)
+
+        self.setCentralWidget(central)
+
         self._timer = QtCore.QTimer(self)
         self._timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
-        self._timer.setInterval(33)  # ~30 Hz refresh
+        self._timer.setInterval(16)  # ~60 Hz refresh; keeps the UI snappy
         self._timer.timeout.connect(self._update_plot)
         self._timer.start()
 
@@ -138,7 +189,9 @@ class ScopeWindow(QtWidgets.QMainWindow):
         viz_queue = self._controller.visualization_queue
         chunk_arrays: List[np.ndarray] = []
         pending = getattr(viz_queue, "qsize", lambda: 0)()
+        last_chunk = None
         if pending == 0:
+            self._update_status(viz_queue.qsize())
             return
 
         for _ in range(pending):
@@ -149,11 +202,15 @@ class ScopeWindow(QtWidgets.QMainWindow):
             else:
                 if chunk is EndOfStream:
                     continue
+                # We never block the GUI thread—just grab whatever is waiting
+                # and let the next timer tick handle the rest.
                 samples = np.asarray(chunk.samples)
                 if samples.ndim == 2 and samples.size:
                     chunk_arrays.append(samples.T)
+                    last_chunk = chunk
 
         if not chunk_arrays:
+            self._update_status(viz_queue.qsize())
             return
 
         new_data = chunk_arrays[0] if len(chunk_arrays) == 1 else np.concatenate(chunk_arrays, axis=0)
@@ -184,8 +241,55 @@ class ScopeWindow(QtWidgets.QMainWindow):
                 skipFiniteCheck=True,
             )
 
+        if last_chunk is not None:
+            self._observe_chunk(last_chunk)
+
+        self._update_status(viz_queue.qsize())
+
+    def _observe_chunk(self, chunk) -> None:
+        """Track chunk cadence so the HUD can estimate rate/health."""
+        seq = getattr(chunk, "seq", None)
+        stamp = getattr(chunk, "start_time", None)
+        if seq is None or stamp is None:
+            return
+        if self._last_seq is not None and self._last_time is not None:
+            delta_seq = seq - self._last_seq
+            delta_time = stamp - self._last_time
+            if delta_seq >= 0 and delta_time > 1e-6:
+                inst_rate = delta_seq / delta_time
+                self._chunk_rate = inst_rate if self._chunk_rate == 0.0 else (0.8 * self._chunk_rate + 0.2 * inst_rate)
+        self._last_seq = seq
+        self._last_time = stamp
+
+    def _update_status(self, viz_depth: int) -> None:
+        """Refresh the labels with queue and throughput diagnostics."""
+        stats = self._controller.dispatcher_stats()
+        drops = stats.get("dropped", {})
+        evicted = stats.get("evicted", {})
+        queue_depths = self._controller.queue_depths()
+
+        sr = self._controller.sample_rate or 0.0
+        self._status_labels["sr"].setText(f"SR: {sr:,.0f} Hz")
+        self._status_labels["chunk"].setText(f"Chunks/s: {self._chunk_rate:5.1f}")
+
+        viz_size, viz_max = queue_depths.get("visualization", (viz_depth, 0))
+        analysis_size, analysis_max = queue_depths.get("analysis", (0, 0))
+        audio_size, audio_max = queue_depths.get("audio", (0, 0))
+        viz_max_text = "∞" if viz_max == 0 else str(viz_max)
+        analysis_max_text = "∞" if analysis_max == 0 else str(analysis_max)
+        audio_max_text = "∞" if audio_max == 0 else str(audio_max)
+        self._status_labels["queues"].setText(
+            f"Queues V:{viz_size}/{viz_max_text} A:{analysis_size}/{analysis_max_text} Au:{audio_size}/{audio_max_text}"
+        )
+
+        viz_drops = drops.get("visualization", 0)
+        log_drops = drops.get("logging", 0)
+        viz_evicted = evicted.get("visualization", 0)
+        self._status_labels["drops"].setText(f"Drops V:{viz_drops} L:{log_drops} Evict:{viz_evicted}")
+
 
 def _select_device(source_cls) -> DeviceInfo:
+    """Pick a device for the demo, honoring DEVICE_ID if provided."""
     devices = source_cls.list_available_devices()
     print("Detected devices:")
     for d in devices:
@@ -204,6 +308,7 @@ def _select_device(source_cls) -> DeviceInfo:
 
 
 def setup_controller() -> tuple[PipelineController, List[str], float]:
+    """Instantiate the controller and configure the chosen data source."""
     filter_settings = FilterSettings(
         ac_couple=FILTER_AC_COUPLE,
         ac_cutoff_hz=FILTER_AC_CUTOFF_HZ,
@@ -244,6 +349,9 @@ def setup_controller() -> tuple[PipelineController, List[str], float]:
         "channels": chan_ids,
         "chunk_size": CHUNK_SIZE,
     }
+    # Additional options are layered in for the simulator. When we add new
+    # sources later (e.g., hardware DAQ), they can provide their own kwargs
+    # without touching the GUI code.
 
     if SOURCE_CLASS is SimulatedPhysiologySource:
         configure_kwargs.update(
@@ -265,6 +373,7 @@ def setup_controller() -> tuple[PipelineController, List[str], float]:
 
 
 def main() -> None:
+    """Launch the harness: configure the pipeline, show the window, run Qt."""
     global controller, active_channels, buf, plot_samples, time_axis
 
     controller, active_channels, actual_rate = setup_controller()
@@ -273,6 +382,8 @@ def main() -> None:
     time_axis = np.linspace(0, PLOT_DURATION_S, plot_samples, dtype=np.float32)
     buf = np.zeros((plot_samples, len(active_channels)), dtype=np.float32)
 
+    # Start the pipeline before showing the window so the first timer tick has
+    # data waiting in the visualization queue.
     controller.start()
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)

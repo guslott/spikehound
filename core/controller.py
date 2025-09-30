@@ -64,6 +64,10 @@ class PipelineController:
     def filter_settings(self) -> FilterSettings:
         return self._filter_settings
 
+    @property
+    def sample_rate(self) -> Optional[float]:
+        return None if self._actual_config is None else float(self._actual_config.sample_rate)
+
     def active_channels(self) -> Sequence[ChannelInfo]:
         return [] if self._actual_config is None else list(self._actual_config.channels)
 
@@ -102,6 +106,9 @@ class PipelineController:
             source.open(selected.id)
             available_channels = source.list_available_channels(selected.id)
             if "channels" not in configure_kwargs or not configure_kwargs["channels"]:
+                # Default to “all” channels, preserving hardware order. Callers
+                # can still override this by providing their own `channels`
+                # sequence in `configure_kwargs`.
                 configure_kwargs["channels"] = [ch.id for ch in available_channels]
 
             try:
@@ -182,6 +189,18 @@ class PipelineController:
                 return {}
             return self._dispatcher.snapshot()
 
+    def queue_depths(self) -> Dict[str, tuple[int, int]]:
+        """Return (size, maxsize) for every queue the controller manages."""
+        with self._lock:
+            depths: Dict[str, tuple[int, int]] = {}
+            if self._source is not None:
+                depths["raw"] = (self._source.data_queue.qsize(), self._source.data_queue.maxsize)
+            depths["visualization"] = (self.visualization_queue.qsize(), self.visualization_queue.maxsize)
+            depths["analysis"] = (self.analysis_queue.qsize(), self.analysis_queue.maxsize)
+            depths["audio"] = (self.audio_queue.qsize(), self.audio_queue.maxsize)
+            depths["logging"] = (self.logging_queue.qsize(), self.logging_queue.maxsize)
+            return depths
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -210,6 +229,7 @@ class PipelineController:
             return
 
     def _reset_output_queues(self) -> None:
+        """Clear downstream queues so the next start() begins fresh."""
         for q in (self.visualization_queue, self.analysis_queue, self.audio_queue, self.logging_queue):
             self._flush_queue(q)
 
@@ -220,6 +240,7 @@ class PipelineController:
             self._dispatcher.stop()
         except Exception:
             pass
+        # Downstream queues remain in place; they are owned by the controller.
         self._dispatcher = None
 
     def _close_source(self) -> None:
