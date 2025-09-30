@@ -1,13 +1,13 @@
 import queue
 import sys
-from typing import List
+from typing import Any, Dict, List
 
 import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from core import Dispatcher, EndOfStream, FilterSettings
-from daq.base_source import ChannelInfo
+from core import EndOfStream, FilterSettings, PipelineController
+from daq.base_source import DeviceInfo
 from daq.simulated_source import SimulatedPhysiologySource
 from daq.soundcard_source import SoundCardSource
 
@@ -20,7 +20,7 @@ PLOT_DURATION_S = 0.4 # Display window
 
 # Simulator control
 NUM_UNITS = 6
-SIM_LINE_HUM_AMP = 0.5          # Adjust to inject 60 Hz interference (e.g., 0.05)
+SIM_LINE_HUM_AMP = 0.0          # Adjust to inject 60 Hz interference (e.g., 0.05)
 SIM_LINE_HUM_FREQ = 60.0        # Line interference frequency in Hz
 
 # Sound card control
@@ -31,7 +31,7 @@ FILTER_AC_COUPLE = True         # Enable 1st-order high-pass to remove DC bias
 FILTER_AC_CUTOFF_HZ = 1.0       # AC coupling cutoff frequency (Hz)
 FILTER_NOTCH_ENABLED = True     # Enable 50/60 Hz notch rejection
 FILTER_NOTCH_FREQ_HZ = 60.0     # Notch center frequency (Hz)
-FILTER_NOTCH_Q = 5.0           # Notch quality factor (higher => narrower)
+FILTER_NOTCH_Q = 35.0           # Notch quality factor (higher => narrower)
 FILTER_LOWPASS_HZ = None        # Set to a value (Hz) for Butterworth low-pass, or None
 FILTER_LOWPASS_ORDER = 4
 FILTER_HIGHPASS_HZ = None       # Set to a value (Hz) for additional Butterworth high-pass
@@ -44,12 +44,7 @@ DEVICE_ID = None  # Optional: pick a specific device id from list_available_devi
 
 
 # ---- App State ----
-sim = None
-dispatcher: Dispatcher | None = None
-visualization_queue: queue.Queue | None = None
-analysis_queue: queue.Queue | None = None
-audio_queue: queue.Queue | None = None
-logging_queue: queue.Queue | None = None
+controller: PipelineController | None = None
 active_channels: List[str] = []
 plot_samples = int(PLOT_DURATION_S * SAMPLE_RATE)
 time_axis = np.linspace(0, PLOT_DURATION_S, plot_samples, dtype=np.float32)
@@ -65,23 +60,14 @@ def _determine_ylim():
 
 def stop_source() -> None:
     """Ensure the active source and dispatcher are stopped and closed."""
-    global sim, dispatcher, visualization_queue, analysis_queue, audio_queue, logging_queue
+    global controller
     try:
-        if sim:
-            if getattr(sim, "running", False):
-                sim.stop()
-            sim.close()
-        if dispatcher:
-            dispatcher.stop()
+        if controller:
+            controller.shutdown()
     except Exception as exc:
         print(f"Error while closing source: {exc}")
     finally:
-        sim = None
-        dispatcher = None
-        visualization_queue = None
-        analysis_queue = None
-        audio_queue = None
-        logging_queue = None
+        controller = None
 
 
 class ScopeWindow(QtWidgets.QMainWindow):
@@ -89,19 +75,17 @@ class ScopeWindow(QtWidgets.QMainWindow):
 
     def __init__(
         self,
-        source,
         channel_names: List[str],
         x_axis: np.ndarray,
         data_buf: np.ndarray,
-        viz_queue: queue.Queue,
+        pipeline: PipelineController,
     ) -> None:
         super().__init__()
-        self._source = source
+        self._controller = pipeline
         self._channel_names = channel_names
         self._time_axis = x_axis
         self._buf = data_buf
         self._curves = []
-        self._viz_queue = viz_queue
 
         self.setWindowTitle("SpikeHound – Live Data")
 
@@ -151,14 +135,15 @@ class ScopeWindow(QtWidgets.QMainWindow):
         if not self._curves:
             return
 
+        viz_queue = self._controller.visualization_queue
         chunk_arrays: List[np.ndarray] = []
-        pending = getattr(self._viz_queue, "qsize", lambda: 0)()
+        pending = getattr(viz_queue, "qsize", lambda: 0)()
         if pending == 0:
             return
 
         for _ in range(pending):
             try:
-                chunk = self._viz_queue.get_nowait()
+                chunk = viz_queue.get_nowait()
             except queue.Empty:
                 break
             else:
@@ -200,9 +185,8 @@ class ScopeWindow(QtWidgets.QMainWindow):
             )
 
 
-def create_source_and_channels():
-    """Instantiate the selected source and choose default channels."""
-    devices = SOURCE_CLASS.list_available_devices()
+def _select_device(source_cls) -> DeviceInfo:
+    devices = source_cls.list_available_devices()
     print("Detected devices:")
     for d in devices:
         print(f"  - {d.id}: {d.name}")
@@ -210,53 +194,16 @@ def create_source_and_channels():
         raise RuntimeError("No devices found for selected SOURCE_CLASS.")
 
     if DEVICE_ID is None:
-        selected = devices[1] if len(devices) > 1 else devices[0]
-    else:
-        selected = next((d for d in devices if str(d.id) == str(DEVICE_ID)), devices[0])
+        return devices[1] if len(devices) > 1 else devices[0]
 
-    driver = SOURCE_CLASS()
-    driver.open(selected.id)
-    available: List[ChannelInfo] = driver.list_available_channels(selected.id)
+    for dev in devices:
+        if str(dev.id) == str(DEVICE_ID):
+            return dev
 
-    if SOURCE_CLASS is SimulatedPhysiologySource:
-        chan_ids = [c.id for c in available]
-        driver.configure(
-            sample_rate=SAMPLE_RATE,
-            channels=chan_ids,
-            chunk_size=CHUNK_SIZE,
-            num_units=NUM_UNITS,
-            line_hum_amp=SIM_LINE_HUM_AMP,
-            line_hum_freq=SIM_LINE_HUM_FREQ,
-        )
-        return driver, [c.name for c in available]
-
-    if SOURCE_CLASS is SoundCardSource:
-        if not available:
-            raise RuntimeError("No input channels available on the selected audio device.")
-        count = max(1, NUM_AUDIO_CHANNELS)
-        chan_ids = [c.id for c in available[:count]]
-        driver.configure(sample_rate=SAMPLE_RATE, channels=chan_ids, chunk_size=CHUNK_SIZE)
-        return driver, [c.name for c in available[:len(chan_ids)]]
-
-    raise ValueError("Unsupported SOURCE_CLASS")
+    raise ValueError(f"Device id {DEVICE_ID!r} not available")
 
 
-def main() -> None:
-    global sim, dispatcher, visualization_queue, analysis_queue, audio_queue, logging_queue
-    global active_channels, buf, plot_samples, time_axis
-
-    sim, active_channels = create_source_and_channels()
-
-    actual_rate = getattr(getattr(sim, "config", None), "sample_rate", SAMPLE_RATE)
-    plot_samples = int(PLOT_DURATION_S * actual_rate)
-    time_axis = np.linspace(0, PLOT_DURATION_S, plot_samples, dtype=np.float32)
-    buf = np.zeros((plot_samples, len(active_channels)), dtype=np.float32)
-
-    visualization_queue = queue.Queue(maxsize=64)
-    analysis_queue = queue.Queue()
-    audio_queue = queue.Queue()
-    logging_queue = queue.Queue()
-
+def setup_controller() -> tuple[PipelineController, List[str], float]:
     filter_settings = FilterSettings(
         ac_couple=FILTER_AC_COUPLE,
         ac_cutoff_hz=FILTER_AC_CUTOFF_HZ,
@@ -269,20 +216,67 @@ def main() -> None:
         highpass_order=FILTER_HIGHPASS_ORDER,
     )
 
-    dispatcher = Dispatcher(
-        raw_queue=sim.data_queue,
-        visualization_queue=visualization_queue,
-        analysis_queue=analysis_queue,
-        audio_queue=audio_queue,
-        logging_queue=logging_queue,
+    pipeline = PipelineController(
         filter_settings=filter_settings,
+        visualization_queue_size=128,
+        analysis_queue_size=64,
+        audio_queue_size=64,
+        logging_queue_size=256,
     )
-    dispatcher.start()
 
-    sim.start()
+    selected = _select_device(SOURCE_CLASS)
+    probe_source = SOURCE_CLASS()
+    probe_source.open(selected.id)
+    try:
+        available = probe_source.list_available_channels(selected.id)
+    finally:
+        probe_source.close()
+
+    if not available:
+        raise RuntimeError("Selected device has no channels")
+
+    chan_ids = [c.id for c in available]
+    if SOURCE_CLASS is SoundCardSource:
+        chan_ids = chan_ids[: max(1, NUM_AUDIO_CHANNELS)]
+
+    configure_kwargs: Dict[str, Any] = {
+        "sample_rate": SAMPLE_RATE,
+        "channels": chan_ids,
+        "chunk_size": CHUNK_SIZE,
+    }
+
+    if SOURCE_CLASS is SimulatedPhysiologySource:
+        configure_kwargs.update(
+            {
+                "num_units": NUM_UNITS,
+                "line_hum_amp": SIM_LINE_HUM_AMP,
+                "line_hum_freq": SIM_LINE_HUM_FREQ,
+            }
+        )
+
+    actual = pipeline.switch_source(
+        SOURCE_CLASS,
+        device_id=selected.id,
+        configure_kwargs=configure_kwargs,
+    )
+
+    channel_names = [ch.name for ch in actual.channels]
+    return pipeline, channel_names, float(actual.sample_rate)
+
+
+def main() -> None:
+    global controller, active_channels, buf, plot_samples, time_axis
+
+    controller, active_channels, actual_rate = setup_controller()
+
+    plot_samples = int(PLOT_DURATION_S * actual_rate)
+    time_axis = np.linspace(0, PLOT_DURATION_S, plot_samples, dtype=np.float32)
+    buf = np.zeros((plot_samples, len(active_channels)), dtype=np.float32)
+
+    controller.start()
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
-    window = ScopeWindow(sim, active_channels, time_axis, buf, visualization_queue)
+    window = ScopeWindow(active_channels, time_axis, buf, controller)
     app.aboutToQuit.connect(stop_source)
     window.show()
 
