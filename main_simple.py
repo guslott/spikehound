@@ -22,7 +22,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from core import EndOfStream, FilterSettings, PipelineController
+from core import ChannelFilterSettings, EndOfStream, FilterSettings, PipelineController
 from daq.base_source import DeviceInfo
 from daq.simulated_source import SimulatedPhysiologySource
 from daq.soundcard_source import SoundCardSource
@@ -309,7 +309,7 @@ def _select_device(source_cls) -> DeviceInfo:
 
 def setup_controller() -> tuple[PipelineController, List[str], float]:
     """Instantiate the controller and configure the chosen data source."""
-    filter_settings = FilterSettings(
+    default_channel_filters = ChannelFilterSettings(
         ac_couple=FILTER_AC_COUPLE,
         ac_cutoff_hz=FILTER_AC_CUTOFF_HZ,
         notch_enabled=FILTER_NOTCH_ENABLED,
@@ -320,6 +320,8 @@ def setup_controller() -> tuple[PipelineController, List[str], float]:
         highpass_hz=FILTER_HIGHPASS_HZ,
         highpass_order=FILTER_HIGHPASS_ORDER,
     )
+
+    filter_settings = FilterSettings(default=default_channel_filters)
 
     pipeline = PipelineController(
         filter_settings=filter_settings,

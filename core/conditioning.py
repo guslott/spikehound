@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Sequence
+from dataclasses import dataclass, asdict, field
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy import signal
@@ -9,9 +9,9 @@ from scipy import signal
 from .models import Chunk
 
 
-@dataclass
-class FilterSettings:
-    """Runtime configuration for real-time signal conditioning."""
+@dataclass(frozen=True)
+class ChannelFilterSettings:
+    """Filter configuration applied to a single channel."""
 
     ac_couple: bool = False
     ac_cutoff_hz: float = 1.0
@@ -23,7 +23,7 @@ class FilterSettings:
     highpass_hz: Optional[float] = None
     highpass_order: int = 2
 
-    def as_dict(self) -> Dict[str, object]:
+    def to_dict(self) -> Dict[str, object]:
         return asdict(self)
 
     def any_enabled(self) -> bool:
@@ -38,9 +38,8 @@ class FilterSettings:
         nyquist = sample_rate / 2.0
         if sample_rate <= 0:
             raise ValueError("sample_rate must be positive")
-        if self.ac_couple:
-            if not (0 < self.ac_cutoff_hz < nyquist):
-                raise ValueError("ac_cutoff_hz must be between 0 and Nyquist")
+        if self.ac_couple and not (0 < self.ac_cutoff_hz < nyquist):
+            raise ValueError("ac_cutoff_hz must be between 0 and Nyquist")
         if self.notch_enabled:
             if not (0 < self.notch_freq_hz < nyquist):
                 raise ValueError("notch_freq_hz must be between 0 and Nyquist")
@@ -56,6 +55,33 @@ class FilterSettings:
                 raise ValueError("highpass_hz must be between 0 and Nyquist")
             if self.highpass_order <= 0:
                 raise ValueError("highpass_order must be positive")
+
+
+@dataclass
+class FilterSettings:
+    """Per-channel filter configuration for the dispatcher."""
+
+    default: ChannelFilterSettings = field(default_factory=ChannelFilterSettings)
+    overrides: Dict[str, ChannelFilterSettings] = field(default_factory=dict)
+
+    def for_channel(self, channel_name: str) -> ChannelFilterSettings:
+        return self.overrides.get(channel_name, self.default)
+
+    def any_enabled(self) -> bool:
+        if self.default.any_enabled():
+            return True
+        return any(cfg.any_enabled() for cfg in self.overrides.values())
+
+    def validate(self, sample_rate: float) -> None:
+        self.default.validate(sample_rate)
+        for cfg in self.overrides.values():
+            cfg.validate(sample_rate)
+
+    def as_dict(self) -> Dict[str, object]:
+        return {
+            "default": self.default.to_dict(),
+            "overrides": {name: cfg.to_dict() for name, cfg in self.overrides.items()},
+        }
 
 
 class _BaseFilter:
@@ -149,7 +175,8 @@ class SignalConditioner:
         self._settings = settings or FilterSettings()
         self._sample_rate: Optional[float] = None
         self._channel_names: Optional[Sequence[str]] = None
-        self._filters: List[_BaseFilter] = []
+        self._channel_specs: Optional[Tuple[ChannelFilterSettings, ...]] = None
+        self._channel_filters: List[List[_BaseFilter]] = []
 
     @property
     def settings(self) -> FilterSettings:
@@ -159,7 +186,8 @@ class SignalConditioner:
         self._settings = settings
         # Force rebuild on next chunk
         self._sample_rate = None
-        self._filters = []
+        self._channel_filters = []
+        self._channel_specs = None
 
     def describe(self) -> Dict[str, object]:
         return self._settings.as_dict()
@@ -167,47 +195,50 @@ class SignalConditioner:
     def _ensure_filters(self, chunk: Chunk) -> bool:
         sample_rate = 1.0 / chunk.dt
         channel_names = chunk.channel_names
+        channel_specs = tuple(self._settings.for_channel(name) for name in channel_names)
         if (
-            self._filters
+            self._channel_filters
             and self._sample_rate == sample_rate
             and self._channel_names == channel_names
+            and self._channel_specs == channel_specs
         ):
             return False
 
         self._settings.validate(sample_rate)
-        n_channels = len(channel_names)
         self._sample_rate = sample_rate
         self._channel_names = channel_names
+        self._channel_specs = channel_specs
 
-        filters: List[_BaseFilter] = []
-        if self._settings.ac_couple:
-            filters.append(_ACCouplingFilter(sample_rate, self._settings.ac_cutoff_hz, n_channels))
-        if self._settings.notch_enabled:
-            filters.append(
-                _NotchFilter(sample_rate, self._settings.notch_freq_hz, self._settings.notch_q, n_channels)
-            )
-        if self._settings.highpass_hz is not None:
-            filters.append(
-                _ButterworthFilter(
-                    sample_rate,
-                    self._settings.highpass_hz,
-                    n_channels,
-                    order=self._settings.highpass_order,
-                    btype="highpass",
+        channel_filters: List[List[_BaseFilter]] = []
+        for spec in channel_specs:
+            chain: List[_BaseFilter] = []
+            if spec.ac_couple:
+                chain.append(_ACCouplingFilter(sample_rate, spec.ac_cutoff_hz, 1))
+            if spec.notch_enabled:
+                chain.append(_NotchFilter(sample_rate, spec.notch_freq_hz, spec.notch_q, 1))
+            if spec.highpass_hz is not None:
+                chain.append(
+                    _ButterworthFilter(
+                        sample_rate,
+                        spec.highpass_hz,
+                        1,
+                        order=spec.highpass_order,
+                        btype="highpass",
+                    )
                 )
-            )
-        if self._settings.lowpass_hz is not None:
-            filters.append(
-                _ButterworthFilter(
-                    sample_rate,
-                    self._settings.lowpass_hz,
-                    n_channels,
-                    order=self._settings.lowpass_order,
-                    btype="lowpass",
+            if spec.lowpass_hz is not None:
+                chain.append(
+                    _ButterworthFilter(
+                        sample_rate,
+                        spec.lowpass_hz,
+                        1,
+                        order=spec.lowpass_order,
+                        btype="lowpass",
+                    )
                 )
-            )
+            channel_filters.append(chain)
 
-        self._filters = filters
+        self._channel_filters = channel_filters
         return True
 
     def process(self, chunk: Chunk) -> np.ndarray:
@@ -216,17 +247,30 @@ class SignalConditioner:
             return samples
 
         rebuilt = self._ensure_filters(chunk)
+        if not self._channel_filters:
+            return samples
+
         if rebuilt and samples.size:
             initial = samples[:, 0]
-            for filt in self._filters:
-                filt.prime(initial)
-        filtered = samples
-        for filt in self._filters:
-            filtered = filt.apply(filtered)
+            for idx, chain in enumerate(self._channel_filters):
+                if not chain:
+                    continue
+                priming = np.asarray([initial[idx]], dtype=np.float32)
+                for filt in chain:
+                    filt.prime(priming)
+
+        filtered = samples.copy()
+        for idx, chain in enumerate(self._channel_filters):
+            if not chain:
+                continue
+            row = filtered[idx : idx + 1]
+            for filt in chain:
+                row = filt.apply(row)
+            filtered[idx, :] = row[0]
         return filtered
 
     def reset(self) -> None:
-        if self._filters:
-            n_channels = len(self._channel_names or [])
-            for filt in self._filters:
-                filt.reset(n_channels)
+        if self._channel_filters:
+            for chain in self._channel_filters:
+                for filt in chain:
+                    filt.reset(1)

@@ -3,6 +3,7 @@ import queue
 
 import numpy as np
 from core import (
+    ChannelFilterSettings,
     Chunk,
     Dispatcher,
     EndOfStream,
@@ -56,11 +57,13 @@ def test_dispatcher_filters_dc_and_notch_at_target_frequency():
     logging_queue: "queue.Queue" = queue.Queue()
 
     settings = FilterSettings(
-        ac_couple=True,
-        ac_cutoff_hz=1.0,
-        notch_enabled=True,
-        notch_freq_hz=notch_freq,
-        notch_q=35.0,
+        default=ChannelFilterSettings(
+            ac_couple=True,
+            ac_cutoff_hz=1.0,
+            notch_enabled=True,
+            notch_freq_hz=notch_freq,
+            notch_q=35.0,
+        )
     )
     dispatcher = Dispatcher(
         raw_queue,
@@ -83,7 +86,7 @@ def test_dispatcher_filters_dc_and_notch_at_target_frequency():
     assert abs(float(np.mean(filtered))) < 5e-3
 
     conditioner_no_notch = SignalConditioner(
-        FilterSettings(ac_couple=True, ac_cutoff_hz=1.0)
+        FilterSettings(default=ChannelFilterSettings(ac_couple=True, ac_cutoff_hz=1.0))
     )
     baseline = conditioner_no_notch.process(chunk)[0]
     baseline -= np.mean(baseline)
@@ -122,7 +125,9 @@ def test_dispatcher_preserves_filter_state_across_chunks():
     audio_queue: "queue.Queue" = queue.Queue()
     logging_queue: "queue.Queue" = queue.Queue()
 
-    settings = FilterSettings(lowpass_hz=200.0, lowpass_order=4)
+    settings = FilterSettings(
+        default=ChannelFilterSettings(lowpass_hz=200.0, lowpass_order=4)
+    )
     dispatcher = Dispatcher(
         raw_queue,
         visualization_queue,
