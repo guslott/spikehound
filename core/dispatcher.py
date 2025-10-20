@@ -6,8 +6,11 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
+import numpy as np
+from PySide6 import QtCore
+
 from .conditioning import FilterSettings, SignalConditioner
-from .models import Chunk, EndOfStream
+from .models import Chunk, EndOfStream, TriggerConfig
 
 
 @dataclass
@@ -26,6 +29,10 @@ class DispatcherStats:
             "evicted": dict(self.evicted),
             "dropped": dict(self.dropped),
         }
+
+
+class DispatcherSignals(QtCore.QObject):
+    tick = QtCore.Signal(dict)
 
 
 class Dispatcher:
@@ -51,11 +58,25 @@ class Dispatcher:
         self._logging_queue = logging_queue
         self._conditioner = SignalConditioner(filter_settings)
         self._poll_timeout = poll_timeout
+        self.signals = DispatcherSignals()
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._tick_thread: Optional[threading.Thread] = None
+        self._tick_interval = 1.0 / 30.0
         self._stats = DispatcherStats()
         self._stats_lock = threading.Lock()
+
+        # Ring buffer state
+        self._ring_lock = threading.Lock()
+        self._ring_buffer: Optional[np.ndarray] = None
+        self._buffer_len: int = 0
+        self._write_idx: int = 0
+        self._filled: int = 0
+        self._sample_rate: Optional[float] = None
+        self._window_sec: float = 0.2
+        self._channel_names: tuple[str, ...] = tuple()
+        self._current_trigger: Optional[TriggerConfig] = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -63,12 +84,16 @@ class Dispatcher:
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run, name="DispatcherThread", daemon=True)
         self._thread.start()
+        self._start_tick_thread()
 
     def stop(self) -> None:
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join()
             self._thread = None
+        if self._tick_thread is not None:
+            self._tick_thread.join()
+            self._tick_thread = None
 
     def join(self, timeout: Optional[float] = None) -> None:
         if self._thread is not None:
@@ -76,6 +101,24 @@ class Dispatcher:
 
     def update_filter_settings(self, settings: FilterSettings) -> None:
         self._conditioner.update_settings(settings)
+
+    # Trigger configuration stubs -------------------------------------
+
+    def set_trigger_config(self, config: TriggerConfig, sample_rate: float) -> None:
+        with self._ring_lock:
+            self._current_trigger = config
+            if sample_rate > 0:
+                self._sample_rate = sample_rate
+                self._ensure_buffer_capacity_locked()
+            self._window_sec = max(config.window_sec, 1e-3)
+            self._ensure_buffer_capacity_locked()
+
+    def set_window_duration(self, window_sec: float) -> None:
+        if window_sec <= 0:
+            return
+        with self._ring_lock:
+            self._window_sec = window_sec
+            self._ensure_buffer_capacity_locked()
 
     def snapshot(self) -> Dict[str, object]:
         with self._stats_lock:
@@ -124,6 +167,7 @@ class Dispatcher:
             units=chunk.units,
             meta=meta,
         )
+        self._update_ring_buffer(filtered_chunk)
         with self._stats_lock:
             self._stats.processed += 1
         return filtered_chunk
@@ -173,3 +217,138 @@ class Dispatcher:
                             self._stats.evicted[name] += 1
                     except queue.Empty:
                         pass
+
+    def _start_tick_thread(self) -> None:
+        if self._tick_thread is not None and self._tick_thread.is_alive():
+            return
+        self._tick_thread = threading.Thread(target=self._tick_loop, name="DispatcherTick", daemon=True)
+        self._tick_thread.start()
+
+    def _tick_loop(self) -> None:
+        while not self._stop_event.is_set():
+            payload = self._collect_window_payload()
+            if payload is not None:
+                self.signals.tick.emit(payload)
+            self._stop_event.wait(self._tick_interval)
+
+    def _collect_window_payload(self) -> Optional[dict]:
+        with self._ring_lock:
+            if self._ring_buffer is None or self._sample_rate is None:
+                return None
+            if self._filled == 0:
+                return None
+            mode = "continuous"
+            if self._current_trigger is not None:
+                mode = self._current_trigger.mode
+            if mode != "continuous":
+                return None
+
+            window_samples = int(max(1, min(self._buffer_len, self._window_sec * self._sample_rate)))
+            window_samples = min(window_samples, self._filled)
+            if window_samples <= 0:
+                return None
+
+            start = (self._write_idx - window_samples) % self._buffer_len
+            if start + window_samples <= self._buffer_len:
+                data = self._ring_buffer[:, start : start + window_samples].copy()
+            else:
+                first = self._buffer_len - start
+                part1 = self._ring_buffer[:, start:].copy()
+                part2 = self._ring_buffer[:, : window_samples - first].copy()
+                data = np.concatenate((part1, part2), axis=1)
+
+            actual_window_sec = window_samples / self._sample_rate if self._sample_rate else 0.0
+            return {
+                "channel_names": self._channel_names,
+                "samples": data,
+                "sample_rate": self._sample_rate,
+                "window_sec": actual_window_sec,
+            }
+
+    def _update_ring_buffer(self, chunk: Chunk) -> None:
+        with self._ring_lock:
+            self._ensure_buffer_for_chunk_locked(chunk)
+            if self._ring_buffer is None:
+                return
+
+            data = chunk.samples
+            frames = data.shape[1]
+            buffer_len = self._buffer_len
+
+            if frames >= buffer_len:
+                self._ring_buffer[:, :] = data[:, -buffer_len:]
+                self._write_idx = 0
+                self._filled = buffer_len
+                return
+
+            end = self._write_idx + frames
+            if end <= buffer_len:
+                self._ring_buffer[:, self._write_idx:end] = data
+            else:
+                first = buffer_len - self._write_idx
+                self._ring_buffer[:, self._write_idx:] = data[:, :first]
+                self._ring_buffer[:, : frames - first] = data[:, first:]
+            self._write_idx = (self._write_idx + frames) % buffer_len
+            self._filled = min(buffer_len, self._filled + frames)
+
+    def _ensure_buffer_for_chunk_locked(self, chunk: Chunk) -> None:
+        prev_sample_rate = self._sample_rate
+        self._sample_rate = 1.0 / chunk.dt if chunk.dt > 0 else self._sample_rate
+        channel_names = tuple(chunk.channel_names)
+        channels = len(channel_names)
+        if channels == 0 or self._sample_rate is None:
+            return
+
+        resize_needed = False
+        if self._ring_buffer is None:
+            resize_needed = True
+        else:
+            if self._ring_buffer.shape[0] != channels:
+                resize_needed = True
+            elif prev_sample_rate is not None and abs(prev_sample_rate - self._sample_rate) > 1e-6:
+                resize_needed = True
+
+        self._channel_names = channel_names
+        if resize_needed:
+            desired_len = self._compute_buffer_len(self._sample_rate)
+            self._ring_buffer = np.zeros((channels, desired_len), dtype=np.float32)
+            self._buffer_len = desired_len
+            self._write_idx = 0
+            self._filled = 0
+        else:
+            self._ensure_buffer_capacity_locked()
+
+    def _ensure_buffer_capacity_locked(self) -> None:
+        if self._ring_buffer is None or self._sample_rate is None:
+            return
+        desired_len = self._compute_buffer_len(self._sample_rate)
+        if desired_len <= self._buffer_len:
+            return
+        channels = self._ring_buffer.shape[0]
+        recent = self._collect_recent_locked(min(self._filled, desired_len))
+        new_buffer = np.zeros((channels, desired_len), dtype=np.float32)
+        if recent.size:
+            new_buffer[:, -recent.shape[1] :] = recent
+            self._filled = recent.shape[1]
+            self._write_idx = self._filled % desired_len
+        else:
+            self._filled = 0
+            self._write_idx = 0
+        self._ring_buffer = new_buffer
+        self._buffer_len = desired_len
+
+    def _collect_recent_locked(self, count: int) -> np.ndarray:
+        if self._ring_buffer is None or count <= 0 or self._filled == 0:
+            return np.empty((0, 0), dtype=np.float32)
+        count = min(count, self._filled)
+        start = (self._write_idx - count) % self._buffer_len
+        if start + count <= self._buffer_len:
+            return self._ring_buffer[:, start : start + count].copy()
+        first = self._buffer_len - start
+        part1 = self._ring_buffer[:, start:].copy()
+        part2 = self._ring_buffer[:, : count - first].copy()
+        return np.concatenate((part1, part2), axis=1)
+
+    def _compute_buffer_len(self, sample_rate: float) -> int:
+        max_window = max(self._window_sec, 1e-3)
+        return max(int(sample_rate * max_window * 2), 1)

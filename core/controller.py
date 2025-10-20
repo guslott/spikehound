@@ -2,18 +2,126 @@ from __future__ import annotations
 
 import queue
 import threading
-from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Type
+
+from PySide6 import QtCore
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from daq.base_source import ActualConfig, BaseSource, ChannelInfo
+    from daq.registry import DeviceDescriptor
 else:  # pragma: no cover - runtime fallback
     ActualConfig = Any
     BaseSource = Any
     ChannelInfo = Any
+    DeviceDescriptor = Any
 
 from .conditioning import FilterSettings
 from .dispatcher import Dispatcher
-from .models import EndOfStream
+from .models import EndOfStream, TriggerConfig
+
+
+def _registry():
+    from daq import registry as reg  # local import to avoid circular dependencies
+
+    return reg
+
+
+class DeviceManager(QtCore.QObject):
+    """Tracks available DAQ drivers and manages a single active connection."""
+
+    devicesChanged = QtCore.Signal(list)
+    deviceConnected = QtCore.Signal(str)
+    deviceDisconnected = QtCore.Signal()
+    availableChannelsChanged = QtCore.Signal(list)
+
+    def __init__(self, parent: Optional[QtCore.QObject] = None) -> None:
+        super().__init__(parent)
+        self._descriptors: Dict[str, DeviceDescriptor] = {}
+        self._active_key: Optional[str] = None
+        self._driver: Optional[BaseSource] = None
+        self._channels: List[ChannelInfo] = []
+        self.refresh_devices()
+
+    def refresh_devices(self) -> None:
+        reg = _registry()
+        reg.scan_devices(force=True)
+        self._descriptors = {d.key: d for d in reg.list_devices()}
+        payload = [
+            {
+                "key": d.key,
+                "name": d.name,
+                "module": d.module,
+                "capabilities": d.capabilities,
+            }
+            for d in self._descriptors.values()
+        ]
+        self.devicesChanged.emit(payload)
+
+    def get_device_list(self) -> List[DeviceDescriptor]:
+        return list(self._descriptors.values())
+
+    def connect_device(self, device_key: str, sample_rate: float, *, chunk_size: int = 1024, **driver_kwargs) -> BaseSource:
+        self.disconnect_device()
+
+        descriptor = self._descriptors.get(device_key)
+        if descriptor is None:
+            raise KeyError(f"Unknown device key: {device_key!r}")
+
+        reg = _registry()
+        driver = reg.create_device(device_key, **driver_kwargs)
+        available = descriptor.cls.list_available_devices()
+        if not available:
+            raise RuntimeError(f"No hardware targets available for {descriptor.name}")
+
+        target = available[0]
+        driver.open(target.id)
+        channels = driver.list_available_channels(target.id)
+
+        configure_kwargs = {
+            "sample_rate": int(sample_rate),
+            "channels": [ch.id for ch in channels] if channels else None,
+            "chunk_size": chunk_size,
+        }
+        configure_kwargs = {k: v for k, v in configure_kwargs.items() if v is not None}
+
+        try:
+            driver.configure(**configure_kwargs)
+        except Exception:
+            driver.close()
+            raise
+
+        self._driver = driver
+        self._active_key = device_key
+        self._channels = channels
+        self.availableChannelsChanged.emit(list(channels))
+        self.deviceConnected.emit(device_key)
+        return driver
+
+    def disconnect_device(self) -> None:
+        if self._driver is None:
+            return
+        try:
+            if getattr(self._driver, "running", False):
+                try:
+                    self._driver.stop()
+                except Exception:
+                    pass
+            try:
+                self._driver.close()
+            except Exception:
+                pass
+        finally:
+            self._driver = None
+            self._active_key = None
+            self._channels = []
+            self.availableChannelsChanged.emit([])
+            self.deviceDisconnected.emit()
+
+    def get_available_channels(self) -> List[ChannelInfo]:
+        return list(self._channels)
+
+    def active_key(self) -> Optional[str]:
+        return self._active_key
 
 
 class PipelineController:
@@ -183,11 +291,51 @@ class PipelineController:
             if self._dispatcher is not None:
                 self._dispatcher.update_filter_settings(settings)
 
+    # Trigger configuration placeholder ---------------------------------
+
+    def update_trigger_config(self, config: Dict[str, Any]) -> None:
+        """Receive trigger configuration updates from the GUI and forward them."""
+        with self._lock:
+            if self._dispatcher is None:
+                return
+
+            channel_index = int(config.get("channel_index", -1))
+            trigger_conf = TriggerConfig(
+                channel_index=channel_index,
+                threshold=float(config.get("threshold", 0.0)),
+                hysteresis=float(config.get("hysteresis", 0.0)),
+                pretrigger_frac=float(config.get("pretrigger_frac", 0.0)),
+                window_sec=float(config.get("window_sec", 0.0)),
+                mode=str(config.get("mode", "continuous")),
+            )
+
+            sample_rate = self.sample_rate or 0.0
+            self._dispatcher.set_trigger_config(trigger_conf, sample_rate)
+            self._dispatcher.set_window_duration(trigger_conf.window_sec)
+
+    def start_recording(self, path: str, rollover: bool) -> None:
+        """Placeholder for future recording start logic."""
+        _ = (path, rollover)
+
+    def stop_recording(self) -> None:
+        """Placeholder for future recording stop logic."""
+        pass
+
+    def update_window_span(self, window_sec: float) -> None:
+        with self._lock:
+            if self._dispatcher is None:
+                return
+            self._dispatcher.set_window_duration(window_sec)
+
     def dispatcher_stats(self) -> Dict[str, object]:
         with self._lock:
             if self._dispatcher is None:
                 return {}
             return self._dispatcher.snapshot()
+
+    def dispatcher_signals(self):
+        with self._lock:
+            return None if self._dispatcher is None else self._dispatcher.signals
 
     def queue_depths(self) -> Dict[str, tuple[int, int]]:
         """Return (size, maxsize) for every queue the controller manages."""

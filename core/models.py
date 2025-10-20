@@ -135,3 +135,15 @@ class _EndOfStreamSentinel:
 
 
 EndOfStream = _EndOfStreamSentinel()
+
+
+@dataclass(frozen=True)
+class TriggerConfig:
+    """Trigger parameters shared with the dispatcher/analyzer layer."""
+
+    channel_index: int
+    threshold: float
+    hysteresis: float
+    pretrigger_frac: float
+    window_sec: float
+    mode: str

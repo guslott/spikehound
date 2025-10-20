@@ -14,7 +14,6 @@ Think of this as a live “smoke test” for the architecture. It deliberately
 trades bells-and-whistles for clarity.
 """
 
-import queue
 import sys
 from typing import Any, Dict, List
 
@@ -93,67 +92,45 @@ def stop_source() -> None:
 
 
 class ScopeWindow(QtWidgets.QMainWindow):
-    """Simple oscilloscope-style window that renders the visualization queue."""
+    """Simple oscilloscope-style window driven by dispatcher ticks."""
 
     def __init__(
         self,
         channel_names: List[str],
-        x_axis: np.ndarray,
-        data_buf: np.ndarray,
+        _x_axis: np.ndarray,
+        _data_buf: np.ndarray,
         pipeline: PipelineController,
     ) -> None:
         super().__init__()
         self._controller = pipeline
-        self._channel_names = channel_names
-        self._time_axis = x_axis
-        self._buf = data_buf
-        self._curves = []
-        self._last_seq: int | None = None
-        self._last_time: float | None = None
+        self._channel_names: List[str] = list(channel_names)
+        self._curves: List[pg.PlotCurveItem] = []
         self._chunk_rate: float = 0.0
 
         self.setWindowTitle("SpikeHound – Live Data")
 
-        # --- Plot area ----------------------------------------------------
-        # A plain QWidget + layout keeps the structure obvious: plot on top,
-        # status HUD underneath. No fancy Qt Designer pieces required.
         central = QtWidgets.QWidget(self)
         layout = QtWidgets.QVBoxLayout(central)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(8)
 
-        plot = pg.PlotWidget()
-        plot.setBackground("w")
-        plot.showGrid(x=True, y=True, alpha=0.3)
-        plot.setLabel("left", "Voltage", units="V")
-        plot.setLabel("bottom", "Time", units="s")
-        plot.setXRange(0.0, PLOT_DURATION_S, padding=0.0)
-        plot.setYRange(*_determine_ylim())
-        plot.setMouseEnabled(x=False, y=False)
-        plot.enableAutoRange(axis="xy", enable=False)
+        self.plot_widget = pg.PlotWidget()
+        self.plot_widget.setBackground("w")
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.plot_widget.setLabel("left", "Voltage", units="V")
+        self.plot_widget.setLabel("bottom", "Time", units="s")
+        self.plot_widget.setMouseEnabled(x=False, y=False)
+        self.plot_widget.enableAutoRange(axis="y", enable=False)
 
-        plot_item = plot.getPlotItem()
+        plot_item = self.plot_widget.getPlotItem()
         if hasattr(plot_item, "setClipToView"):
             plot_item.setClipToView(True)
         if hasattr(plot_item, "setDownsampling"):
             plot_item.setDownsampling(mode="peak")
 
-        layout.addWidget(plot)
-        self._plot = plot
+        layout.addWidget(self.plot_widget)
+        self._ensure_curves(self._channel_names)
 
-        for index, name in enumerate(channel_names):
-            pen = pg.mkPen(color=pg.intColor(index, hues=max(len(channel_names), 1)), width=1.5)
-            curve = plot_item.plot(
-                self._time_axis,
-                self._buf[:, index],
-                pen=pen,
-            )
-            self._curves.append(curve)
-
-        # --- Status HUD ---------------------------------------------------
-        # Lightweight, text-only indicators that show the health of the demo
-        # pipeline (sample rate, chunk rate, queue depth, drops). Students get
-        # immediate feedback if they shrink queue sizes or overwhelm the GUI.
         status_row = QtWidgets.QHBoxLayout()
         status_row.setContentsMargins(0, 0, 0, 0)
         status_row.setSpacing(12)
@@ -168,98 +145,62 @@ class ScopeWindow(QtWidgets.QMainWindow):
 
         self.setCentralWidget(central)
 
-        self._timer = QtCore.QTimer(self)
-        self._timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
-        self._timer.setInterval(16)  # ~60 Hz refresh; keeps the UI snappy
-        self._timer.timeout.connect(self._update_plot)
-        self._timer.start()
-
         close_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Close), self)
         close_shortcut.activated.connect(self.close)
 
+        signals = self._controller.dispatcher_signals()
+        if signals is not None:
+            signals.tick.connect(self._on_dispatcher_tick)
+
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        self._timer.stop()
         stop_source()
         super().closeEvent(event)
 
-    def _update_plot(self) -> None:
+    def _ensure_curves(self, channel_names: List[str]) -> None:
+        plot_item = self.plot_widget.getPlotItem()
+        for curve in self._curves:
+            plot_item.removeItem(curve)
+        self._curves.clear()
+        if not channel_names:
+            return
+        for index, _ in enumerate(channel_names):
+            pen = pg.mkPen(color=pg.intColor(index, hues=max(len(channel_names), 1)), width=1.5)
+            curve = pg.PlotCurveItem(pen=pen)
+            self._curves.append(curve)
+            plot_item.addItem(curve)
+
+    @QtCore.Slot(dict)
+    def _on_dispatcher_tick(self, payload: dict) -> None:
+        channel_names = list(payload.get("channel_names", []))
+        samples = payload.get("samples")
+        sample_rate = float(payload.get("sample_rate") or 0)
+        window_sec = float(payload.get("window_sec") or 0)
+        if samples is None or sample_rate <= 0 or window_sec <= 0:
+            return
+
+        data = np.asarray(samples)
+        if data.ndim != 2 or data.size == 0:
+            return
+
+        if channel_names != self._channel_names:
+            self._channel_names = channel_names
+            self._ensure_curves(self._channel_names)
+
         if not self._curves:
             return
 
-        viz_queue = self._controller.visualization_queue
-        chunk_arrays: List[np.ndarray] = []
-        pending = getattr(viz_queue, "qsize", lambda: 0)()
-        last_chunk = None
-        if pending == 0:
-            self._update_status(viz_queue.qsize())
+        num_samples = data.shape[1]
+        if num_samples == 0:
             return
+        time_axis = np.linspace(0.0, window_sec, num_samples, endpoint=False, dtype=np.float32)
 
-        for _ in range(pending):
-            try:
-                chunk = viz_queue.get_nowait()
-            except queue.Empty:
-                break
-            else:
-                if chunk is EndOfStream:
-                    continue
-                # We never block the GUI thread—just grab whatever is waiting
-                # and let the next timer tick handle the rest.
-                samples = np.asarray(chunk.samples)
-                if samples.ndim == 2 and samples.size:
-                    chunk_arrays.append(samples.T)
-                    last_chunk = chunk
+        for idx, curve in enumerate(self._curves):
+            if idx < data.shape[0]:
+                curve.setData(time_axis, data[idx], skipFiniteCheck=True)
 
-        if not chunk_arrays:
-            self._update_status(viz_queue.qsize())
-            return
-
-        new_data = chunk_arrays[0] if len(chunk_arrays) == 1 else np.concatenate(chunk_arrays, axis=0)
-
-        rows, cols = new_data.shape
-        buf_rows, buf_cols = self._buf.shape
-
-        if cols != buf_cols:
-            if cols > buf_cols:
-                new_data = new_data[:, :buf_cols]
-                cols = buf_cols
-            else:
-                padded = np.zeros((rows, buf_cols), dtype=self._buf.dtype)
-                padded[:, :cols] = new_data
-                new_data = padded
-                cols = buf_cols
-
-        if rows >= buf_rows:
-            self._buf[:, :] = new_data[-buf_rows:, :]
-        else:
-            self._buf[:-rows, :] = self._buf[rows:, :]
-            self._buf[-rows:, :] = new_data
-
-        for index, curve in enumerate(self._curves):
-            curve.setData(
-                self._time_axis,
-                self._buf[:, index],
-                skipFiniteCheck=True,
-            )
-
-        if last_chunk is not None:
-            self._observe_chunk(last_chunk)
-
-        self._update_status(viz_queue.qsize())
-
-    def _observe_chunk(self, chunk) -> None:
-        """Track chunk cadence so the HUD can estimate rate/health."""
-        seq = getattr(chunk, "seq", None)
-        stamp = getattr(chunk, "start_time", None)
-        if seq is None or stamp is None:
-            return
-        if self._last_seq is not None and self._last_time is not None:
-            delta_seq = seq - self._last_seq
-            delta_time = stamp - self._last_time
-            if delta_seq >= 0 and delta_time > 1e-6:
-                inst_rate = delta_seq / delta_time
-                self._chunk_rate = inst_rate if self._chunk_rate == 0.0 else (0.8 * self._chunk_rate + 0.2 * inst_rate)
-        self._last_seq = seq
-        self._last_time = stamp
+        self.plot_widget.getPlotItem().setXRange(0, window_sec, padding=0)
+        self._chunk_rate = sample_rate
+        self._update_status(0)
 
     def _update_status(self, viz_depth: int) -> None:
         """Refresh the labels with queue and throughput diagnostics."""
