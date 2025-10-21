@@ -4,7 +4,7 @@ import queue
 import threading
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 import numpy as np
 from PySide6 import QtCore
@@ -67,7 +67,7 @@ class Dispatcher:
         self._stats = DispatcherStats()
         self._stats_lock = threading.Lock()
 
-        # Ring buffer state
+        # Ring buffer / selection state
         self._ring_lock = threading.Lock()
         self._ring_buffer: Optional[np.ndarray] = None
         self._buffer_len: int = 0
@@ -76,7 +76,10 @@ class Dispatcher:
         self._sample_rate: Optional[float] = None
         self._window_sec: float = 0.2
         self._channel_names: tuple[str, ...] = tuple()
+        self._channel_ids: tuple[int, ...] = tuple()
+        self._channel_index_map: Dict[int, int] = {}
         self._current_trigger: Optional[TriggerConfig] = None
+        self._active_channel_ids: list[int] = []
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -101,6 +104,35 @@ class Dispatcher:
 
     def update_filter_settings(self, settings: FilterSettings) -> None:
         self._conditioner.update_settings(settings)
+
+    def set_active_channels(self, channel_ids: Sequence[int]) -> None:
+        with self._ring_lock:
+            self._active_channel_ids = list(channel_ids)
+
+    def clear_active_channels(self) -> None:
+        with self._ring_lock:
+            self._active_channel_ids = []
+            self._filled = 0
+
+    def set_channel_layout(self, channel_ids: Sequence[int], channel_names: Sequence[str]) -> None:
+        with self._ring_lock:
+            self._channel_ids = tuple(channel_ids)
+            self._channel_names = tuple(channel_names)
+            self._channel_index_map = {cid: idx for idx, cid in enumerate(self._channel_ids)}
+            self._ring_buffer = None
+            self._buffer_len = 0
+            self._write_idx = 0
+            self._filled = 0
+
+    def reset_buffers(self) -> None:
+        with self._ring_lock:
+            if self._ring_buffer is not None:
+                self._ring_buffer.fill(0.0)
+            self._write_idx = 0
+            self._filled = 0
+
+    def emit_empty_tick(self) -> None:
+        self.signals.tick.emit(self._empty_payload())
 
     # Trigger configuration stubs -------------------------------------
 
@@ -233,20 +265,24 @@ class Dispatcher:
 
     def _collect_window_payload(self) -> Optional[dict]:
         with self._ring_lock:
+            status = {
+                "sample_rate": float(self._sample_rate or 0.0),
+                "window_sec": float(self._window_sec),
+            }
             if self._ring_buffer is None or self._sample_rate is None:
-                return None
+                return self._empty_payload(status)
             if self._filled == 0:
-                return None
+                return self._empty_payload(status)
             mode = "continuous"
             if self._current_trigger is not None:
                 mode = self._current_trigger.mode
             if mode != "continuous":
-                return None
+                return self._empty_payload(status)
 
             window_samples = int(max(1, min(self._buffer_len, self._window_sec * self._sample_rate)))
             window_samples = min(window_samples, self._filled)
             if window_samples <= 0:
-                return None
+                return self._empty_payload(status)
 
             start = (self._write_idx - window_samples) % self._buffer_len
             if start + window_samples <= self._buffer_len:
@@ -257,12 +293,27 @@ class Dispatcher:
                 part2 = self._ring_buffer[:, : window_samples - first].copy()
                 data = np.concatenate((part1, part2), axis=1)
 
+            if self._active_channel_ids:
+                indices = [self._channel_index_map[cid] for cid in self._active_channel_ids if cid in self._channel_index_map]
+            else:
+                indices = list(range(data.shape[0]))
+            if not indices:
+                return self._empty_payload(status)
+
+            safe_indices = [idx for idx in indices if 0 <= idx < data.shape[0]]
+            if not safe_indices:
+                return self._empty_payload(status)
+            data = data[safe_indices, :]
+            channel_ids = [self._channel_ids[idx] if idx < len(self._channel_ids) else idx for idx in safe_indices]
+            channel_names = [self._channel_names[idx] if idx < len(self._channel_names) else str(channel_ids[i]) for i, idx in enumerate(safe_indices)]
             actual_window_sec = window_samples / self._sample_rate if self._sample_rate else 0.0
+            times = np.linspace(0.0, actual_window_sec, window_samples, endpoint=False, dtype=np.float32)
             return {
-                "channel_names": self._channel_names,
+                "channel_ids": channel_ids,
+                "channel_names": channel_names,
                 "samples": data,
-                "sample_rate": self._sample_rate,
-                "window_sec": actual_window_sec,
+                "times": times,
+                "status": status,
             }
 
     def _update_ring_buffer(self, chunk: Chunk) -> None:
@@ -274,6 +325,10 @@ class Dispatcher:
             data = chunk.samples
             frames = data.shape[1]
             buffer_len = self._buffer_len
+
+            if not self._channel_ids or len(self._channel_ids) != data.shape[0]:
+                self._channel_ids = tuple(self._active_channel_ids) if self._active_channel_ids else tuple(range(data.shape[0]))
+                self._channel_index_map = {cid: idx for idx, cid in enumerate(self._channel_ids)}
 
             if frames >= buffer_len:
                 self._ring_buffer[:, :] = data[:, -buffer_len:]
@@ -308,7 +363,8 @@ class Dispatcher:
             elif prev_sample_rate is not None and abs(prev_sample_rate - self._sample_rate) > 1e-6:
                 resize_needed = True
 
-        self._channel_names = channel_names
+        if not self._channel_names:
+            self._channel_names = channel_names
         if resize_needed:
             desired_len = self._compute_buffer_len(self._sample_rate)
             self._ring_buffer = np.zeros((channels, desired_len), dtype=np.float32)
@@ -352,3 +408,17 @@ class Dispatcher:
     def _compute_buffer_len(self, sample_rate: float) -> int:
         max_window = max(self._window_sec, 1e-3)
         return max(int(sample_rate * max_window * 2), 1)
+
+    def _empty_payload(self, status: Optional[dict] = None) -> dict:
+        if status is None:
+            status = {
+                "sample_rate": float(self._sample_rate or 0.0),
+                "window_sec": float(self._window_sec),
+            }
+        return {
+            "channel_ids": [],
+            "channel_names": [],
+            "samples": np.zeros((0, 0), dtype=np.float32),
+            "times": np.zeros(0, dtype=np.float32),
+            "status": status,
+        }

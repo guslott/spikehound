@@ -92,8 +92,8 @@ class DeviceManager(QtCore.QObject):
 
         self._driver = driver
         self._active_key = device_key
-        self._channels = channels
-        self.availableChannelsChanged.emit(list(channels))
+        self._channels = list(channels)
+        self.availableChannelsChanged.emit(list(self._channels))
         self.deviceConnected.emit(device_key)
         return driver
 
@@ -123,6 +123,9 @@ class DeviceManager(QtCore.QObject):
     def active_key(self) -> Optional[str]:
         return self._active_key
 
+    def current_driver(self) -> Optional[BaseSource]:
+        return self._driver
+
 
 class PipelineController:
     """Owns the acquisition pipeline lifecycle (source + dispatcher)."""
@@ -151,6 +154,10 @@ class PipelineController:
         self._configure_kwargs: Dict[str, Any] = {}
         self._running = False
         self._lock = threading.RLock()
+        self._window_sec: float = 0.2
+        self._streaming: bool = False
+        self._active_channel_ids: List[int] = []
+        self._channel_infos: List[ChannelInfo] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -229,6 +236,8 @@ class PipelineController:
             self._actual_config = actual
             self._device_id = selected.id
             self._configure_kwargs = configure_kwargs
+            self._channel_infos = list(actual.channels)
+            self._streaming = False
             self._dispatcher = Dispatcher(
                 raw_queue=source.data_queue,
                 visualization_queue=self.visualization_queue,
@@ -309,9 +318,72 @@ class PipelineController:
                 mode=str(config.get("mode", "continuous")),
             )
 
+            self._window_sec = trigger_conf.window_sec or self._window_sec
             sample_rate = self.sample_rate or 0.0
             self._dispatcher.set_trigger_config(trigger_conf, sample_rate)
             self._dispatcher.set_window_duration(trigger_conf.window_sec)
+
+    def attach_source(self, driver: BaseSource, sample_rate: float, channels: Sequence[ChannelInfo]) -> None:
+        with self._lock:
+            self._stop_streaming_locked()
+            self._destroy_dispatcher()
+            self._close_source()
+
+            self._source = driver
+            self._actual_config = getattr(driver, "config", None)
+            self._device_id = None
+            self._configure_kwargs = {}
+            self._channel_infos = list(channels)
+            self._active_channel_ids = []
+            self._streaming = False
+
+            self._dispatcher = Dispatcher(
+                raw_queue=driver.data_queue,
+                visualization_queue=self.visualization_queue,
+                analysis_queue=self.analysis_queue,
+                audio_queue=self.audio_queue,
+                logging_queue=self.logging_queue,
+                filter_settings=self._filter_settings,
+                poll_timeout=self._dispatcher_timeout,
+            )
+            channel_ids = [info.id for info in channels]
+            channel_names = [info.name for info in channels]
+            self._dispatcher.set_channel_layout(channel_ids, channel_names)
+            self._dispatcher.set_window_duration(self._window_sec)
+            self._dispatcher.clear_active_channels()
+
+    def detach_device(self) -> None:
+        with self._lock:
+            self._stop_streaming_locked()
+            self._destroy_dispatcher()
+            self._close_source()
+            self._channel_infos = []
+            self._active_channel_ids = []
+
+    def set_active_channels(self, channel_ids: Sequence[int]) -> None:
+        with self._lock:
+            self._active_channel_ids = list(channel_ids)
+            if self._dispatcher is not None:
+                info_map = {info.id: info for info in self._channel_infos}
+                ordered_infos = [info_map[cid] for cid in self._active_channel_ids if cid in info_map]
+                names = [info.name for info in ordered_infos]
+                self._dispatcher.set_channel_layout(self._active_channel_ids, names)
+                self._dispatcher.set_active_channels(self._active_channel_ids)
+            if self._source is not None:
+                try:
+                    self._source.set_active_channels(self._active_channel_ids)
+                except Exception:
+                    pass
+
+            if self._active_channel_ids and self._dispatcher is not None and self._source is not None:
+                if not self._streaming:
+                    self._start_streaming_locked()
+            else:
+                if self._streaming:
+                    self._stop_streaming_locked()
+
+    def clear_active_channels(self) -> None:
+        self.set_active_channels([])
 
     def start_recording(self, path: str, rollover: bool) -> None:
         """Placeholder for future recording start logic."""
@@ -386,9 +458,9 @@ class PipelineController:
             return
         try:
             self._dispatcher.stop()
+            self._dispatcher.emit_empty_tick()
         except Exception:
             pass
-        # Downstream queues remain in place; they are owned by the controller.
         self._dispatcher = None
 
     def _close_source(self) -> None:
@@ -401,4 +473,42 @@ class PipelineController:
         except Exception:
             pass
         self._source = None
-        self._source = None
+        self._streaming = False
+        self._active_channel_ids = []
+
+    def _start_streaming_locked(self) -> None:
+        if self._dispatcher is None or self._source is None:
+            return
+        try:
+            info_map = {info.id: info for info in self._channel_infos}
+            ordered_infos = [info_map[cid] for cid in self._active_channel_ids if cid in info_map]
+            names = [info.name for info in ordered_infos]
+            self._dispatcher.set_channel_layout(self._active_channel_ids, names)
+            self._dispatcher.set_active_channels(self._active_channel_ids)
+            self._dispatcher.start()
+        except Exception:
+            pass
+        try:
+            self._source.start()
+        except Exception:
+            pass
+        self._streaming = True
+
+    def _stop_streaming_locked(self) -> None:
+        if not self._streaming:
+            return
+        if self._source is not None:
+            try:
+                if self._source.running:
+                    self._source.stop()
+            except Exception:
+                pass
+        if self._dispatcher is not None:
+            try:
+                self._dispatcher.clear_active_channels()
+                self._dispatcher.reset_buffers()
+                self._dispatcher.emit_empty_tick()
+                self._dispatcher.stop()
+            except Exception:
+                pass
+        self._streaming = False

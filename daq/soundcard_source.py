@@ -170,9 +170,18 @@ class SoundCardSource(BaseSource):
         pass
 
     def _configure_impl(self, sample_rate: int, channels: Sequence[int], chunk_size: int, **options) -> ActualConfig:
-        # Prepare residual buffer according to total input channel count
+        if sd is None:
+            raise RuntimeError(f"`sounddevice` unavailable: {_IMPORT_ERROR!r}")
+
+        if self._device_index is None:
+            raise RuntimeError("Device must be opened before configure().")
+
+        try:
+            sd.check_input_settings(device=self._device_index, samplerate=sample_rate, channels=len(channels))
+        except Exception as exc:
+            raise ValueError(f"Sample rate {sample_rate} Hz not supported: {exc}") from exc
+
         self._residual = np.zeros((0, self._n_in), dtype=np.float32)
-        # Build ChannelInfo objects in the selected order
         id_to_info = {ch.id: ch for ch in self._available_channels}
         selected = [id_to_info[c] for c in channels]
         cfg = ActualConfig(sample_rate=sample_rate, channels=selected, chunk_size=chunk_size, dtype=self.dtype)
@@ -203,7 +212,11 @@ class SoundCardSource(BaseSource):
                     # Emit via base to stamp counters
                     self.emit_array(data_chunk, mono_time=_time.monotonic())
 
-        # Create and start the PortAudio stream; no extra worker thread is needed.
+        if self._stream is not None:
+            try:
+                self._stream.close()
+            except Exception:
+                self._stream = None
         self._stream = sd.InputStream(
             device=self._device_index,
             channels=self._n_in,
@@ -213,6 +226,7 @@ class SoundCardSource(BaseSource):
             callback=_callback,
         )
         self._stream.start()
+
 
     def _stop_impl(self) -> None:
         # Stop and close the PortAudio stream synchronously to release the device.

@@ -15,7 +15,7 @@ trades bells-and-whistles for clarity.
 """
 
 import sys
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 import numpy as np
 import pyqtgraph as pg
@@ -129,7 +129,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
             plot_item.setDownsampling(mode="peak")
 
         layout.addWidget(self.plot_widget)
-        self._ensure_curves(self._channel_names)
+        self._ensure_curves_for_ids([], [])
 
         status_row = QtWidgets.QHBoxLayout()
         status_row.setContentsMargins(0, 0, 0, 0)
@@ -156,60 +156,88 @@ class ScopeWindow(QtWidgets.QMainWindow):
         stop_source()
         super().closeEvent(event)
 
-    def _ensure_curves(self, channel_names: List[str]) -> None:
+    def _ensure_curves_for_ids(self, channel_ids: Sequence[int], channel_names: Sequence[str]) -> None:
         plot_item = self.plot_widget.getPlotItem()
         for curve in self._curves:
             plot_item.removeItem(curve)
-        self._curves.clear()
-        if not channel_names:
+        self._curves = []
+        self._channel_names = list(channel_names)
+        self._channel_ids = list(channel_ids)
+        self._channel_offsets = {}
+        if not self._channel_ids:
             return
-        for index, _ in enumerate(channel_names):
-            pen = pg.mkPen(color=pg.intColor(index, hues=max(len(channel_names), 1)), width=1.5)
+        for index, cid in enumerate(self._channel_ids):
+            pen = pg.mkPen(color=pg.intColor(index, hues=max(len(self._channel_ids), 1)), width=1.5)
             curve = pg.PlotCurveItem(pen=pen)
-            self._curves.append(curve)
             plot_item.addItem(curve)
+            self._curves.append(curve)
+            self._channel_offsets[cid] = index * self._offset_step
 
     @QtCore.Slot(dict)
     def _on_dispatcher_tick(self, payload: dict) -> None:
-        channel_names = list(payload.get("channel_names", []))
         samples = payload.get("samples")
-        sample_rate = float(payload.get("sample_rate") or 0)
-        window_sec = float(payload.get("window_sec") or 0)
-        if samples is None or sample_rate <= 0 or window_sec <= 0:
-            return
+        times = payload.get("times")
+        status = payload.get("status", {})
+        channel_ids = list(payload.get("channel_ids", []))
+        channel_names = list(payload.get("channel_names", []))
+        sample_rate = float(status.get("sample_rate", 0.0))
+        window_sec = float(status.get("window_sec", 0.0))
 
-        data = np.asarray(samples)
-        if data.ndim != 2 or data.size == 0:
-            return
+        data = np.asarray(samples) if samples is not None else np.zeros((0, 0), dtype=np.float32)
+        time_axis = np.asarray(times) if times is not None else np.zeros(0, dtype=np.float32)
 
-        if channel_names != self._channel_names:
-            self._channel_names = channel_names
-            self._ensure_curves(self._channel_names)
+        if channel_ids != self._channel_ids:
+            self._ensure_curves_for_ids(channel_ids, channel_names)
 
         if not self._curves:
+            self.plot_widget.getPlotItem().setXRange(0, max(window_sec, 0.001), padding=0)
+            self._current_sample_rate = sample_rate
+            self._current_window_sec = window_sec
+            self._chunk_rate = 0.0
+            self._update_status(0)
             return
 
-        num_samples = data.shape[1]
-        if num_samples == 0:
+        if data.ndim != 2 or data.size == 0:
+            for curve in self._curves:
+                curve.clear()
+            self._current_sample_rate = sample_rate
+            self._current_window_sec = window_sec
+            self._chunk_rate = 0.0
+            self._update_status(0)
             return
-        time_axis = np.linspace(0.0, window_sec, num_samples, endpoint=False, dtype=np.float32)
 
         for idx, curve in enumerate(self._curves):
-            if idx < data.shape[0]:
-                curve.setData(time_axis, data[idx], skipFiniteCheck=True)
+            if idx < data.shape[0] and idx < len(self._channel_ids):
+                cid = self._channel_ids[idx]
+                offset = self._channel_offsets.get(cid, idx * self._offset_step)
+                curve.setData(time_axis, data[idx] + offset, skipFiniteCheck=True)
+            else:
+                curve.clear()
 
-        self.plot_widget.getPlotItem().setXRange(0, window_sec, padding=0)
+        if window_sec > 0:
+            self.plot_widget.getPlotItem().setXRange(0, window_sec, padding=0)
+        if self._channel_offsets:
+            max_offset = max(self._channel_offsets.values())
+            self.plot_widget.getPlotItem().setYRange(-self._offset_step, max_offset + self._offset_step, padding=0)
+
+        self._current_sample_rate = sample_rate
+        self._current_window_sec = window_sec
         self._chunk_rate = sample_rate
         self._update_status(0)
 
     def _update_status(self, viz_depth: int) -> None:
         """Refresh the labels with queue and throughput diagnostics."""
-        stats = self._controller.dispatcher_stats()
-        drops = stats.get("dropped", {})
-        evicted = stats.get("evicted", {})
-        queue_depths = self._controller.queue_depths()
+        if self._controller is not None:
+            stats = self._controller.dispatcher_stats()
+            drops = stats.get("dropped", {})
+            evicted = stats.get("evicted", {})
+            queue_depths = self._controller.queue_depths()
+        else:
+            drops = {}
+            evicted = {}
+            queue_depths = {}
 
-        sr = self._controller.sample_rate or 0.0
+        sr = getattr(self, "_current_sample_rate", 0.0)
         self._status_labels["sr"].setText(f"SR: {sr:,.0f} Hz")
         self._status_labels["chunk"].setText(f"Chunks/s: {self._chunk_rate:5.1f}")
 

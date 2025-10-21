@@ -34,6 +34,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chunk_rate: float = 0.0
         self._device_map: Dict[str, dict] = {}
         self._device_connected = False
+        self._active_channel_infos: List[object] = []
+        self._channel_ids_current: List[int] = []
+        self._offset_step = 0.5
+        self._channel_offsets: Dict[int, float] = {}
+        self._current_sample_rate: float = 0.0
+        self._current_window_sec: float = 0.0
 
         self._apply_palette()
         self._style_plot()
@@ -49,6 +55,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._device_manager.refresh_devices()
         self.attach_controller(controller)
         self._emit_trigger_config()
+
+        # Global shortcuts for quitting/closing
+        quit_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Quit), self)
+        quit_shortcut.activated.connect(self._quit_application)
+        close_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Close), self)
+        close_shortcut.activated.connect(self.close)
 
     # ------------------------------------------------------------------
     # UI Construction
@@ -181,6 +193,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.device_group = QtWidgets.QGroupBox("Device")
         device_layout = QtWidgets.QGridLayout(self.device_group)
+        device_layout.setColumnStretch(1, 1)
 
         device_layout.addWidget(self._label("Source"), 0, 0)
         self.device_combo = QtWidgets.QComboBox()
@@ -196,10 +209,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sample_rate_spin.setStyleSheet("color: rgb(255,255,255); background-color: rgb(0,0,0);")
         device_layout.addWidget(self.sample_rate_spin, 1, 1)
 
+        self.rescan_btn = QtWidgets.QPushButton("Rescan Devices")
+        self.rescan_btn.clicked.connect(self._on_rescan_devices)
+        device_layout.addWidget(self.rescan_btn, 2, 0, 1, 2)
+
         self.device_toggle_btn = QtWidgets.QPushButton("Connect")
         self.device_toggle_btn.setCheckable(True)
         self.device_toggle_btn.clicked.connect(self._on_device_button_clicked)
-        device_layout.addWidget(self.device_toggle_btn, 2, 0, 1, 2)
+        device_layout.addWidget(self.device_toggle_btn, 3, 0, 1, 2)
+
+        help_label = QtWidgets.QLabel(
+            "Drop a *.py driver in daq/ that subclasses BaseSource, then click Rescan to load it."
+        )
+        help_label.setWordWrap(True)
+        help_label.setStyleSheet("color: rgb(40,40,40); font-size: 11px;")
+        device_layout.addWidget(help_label, 4, 0, 1, 2)
 
         bottom_layout.addWidget(self.device_group, 1)
 
@@ -211,6 +235,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.available_list = QtWidgets.QListWidget()
         self.available_list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.available_list.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.available_list.setMaximumHeight(60)
         channels_layout.addWidget(self.available_list, 1, 0)
 
         buttons_layout = QtWidgets.QVBoxLayout()
@@ -225,6 +251,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.active_list = QtWidgets.QListWidget()
         self.active_list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.active_list.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.active_list.setMaximumHeight(60)
         channels_layout.addWidget(self.active_list, 1, 2)
 
         bottom_layout.addWidget(self.channels_group, 1)
@@ -338,9 +366,10 @@ class MainWindow(QtWidgets.QMainWindow):
         return label
 
     def _emit_trigger_config(self, *_) -> None:
-        idx = self.trigger_channel_combo.currentIndex()
+        data = self.trigger_channel_combo.currentData()
+        idx = int(data) if data is not None else -1
         config = {
-            "channel_index": idx if idx >= 0 else -1,
+            "channel_index": idx,
             "mode": self._current_trigger_mode(),
             "threshold": self.threshold_spin.value(),
             "hysteresis": 0.0,
@@ -376,6 +405,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.device_toggle_btn.setChecked(False)
             self.device_toggle_btn.blockSignals(False)
 
+    def _on_rescan_devices(self) -> None:
+        if not hasattr(self, "_device_manager") or self._device_manager is None:
+            return
+        self._device_manager.refresh_devices()
+        if not self._device_connected:
+            self.available_list.clear()
+            self.active_list.clear()
+            self._publish_active_channels()
+
     def _on_devices_changed(self, entries: List[dict]) -> None:
         self._device_map = {entry["key"]: entry for entry in entries}
         self.device_combo.blockSignals(True)
@@ -383,7 +421,14 @@ class MainWindow(QtWidgets.QMainWindow):
         for entry in entries:
             self.device_combo.addItem(entry["name"], entry["key"])
         self.device_combo.blockSignals(False)
+        if self._device_connected:
+            active_key = self._device_manager.active_key()
+            if active_key is not None:
+                idx = self.device_combo.findData(active_key)
+                if idx >= 0:
+                    self.device_combo.setCurrentIndex(idx)
         self._apply_device_state(self._device_connected and bool(entries))
+        self._update_channel_buttons()
 
     def _on_device_connected(self, key: str) -> None:
         self._device_connected = True
@@ -391,38 +436,86 @@ class MainWindow(QtWidgets.QMainWindow):
         idx = self.device_combo.findData(key)
         if idx >= 0:
             self.device_combo.setCurrentIndex(idx)
+        if self._controller is not None:
+            driver = self._device_manager.current_driver()
+            if driver is not None:
+                channels = self._device_manager.get_available_channels()
+                self._controller.attach_source(driver, self.sample_rate_spin.value(), channels)
+        self._update_channel_buttons()
 
     def _on_device_disconnected(self) -> None:
         self._device_connected = False
         self._apply_device_state(False)
+        if self._controller is not None:
+            self._controller.detach_device()
+            self._controller.clear_active_channels()
+        self.available_list.clear()
+        self.active_list.clear()
         self.set_trigger_channels([])
+        self._update_channel_buttons()
+        self._publish_active_channels()
 
     def _on_available_channels(self, channels: Sequence[object]) -> None:
-        names = [getattr(ch, "name", str(ch)) for ch in channels]
-        self.set_trigger_channels(names)
         self.available_list.clear()
-        for name in names:
-            self.available_list.addItem(name)
-        if not self._device_connected:
-            self.active_list.clear()
+        self.active_list.clear()
+        for info in channels:
+            name = getattr(info, "name", str(info))
+            item = QtWidgets.QListWidgetItem(name)
+            item.setData(QtCore.Qt.UserRole, info)
+            self.available_list.addItem(item)
+        self.set_trigger_channels(channels)
+        self._update_channel_buttons()
+        self._publish_active_channels()
 
     def _on_add_channel(self) -> None:
         current = self.available_list.currentItem()
         if current is None:
             return
-        self.active_list.addItem(current.text())
+        info = current.data(QtCore.Qt.UserRole)
+        item = QtWidgets.QListWidgetItem(current.text())
+        item.setData(QtCore.Qt.UserRole, info)
+        self.active_list.addItem(item)
         row = self.available_list.row(current)
         self.available_list.takeItem(row)
+        self._update_channel_buttons()
+        self._publish_active_channels()
         self._emit_trigger_config()
 
     def _on_remove_channel(self) -> None:
         current = self.active_list.currentItem()
         if current is None:
             return
-        self.available_list.addItem(current.text())
+        info = current.data(QtCore.Qt.UserRole)
+        item = QtWidgets.QListWidgetItem(current.text())
+        item.setData(QtCore.Qt.UserRole, info)
+        self.available_list.addItem(item)
         row = self.active_list.row(current)
         self.active_list.takeItem(row)
+        self._update_channel_buttons()
+        self._publish_active_channels()
         self._emit_trigger_config()
+
+    def _publish_active_channels(self) -> None:
+        infos = []
+        for index in range(self.active_list.count()):
+            item = self.active_list.item(index)
+            info = item.data(QtCore.Qt.UserRole)
+            if info is not None:
+                infos.append(info)
+        self._active_channel_infos = infos
+        self._update_channel_buttons()
+        if self._controller is not None:
+            ids = [getattr(info, "id", None) for info in infos]
+            ids = [cid for cid in ids if cid is not None]
+            if ids:
+                self._controller.set_active_channels(ids)
+            else:
+                self._controller.clear_active_channels()
+
+    def _update_channel_buttons(self) -> None:
+        connected = self._device_connected
+        self.add_channel_btn.setEnabled(connected and self.available_list.count() > 0)
+        self.remove_channel_btn.setEnabled(connected and self.active_list.count() > 0)
 
     def _on_browse_record_path(self) -> None:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Select Recording File", "", "HDF5 (*.h5);;All Files (*)")
@@ -464,6 +557,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.record_autoinc.setEnabled(enabled)
         self.record_toggle_btn.setEnabled(True)
         self.threshold_line.setMovable(enabled)
+        self.available_list.setEnabled(enabled and self._device_connected)
+        self.active_list.setEnabled(enabled and self._device_connected)
 
     def _apply_device_state(self, connected: bool) -> None:
         has_devices = bool(self._device_map)
@@ -474,6 +569,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_toggle_btn.setText("Disconnect" if connected else "Connect")
         self.device_toggle_btn.setEnabled(connected or has_devices)
         self.device_toggle_btn.blockSignals(False)
+        self.rescan_btn.setEnabled(True)
+        self.available_list.setEnabled(connected)
+        self.active_list.setEnabled(connected)
+        self._update_channel_buttons()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[override]
         if hasattr(self, "_device_manager") and self._device_manager is not None:
@@ -482,6 +581,9 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
         super().closeEvent(event)
+
+    def _quit_application(self) -> None:
+        QtWidgets.QApplication.instance().exit()
 
     def _on_threshold_line_changed(self) -> None:
         value = float(self.threshold_line.value())
@@ -513,11 +615,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if controller is None:
             stats = {}
             queue_depths: Dict[str, tuple[int, int]] = {}
-            sr = 0.0
         else:
             stats = controller.dispatcher_stats()
             queue_depths = controller.queue_depths()
-            sr = controller.sample_rate or 0.0
+
+        sr = getattr(self, "_current_sample_rate", 0.0)
 
         drops = stats.get("dropped", {}) if isinstance(stats, dict) else {}
         evicted = stats.get("evicted", {}) if isinstance(stats, dict) else {}
@@ -554,59 +656,89 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ensure_curves(names)
         self.set_trigger_channels(names)
 
-    def set_trigger_channels(self, channels: Sequence[str], *, current: Optional[str] = None) -> None:
+    def set_trigger_channels(self, channels: Sequence[object], *, current: Optional[int] = None) -> None:
         """Update trigger channel choices presented to the user."""
-        names = [getattr(ch, "name", str(ch)) for ch in channels]
         self.trigger_channel_combo.blockSignals(True)
         self.trigger_channel_combo.clear()
-        self.trigger_channel_combo.addItems(names)
-        if names and (current is None or current not in names):
+        for entry in channels:
+            name = getattr(entry, "name", str(entry))
+            cid = getattr(entry, "id", None)
+            self.trigger_channel_combo.addItem(name, cid)
+        if current is not None:
+            idx = self.trigger_channel_combo.findData(current)
+            if idx >= 0:
+                self.trigger_channel_combo.setCurrentIndex(idx)
+        elif self.trigger_channel_combo.count() > 0:
             self.trigger_channel_combo.setCurrentIndex(0)
-        elif current and current in names:
-            self.trigger_channel_combo.setCurrentText(current)
         self.trigger_channel_combo.blockSignals(False)
         self._emit_trigger_config()
 
-    def _ensure_curves(self, channel_names: Sequence[str]) -> None:
+    def _ensure_curves_for_ids(self, channel_ids: Sequence[int], channel_names: Sequence[str]) -> None:
         plot_item = self.plot_widget.getPlotItem()
-        for curve in getattr(self, "_curves", []):
+        for curve in self._curves:
             plot_item.removeItem(curve)
         self._curves = []
         self._channel_names = list(channel_names)
-        if not self._channel_names:
+        self._channel_ids_current = list(channel_ids)
+        self._channel_offsets = {}
+        if not self._channel_ids_current:
             return
-        for index, _ in enumerate(self._channel_names):
-            pen = pg.mkPen(color=pg.intColor(index, hues=max(len(self._channel_names), 1)), width=1.5)
+        for index, cid in enumerate(self._channel_ids_current):
+            pen = pg.mkPen(color=pg.intColor(index, hues=max(len(self._channel_ids_current), 1)), width=1.5)
             curve = pg.PlotCurveItem(pen=pen)
-            self._curves.append(curve)
             plot_item.addItem(curve)
+            self._curves.append(curve)
+            self._channel_offsets[cid] = index * self._offset_step
 
     @QtCore.Slot(dict)
     def _on_dispatcher_tick(self, payload: dict) -> None:
         samples = payload.get("samples")
-        sample_rate = float(payload.get("sample_rate") or 0)
-        window_sec = float(payload.get("window_sec") or 0)
+        times = payload.get("times")
+        status = payload.get("status", {})
+        sample_rate = float(status.get("sample_rate", 0.0))
+        window_sec = float(status.get("window_sec", 0.0))
+        channel_ids = list(payload.get("channel_ids", []))
         channel_names = list(payload.get("channel_names", []))
-        if samples is None or sample_rate <= 0 or window_sec <= 0:
+
+        data = np.asarray(samples) if samples is not None else np.zeros((0, 0), dtype=np.float32)
+        times_arr = np.asarray(times) if times is not None else np.zeros(0, dtype=np.float32)
+
+        if channel_ids != self._channel_ids_current:
+            self._ensure_curves_for_ids(channel_ids, channel_names)
+
+        if not self._curves:
+            self.plot_widget.getPlotItem().setXRange(0, max(window_sec, 0.001), padding=0)
+            self._current_sample_rate = sample_rate
+            self._current_window_sec = window_sec
+            self._chunk_rate = 0.0
+            self._update_status(viz_depth=0)
             return
 
-        data = np.asarray(samples)
         if data.ndim != 2 or data.size == 0:
+            for curve in self._curves:
+                curve.clear()
+            self._current_sample_rate = sample_rate
+            self._current_window_sec = window_sec
+            self._chunk_rate = 0.0
+            self._update_status(viz_depth=0)
             return
 
-        if channel_names != getattr(self, "_channel_names", []):
-            self._ensure_curves(channel_names)
-
-        if not getattr(self, "_curves", []):
-            return
-
-        count = data.shape[1]
-        time_axis = np.linspace(0.0, window_sec, count, endpoint=False, dtype=np.float32)
         for idx, curve in enumerate(self._curves):
-            if idx < data.shape[0]:
-                curve.setData(time_axis, data[idx], skipFiniteCheck=True)
+            if idx < data.shape[0] and idx < len(channel_ids):
+                cid = channel_ids[idx]
+                offset = self._channel_offsets.get(cid, idx * self._offset_step)
+                curve.setData(times_arr, data[idx] + offset, skipFiniteCheck=True)
+            else:
+                curve.clear()
 
-        self.plot_widget.getPlotItem().setXRange(0, window_sec, padding=0)
+        if window_sec > 0:
+            self.plot_widget.getPlotItem().setXRange(0, window_sec, padding=0)
+        if self._channel_offsets:
+            max_offset = max(self._channel_offsets.values()) if self._channel_offsets else 0.0
+            self.plot_widget.getPlotItem().setYRange(-self._offset_step, max_offset + self._offset_step, padding=0)
+
+        self._current_sample_rate = sample_rate
+        self._current_window_sec = window_sec
         self._chunk_rate = sample_rate
         self._update_status(viz_depth=0)
 
