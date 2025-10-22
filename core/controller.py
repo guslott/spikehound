@@ -37,6 +37,7 @@ class DeviceManager(QtCore.QObject):
     def __init__(self, parent: Optional[QtCore.QObject] = None) -> None:
         super().__init__(parent)
         self._descriptors: Dict[str, DeviceDescriptor] = {}
+        self._device_entries: Dict[str, Dict[str, object]] = {}
         self._active_key: Optional[str] = None
         self._driver: Optional[BaseSource] = None
         self._channels: List[ChannelInfo] = []
@@ -45,16 +46,82 @@ class DeviceManager(QtCore.QObject):
     def refresh_devices(self) -> None:
         reg = _registry()
         reg.scan_devices(force=True)
-        self._descriptors = {d.key: d for d in reg.list_devices()}
-        payload = [
-            {
-                "key": d.key,
-                "name": d.name,
-                "module": d.module,
-                "capabilities": d.capabilities,
-            }
-            for d in self._descriptors.values()
-        ]
+        descriptors = reg.list_devices()
+        self._descriptors = {d.key: d for d in descriptors}
+        self._device_entries = {}
+        payload: List[Dict[str, object]] = []
+        for descriptor in descriptors:
+            try:
+                available = descriptor.cls.list_available_devices()
+            except Exception as exc:  # pragma: no cover - discovery errors shown in UI
+                entry_key = f"{descriptor.key}::unavailable"
+                self._device_entries[entry_key] = {
+                    "descriptor_key": descriptor.key,
+                    "device_id": None,
+                    "error": str(exc),
+                }
+                payload.append(
+                    {
+                        "key": entry_key,
+                        "name": f"{descriptor.name} (unavailable)",
+                        "module": descriptor.module,
+                        "capabilities": descriptor.capabilities,
+                        "driver_key": descriptor.key,
+                        "driver_name": descriptor.name,
+                        "device_id": None,
+                        "device_name": None,
+                        "error": str(exc),
+                    }
+                )
+                continue
+
+            if not available:
+                entry_key = f"{descriptor.key}::none"
+                self._device_entries[entry_key] = {
+                    "descriptor_key": descriptor.key,
+                    "device_id": None,
+                    "error": "No hardware devices detected.",
+                }
+                payload.append(
+                    {
+                        "key": entry_key,
+                        "name": f"{descriptor.name} (no devices detected)",
+                        "module": descriptor.module,
+                        "capabilities": descriptor.capabilities,
+                        "driver_key": descriptor.key,
+                        "driver_name": descriptor.name,
+                        "device_id": None,
+                        "device_name": None,
+                        "error": "No hardware devices detected.",
+                    }
+                )
+                continue
+
+            for device in sorted(available, key=lambda info: info.name.lower()):
+                entry_key = f"{descriptor.key}::{device.id}"
+                self._device_entries[entry_key] = {
+                    "descriptor_key": descriptor.key,
+                    "device_id": device.id,
+                }
+                entry: Dict[str, object] = {
+                    "key": entry_key,
+                    "name": f"{descriptor.name} - {device.name}",
+                    "module": descriptor.module,
+                    "capabilities": descriptor.capabilities,
+                    "driver_key": descriptor.key,
+                    "driver_name": descriptor.name,
+                    "device_id": device.id,
+                    "device_name": device.name,
+                }
+                vendor = getattr(device, "vendor", None)
+                if vendor:
+                    entry["device_vendor"] = vendor
+                details = getattr(device, "details", None)
+                if details:
+                    entry["device_details"] = details
+                payload.append(entry)
+
+        payload.sort(key=lambda item: (item.get("driver_name", ""), item.get("device_name", "") or item["name"]))
         self.devicesChanged.emit(payload)
 
     def get_device_list(self) -> List[DeviceDescriptor]:
@@ -63,17 +130,30 @@ class DeviceManager(QtCore.QObject):
     def connect_device(self, device_key: str, sample_rate: float, *, chunk_size: int = 1024, **driver_kwargs) -> BaseSource:
         self.disconnect_device()
 
-        descriptor = self._descriptors.get(device_key)
-        if descriptor is None:
+        entry = self._device_entries.get(device_key)
+        if entry is None:
             raise KeyError(f"Unknown device key: {device_key!r}")
 
-        reg = _registry()
-        driver = reg.create_device(device_key, **driver_kwargs)
-        available = descriptor.cls.list_available_devices()
-        if not available:
-            raise RuntimeError(f"No hardware targets available for {descriptor.name}")
+        descriptor_key = entry.get("descriptor_key")
+        device_id = entry.get("device_id")
+        if descriptor_key is None or not isinstance(descriptor_key, str):
+            raise KeyError(f"Invalid descriptor for key: {device_key!r}")
 
-        target = available[0]
+        descriptor = self._descriptors.get(descriptor_key)
+        if descriptor is None:
+            raise KeyError(f"Unknown descriptor key: {descriptor_key!r}")
+
+        if device_id is None or device_id == "":
+            error_message = entry.get("error") or "No hardware devices detected for this driver."
+            raise RuntimeError(error_message)
+
+        reg = _registry()
+        driver = reg.create_device(descriptor_key, **driver_kwargs)
+        available = descriptor.cls.list_available_devices()
+        target = next((dev for dev in available if str(dev.id) == str(device_id)), None)
+        if target is None:
+            raise RuntimeError(f"Selected device is no longer available: {device_id!r}")
+
         driver.open(target.id)
         channels = driver.list_available_channels(target.id)
 
@@ -154,7 +234,7 @@ class PipelineController:
         self._configure_kwargs: Dict[str, Any] = {}
         self._running = False
         self._lock = threading.RLock()
-        self._window_sec: float = 0.2
+        self._window_sec: float = 1.0
         self._streaming: bool = False
         self._active_channel_ids: List[int] = []
         self._channel_infos: List[ChannelInfo] = []

@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, TYPE_CHECKING
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
-if TYPE_CHECKING:  # pragma: no cover
-    from core.controller import PipelineController
-
-from core import DeviceManager
+from core import DeviceManager, PipelineController
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -22,10 +19,12 @@ class MainWindow(QtWidgets.QMainWindow):
     stopRecording = QtCore.Signal()
     triggerConfigChanged = QtCore.Signal(dict)
 
-    def __init__(self, controller: Optional["PipelineController"] = None) -> None:
+    def __init__(self, controller: Optional[PipelineController] = None) -> None:
         super().__init__()
-        self._controller: Optional["PipelineController"] = None
-        self.setWindowTitle("SpikeHound")
+        if controller is None:
+            controller = PipelineController()
+        self._controller: Optional[PipelineController] = None
+        self.setWindowTitle("SpikeHound - Manlius Pebble Hill School & Cornell University")
         self.resize(1100, 720)
         self.statusBar()
 
@@ -39,7 +38,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._offset_step = 0.5
         self._channel_offsets: Dict[int, float] = {}
         self._current_sample_rate: float = 0.0
-        self._current_window_sec: float = 0.0
+        self._current_window_sec: float = 1.0
+        self._dispatcher_signals: Optional[QtCore.QObject] = None
 
         self._apply_palette()
         self._style_plot()
@@ -93,6 +93,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pretrigger_line.setVisible(False)
         self.plot_widget.addItem(self.pretrigger_line)
 
+        status_row = QtWidgets.QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(12)
+        self._status_labels = {}
+        for key in ("sr", "chunk", "queues", "drops"):
+            label = QtWidgets.QLabel("SR: 0 Hz" if key == "sr" else "…")
+            label.setStyleSheet("color: rgb(50,50,50); font-size: 11px;")
+            status_row.addWidget(label)
+            self._status_labels[key] = label
+        status_row.addStretch(1)
+        grid.addLayout(status_row, 1, 0, 1, 2)
+
         # Upper-right: stacked control boxes (Recording, Trigger).
         side_panel = QtWidgets.QWidget()
         side_layout = QtWidgets.QVBoxLayout(side_panel)
@@ -107,13 +119,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.record_path_edit.setPlaceholderText("Select output file...")
         path_row.addWidget(self.record_path_edit, 1)
         browse_btn = QtWidgets.QPushButton("Browse…")
-        browse_btn.setStyleSheet("color: rgb(0,0,0);")
         browse_btn.clicked.connect(self._on_browse_record_path)
         path_row.addWidget(browse_btn)
         record_layout.addLayout(path_row)
 
         self.record_autoinc = QtWidgets.QCheckBox("Auto-increment filename if exists")
-        self.record_autoinc.setStyleSheet("color: rgb(0,0,0);")
         self.record_autoinc.setChecked(True)
         record_layout.addWidget(self.record_autoinc)
 
@@ -132,7 +142,6 @@ class MainWindow(QtWidgets.QMainWindow):
         row = 0
         trigger_layout.addWidget(self._label("Channel"), row, 0)
         self.trigger_channel_combo = QtWidgets.QComboBox()
-        self.trigger_channel_combo.setStyleSheet("color: rgb(0,0,0);")
         trigger_layout.addWidget(self.trigger_channel_combo, row, 1)
         row += 1
 
@@ -141,8 +150,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trigger_mode_continuous = QtWidgets.QRadioButton("No Trigger (Continuous)")
         self.trigger_mode_single = QtWidgets.QRadioButton("Single")
         self.trigger_mode_repeating = QtWidgets.QRadioButton("Continuous Trigger")
-        for btn in (self.trigger_mode_continuous, self.trigger_mode_single, self.trigger_mode_repeating):
-            btn.setStyleSheet("color: rgb(0,0,0);")
         self.trigger_mode_continuous.setChecked(True)
         mode_layout.addWidget(self.trigger_mode_continuous)
         mode_layout.addWidget(self.trigger_mode_single)
@@ -173,10 +180,10 @@ class MainWindow(QtWidgets.QMainWindow):
         window_box = QtWidgets.QHBoxLayout()
         window_box.addWidget(self._label("Window (s)"))
         self.window_combo = QtWidgets.QComboBox()
-        self.window_combo.setStyleSheet("color: rgb(0,0,0);")
         for value in (0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0):
             self.window_combo.addItem(f"{value:.1f}", value)
-        self.window_combo.setCurrentIndex(1)
+        default_index = 3 if self.window_combo.count() > 3 else self.window_combo.count() - 1
+        self.window_combo.setCurrentIndex(max(0, default_index))
         window_box.addWidget(self.window_combo)
         trigger_layout.addLayout(window_box, row, 0, 1, 2)
 
@@ -197,7 +204,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         device_layout.addWidget(self._label("Source"), 0, 0)
         self.device_combo = QtWidgets.QComboBox()
-        self.device_combo.setStyleSheet("color: rgb(0,0,0);")
         device_layout.addWidget(self.device_combo, 0, 1)
 
         device_layout.addWidget(self._label("Sample Rate (Hz)"), 1, 0)
@@ -209,21 +215,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sample_rate_spin.setStyleSheet("color: rgb(255,255,255); background-color: rgb(0,0,0);")
         device_layout.addWidget(self.sample_rate_spin, 1, 1)
 
-        self.rescan_btn = QtWidgets.QPushButton("Rescan Devices")
-        self.rescan_btn.clicked.connect(self._on_rescan_devices)
-        device_layout.addWidget(self.rescan_btn, 2, 0, 1, 2)
-
         self.device_toggle_btn = QtWidgets.QPushButton("Connect")
         self.device_toggle_btn.setCheckable(True)
         self.device_toggle_btn.clicked.connect(self._on_device_button_clicked)
-        device_layout.addWidget(self.device_toggle_btn, 3, 0, 1, 2)
+        device_layout.addWidget(self.device_toggle_btn, 2, 0, 1, 2)
 
         help_label = QtWidgets.QLabel(
-            "Drop a *.py driver in daq/ that subclasses BaseSource, then click Rescan to load it."
+            "Select a device from the menu above, then click Connect to get started."
         )
         help_label.setWordWrap(True)
         help_label.setStyleSheet("color: rgb(40,40,40); font-size: 11px;")
-        device_layout.addWidget(help_label, 4, 0, 1, 2)
+        device_layout.addWidget(help_label, 3, 0, 1, 2)
 
         bottom_layout.addWidget(self.device_group, 1)
 
@@ -263,10 +265,11 @@ class MainWindow(QtWidgets.QMainWindow):
         channel_opts_layout.addStretch(1)
         bottom_layout.addWidget(self.channel_opts_group, 1)
 
-        grid.addWidget(bottom_panel, 1, 0, 1, 2)
+        grid.addWidget(bottom_panel, 2, 0, 1, 2)
 
         grid.setRowStretch(0, 1)
         grid.setRowStretch(1, 0)
+        grid.setRowStretch(2, 0)
         grid.setColumnStretch(0, 5)
         grid.setColumnStretch(1, 3)
 
@@ -281,11 +284,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.window_combo.currentIndexChanged.connect(self._emit_trigger_config)
         self.threshold_line.sigPositionChanged.connect(self._on_threshold_line_changed)
 
-    def attach_controller(self, controller: Optional["PipelineController"]) -> None:
+    def attach_controller(self, controller: Optional[PipelineController]) -> None:
         if controller is self._controller:
             return
 
         if self._controller is not None:
+            if self._dispatcher_signals is not None:
+                try:
+                    self._dispatcher_signals.tick.disconnect(self._on_dispatcher_tick)
+                except (TypeError, RuntimeError):
+                    pass
+                self._dispatcher_signals = None
             try:
                 self.triggerConfigChanged.disconnect(self._controller.update_trigger_config)
             except (TypeError, RuntimeError):
@@ -314,11 +323,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.startRecording.connect(controller.start_recording)
         self.stopRecording.connect(controller.stop_recording)
 
-        signals = controller.dispatcher_signals()
-        if signals is not None:
-            signals.tick.connect(self._on_dispatcher_tick)
-
+        self._bind_dispatcher_signals()
         self._update_status(0)
+
+    def _bind_dispatcher_signals(self) -> None:
+        if self._controller is None:
+            self._dispatcher_signals = None
+            return
+        signals = self._controller.dispatcher_signals()
+        if signals is None:
+            if self._dispatcher_signals is not None:
+                try:
+                    self._dispatcher_signals.tick.disconnect(self._on_dispatcher_tick)
+                except (TypeError, RuntimeError):
+                    pass
+            self._dispatcher_signals = None
+            return
+        if self._dispatcher_signals is signals:
+            return
+        if self._dispatcher_signals is not None:
+            try:
+                self._dispatcher_signals.tick.disconnect(self._on_dispatcher_tick)
+            except (TypeError, RuntimeError):
+                pass
+        try:
+            signals.tick.connect(self._on_dispatcher_tick)
+        except (TypeError, RuntimeError):
+            return
+        self._dispatcher_signals = signals
 
     def _apply_palette(self) -> None:
         palette = self.palette()
@@ -337,6 +369,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setStyleSheet(
             """
             QMainWindow { background-color: rgb(200,200,200); }
+            QWidget { color: rgb(0,0,0); }
             QGroupBox {
                 background-color: rgb(223,223,223);
                 border: 1px solid rgb(120, 120, 120);
@@ -352,7 +385,64 @@ class MainWindow(QtWidgets.QMainWindow):
                 color: rgb(128, 0, 0);
             }
             QLabel { color: rgb(0,0,0); }
-            QPushButton { background-color: rgb(223,223,223); }
+            QPushButton {
+                background-color: rgb(223,223,223);
+                color: rgb(0,0,0);
+                border: 1px solid rgb(120,120,120);
+                padding: 4px 8px;
+            }
+            QPushButton:checked {
+                background-color: rgb(200,200,200);
+            }
+            QLineEdit,
+            QPlainTextEdit,
+            QTextEdit,
+            QAbstractSpinBox,
+            QComboBox {
+                color: rgb(0,0,0);
+                background-color: rgb(245,245,245);
+                selection-background-color: rgb(30,144,255);
+                selection-color: rgb(255,255,255);
+                border: 1px solid rgb(120,120,120);
+                padding: 2px 4px;
+            }
+            QComboBox::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 18px;
+                border-left: 1px solid rgb(120,120,120);
+                background-color: rgb(223,223,223);
+            }
+            QComboBox QAbstractItemView {
+                color: rgb(0,0,0);
+                background-color: rgb(245,245,245);
+                selection-background-color: rgb(30,144,255);
+                selection-color: rgb(255,255,255);
+            }
+            QListView,
+            QListWidget {
+                color: rgb(0,0,0);
+                background-color: rgb(245,245,245);
+                selection-background-color: rgb(30,144,255);
+                selection-color: rgb(255,255,255);
+                border: 1px solid rgb(120,120,120);
+            }
+            QCheckBox,
+            QRadioButton {
+                color: rgb(0,0,0);
+            }
+            QSlider::groove:horizontal {
+                border: 1px solid rgb(120,120,120);
+                height: 6px;
+                background: rgb(200,200,200);
+                margin: 0px;
+            }
+            QSlider::handle:horizontal {
+                background: rgb(30,144,255);
+                border: 1px solid rgb(0,0,0);
+                width: 14px;
+                margin: -4px 0;
+            }
             QStatusBar { background-color: rgb(192,192,192); }
             """
         )
@@ -397,6 +487,12 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "Device", "Please select a device to connect.")
             self.device_toggle_btn.setChecked(False)
             return
+        entry = self._device_map.get(key)
+        if entry is not None and not entry.get("device_id"):
+            message = entry.get("error") or "No hardware devices detected for this driver."
+            QtWidgets.QMessageBox.information(self, "Device", message)
+            self.device_toggle_btn.setChecked(False)
+            return
         try:
             self._device_manager.connect_device(key, sample_rate=self.sample_rate_spin.value())
         except Exception as exc:  # pragma: no cover - GUI feedback only
@@ -405,21 +501,35 @@ class MainWindow(QtWidgets.QMainWindow):
             self.device_toggle_btn.setChecked(False)
             self.device_toggle_btn.blockSignals(False)
 
-    def _on_rescan_devices(self) -> None:
-        if not hasattr(self, "_device_manager") or self._device_manager is None:
-            return
-        self._device_manager.refresh_devices()
-        if not self._device_connected:
-            self.available_list.clear()
-            self.active_list.clear()
-            self._publish_active_channels()
-
     def _on_devices_changed(self, entries: List[dict]) -> None:
         self._device_map = {entry["key"]: entry for entry in entries}
         self.device_combo.blockSignals(True)
         self.device_combo.clear()
         for entry in entries:
-            self.device_combo.addItem(entry["name"], entry["key"])
+            key = entry.get("key")
+            name = entry.get("name") or str(key)
+            self.device_combo.addItem(name, key)
+            idx = self.device_combo.count() - 1
+            tooltip_lines = []
+            driver_name = entry.get("driver_name")
+            device_name = entry.get("device_name")
+            if driver_name and device_name:
+                tooltip_lines.append(f"{driver_name} device: {device_name}")
+            elif driver_name:
+                tooltip_lines.append(driver_name)
+            vendor = entry.get("device_vendor")
+            if vendor:
+                tooltip_lines.append(f"Vendor: {vendor}")
+            details = entry.get("device_details")
+            if isinstance(details, dict):
+                for d_key, d_val in details.items():
+                    tooltip_lines.append(f"{d_key}: {d_val}")
+            error_text = entry.get("error")
+            if error_text:
+                tooltip_lines.append(str(error_text))
+            if tooltip_lines:
+                tooltip = "\n".join(str(line) for line in tooltip_lines)
+                self.device_combo.setItemData(idx, tooltip, QtCore.Qt.ToolTipRole)
         self.device_combo.blockSignals(False)
         if self._device_connected:
             active_key = self._device_manager.active_key()
@@ -441,6 +551,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if driver is not None:
                 channels = self._device_manager.get_available_channels()
                 self._controller.attach_source(driver, self.sample_rate_spin.value(), channels)
+                self._bind_dispatcher_signals()
         self._update_channel_buttons()
 
     def _on_device_disconnected(self) -> None:
@@ -449,6 +560,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._controller is not None:
             self._controller.detach_device()
             self._controller.clear_active_channels()
+        if self._dispatcher_signals is not None:
+            try:
+                self._dispatcher_signals.tick.disconnect(self._on_dispatcher_tick)
+            except (TypeError, RuntimeError):
+                pass
+            self._dispatcher_signals = None
         self.available_list.clear()
         self.active_list.clear()
         self.set_trigger_channels([])
@@ -504,9 +621,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 infos.append(info)
         self._active_channel_infos = infos
         self._update_channel_buttons()
+        ids = [getattr(info, "id", None) for info in infos]
+        ids = [cid for cid in ids if cid is not None]
+        names = [getattr(info, "name", str(info)) for info in infos]
+        self._reset_scope_for_channels(ids, names)
+        self.trigger_mode_continuous.setChecked(True)
+        if infos:
+            self.set_trigger_channels(infos)
+        else:
+            self.trigger_channel_combo.blockSignals(True)
+            self.trigger_channel_combo.clear()
+            self.trigger_channel_combo.blockSignals(False)
+            self._emit_trigger_config()
         if self._controller is not None:
-            ids = [getattr(info, "id", None) for info in infos]
-            ids = [cid for cid in ids if cid is not None]
             if ids:
                 self._controller.set_active_channels(ids)
             else:
@@ -561,15 +688,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.active_list.setEnabled(enabled and self._device_connected)
 
     def _apply_device_state(self, connected: bool) -> None:
-        has_devices = bool(self._device_map)
-        self.device_combo.setEnabled(not connected and has_devices)
+        has_entries = bool(self._device_map)
+        has_connectable = any(entry.get("device_id") for entry in self._device_map.values())
+        self.device_combo.setEnabled(not connected and has_entries)
         self.sample_rate_spin.setEnabled(not connected)
         self.device_toggle_btn.blockSignals(True)
         self.device_toggle_btn.setChecked(connected)
         self.device_toggle_btn.setText("Disconnect" if connected else "Connect")
-        self.device_toggle_btn.setEnabled(connected or has_devices)
+        self.device_toggle_btn.setEnabled(connected or has_connectable)
         self.device_toggle_btn.blockSignals(False)
-        self.rescan_btn.setEnabled(True)
         self.available_list.setEnabled(connected)
         self.active_list.setEnabled(connected)
         self._update_channel_buttons()
@@ -673,6 +800,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trigger_channel_combo.blockSignals(False)
         self._emit_trigger_config()
 
+    def _reset_scope_for_channels(self, channel_ids: Sequence[int], channel_names: Sequence[str]) -> None:
+        self._ensure_curves_for_ids(channel_ids, channel_names)
+        plot_item = self.plot_widget.getPlotItem()
+        target_window = float(self.window_combo.currentData() or 1.0)
+        self._current_window_sec = max(target_window, 1e-3)
+        plot_item.setXRange(0.0, self._current_window_sec, padding=0.0)
+        if self._channel_offsets:
+            max_offset = max(self._channel_offsets.values())
+            plot_item.setYRange(-self._offset_step, max_offset + self._offset_step, padding=0.0)
+        else:
+            plot_item.setYRange(-self._offset_step, self._offset_step, padding=0.0)
+        for curve in self._curves:
+            curve.clear()
+        self._current_sample_rate = 0.0
+        self._chunk_rate = 0.0
+        self._update_status(viz_depth=0)
+        if self._controller is not None:
+            self._controller.update_window_span(self._current_window_sec)
+
     def _ensure_curves_for_ids(self, channel_ids: Sequence[int], channel_names: Sequence[str]) -> None:
         plot_item = self.plot_widget.getPlotItem()
         for curve in self._curves:
@@ -683,8 +829,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._channel_offsets = {}
         if not self._channel_ids_current:
             return
+        palette = [
+            (0, 0, 139),
+            (0, 57, 166),
+            (25, 25, 112),
+            (0, 105, 148),
+        ]
         for index, cid in enumerate(self._channel_ids_current):
-            pen = pg.mkPen(color=pg.intColor(index, hues=max(len(self._channel_ids_current), 1)), width=1.5)
+            color = palette[index % len(palette)]
+            pen = pg.mkPen(color=color, width=2.0)
             curve = pg.PlotCurveItem(pen=pen)
             plot_item.addItem(curve)
             self._curves.append(curve)
