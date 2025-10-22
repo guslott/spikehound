@@ -29,7 +29,7 @@ class SimulatedPhysiologySource(BaseSource):
         self._worker: threading.Thread | None = None
         # Buffers initialized in _configure_impl
         self._unit_wave_buffers = []
-        self._unit_imp_buffers = []
+        self._unit_psp_buffers = []
         self._buf_len = 0
         self._psp_template = np.zeros(1)
         self._psp_len = 1
@@ -66,6 +66,7 @@ class SimulatedPhysiologySource(BaseSource):
         t_psp = np.linspace(0, 5, psp_len)
         self._psp_template = t_psp * np.exp(-t_psp)
         self._psp_template /= np.max(self._psp_template)
+        self._psp_template = self._psp_template.astype(np.float32, copy=False)
         self._psp_len = len(self._psp_template)
 
         self._units.clear()
@@ -77,8 +78,47 @@ class SimulatedPhysiologySource(BaseSource):
             t_spike = np.linspace(-1, 1, spike_len)
             template = (1 - t_spike**2) * np.exp(-t_spike**2 / 0.5)
             template = -template
+            # Remove DC component while keeping endpoints pinned at zero.
             template -= np.mean(template)
-            template /= max(1e-12, np.max(np.abs(template)))
+            edge_val = template[0]
+            template -= edge_val
+            basis = 1.0 - (t_spike / t_spike[-1])**2
+            basis_mean = np.mean(basis)
+            if abs(basis_mean) > 1e-12:
+                template -= (template.mean() / basis_mean) * basis
+            peak = np.max(np.abs(template))
+            if peak > 1e-12:
+                template /= peak
+            # Truncate tail once magnitude falls below 1% of the peak.
+            significant = np.where(np.abs(template) >= 0.01)[0]
+            if significant.size:
+                end_idx = significant[-1]
+                trimmed = template[: end_idx + 1]
+                tail = []
+                tail_value = trimmed[-1]
+                while abs(tail_value) > 0.01:
+                    tail_value *= 0.5
+                    tail.append(tail_value)
+                tail.append(0.0)
+                template = np.concatenate((trimmed, np.asarray(tail, dtype=np.float64)))
+            else:
+                template = template[:1]
+            template = template.astype(np.float32, copy=False)
+            template -= np.mean(template)
+            if template.size > 1:
+                edge_start = template[0]
+                edge_end = template[-1]
+                ramp = np.linspace(edge_start, edge_end, template.size, dtype=np.float32)
+                template -= ramp
+            template -= np.mean(template)
+            template[0] = 0.0
+            template[-1] = 0.0
+            template -= np.mean(template)
+            template[0] = 0.0
+            template[-1] = 0.0
+            peak = np.max(np.abs(template))
+            if peak > 1e-12:
+                template /= peak
 
             rate_hz = 5 + rng.random() * 20
             base_amp_prox = 0.2 + rng.random() * 1.0
@@ -109,8 +149,8 @@ class SimulatedPhysiologySource(BaseSource):
         self._buffer_margin = max(max_template, max_ec_delay, max_syn + self._psp_len)
 
         buf_len = self.config.chunk_size + self._buffer_margin if self.config else 0
-        self._unit_wave_buffers = [np.zeros(buf_len) for _ in self._units]
-        self._unit_imp_buffers = [np.zeros(buf_len) for _ in self._units]
+        self._unit_wave_buffers = [np.zeros(buf_len, dtype=np.float32) for _ in self._units]
+        self._unit_psp_buffers = [np.zeros(buf_len, dtype=np.float32) for _ in self._units]
         self._buf_len = buf_len
     # ------------- BaseSource overrides -------------
 
@@ -146,7 +186,7 @@ class SimulatedPhysiologySource(BaseSource):
             sr = self.config.sample_rate
             chunk_duration = chunk_size / sr
             wave_buffers = self._unit_wave_buffers
-            imp_buffers = self._unit_imp_buffers
+            psp_buffers = self._unit_psp_buffers
             buf_len = self._buf_len
             next_deadline = time.perf_counter()
 
@@ -157,26 +197,31 @@ class SimulatedPhysiologySource(BaseSource):
             while not self.stop_event.is_set():
                 loop_start = time.perf_counter()
 
-                # Roll buffers and clear the new segment
-                for i in range(len(wave_buffers)):
-                    wave_buffers[i] = np.roll(wave_buffers[i], -chunk_size)
-                    imp_buffers[i] = np.roll(imp_buffers[i], -chunk_size)
-                    wave_buffers[i][-chunk_size:] = 0.0
-                    imp_buffers[i][-chunk_size:] = 0.0
-
-                start_idx = buf_len - chunk_size
                 # Generate new events per unit
                 for ui, u in enumerate(self._units):
                     p_spike = u['rate_hz'] / sr
                     events = np.random.rand(chunk_size) < p_spike
                     offs = np.where(events)[0]
                     templ = u['template']
+                    templ_len = u['templ_len']
+                    wave_buf = wave_buffers[ui]
+                    psp_buf = psp_buffers[ui]
+                    psp_gain = u['psp_gain']
+                    syn_delay = u['syn_delay_samples']
                     for off in offs:
-                        i0 = start_idx + off
-                        if i0 + u['templ_len'] < buf_len:
-                            amp = u['amp_prox'] * (0.95 + 0.10 * np.random.rand())
-                            wave_buffers[ui][i0 : i0 + u['templ_len']] += templ * amp
-                            imp_buffers[ui][i0] += 1.0
+                        amp = u['amp_prox'] * (0.95 + 0.10 * np.random.rand())
+                        scaled = templ * amp
+                        end = off + templ_len
+                        if end > buf_len:
+                            end = buf_len
+                        wave_buf[off:end] += scaled[: end - off]
+                        psp_start = off + syn_delay
+                        psp_end = psp_start + self._psp_len
+                        if psp_end > buf_len:
+                            psp_end = buf_len
+                        span = psp_end - psp_start
+                        if span > 0:
+                            psp_buf[psp_start:psp_end] += self._psp_template[:span] * psp_gain
 
                 # Build output in the selected order
                 data_chunk = np.zeros((chunk_size, len(active_ids)), dtype=np.float32)
@@ -186,7 +231,7 @@ class SimulatedPhysiologySource(BaseSource):
                     if ch_type == 'extracellular_prox':
                         sig = np.zeros(chunk_size)
                         for ui, _ in enumerate(self._units):
-                            seg = wave_buffers[ui][-chunk_size:]
+                            seg = wave_buffers[ui][:chunk_size]
                             sig += seg
                         data_chunk[:, col] = sig + np.random.randn(chunk_size) * self._noise_level
                     elif ch_type == 'extracellular_dist':
@@ -194,16 +239,21 @@ class SimulatedPhysiologySource(BaseSource):
                         for ui, u in enumerate(self._units):
                             delay_s = self._distance_m / max(1e-6, u['velocity'])
                             delay = int(round(delay_s * sr))
-                            seg = wave_buffers[ui][delay : delay + chunk_size]
+                            start = delay
+                            end = start + chunk_size
+                            if end > buf_len:
+                                end = buf_len
+                            seg = wave_buffers[ui][start:end]
+                            if seg.shape[0] < chunk_size:
+                                padded = np.zeros(chunk_size, dtype=np.float32)
+                                padded[: seg.shape[0]] = seg
+                                seg = padded
                             sig += seg * u['amp_dist_ratio']
                         data_chunk[:, col] = sig + np.random.randn(chunk_size) * self._noise_level
                     else:  # intracellular
                         sig = np.zeros(chunk_size)
                         for ui, u in enumerate(self._units):
-                            base = np.zeros(chunk_size + u['syn_delay_samples'] + self._psp_len)
-                            base[u['syn_delay_samples'] : u['syn_delay_samples'] + chunk_size] = imp_buffers[ui][-chunk_size:]
-                            psp = np.convolve(base, self._psp_template, mode='full')[:chunk_size]
-                            sig += psp * u['psp_gain']
+                            sig += psp_buffers[ui][:chunk_size]
                         data_chunk[:, col] = -0.070 + sig + np.random.randn(chunk_size) * (self._noise_level * 0.1)
 
                 if self._line_hum_amp != 0.0 and self._line_hum_omega != 0.0:
@@ -213,6 +263,21 @@ class SimulatedPhysiologySource(BaseSource):
                     self._line_hum_phase = (self._line_hum_phase + self._line_hum_omega * chunk_size) % (2.0 * np.pi)
 
                 self.emit_array(data_chunk, mono_time=loop_start)
+
+                # Advance buffers for the next chunk
+                if chunk_size < buf_len:
+                    shift = buf_len - chunk_size
+                    for ui in range(len(wave_buffers)):
+                        wave = wave_buffers[ui]
+                        wave[:shift] = wave[chunk_size:]
+                        wave[shift:] = 0.0
+                        psp = psp_buffers[ui]
+                        psp[:shift] = psp[chunk_size:]
+                        psp[shift:] = 0.0
+                else:
+                    for ui in range(len(wave_buffers)):
+                        wave_buffers[ui][:] = 0.0
+                        psp_buffers[ui][:] = 0.0
 
                 next_deadline += chunk_duration
                 time.sleep(max(0.0, next_deadline - time.perf_counter()))
