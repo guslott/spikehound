@@ -10,6 +10,10 @@ from daq.simulated_source import SimulatedPhysiologySource
 IN_SAMPLE_RATE = 20_000
 CHUNK_SIZE = 200
 SELECTED_CHANNEL = 1  # try 0 or 1 if you don't hear anything
+LINE_HUM_FREQ = 440.0
+LINE_HUM_AMP = 0.8
+LINE_HUM_DURATION = 2.0
+SPIKE_PLAY_DURATION = 10.0
 
 def dispatcher(src, audio_q: "queue.Queue"):
     """Pass-through dispatcher: drain source.data_queue -> audio queue."""
@@ -32,26 +36,8 @@ def dispatcher(src, audio_q: "queue.Queue"):
                 pass
 
 def main():
-    # 1) Simulated source
-    print("Setting up simulated source…")
-    src = SimulatedPhysiologySource()
-    dev = src.list_available_devices()[0]
-    src.open(dev.id)
-    chans = src.list_available_channels(dev.id)
-    src.configure(sample_rate=IN_SAMPLE_RATE,
-                  channels=[c.id for c in chans],
-                  chunk_size=CHUNK_SIZE,
-                  num_units=6)
-    src.start()
-
-    # 2) Audio queue and dispatcher
     audio_q: "queue.Queue" = queue.Queue(maxsize=64)
-    print("Starting dispatcher…")
-    t_disp = threading.Thread(target=dispatcher, args=(src, audio_q),
-                              name="dispatcher", daemon=True)
-    t_disp.start()
 
-    # 3) Audio player
     print("Starting audio player…")
     cfg = AudioConfig(
         out_samplerate = 44_100,
@@ -66,32 +52,63 @@ def main():
                          selected_channel=SELECTED_CHANNEL)
     player.start()
 
-        # --- TEMP: 2-second tone test at 440 Hz to verify audio path ---
-    import numpy as np
-    TONE_TEST = True
-    if TONE_TEST:
-        print("Tone test (440 Hz) for 2 seconds…")
-        dur = 2.0
-        n = int(IN_SAMPLE_RATE * dur)                # samples at the *input* sample rate
-        t = np.arange(n, dtype=np.float32) / IN_SAMPLE_RATE
-        tone = 0.2 * np.sin(2*np.pi*440.0 * t)      # mono at IN_SAMPLE_RATE
-        # Match the player’s expected shape: (frames, channels). Selected channel = 0
-        tone = tone[:, None]
-        # Push in manageable chunks so we don’t overflow the queue
-        step = 1000
-        for i in range(0, n, step):
-            player.q.put(tone[i:i+step], block=True, timeout=0.5)
+    def drain_audio_queue(q: "queue.Queue") -> None:
+        try:
+            while True:
+                q.get_nowait()
+        except queue.Empty:
+            pass
 
+    def run_sim_phase(*, line_hum_amp: float, line_hum_freq: float, duration: float, label: str) -> None:
+        print(f"{label}…")
+        src = SimulatedPhysiologySource()
+        devices = src.list_available_devices()
+        if not devices:
+            raise RuntimeError("No simulated devices available.")
+        dev = devices[0]
+        src.open(dev.id)
+        chans = src.list_available_channels(dev.id)
+        channel_ids = [c.id for c in chans]
+        src.configure(sample_rate=IN_SAMPLE_RATE,
+                      channels=channel_ids,
+                      chunk_size=CHUNK_SIZE,
+                      num_units=6,
+                      line_hum_amp=line_hum_amp,
+                      line_hum_freq=line_hum_freq)
 
-    # 4) Let it play
-    print("Playing spikes for 10 seconds…")
+        t_disp: threading.Thread | None = None
+        try:
+            src.start()
+            thread_name = f"dispatcher-{label.replace(' ', '-').lower()}"
+            t_disp = threading.Thread(target=dispatcher,
+                                      args=(src, audio_q),
+                                      name=thread_name,
+                                      daemon=True)
+            t_disp.start()
+            time.sleep(duration)
+        finally:
+            src.stop()
+            if t_disp is not None:
+                t_disp.join(timeout=1.0)
+            src.close()
+
     try:
-        time.sleep(10)
+        run_sim_phase(line_hum_amp=LINE_HUM_AMP,
+                      line_hum_freq=LINE_HUM_FREQ,
+                      duration=LINE_HUM_DURATION,
+                      label="Phase 1: line hum 440 Hz")
+
+        drain_audio_queue(audio_q)
+        print("Switching to spike-only playback…")
+
+        run_sim_phase(line_hum_amp=0.0,
+                      line_hum_freq=LINE_HUM_FREQ,
+                      duration=SPIKE_PLAY_DURATION,
+                      label="Phase 2: spikes only")
     finally:
         print("Stopping…")
         player.stop()
         player.join(timeout=2.0)
-        src.stop(); src.close()
         print("Done.")
 
 if __name__ == "__main__":

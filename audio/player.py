@@ -58,7 +58,7 @@ class AudioPlayer(threading.Thread):
         # For interpolation time tracking
         self._t_in_cursor = 0.0  # seconds in input timebase
 
-        self._stop = threading.Event()
+        self._stop_evt = threading.Event()
         self._stream = None
 
     # ---- Public control ------------------------------------------------------
@@ -67,7 +67,7 @@ class AudioPlayer(threading.Thread):
         self._selected = None if idx is None else int(idx)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_evt.set()
 
     # ---- Ring buffer helpers -------------------------------------------------
 
@@ -216,7 +216,7 @@ class AudioPlayer(threading.Thread):
         self._stream.start()
 
         try:
-            while not self._stop.is_set():
+            while not self._stop_evt.is_set():
                 # Drain upstream queue
                 try:
                     ch = self.q.get(timeout=0.05)
