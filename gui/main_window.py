@@ -189,6 +189,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         side_layout.addWidget(self.trigger_group)
 
+        self.listen_group = QtWidgets.QGroupBox("Listen")
+        listen_layout = QtWidgets.QVBoxLayout(self.listen_group)
+        listen_label = QtWidgets.QLabel("Coming soon...")
+        listen_label.setAlignment(QtCore.Qt.AlignCenter)
+        listen_label.setStyleSheet("color: rgb(80, 80, 80); font-style: italic;")
+        listen_layout.addStretch(1)
+        listen_layout.addWidget(listen_label)
+        listen_layout.addStretch(1)
+        side_layout.addWidget(self.listen_group)
+
         side_layout.addStretch(1)
         grid.addWidget(side_panel, 0, 1)
 
@@ -201,6 +211,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_group = QtWidgets.QGroupBox("Device")
         device_layout = QtWidgets.QGridLayout(self.device_group)
         device_layout.setColumnStretch(1, 1)
+        self.device_group.setMaximumWidth(320)
 
         device_layout.addWidget(self._label("Source"), 0, 0)
         self.device_combo = QtWidgets.QComboBox()
@@ -227,18 +238,21 @@ class MainWindow(QtWidgets.QMainWindow):
         help_label.setStyleSheet("color: rgb(40,40,40); font-size: 11px;")
         device_layout.addWidget(help_label, 3, 0, 1, 2)
 
-        bottom_layout.addWidget(self.device_group, 1)
+        bottom_layout.addWidget(self.device_group)
 
         self.channels_group = QtWidgets.QGroupBox("Channels")
         channels_layout = QtWidgets.QGridLayout(self.channels_group)
+        channels_layout.setVerticalSpacing(6)
+        channels_layout.setContentsMargins(8, 12, 8, 12)
 
         channels_layout.addWidget(self._label("Available"), 0, 0)
         channels_layout.addWidget(self._label("Active"), 0, 2)
 
         self.available_list = QtWidgets.QListWidget()
         self.available_list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.available_list.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-        self.available_list.setMaximumHeight(60)
+        self.available_list.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.available_list.setMinimumHeight(120)
+        self.available_list.setMaximumHeight(140)
         channels_layout.addWidget(self.available_list, 1, 0)
 
         buttons_layout = QtWidgets.QVBoxLayout()
@@ -253,17 +267,24 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.active_list = QtWidgets.QListWidget()
         self.active_list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.active_list.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-        self.active_list.setMaximumHeight(60)
+        self.active_list.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.active_list.setMinimumHeight(120)
+        self.active_list.setMaximumHeight(140)
         channels_layout.addWidget(self.active_list, 1, 2)
 
-        bottom_layout.addWidget(self.channels_group, 1)
+        channels_layout.setRowStretch(1, 1)
+
+        bottom_layout.addWidget(self.channels_group, stretch=2)
 
         self.channel_opts_group = QtWidgets.QGroupBox("Channel Options")
         channel_opts_layout = QtWidgets.QVBoxLayout(self.channel_opts_group)
         channel_opts_layout.addWidget(self._label("Per-channel options coming soon."))
         channel_opts_layout.addStretch(1)
-        bottom_layout.addWidget(self.channel_opts_group, 1)
+        bottom_layout.addWidget(self.channel_opts_group)
+
+        bottom_layout.setStretch(0, 1)
+        bottom_layout.setStretch(1, 3)
+        bottom_layout.setStretch(2, 1)
 
         grid.addWidget(bottom_panel, 2, 0, 1, 2)
 
