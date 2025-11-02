@@ -34,7 +34,8 @@ class SimulatedPhysiologySource(BaseSource):
         self._psp_template = np.zeros(1)
         self._psp_len = 1
         self._buffer_margin = 0
-        self._line_hum_amp = 0.0
+        self._default_line_hum_amp = 0.05
+        self._line_hum_amp = self._default_line_hum_amp
         self._line_hum_freq = 60.0
         self._line_hum_phase = 0.0
         self._line_hum_omega = 0.0
@@ -164,7 +165,7 @@ class SimulatedPhysiologySource(BaseSource):
 
     def _configure_impl(self, sample_rate: int, channels, chunk_size: int, **options) -> ActualConfig:
         num_units = int(options.get('num_units', 5))
-        self._line_hum_amp = float(options.get('line_hum_amp', 0.0))
+        self._line_hum_amp = float(options.get('line_hum_amp', self._default_line_hum_amp))
         self._line_hum_freq = float(options.get('line_hum_freq', 60.0))
         self._line_hum_phase = 0.0
         self._line_hum_omega = 0.0 if sample_rate <= 0 else 2.0 * np.pi * (self._line_hum_freq / sample_rate)
@@ -190,12 +191,16 @@ class SimulatedPhysiologySource(BaseSource):
             buf_len = self._buf_len
             next_deadline = time.perf_counter()
 
-            # Resolve active channel ids to types in order
-            id_to_type = {0: 'extracellular_prox', 1: 'extracellular_dist', 2: 'intracellular'}
-            active_ids = [ch.id for ch in self.get_active_channels()]
-
             while not self.stop_event.is_set():
                 loop_start = time.perf_counter()
+                active_infos = self.get_active_channels()
+                active_ids = [ch.id for ch in active_infos]
+                if not active_ids:
+                    time.sleep(0.01)
+                    continue
+
+                # Resolve active channel ids to types in order
+                id_to_type = {0: 'extracellular_prox', 1: 'extracellular_dist', 2: 'intracellular'}
 
                 # Generate new events per unit
                 for ui, u in enumerate(self._units):
