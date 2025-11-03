@@ -72,6 +72,7 @@ class ChannelOptionsPanel(QtWidgets.QWidget):
         range_row = QtWidgets.QHBoxLayout()
         range_row.addWidget(QtWidgets.QLabel("Vertical Range (±V)"))
         self.range_combo = QtWidgets.QComboBox()
+        self.range_combo.setMaximumWidth(120)
         for value in (0.1, 0.2, 0.5, 1.0, 2.0, 5.0):
             self.range_combo.addItem(f"{value:.1f}", value)
         range_row.addWidget(self.range_combo, 1)
@@ -84,6 +85,7 @@ class ChannelOptionsPanel(QtWidgets.QWidget):
         self.offset_spin.setRange(-10_000.0, 10_000.0)
         self.offset_spin.setDecimals(3)
         self.offset_spin.setSingleStep(0.1)
+        self.offset_spin.setMaximumWidth(110)
         offset_row.addWidget(self.offset_spin, 1)
         layout.addLayout(offset_row)
 
@@ -98,6 +100,7 @@ class ChannelOptionsPanel(QtWidgets.QWidget):
         self.notch_spin.setValue(60.0)
         self.notch_spin.setDecimals(1)
         self.notch_spin.setSingleStep(1.0)
+        self.notch_spin.setMaximumWidth(110)
         notch_row.addWidget(self.notch_spin)
         layout.addLayout(notch_row)
 
@@ -111,6 +114,7 @@ class ChannelOptionsPanel(QtWidgets.QWidget):
         self.highpass_spin.setValue(10.0)
         self.highpass_spin.setDecimals(1)
         self.highpass_spin.setSingleStep(1.0)
+        self.highpass_spin.setMaximumWidth(110)
         hp_row.addWidget(self.highpass_spin)
         layout.addLayout(hp_row)
 
@@ -124,6 +128,7 @@ class ChannelOptionsPanel(QtWidgets.QWidget):
         self.lowpass_spin.setValue(1_000.0)
         self.lowpass_spin.setDecimals(1)
         self.lowpass_spin.setSingleStep(10.0)
+        self.lowpass_spin.setMaximumWidth(110)
         lp_row.addWidget(self.lowpass_spin)
         layout.addLayout(lp_row)
 
@@ -424,6 +429,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Upper-right: stacked control boxes (Recording, Trigger, Channel Options).
         side_panel = QtWidgets.QWidget()
+        side_panel.setMaximumWidth(320)
         side_layout = QtWidgets.QVBoxLayout(side_panel)
         side_layout.setContentsMargins(0, 0, 0, 0)
         side_layout.setSpacing(8)
@@ -433,9 +439,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         path_row = QtWidgets.QHBoxLayout()
         self.record_path_edit = QtWidgets.QLineEdit()
+        self.record_path_edit.setMaximumWidth(220)
         self.record_path_edit.setPlaceholderText("Select output file...")
         path_row.addWidget(self.record_path_edit, 1)
         browse_btn = QtWidgets.QPushButton("Browse…")
+        browse_btn.setFixedWidth(80)
         browse_btn.clicked.connect(self._on_browse_record_path)
         path_row.addWidget(browse_btn)
         record_layout.addLayout(path_row)
@@ -459,6 +467,8 @@ class MainWindow(QtWidgets.QMainWindow):
         row = 0
         trigger_layout.addWidget(self._label("Channel"), row, 0)
         self.trigger_channel_combo = QtWidgets.QComboBox()
+        self.trigger_channel_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.trigger_channel_combo.setMaximumWidth(200)
         trigger_layout.addWidget(self.trigger_channel_combo, row, 1)
         row += 1
 
@@ -490,6 +500,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.threshold_spin.setSingleStep(0.05)
         self.threshold_spin.setDecimals(3)
         self.threshold_spin.setValue(0.0)
+        self.threshold_spin.setMaximumWidth(100)
         threshold_box.addWidget(self.threshold_spin)
         trigger_layout.addLayout(threshold_box, row, 0, 1, 2)
         row += 1
@@ -497,6 +508,7 @@ class MainWindow(QtWidgets.QMainWindow):
         pretrig_box = QtWidgets.QHBoxLayout()
         pretrig_box.addWidget(self._label("Pre-trigger (s)"))
         self.pretrigger_combo = QtWidgets.QComboBox()
+        self.pretrigger_combo.setMaximumWidth(110)
         for value in (0.0, 0.01, 0.02, 0.05):
             self.pretrigger_combo.addItem(f"{value:.2f}", value)
         self.pretrigger_combo.setCurrentIndex(0)
@@ -507,6 +519,7 @@ class MainWindow(QtWidgets.QMainWindow):
         window_box = QtWidgets.QHBoxLayout()
         window_box.addWidget(self._label("Window Width (s)"))
         self.window_combo = QtWidgets.QComboBox()
+        self.window_combo.setMaximumWidth(110)
         for value in (0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0):
             self.window_combo.addItem(f"{value:.1f}", value)
         default_index = 3 if self.window_combo.count() > 3 else self.window_combo.count() - 1
