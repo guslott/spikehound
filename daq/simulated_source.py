@@ -39,6 +39,7 @@ class SimulatedPhysiologySource(BaseSource):
         self._line_hum_freq = 60.0
         self._line_hum_phase = 0.0
         self._line_hum_omega = 0.0
+        self._chunk_buffer: np.ndarray | None = None
 
     # ---- Discovery ------------------------------------------------------------
     @classmethod
@@ -202,6 +203,16 @@ class SimulatedPhysiologySource(BaseSource):
                 # Resolve active channel ids to types in order
                 id_to_type = {0: 'extracellular_prox', 1: 'extracellular_dist', 2: 'intracellular'}
 
+                if (
+                    self._chunk_buffer is None
+                    or self._chunk_buffer.shape[0] != chunk_size
+                    or self._chunk_buffer.shape[1] != len(active_ids)
+                ):
+                    self._chunk_buffer = np.zeros((chunk_size, len(active_ids)), dtype=np.float32)
+                else:
+                    self._chunk_buffer.fill(0.0)
+                data_chunk = self._chunk_buffer
+
                 # Generate new events per unit
                 for ui, u in enumerate(self._units):
                     p_spike = u['rate_hz'] / sr
@@ -228,19 +239,17 @@ class SimulatedPhysiologySource(BaseSource):
                         if span > 0:
                             psp_buf[psp_start:psp_end] += self._psp_template[:span] * psp_gain
 
-                # Build output in the selected order
-                data_chunk = np.zeros((chunk_size, len(active_ids)), dtype=np.float32)
-
                 for col, cid in enumerate(active_ids):
                     ch_type = id_to_type.get(cid, 'extracellular_prox')
                     if ch_type == 'extracellular_prox':
-                        sig = np.zeros(chunk_size)
+                        sig = np.zeros(chunk_size, dtype=np.float32)
                         for ui, _ in enumerate(self._units):
                             seg = wave_buffers[ui][:chunk_size]
                             sig += seg
-                        data_chunk[:, col] = sig + np.random.randn(chunk_size) * self._noise_level
+                        sig += np.random.normal(0.0, self._noise_level, size=chunk_size).astype(np.float32)
+                        data_chunk[:, col] = sig
                     elif ch_type == 'extracellular_dist':
-                        sig = np.zeros(chunk_size)
+                        sig = np.zeros(chunk_size, dtype=np.float32)
                         for ui, u in enumerate(self._units):
                             delay_s = self._distance_m / max(1e-6, u['velocity'])
                             delay = int(round(delay_s * sr))
@@ -254,12 +263,14 @@ class SimulatedPhysiologySource(BaseSource):
                                 padded[: seg.shape[0]] = seg
                                 seg = padded
                             sig += seg * u['amp_dist_ratio']
-                        data_chunk[:, col] = sig + np.random.randn(chunk_size) * self._noise_level
+                        sig += np.random.normal(0.0, self._noise_level, size=chunk_size).astype(np.float32)
+                        data_chunk[:, col] = sig
                     else:  # intracellular
-                        sig = np.zeros(chunk_size)
+                        sig = np.zeros(chunk_size, dtype=np.float32)
                         for ui, u in enumerate(self._units):
                             sig += psp_buffers[ui][:chunk_size]
-                        data_chunk[:, col] = -0.070 + sig + np.random.randn(chunk_size) * (self._noise_level * 0.1)
+                        sig = -0.070 + sig + np.random.normal(0.0, self._noise_level * 0.1, size=chunk_size).astype(np.float32)
+                        data_chunk[:, col] = sig
 
                 if self._line_hum_amp != 0.0 and self._line_hum_omega != 0.0:
                     idx = np.arange(chunk_size, dtype=np.float64)

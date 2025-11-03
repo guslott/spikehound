@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
+from collections import deque
 
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Sequence
@@ -299,6 +301,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._channel_configs: Dict[int, ChannelConfig] = {}
         self._channel_panels: Dict[int, ChannelOptionsPanel] = {}
         self._channel_last_samples: Dict[int, np.ndarray] = {}
+        self._channel_display_buffers: Dict[int, np.ndarray] = {}
         self._last_times: np.ndarray = np.zeros(0, dtype=np.float32)
         self._channel_color_cycle: List[QtGui.QColor] = [
             QtGui.QColor(0, 0, 139),
@@ -322,12 +325,35 @@ class MainWindow(QtWidgets.QMainWindow):
         self._audio_player_queue: Optional["queue.Queue"] = None
         self._audio_input_samplerate: float = 0.0
         self._audio_lock = threading.Lock()
+        self._trigger_mode: str = "stream"
+        self._trigger_channel_id: Optional[int] = None
+        self._trigger_threshold: float = 0.0
+        self._trigger_pre_seconds: float = 0.01
+        self._trigger_pre_samples: int = 0
+        self._trigger_window_samples: int = 1
+        self._trigger_last_sample_rate: float = 0.0
+        self._trigger_history: deque[np.ndarray] = deque()
+        self._trigger_history_length: int = 0
+        self._trigger_history_total: int = 0
+        self._trigger_max_chunk: int = 0
+        self._trigger_prev_value: float = 0.0
+        self._trigger_capture_start_abs: Optional[int] = None
+        self._trigger_capture_end_abs: Optional[int] = None
+        self._trigger_display: Optional[np.ndarray] = None
+        self._trigger_display_times: Optional[np.ndarray] = None
+        self._trigger_hold_until: float = 0.0
+        self._trigger_single_armed: bool = False
+        self._trigger_display_pre_samples: int = 0
+        self._plot_refresh_hz = 40.0
+        self._plot_interval = 1.0 / self._plot_refresh_hz
+        self._last_plot_refresh = 0.0
 
         self._apply_palette()
         self._style_plot()
 
         self._build_ui()
         self._wire_placeholders()
+        self._update_trigger_controls()
         self._device_manager = DeviceManager(self)
         self._device_manager.devicesChanged.connect(self._on_devices_changed)
         self._device_manager.deviceConnected.connect(self._on_device_connected)
@@ -369,9 +395,13 @@ class MainWindow(QtWidgets.QMainWindow):
         plot_item.vb.setBorder(pg.mkPen((0, 0, 139)))
         grid.addWidget(self.plot_widget, 0, 0)
 
-        self.threshold_line = pg.InfiniteLine(angle=0, pen=pg.mkPen((178, 34, 34), width=2), movable=True)
+        self.threshold_line = pg.InfiniteLine(angle=0, pen=pg.mkPen((178, 34, 34), width=3), movable=True)
         self.threshold_line.setVisible(False)
         self.plot_widget.addItem(self.threshold_line)
+        try:
+            self.threshold_line.setZValue(100)
+        except AttributeError:
+            pass
 
         self.pretrigger_line = pg.InfiniteLine(angle=90, pen=pg.mkPen((0, 0, 139), style=QtCore.Qt.DashLine), movable=False)
         self.pretrigger_line.setVisible(False)
@@ -434,14 +464,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
         trigger_layout.addWidget(self._label("Mode"), row, 0)
         mode_layout = QtWidgets.QVBoxLayout()
-        self.trigger_mode_continuous = QtWidgets.QRadioButton("No Trigger (Continuous)")
+        self.trigger_mode_continuous = QtWidgets.QRadioButton("No Trigger (Stream)")
         self.trigger_mode_single = QtWidgets.QRadioButton("Single")
         self.trigger_mode_single.setEnabled(False)
         self.trigger_mode_repeating = QtWidgets.QRadioButton("Continuous Trigger")
         self.trigger_mode_repeating.setEnabled(False)
         self.trigger_mode_continuous.setChecked(True)
         mode_layout.addWidget(self.trigger_mode_continuous)
-        mode_layout.addWidget(self.trigger_mode_single)
+        single_row = QtWidgets.QHBoxLayout()
+        single_row.setSpacing(4)
+        self.trigger_single_button = QtWidgets.QPushButton("Trigger Once")
+        self.trigger_single_button.setEnabled(False)
+        single_row.addWidget(self.trigger_mode_single)
+        single_row.addWidget(self.trigger_single_button)
+        single_row.addStretch(1)
+        mode_layout.addLayout(single_row)
         mode_layout.addWidget(self.trigger_mode_repeating)
         trigger_layout.addLayout(mode_layout, row, 1)
         row += 1
@@ -460,9 +497,9 @@ class MainWindow(QtWidgets.QMainWindow):
         pretrig_box = QtWidgets.QHBoxLayout()
         pretrig_box.addWidget(self._label("Pre-trigger (s)"))
         self.pretrigger_combo = QtWidgets.QComboBox()
-        for value in (0.01, 0.05, 0.10):
+        for value in (0.0, 0.01, 0.02, 0.05):
             self.pretrigger_combo.addItem(f"{value:.2f}", value)
-        self.pretrigger_combo.setCurrentIndex(1)
+        self.pretrigger_combo.setCurrentIndex(0)
         pretrig_box.addWidget(self.pretrigger_combo)
         trigger_layout.addLayout(pretrig_box, row, 0, 1, 2)
         row += 1
@@ -538,38 +575,34 @@ class MainWindow(QtWidgets.QMainWindow):
         bottom_layout.addWidget(self.device_group)
 
         self.channels_group = QtWidgets.QGroupBox("Channels")
-        channels_layout = QtWidgets.QGridLayout(self.channels_group)
-        channels_layout.setVerticalSpacing(6)
+        channels_layout = QtWidgets.QVBoxLayout(self.channels_group)
         channels_layout.setContentsMargins(8, 12, 8, 12)
+        channels_layout.setSpacing(6)
 
-        channels_layout.addWidget(self._label("Available"), 0, 0)
-        channels_layout.addWidget(self._label("Active"), 0, 2)
-
-        self.available_list = QtWidgets.QListWidget()
-        self.available_list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.available_list.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        self.available_list.setMinimumHeight(120)
-        self.available_list.setMaximumHeight(140)
-        channels_layout.addWidget(self.available_list, 1, 0)
-
-        buttons_layout = QtWidgets.QVBoxLayout()
-        self.add_channel_btn = QtWidgets.QPushButton("Add →")
-        self.add_channel_btn.clicked.connect(self._on_add_channel)
-        buttons_layout.addWidget(self.add_channel_btn)
-        self.remove_channel_btn = QtWidgets.QPushButton("← Remove")
-        self.remove_channel_btn.clicked.connect(self._on_remove_channel)
-        buttons_layout.addWidget(self.remove_channel_btn)
-        buttons_layout.addStretch(1)
-        channels_layout.addLayout(buttons_layout, 1, 1)
-
+        active_label = self._label("Active")
+        channels_layout.addWidget(active_label)
         self.active_list = QtWidgets.QListWidget()
         self.active_list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.active_list.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        self.active_list.setMinimumHeight(120)
-        self.active_list.setMaximumHeight(140)
-        channels_layout.addWidget(self.active_list, 1, 2)
+        self.active_list.setMinimumHeight(50)
+        self.active_list.setMaximumHeight(60)
+        channels_layout.addWidget(self.active_list)
 
-        channels_layout.setRowStretch(1, 1)
+        available_row = QtWidgets.QHBoxLayout()
+        available_row.setContentsMargins(0, 0, 0, 0)
+        available_row.setSpacing(6)
+        available_label = self._label("Available")
+        available_row.addWidget(available_label)
+        available_row.addStretch(1)
+        self.add_channel_btn = QtWidgets.QPushButton("↑ Add")
+        self.add_channel_btn.clicked.connect(self._on_add_channel)
+        available_row.addWidget(self.add_channel_btn)
+        self.remove_channel_btn = QtWidgets.QPushButton("↓ Remove")
+        self.remove_channel_btn.clicked.connect(self._on_remove_channel)
+        available_row.addWidget(self.remove_channel_btn)
+        channels_layout.addLayout(available_row)
+        self.available_combo = QtWidgets.QComboBox()
+        channels_layout.addWidget(self.available_combo)
 
         bottom_layout.addWidget(self.channels_group, stretch=2)
 
@@ -590,10 +623,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trigger_mode_continuous.toggled.connect(self._emit_trigger_config)
         self.trigger_mode_single.toggled.connect(self._emit_trigger_config)
         self.trigger_mode_repeating.toggled.connect(self._emit_trigger_config)
+        self.trigger_mode_continuous.toggled.connect(self._on_trigger_mode_changed)
+        self.trigger_mode_single.toggled.connect(self._on_trigger_mode_changed)
+        self.trigger_mode_repeating.toggled.connect(self._on_trigger_mode_changed)
         self.threshold_spin.valueChanged.connect(self._emit_trigger_config)
+        self.pretrigger_combo.currentIndexChanged.connect(self._emit_trigger_config)
         self.window_combo.currentIndexChanged.connect(self._on_window_changed)
         self.threshold_line.sigPositionChanged.connect(self._on_threshold_line_changed)
         self.active_list.currentItemChanged.connect(self._on_active_channel_selected)
+        self.trigger_single_button.clicked.connect(self._on_trigger_single_clicked)
 
     def attach_controller(self, controller: Optional[PipelineController]) -> None:
         if controller is self._controller:
@@ -614,6 +652,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.stopRecording.disconnect(self._controller.stop_recording)
             except (TypeError, RuntimeError):
                 pass
+            try:
+                self.triggerConfigChanged.disconnect(self._controller.update_trigger_config)
+            except (TypeError, RuntimeError):
+                pass
             signals = self._controller.dispatcher_signals()
             if signals is not None:
                 try:
@@ -628,6 +670,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.startRecording.connect(controller.start_recording)
         self.stopRecording.connect(controller.stop_recording)
+        self.triggerConfigChanged.connect(controller.update_trigger_config)
 
         self._bind_dispatcher_signals()
         self._ensure_audio_router()
@@ -764,19 +807,34 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _emit_trigger_config(self, *_) -> None:
         data = self.trigger_channel_combo.currentData()
-        idx = int(data) if data is not None else -1
-        config = {
+        channel_id = int(data) if data is not None else None
+        ui_mode = self._current_trigger_mode()
+        self._trigger_channel_id = channel_id
+        self._trigger_mode = ui_mode
+        self._trigger_threshold = float(self.threshold_spin.value())
+        pre_value = self.pretrigger_combo.currentData()
+        self._trigger_pre_seconds = float(pre_value if pre_value is not None else 0.0)
+        self._reset_trigger_state()
+
+        idx = channel_id if channel_id is not None else -1
+        visual_config = {
             "channel_index": idx,
-            "mode": self._current_trigger_mode(),
+            "mode": ui_mode,
             "threshold": self.threshold_spin.value(),
             "hysteresis": 0.0,
-            "pretrigger_frac": 0.0,
+            "pretrigger_frac": self._trigger_pre_seconds,
             "window_sec": float(self.window_combo.currentData() or 0.0),
         }
-        self._update_trigger_visuals(config)
+        self._update_trigger_visuals(visual_config)
+
+        self.triggerConfigChanged.emit(dict(visual_config))
 
     def _current_trigger_mode(self) -> str:
-        return "continuous"
+        if self.trigger_mode_repeating.isChecked():
+            return "continuous"
+        if self.trigger_mode_single.isChecked():
+            return "single"
+        return "stream"
 
     def _on_device_button_clicked(self) -> None:
         if not hasattr(self, "_device_manager") or self._device_manager is None:
@@ -869,7 +927,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
             self._dispatcher_signals = None
         self._clear_listen_channel()
-        self.available_list.clear()
+        self._reset_trigger_state()
+        self.available_combo.clear()
         self.active_list.clear()
         self._clear_channel_panels()
         self.set_trigger_channels([])
@@ -877,28 +936,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self._publish_active_channels()
 
     def _on_available_channels(self, channels: Sequence[object]) -> None:
-        self.available_list.clear()
+        self.available_combo.clear()
         self.active_list.clear()
         self._clear_channel_panels()
         for info in channels:
             name = getattr(info, "name", str(info))
-            item = QtWidgets.QListWidgetItem(name)
-            item.setData(QtCore.Qt.UserRole, info)
-            self.available_list.addItem(item)
+            self.available_combo.addItem(name, info)
+        if self.available_combo.count():
+            self.available_combo.setCurrentIndex(0)
         self.set_trigger_channels(channels)
         self._update_channel_buttons()
         self._publish_active_channels()
 
     def _on_add_channel(self) -> None:
-        current = self.available_list.currentItem()
-        if current is None:
+        idx = self.available_combo.currentIndex()
+        if idx < 0:
             return
-        info = current.data(QtCore.Qt.UserRole)
-        item = QtWidgets.QListWidgetItem(current.text())
+        info = self.available_combo.itemData(idx)
+        item = QtWidgets.QListWidgetItem(self.available_combo.currentText())
         item.setData(QtCore.Qt.UserRole, info)
         self.active_list.addItem(item)
-        row = self.available_list.row(current)
-        self.available_list.takeItem(row)
+        self.available_combo.removeItem(idx)
+        if self.available_combo.count():
+            self.available_combo.setCurrentIndex(min(idx, self.available_combo.count() - 1))
         self.active_list.setCurrentItem(item)
         self._update_channel_buttons()
         self._publish_active_channels()
@@ -911,13 +971,15 @@ class MainWindow(QtWidgets.QMainWindow):
         info = current.data(QtCore.Qt.UserRole)
         item = QtWidgets.QListWidgetItem(current.text())
         item.setData(QtCore.Qt.UserRole, info)
-        self.available_list.addItem(item)
+        self.available_combo.addItem(item.text(), info)
         row = self.active_list.row(current)
         self.active_list.takeItem(row)
         if self.active_list.count() > 0:
             self.active_list.setCurrentRow(0)
         else:
             self._show_channel_panel(None)
+        if self.available_combo.count():
+            self.available_combo.setCurrentIndex(self.available_combo.count() - 1)
         self._update_channel_buttons()
         self._publish_active_channels()
         self._emit_trigger_config()
@@ -934,11 +996,14 @@ class MainWindow(QtWidgets.QMainWindow):
         ids = [getattr(info, "id", None) for info in infos]
         ids = [cid for cid in ids if cid is not None]
         names = [getattr(info, "name", str(info)) for info in infos]
+        if list(ids) != self._channel_ids_current:
+            self._reset_trigger_state()
         self._sync_channel_panels(ids, names)
         self._reset_scope_for_channels(ids, names)
         self._sync_filter_settings()
         self._ensure_active_channel_focus()
         self._channel_last_samples = {cid: self._channel_last_samples[cid] for cid in ids if cid in self._channel_last_samples}
+        self._channel_display_buffers = {cid: self._channel_display_buffers[cid] for cid in ids if cid in self._channel_display_buffers}
         if self._listen_channel_id is not None and self._listen_channel_id not in ids:
             self._clear_listen_channel()
         self.trigger_mode_continuous.setChecked(True)
@@ -1004,6 +1069,8 @@ class MainWindow(QtWidgets.QMainWindow):
             panel.deleteLater()
         self._channel_panels.clear()
         self._channel_configs.clear()
+        self._channel_last_samples.clear()
+        self._channel_display_buffers.clear()
         self._show_channel_panel(None)
 
     def _show_channel_panel(self, channel_id: Optional[int]) -> None:
@@ -1094,11 +1161,9 @@ class MainWindow(QtWidgets.QMainWindow):
         config = self._channel_configs.get(self._drag_channel_id)
         if config is None:
             return
-        span = max(config.range_v, 1e-6)
-        y_clamped = max(min(y, span), -span)
-        if abs(config.offset_v - y_clamped) < 1e-6:
+        if abs(config.offset_v - y) < 1e-6:
             return
-        config.offset_v = y_clamped
+        config.offset_v = y
         panel = self._channel_panels.get(self._drag_channel_id)
         if panel is not None:
             panel.set_config(config)
@@ -1112,8 +1177,6 @@ class MainWindow(QtWidgets.QMainWindow):
         existing = self._channel_configs.get(channel_id)
         if existing is not None:
             config.channel_name = existing.channel_name or config.channel_name
-        span = max(config.range_v, 1e-6)
-        config.offset_v = max(min(config.offset_v, span), -span)
         panel = self._channel_panels.get(channel_id)
         if panel is not None:
             panel.set_config(config)
@@ -1134,8 +1197,12 @@ class MainWindow(QtWidgets.QMainWindow):
         raw = self._channel_last_samples.get(channel_id)
         if curve is None or raw is None or raw.size == 0 or self._last_times.size == 0:
             return
-        display = raw + config.offset_v
-        curve.setData(self._last_times, display, skipFiniteCheck=True)
+        buf = self._channel_display_buffers.get(channel_id)
+        if buf is None or buf.shape != raw.shape:
+            buf = np.empty_like(raw)
+            self._channel_display_buffers[channel_id] = buf
+        np.add(raw, config.offset_v, out=buf)
+        curve.setData(self._last_times, buf, skipFiniteCheck=True)
         self._apply_active_channel_style()
 
     def _apply_active_channel_style(self) -> None:
@@ -1282,7 +1349,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if player_queue is None:
                     continue
                 try:
-                    player_queue.put(payload, timeout=0.05)
+                    player_queue.put_nowait(payload)
                 except queue.Full:
                     pass
             except Exception:
@@ -1306,7 +1373,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 player_to_stop.join(timeout=1.0)
             except Exception:
                 pass
-        queue_obj: "queue.Queue" = queue.Queue(maxsize=32)
+        queue_obj: "queue.Queue" = queue.Queue(maxsize=128)
         config = AudioConfig(out_samplerate=44_100, out_channels=1, gain=0.7, blocksize=512, ring_seconds=0.5)
         try:
             player = AudioPlayer(
@@ -1464,8 +1531,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_channel_buttons(self) -> None:
         connected = self._device_connected
-        self.add_channel_btn.setEnabled(connected and self.available_list.count() > 0)
+        self.add_channel_btn.setEnabled(connected and self.available_combo.count() > 0)
         self.remove_channel_btn.setEnabled(connected and self.active_list.count() > 0)
+        self._update_trigger_controls()
+
+    def _update_trigger_controls(self) -> None:
+        has_active = self.active_list.count() > 0
+        for widget in (
+            self.trigger_mode_continuous,
+            self.trigger_mode_single,
+            self.trigger_mode_repeating,
+            self.threshold_spin,
+            self.pretrigger_combo,
+        ):
+            widget.setEnabled(has_active)
+        self.trigger_single_button.setEnabled(has_active and self.trigger_mode_single.isChecked())
 
     def _on_browse_record_path(self) -> None:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Select Recording File", "", "HDF5 (*.h5);;All Files (*)")
@@ -1507,7 +1587,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.record_autoinc.setEnabled(enabled)
         self.record_toggle_btn.setEnabled(True)
         self.threshold_line.setMovable(enabled)
-        self.available_list.setEnabled(enabled and self._device_connected)
+        self.available_combo.setEnabled(enabled and self._device_connected)
         self.active_list.setEnabled(enabled and self._device_connected)
 
     def _apply_device_state(self, connected: bool) -> None:
@@ -1520,7 +1600,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_toggle_btn.setText("Disconnect" if connected else "Connect")
         self.device_toggle_btn.setEnabled(connected or has_connectable)
         self.device_toggle_btn.blockSignals(False)
-        self.available_list.setEnabled(connected)
+        self.available_combo.setEnabled(connected)
         self.active_list.setEnabled(connected)
         self._update_channel_buttons()
 
@@ -1546,6 +1626,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._controller is not None:
             self._controller.update_window_span(self._current_window_sec)
         self._update_status(viz_depth=0)
+        if self._trigger_last_sample_rate > 0:
+            self._update_trigger_sample_parameters(self._trigger_last_sample_rate)
 
     def _on_threshold_line_changed(self) -> None:
         value = float(self.threshold_line.value())
@@ -1555,10 +1637,59 @@ class MainWindow(QtWidgets.QMainWindow):
             self.threshold_spin.blockSignals(False)
         self._emit_trigger_config()
 
-    def _update_trigger_visuals(self, config: dict) -> None:
-        _ = config
-        self.threshold_line.setVisible(False)
+    def _on_trigger_mode_changed(self) -> None:
+        self._update_trigger_controls()
+
+    def _on_trigger_single_clicked(self) -> None:
+        if self._trigger_mode != "single":
+            self.trigger_mode_single.setChecked(True)
+            return
+        self._trigger_single_armed = True
+        self._trigger_display = None
+        self._trigger_display_times = None
+        self._trigger_capture_start_abs = None
+        self._trigger_capture_end_abs = None
+        self._trigger_hold_until = 0.0
+
+    def _reset_trigger_state(self) -> None:
+        self._trigger_history.clear()
+        self._trigger_history_length = 0
+        self._trigger_history_total = 0
+        self._trigger_max_chunk = 0
+        self._trigger_last_sample_rate = 0.0
+        self._trigger_prev_value = 0.0
+        self._trigger_capture_start_abs = None
+        self._trigger_capture_end_abs = None
+        self._trigger_display = None
+        self._trigger_display_times = None
+        self._trigger_hold_until = 0.0
+        self._trigger_display_pre_samples = 0
+        if self._trigger_mode != "single":
+            self._trigger_single_armed = False
         self.pretrigger_line.setVisible(False)
+
+    def _update_trigger_visuals(self, config: dict) -> None:
+        mode = config.get("mode", "stream")
+        channel_valid = config.get("channel_index", -1) != -1
+        if mode == "stream" or not channel_valid:
+            self.threshold_line.setVisible(False)
+            self.pretrigger_line.setVisible(False)
+            return
+        self.threshold_line.setVisible(True)
+        pen = pg.mkPen((0, 0, 0), width=3)
+        self.threshold_line.setPen(pen)
+        try:
+            self.threshold_line.setZValue(100)
+        except AttributeError:
+            pass
+        value = float(config.get("threshold", 0.0))
+        self.threshold_line.setValue(value)
+        pre_value = float(config.get("pretrigger_frac", 0.0) or 0.0)
+        if pre_value > 0.0:
+            self.pretrigger_line.setVisible(True)
+            self.pretrigger_line.setValue(0.0)
+        else:
+            self.pretrigger_line.setVisible(False)
 
     def _update_status(self, viz_depth: int) -> None:
         controller = self._controller
@@ -1647,6 +1778,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if cid not in channel_ids:
                 plot_item.removeItem(curve)
                 del self._curve_map[cid]
+                self._channel_display_buffers.pop(cid, None)
 
         self._channel_names = list(channel_names)
         self._channel_ids_current = list(channel_ids)
@@ -1669,30 +1801,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._refresh_channel_layout()
 
-    @QtCore.Slot(dict)
-    def _on_dispatcher_tick(self, payload: dict) -> None:
-        samples = payload.get("samples")
-        times = payload.get("times")
-        status = payload.get("status", {})
-        sample_rate = float(status.get("sample_rate", 0.0))
-        window_sec = float(status.get("window_sec", 0.0))
-        channel_ids = list(payload.get("channel_ids", []))
-        channel_names = list(payload.get("channel_names", []))
-
-        data = np.asarray(samples) if samples is not None else np.zeros((0, 0), dtype=np.float32)
-        times_arr = np.asarray(times) if times is not None else np.zeros(0, dtype=np.float32)
-        self._last_times = times_arr
-
-        if channel_ids != self._channel_ids_current:
-            self._ensure_curves_for_ids(channel_ids, channel_names)
-
-        if not self._curves:
-            self.plot_widget.getPlotItem().setXRange(0, max(window_sec, 0.001), padding=0)
-            self._current_sample_rate = sample_rate
-            self._current_window_sec = window_sec
-            self._chunk_rate = 0.0
-            self._update_status(viz_depth=0)
-            return
+    def _process_streaming(
+        self,
+        data: np.ndarray,
+        times_arr: np.ndarray,
+        sample_rate: float,
+        window_sec: float,
+        channel_ids: List[int],
+        now: float,
+    ) -> None:
+        should_redraw = (now - self._last_plot_refresh) >= self._plot_interval
+        self.pretrigger_line.setVisible(False)
 
         if data.ndim != 2 or data.size == 0:
             for curve in self._curves:
@@ -1710,21 +1829,30 @@ class MainWindow(QtWidgets.QMainWindow):
                 cid = channel_ids[idx]
                 config = self._channel_configs.get(cid)
                 if config is None:
-                    curve.clear()
+                    if should_redraw:
+                        curve.clear()
                     continue
                 raw = np.asarray(data[idx], dtype=np.float32)
-                display = raw + config.offset_v
-                curve.setData(times_arr, display, skipFiniteCheck=True)
                 active_samples[cid] = raw
+                if not should_redraw:
+                    continue
+                buf = self._channel_display_buffers.get(cid)
+                if buf is None or buf.shape != raw.shape:
+                    buf = np.empty_like(raw)
+                    self._channel_display_buffers[cid] = buf
+                np.add(raw, config.offset_v, out=buf)
+                curve.setData(times_arr, buf, skipFiniteCheck=True)
             else:
-                curve.clear()
+                if should_redraw:
+                    curve.clear()
 
         self._channel_last_samples = active_samples
-        self._apply_active_channel_style()
-
-        if window_sec > 0:
-            self.plot_widget.getPlotItem().setXRange(0, window_sec, padding=0)
-        self._update_plot_y_range()
+        if should_redraw:
+            self._apply_active_channel_style()
+            if window_sec > 0:
+                self.plot_widget.getPlotItem().setXRange(0, window_sec, padding=0)
+            self._update_plot_y_range()
+            self._last_plot_refresh = now
 
         self._current_sample_rate = sample_rate
         self._current_window_sec = window_sec
@@ -1732,6 +1860,235 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_status(viz_depth=0)
         if self._listen_channel_id is not None:
             self._ensure_audio_player()
+
+    def _update_trigger_sample_parameters(self, sample_rate: float) -> None:
+        self._trigger_last_sample_rate = sample_rate
+        self._trigger_window_samples = max(1, int(round(self._current_window_sec * sample_rate)))
+        pre = min(self._trigger_pre_seconds, self._current_window_sec)
+        self._trigger_pre_samples = int(round(pre * sample_rate))
+        if self._trigger_pre_samples >= self._trigger_window_samples:
+            self._trigger_pre_samples = max(0, self._trigger_window_samples - 1)
+
+    def _append_trigger_history(self, chunk_samples: np.ndarray) -> None:
+        if chunk_samples.size == 0:
+            return
+        if not self._trigger_history:
+            self._trigger_history = deque()
+        self._trigger_history.append(chunk_samples)
+        self._trigger_history_length += chunk_samples.shape[0]
+        self._trigger_history_total += chunk_samples.shape[0]
+        self._trigger_max_chunk = max(self._trigger_max_chunk, chunk_samples.shape[0])
+        max_keep = max(self._trigger_window_samples + self._trigger_max_chunk, self._trigger_window_samples + chunk_samples.shape[0])
+        while self._trigger_history_length > max_keep and self._trigger_history:
+            left = self._trigger_history.popleft()
+            self._trigger_history_length -= left.shape[0]
+
+    def _detect_trigger_crossing(self, samples: np.ndarray) -> Optional[int]:
+        threshold = float(self.threshold_spin.value())
+        prev = self._trigger_prev_value
+        for idx, sample in enumerate(samples):
+            if prev < threshold <= sample:
+                self._trigger_prev_value = float(samples[-1])
+                return idx
+            prev = sample
+        self._trigger_prev_value = float(samples[-1])
+        return None
+
+    def _should_arm_trigger(self, now: float) -> bool:
+        if self._trigger_display is not None and now < self._trigger_hold_until:
+            return False
+        if self._trigger_capture_start_abs is not None:
+            return False
+        if self._trigger_mode == "continuous":
+            return True
+        if self._trigger_mode == "single":
+            return self._trigger_single_armed
+        return False
+
+    def _start_trigger_capture(self, chunk_start_abs: int, trigger_idx: int) -> None:
+        window = self._trigger_window_samples
+        if window <= 0:
+            return
+        pre = self._trigger_pre_samples
+        start_abs = max(chunk_start_abs + trigger_idx - pre, self._trigger_history_total - self._trigger_history_length)
+        self._trigger_capture_start_abs = start_abs
+        self._trigger_capture_end_abs = start_abs + window
+        if self._trigger_mode == "single":
+            self._trigger_single_armed = False
+
+    def _finalize_trigger_capture(self) -> None:
+        if self._trigger_capture_start_abs is None or self._trigger_capture_end_abs is None:
+            return
+        if self._trigger_history_total < self._trigger_capture_end_abs:
+            return
+        if not self._trigger_history:
+            return
+        earliest_abs = self._trigger_history_total - self._trigger_history_length
+        start_abs = max(self._trigger_capture_start_abs, earliest_abs)
+        start_idx = start_abs - earliest_abs
+        end_idx = start_idx + self._trigger_window_samples
+        data = np.concatenate(list(self._trigger_history), axis=0)
+        if end_idx > data.shape[0]:
+            end_idx = data.shape[0]
+        snippet = data[start_idx:end_idx]
+        if snippet.shape[0] < self._trigger_window_samples:
+            pad = self._trigger_window_samples - snippet.shape[0]
+            if snippet.shape[0] > 0:
+                last_row = snippet[-1:]
+            else:
+                last_row = np.zeros((1, data.shape[1]), dtype=np.float32)
+            snippet = np.vstack((snippet, np.repeat(last_row, pad, axis=0)))
+        if snippet.shape[0] == 0:
+            snippet = np.zeros((self._trigger_window_samples, data.shape[1]), dtype=np.float32)
+        self._trigger_display = snippet
+        self._trigger_display_times = None
+        self._trigger_display_pre_samples = min(self._trigger_pre_samples, max(snippet.shape[0] - 1, 0))
+        if self._trigger_last_sample_rate > 0:
+            duration = self._trigger_window_samples / self._trigger_last_sample_rate
+        else:
+            duration = self._current_window_sec
+        self._trigger_hold_until = time.perf_counter() + max(duration, 1e-3)
+        self._trigger_capture_start_abs = None
+        self._trigger_capture_end_abs = None
+
+    def _render_trigger_display(self, channel_ids: List[int], window_sec: float) -> None:
+        if self._trigger_display is None:
+            return
+        window = max(window_sec, 1e-6)
+        data = self._trigger_display
+        n = data.shape[0]
+        sr = self._trigger_last_sample_rate if self._trigger_last_sample_rate > 0 else self._current_sample_rate
+        if sr <= 0 and window > 0 and n > 0:
+            sr = n / window
+        if sr <= 0:
+            sr = max(n / max(window, 1e-6), 1.0)
+        dt = 1.0 / sr
+        time_axis = np.arange(n, dtype=np.float32) * float(dt)
+        self._trigger_display_times = np.asarray(time_axis, dtype=np.float32)
+        time_axis = self._trigger_display_times
+
+        plot_item = self.plot_widget.getPlotItem()
+        span = max(window, max(n - 1, 0) * dt)
+        plot_item.setXRange(0.0, span, padding=0)
+
+        pre_samples = min(self._trigger_display_pre_samples, n - 1 if n > 0 else 0)
+        pre_time = pre_samples * dt
+        if pre_time > 0.0:
+            self.pretrigger_line.setVisible(True)
+            self.pretrigger_line.setValue(pre_time)
+        else:
+            self.pretrigger_line.setVisible(False)
+
+        for idx, curve in enumerate(self._curves):
+            if idx < data.shape[1]:
+                cid = channel_ids[idx]
+                config = self._channel_configs.get(cid)
+                offset = config.offset_v if config else 0.0
+                curve.setData(time_axis, data[:, idx] + offset, skipFiniteCheck=True)
+            else:
+                curve.clear()
+        self._channel_last_samples = {cid: data[:, i].astype(np.float32) for i, cid in enumerate(channel_ids) if i < data.shape[1]}
+        self._last_times = time_axis
+        self._last_plot_refresh = time.perf_counter()
+
+    def _process_trigger_mode(
+        self,
+        data: np.ndarray,
+        times_arr: np.ndarray,
+        sample_rate: float,
+        window_sec: float,
+        channel_ids: List[int],
+        now: float,
+    ) -> None:
+        if data.ndim != 2 or data.size == 0:
+            self._process_streaming(data, times_arr, sample_rate, window_sec, channel_ids, now)
+            return
+        if sample_rate > 0 and abs(sample_rate - self._trigger_last_sample_rate) > 1e-6:
+            self._update_trigger_sample_parameters(sample_rate)
+
+        chunk_samples = data.T  # shape (samples, channels)
+        if chunk_samples.ndim != 2 or chunk_samples.size == 0:
+            self._process_streaming(data, times_arr, sample_rate, window_sec, channel_ids, now)
+            return
+        self._append_trigger_history(chunk_samples)
+
+        monitor_idx = None
+        if self._trigger_channel_id is not None and self._trigger_channel_id in channel_ids:
+            monitor_idx = channel_ids.index(self._trigger_channel_id)
+
+        if (
+            self._trigger_display is not None
+            and self._trigger_mode != "single"
+            and now >= self._trigger_hold_until
+        ):
+            self._trigger_display = None
+            self._trigger_display_times = None
+            self.pretrigger_line.setVisible(False)
+            self._trigger_hold_until = 0.0
+
+        if monitor_idx is not None and self._should_arm_trigger(now) and self._trigger_display is None:
+            cross_idx = self._detect_trigger_crossing(chunk_samples[:, monitor_idx])
+            if cross_idx is not None:
+                chunk_start_abs = self._trigger_history_total - chunk_samples.shape[0]
+                self._start_trigger_capture(chunk_start_abs, cross_idx)
+        elif monitor_idx is not None and self._trigger_display is None:
+            # Maintain previous value even if not armed
+            self._detect_trigger_crossing(chunk_samples[:, monitor_idx])
+
+        self._finalize_trigger_capture()
+
+        if self._trigger_display is not None:
+            self._current_sample_rate = sample_rate
+            self._current_window_sec = window_sec
+            self._render_trigger_display(channel_ids, window_sec)
+            self._chunk_rate = sample_rate
+            self._update_status(viz_depth=0)
+            if self._listen_channel_id is not None:
+                self._ensure_audio_player()
+            return
+
+        if self._trigger_mode == "single":
+            self._current_sample_rate = sample_rate
+            self._current_window_sec = window_sec
+            self._chunk_rate = sample_rate
+            self._update_status(viz_depth=0)
+            if self._listen_channel_id is not None:
+                self._ensure_audio_player()
+            return
+
+        self._process_streaming(data, times_arr, sample_rate, window_sec, channel_ids, now)
+
+
+    @QtCore.Slot(dict)
+    def _on_dispatcher_tick(self, payload: dict) -> None:
+        samples = payload.get("samples")
+        times = payload.get("times")
+        status = payload.get("status", {})
+        sample_rate = float(status.get("sample_rate", 0.0))
+        window_sec = float(status.get("window_sec", 0.0))
+        channel_ids = list(payload.get("channel_ids", []))
+        channel_names = list(payload.get("channel_names", []))
+
+        data = np.asarray(samples) if samples is not None else np.zeros((0, 0), dtype=np.float32)
+        times_arr = np.asarray(times) if times is not None else np.zeros(0, dtype=np.float32)
+        self._last_times = times_arr
+        now = time.perf_counter()
+
+        if channel_ids != self._channel_ids_current:
+            self._ensure_curves_for_ids(channel_ids, channel_names)
+
+        if not self._curves:
+            self.plot_widget.getPlotItem().setXRange(0, max(window_sec, 0.001), padding=0)
+            self._current_sample_rate = sample_rate
+            self._current_window_sec = window_sec
+            self._chunk_rate = 0.0
+            self._update_status(viz_depth=0)
+            return
+        mode = self._trigger_mode or "stream"
+        if mode == "stream":
+            self._process_streaming(data, times_arr, sample_rate, window_sec, channel_ids, now)
+        else:
+            self._process_trigger_mode(data, times_arr, sample_rate, window_sec, channel_ids, now)
 
     @QtCore.Slot(bool)
     def on_record_toggled(self, enabled: bool) -> None:

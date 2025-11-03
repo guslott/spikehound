@@ -275,8 +275,8 @@ class Dispatcher:
                 return self._empty_payload(status)
             mode = "continuous"
             if self._current_trigger is not None:
-                mode = self._current_trigger.mode
-            if mode != "continuous":
+                mode = str(self._current_trigger.mode)
+            if mode not in ("continuous", "stream", "single"):
                 return self._empty_payload(status)
 
             window_samples = int(max(1, min(self._buffer_len, self._window_sec * self._sample_rate)))

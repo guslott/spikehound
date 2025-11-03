@@ -11,7 +11,7 @@ from core.dispatcher import Dispatcher
 from core.models import EndOfStream
 
 IN_SAMPLE_RATE = 20_000
-CHUNK_SIZE = 200
+CHUNK_SIZE = 400
 SELECTED_CHANNEL = 1  # try 0 or 1 if you don't hear anything
 LINE_HUM_FREQ = 440.0
 LINE_HUM_AMP = 0.8
