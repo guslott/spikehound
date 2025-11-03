@@ -489,16 +489,28 @@ class PipelineController:
         with self._lock:
             return None if self._dispatcher is None else self._dispatcher.signals
 
-    def queue_depths(self) -> Dict[str, tuple[int, int]]:
-        """Return (size, maxsize) for every queue the controller manages."""
+    def queue_depths(self) -> Dict[str, dict]:
+        """Return per-queue health metrics for visualization, analysis, audio, and logging."""
         with self._lock:
-            depths: Dict[str, tuple[int, int]] = {}
-            if self._source is not None:
-                depths["raw"] = (self._source.data_queue.qsize(), self._source.data_queue.maxsize)
-            depths["visualization"] = (self.visualization_queue.qsize(), self.visualization_queue.maxsize)
-            depths["analysis"] = (self.analysis_queue.qsize(), self.analysis_queue.maxsize)
-            depths["audio"] = (self.audio_queue.qsize(), self.audio_queue.maxsize)
-            depths["logging"] = (self.logging_queue.qsize(), self.logging_queue.maxsize)
+            depths: Dict[str, dict] = {}
+
+            def _queue_status(q: "queue.Queue") -> dict:
+                size = q.qsize()
+                maxsize = q.maxsize
+                utilization = (size / maxsize) if maxsize > 0 else 0.0
+                return {
+                    "size": size,
+                    "max": maxsize,
+                    "utilization": utilization,
+                }
+
+            depths["visualization"] = _queue_status(self.visualization_queue)
+            if self._dispatcher is not None:
+                depths["viz_buffer"] = self._dispatcher.buffer_status()
+
+            depths["analysis"] = _queue_status(self.analysis_queue)
+            depths["audio"] = _queue_status(self.audio_queue)
+            depths["logging"] = _queue_status(self.logging_queue)
             return depths
 
     # ------------------------------------------------------------------

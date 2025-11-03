@@ -21,6 +21,7 @@ from audio.player import AudioPlayer, AudioConfig
 @dataclass
 class ChannelConfig:
     color: QtGui.QColor = field(default_factory=lambda: QtGui.QColor(0, 0, 139))
+    display_enabled: bool = True
     range_v: float = 1.0
     offset_v: float = 0.0
     notch_enabled: bool = False
@@ -49,6 +50,23 @@ class ChannelOptionsPanel(QtWidgets.QWidget):
         self.set_channel_name(channel_name)
         self.set_config(self._config)
 
+    def _apply_toggle_style(self, button: QtWidgets.QPushButton) -> None:
+        button.setCheckable(True)
+        button.setStyleSheet(
+            """
+QPushButton {
+    background-color: rgb(180, 180, 180);
+    border: 1px solid rgb(90, 90, 90);
+    padding: 4px 10px;
+}
+QPushButton:checked {
+    background-color: rgb(30, 144, 255);
+    color: rgb(255, 255, 255);
+    font-weight: bold;
+}
+"""
+        )
+
     def _build_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -65,6 +83,10 @@ class ChannelOptionsPanel(QtWidgets.QWidget):
         self.color_btn.setFixedWidth(48)
         self.color_btn.clicked.connect(self._choose_color)
         color_row.addWidget(self.color_btn)
+        color_row.addSpacing(12)
+        self.display_check = QtWidgets.QCheckBox("Display")
+        self.display_check.setChecked(True)
+        color_row.addWidget(self.display_check)
         color_row.addStretch(1)
         layout.addLayout(color_row)
 
@@ -137,11 +159,11 @@ class ChannelOptionsPanel(QtWidgets.QWidget):
         # Downstream feature toggles
         toggle_row = QtWidgets.QHBoxLayout()
         self.listen_btn = QtWidgets.QPushButton("Listen")
-        self.listen_btn.setCheckable(True)
-        toggle_row.addWidget(self.listen_btn)
+        self._apply_toggle_style(self.listen_btn)
+        toggle_row.addWidget(self.listen_btn, 1)
         self.analyze_btn = QtWidgets.QPushButton("Analyze")
-        self.analyze_btn.setCheckable(True)
-        toggle_row.addWidget(self.analyze_btn)
+        self._apply_toggle_style(self.analyze_btn)
+        toggle_row.addWidget(self.analyze_btn, 1)
         toggle_row.addStretch(1)
         layout.addLayout(toggle_row)
 
@@ -156,6 +178,7 @@ class ChannelOptionsPanel(QtWidgets.QWidget):
         self.offset_spin.valueChanged.connect(self._on_widgets_changed)
         self.listen_btn.toggled.connect(self._on_widgets_changed)
         self.analyze_btn.toggled.connect(self._on_widgets_changed)
+        self.display_check.toggled.connect(self._on_display_toggled)
 
     def set_channel_name(self, name: str) -> None:
         self._config.channel_name = name
@@ -183,6 +206,7 @@ class ChannelOptionsPanel(QtWidgets.QWidget):
         self.offset_spin.setValue(config.offset_v)
         self.listen_btn.setChecked(config.listen_enabled)
         self.analyze_btn.setChecked(config.analyze_enabled)
+        self.display_check.setChecked(config.display_enabled)
         self._block_updates = False
 
     def _apply_color(self, color: QtGui.QColor) -> None:
@@ -226,12 +250,19 @@ class ChannelOptionsPanel(QtWidgets.QWidget):
         self._config.lowpass_freq = float(self.lowpass_spin.value())
         self._config.listen_enabled = self.listen_btn.isChecked()
         self._config.analyze_enabled = self.analyze_btn.isChecked()
+        self._config.display_enabled = self.display_check.isChecked()
         self._emit_config()
 
     def _emit_config(self) -> None:
         if self._block_updates:
             return
         self.configChanged.emit(replace(self._config))
+
+    def _on_display_toggled(self, checked: bool) -> None:
+        if self._block_updates:
+            return
+        self._config.display_enabled = checked
+        self._emit_config()
 
 
 class ChannelViewBox(pg.ViewBox):
@@ -352,6 +383,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._plot_refresh_hz = 40.0
         self._plot_interval = 1.0 / self._plot_refresh_hz
         self._last_plot_refresh = 0.0
+        self._chunk_mean_samples: float = 0.0
+        self._chunk_accum_count: int = 0
+        self._chunk_accum_samples: int = 0
+        self._chunk_rate_window: float = 1.0
+        self._chunk_last_rate_update = time.perf_counter()
 
         self._apply_palette()
         self._style_plot()
@@ -422,6 +458,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for key in ("sr", "chunk", "queues", "drops"):
             label = QtWidgets.QLabel("SR: 0 Hz" if key == "sr" else "…")
             label.setStyleSheet("color: rgb(50,50,50); font-size: 11px;")
+            label.setWordWrap(True)
+            label.setMinimumHeight(28)
             status_row.addWidget(label)
             self._status_labels[key] = label
         status_row.addStretch(1)
@@ -675,6 +713,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     signals.tick.disconnect(self._on_dispatcher_tick)
                 except (TypeError, RuntimeError):
                     pass
+            self._stop_visualization_drain()
 
         self._controller = controller
 
@@ -812,6 +851,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _style_plot(self) -> None:
         pg.setConfigOption("foreground", (0, 0, 139))
+        pg.setConfigOptions(antialias=False)
 
     def _label(self, text: str) -> QtWidgets.QLabel:
         label = QtWidgets.QLabel(text)
@@ -1190,16 +1230,30 @@ class MainWindow(QtWidgets.QMainWindow):
         existing = self._channel_configs.get(channel_id)
         if existing is not None:
             config.channel_name = existing.channel_name or config.channel_name
+        display_changed = existing is not None and existing.display_enabled != config.display_enabled
         panel = self._channel_panels.get(channel_id)
         if panel is not None:
             panel.set_config(config)
         self._channel_configs[channel_id] = config
+        if display_changed:
+            if not config.display_enabled:
+                curve = self._curve_map.get(channel_id)
+                if curve is not None:
+                    curve.clear()
+                self._channel_last_samples.pop(channel_id, None)
+                self._channel_display_buffers.pop(channel_id, None)
+            else:
+                self._channel_last_samples.clear()
+                self._channel_display_buffers.clear()
+                self._last_times = np.zeros(0, dtype=np.float32)
         self._update_channel_display(channel_id)
         self._refresh_channel_layout()
         self._sync_filter_settings()
         if self._active_channel_id == channel_id:
             self._update_axis_label()
         self._handle_listen_change(channel_id, config.listen_enabled)
+        if display_changed and config.display_enabled and self._channel_ids_current and self._channel_names:
+            self._reset_scope_for_channels(self._channel_ids_current, self._channel_names)
 
     def _update_channel_display(self, channel_id: int) -> None:
         """Re-render a single channel's curve using the last raw samples and current offset/range."""
@@ -1208,7 +1262,12 @@ class MainWindow(QtWidgets.QMainWindow):
         config = self._channel_configs[channel_id]
         curve = self._curve_map.get(channel_id)
         raw = self._channel_last_samples.get(channel_id)
-        if curve is None or raw is None or raw.size == 0 or self._last_times.size == 0:
+        if curve is None:
+            return
+        if not config.display_enabled:
+            curve.clear()
+            return
+        if raw is None or raw.size == 0 or self._last_times.size == 0:
             return
         buf = self._channel_display_buffers.get(channel_id)
         if buf is None or buf.shape != raw.shape:
@@ -1482,6 +1541,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_plot_y_range()
         self._update_axis_label()
 
+    def _register_chunk(self, data: np.ndarray) -> None:
+        if data.ndim != 2 or data.size == 0:
+            return
+        self._chunk_accum_count += 1
+        self._chunk_accum_samples += data.shape[1]
+        now = time.perf_counter()
+        elapsed = now - self._chunk_last_rate_update
+        if elapsed >= self._chunk_rate_window:
+            self._chunk_rate = self._chunk_accum_count / elapsed if elapsed > 0 else 0.0
+            if self._chunk_accum_count > 0:
+                self._chunk_mean_samples = self._chunk_accum_samples / self._chunk_accum_count
+            else:
+                self._chunk_mean_samples = 0.0
+            self._chunk_accum_count = 0
+            self._chunk_accum_samples = 0
+            self._chunk_last_rate_update = now
+
     def _update_plot_y_range(self) -> None:
         """Apply a symmetric ±range envelope using the selected channel's scale (or first channel)."""
         plot_item = self.plot_widget.getPlotItem()
@@ -1541,6 +1617,23 @@ class MainWindow(QtWidgets.QMainWindow):
         base = controller.filter_settings
         settings = FilterSettings(default=base.default, overrides=overrides)
         controller.update_filter_settings(settings)
+
+    def _drain_visualization_queue(self) -> None:
+        controller = self._controller
+        if controller is None:
+            return
+        queue_obj = controller.visualization_queue
+        while True:
+            try:
+                item = queue_obj.get_nowait()
+            except queue.Empty:
+                break
+            if item is EndOfStream:
+                continue
+            try:
+                queue_obj.task_done()
+            except Exception:
+                pass
 
     def _update_channel_buttons(self) -> None:
         connected = self._device_connected
@@ -1708,7 +1801,7 @@ class MainWindow(QtWidgets.QMainWindow):
         controller = self._controller
         if controller is None:
             stats = {}
-            queue_depths: Dict[str, tuple[int, int]] = {}
+            queue_depths: Dict[str, dict] = {}
         else:
             stats = controller.dispatcher_stats()
             queue_depths = controller.queue_depths()
@@ -1718,23 +1811,66 @@ class MainWindow(QtWidgets.QMainWindow):
         drops = stats.get("dropped", {}) if isinstance(stats, dict) else {}
         evicted = stats.get("evicted", {}) if isinstance(stats, dict) else {}
 
-        self._status_labels["sr"].setText(f"SR: {sr:,.0f} Hz")
-        self._status_labels["chunk"].setText(f"Chunks/s: {self._chunk_rate:5.1f}")
+        now = time.perf_counter()
+        if self._chunk_accum_count == 0 and (now - self._chunk_last_rate_update) > (self._chunk_rate_window * 2.0):
+            self._chunk_rate = 0.0
+            self._chunk_mean_samples = 0.0
 
-        viz_size, viz_max = queue_depths.get("visualization", (viz_depth, 0))
-        analysis_size, analysis_max = queue_depths.get("analysis", (0, 0))
-        audio_size, audio_max = queue_depths.get("audio", (0, 0))
-        viz_max_text = "∞" if viz_max == 0 else str(viz_max)
-        analysis_max_text = "∞" if analysis_max == 0 else str(analysis_max)
-        audio_max_text = "∞" if audio_max == 0 else str(audio_max)
-        self._status_labels["queues"].setText(
-            f"Queues V:{viz_size}/{viz_max_text} A:{analysis_size}/{analysis_max_text} Au:{audio_size}/{audio_max_text}"
+        if sr > 0 and self._chunk_mean_samples > 0:
+            avg_ms = (self._chunk_mean_samples / sr) * 1_000.0
+            chunk_suffix = f"Avg {avg_ms:5.1f} ms"
+        elif self._chunk_mean_samples > 0:
+            chunk_suffix = f"Avg {self._chunk_mean_samples:5.0f} smp"
+        else:
+            chunk_suffix = ""
+
+        def _format_queue(info: object, label: str) -> str:
+            if not isinstance(info, dict):
+                return f"{label}:0/0"
+            size = int(info.get("size", 0))
+            maxsize = int(info.get("max", 0))
+            util = float(info.get("utilization", 0.0)) * 100.0
+            if maxsize <= 0:
+                return f"{label}:{size}/∞ (0%)"
+            return f"{label}:{size}/{maxsize} ({util:3.0f}%)"
+
+        self._status_labels["sr"].setText(
+            f"SR: {sr:,.0f} Hz\n"
+            f"Drops V:{drops.get('visualization', 0)} "
+            f"L:{drops.get('logging', 0)} Evict:{evicted.get('visualization', 0)}"
         )
 
-        viz_drops = drops.get("visualization", 0)
-        log_drops = drops.get("logging", 0)
-        viz_evicted = evicted.get("visualization", 0)
-        self._status_labels["drops"].setText(f"Drops V:{viz_drops} L:{log_drops} Evict:{viz_evicted}")
+        chunk_line = f"Chunks/s: {self._chunk_rate:5.1f}"
+        if chunk_suffix:
+            chunk_line = f"{chunk_line}\n{chunk_suffix}"
+        else:
+            chunk_line = f"{chunk_line}\n"
+        self._status_labels["chunk"].setText(chunk_line)
+
+        viz_queue_text = _format_queue(queue_depths.get("visualization"), "V")
+
+        ring_info = queue_depths.get("viz_buffer", {})
+        if isinstance(ring_info, dict):
+            ring_seconds = float(ring_info.get("seconds", 0.0))
+            ring_capacity_seconds = float(ring_info.get("capacity_seconds", 0.0))
+            ring_ms = ring_seconds * 1_000.0
+            ring_cap_ms = ring_capacity_seconds * 1_000.0
+            if ring_capacity_seconds > 0:
+                ring_text = f"History {ring_ms:5.0f}/{ring_cap_ms:5.0f} ms"
+            else:
+                ring_text = "History 0 ms"
+        else:
+            ring_text = "History 0 ms"
+
+        analysis_text = _format_queue(queue_depths.get("analysis"), "A")
+        audio_text = _format_queue(queue_depths.get("audio"), "Au")
+        logging_text = _format_queue(queue_depths.get("logging"), "L")
+
+        self._status_labels["queues"].setText(
+            f"Queues {viz_queue_text} {analysis_text} {audio_text} {logging_text}\n{ring_text}"
+        )
+
+        self._status_labels["drops"].setText("")
 
     # ------------------------------------------------------------------
     # Placeholder API (to be implemented later)
@@ -1779,6 +1915,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ensure_active_channel_focus()
         self._current_sample_rate = 0.0
         self._chunk_rate = 0.0
+        self._chunk_mean_samples = 0.0
+        self._chunk_accum_count = 0
+        self._chunk_accum_samples = 0
+        self._chunk_last_rate_update = time.perf_counter()
         self._update_status(viz_depth=0)
         if self._controller is not None:
             self._controller.update_window_span(self._current_window_sec)
@@ -1832,6 +1972,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._current_sample_rate = sample_rate
             self._current_window_sec = window_sec
             self._chunk_rate = 0.0
+            self._chunk_mean_samples = 0.0
+            self._chunk_accum_count = 0
+            self._chunk_accum_samples = 0
+            self._chunk_last_rate_update = now
             self._update_status(viz_depth=0)
             return
 
@@ -1848,6 +1992,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 raw = np.asarray(data[idx], dtype=np.float32)
                 active_samples[cid] = raw
                 if not should_redraw:
+                    continue
+                if not config.display_enabled:
+                    curve.clear()
+                    self._channel_display_buffers.pop(cid, None)
                     continue
                 buf = self._channel_display_buffers.get(cid)
                 if buf is None or buf.shape != raw.shape:
@@ -1869,7 +2017,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._current_sample_rate = sample_rate
         self._current_window_sec = window_sec
-        self._chunk_rate = sample_rate
         self._update_status(viz_depth=0)
         if self._listen_channel_id is not None:
             self._ensure_audio_player()
@@ -1996,6 +2143,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if idx < data.shape[1]:
                 cid = channel_ids[idx]
                 config = self._channel_configs.get(cid)
+                if config is not None and not config.display_enabled:
+                    curve.clear()
+                    continue
                 offset = config.offset_v if config else 0.0
                 curve.setData(time_axis, data[:, idx] + offset, skipFiniteCheck=True)
             else:
@@ -2054,7 +2204,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._current_sample_rate = sample_rate
             self._current_window_sec = window_sec
             self._render_trigger_display(channel_ids, window_sec)
-            self._chunk_rate = sample_rate
             self._update_status(viz_depth=0)
             if self._listen_channel_id is not None:
                 self._ensure_audio_player()
@@ -2063,7 +2212,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._trigger_mode == "single":
             self._current_sample_rate = sample_rate
             self._current_window_sec = window_sec
-            self._chunk_rate = sample_rate
             self._update_status(viz_depth=0)
             if self._listen_channel_id is not None:
                 self._ensure_audio_player()
@@ -2087,6 +2235,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_times = times_arr
         now = time.perf_counter()
 
+        self._register_chunk(data)
+        self._drain_visualization_queue()
+
         if channel_ids != self._channel_ids_current:
             self._ensure_curves_for_ids(channel_ids, channel_names)
 
@@ -2095,6 +2246,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._current_sample_rate = sample_rate
             self._current_window_sec = window_sec
             self._chunk_rate = 0.0
+            self._chunk_mean_samples = 0.0
+            self._chunk_accum_count = 0
+            self._chunk_accum_samples = 0
+            self._chunk_last_rate_update = time.perf_counter()
             self._update_status(viz_depth=0)
             return
         mode = self._trigger_mode or "stream"

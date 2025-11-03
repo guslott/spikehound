@@ -156,6 +156,22 @@ class Dispatcher:
         with self._stats_lock:
             return self._stats.snapshot()
 
+    def buffer_status(self) -> Dict[str, float]:
+        with self._ring_lock:
+            filled = float(self._filled)
+            capacity = float(self._buffer_len)
+            sample_rate = float(self._sample_rate or 0.0)
+            seconds = filled / sample_rate if sample_rate > 0 else 0.0
+            capacity_seconds = capacity / sample_rate if sample_rate > 0 else 0.0
+            utilization = (filled / capacity) if capacity > 0 else 0.0
+            return {
+                "samples": filled,
+                "capacity": capacity,
+                "seconds": seconds,
+                "capacity_seconds": capacity_seconds,
+                "utilization": utilization,
+            }
+
     def _run(self) -> None:
         while True:
             try:
