@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 import queue
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List, Dict
 
 import numpy as np
 
@@ -22,6 +22,36 @@ class AudioConfig:
     gain: float = 0.35             # careful: spikes can be loud
     blocksize: int = 512           # PortAudio block size (latency knob)
     ring_seconds: float = 0.75      # size of the output ring buffer (seconds)
+
+
+def list_output_devices() -> List[Dict[str, object]]:
+    """Return a list of available output devices using sounddevice."""
+    if sd is None:
+        return []
+    devices: List[Dict[str, object]] = []
+    try:
+        all_devices = sd.query_devices()
+        hostapis = {}
+        for idx, info in enumerate(all_devices):
+            if info.get("max_output_channels", 0) <= 0:
+                continue
+            hostapi_idx = info.get("hostapi")
+            if isinstance(hostapi_idx, int):
+                if hostapi_idx not in hostapis:
+                    try:
+                        hostapis[hostapi_idx] = sd.query_hostapis(hostapi_idx).get("name", "")
+                    except Exception:
+                        hostapis[hostapi_idx] = ""
+                host_name = hostapis[hostapi_idx]
+            else:
+                host_name = ""
+            label = info.get("name", f"Device {idx}")
+            if host_name:
+                label = f"{label} ({host_name})"
+            devices.append({"id": idx, "label": label, "name": info.get("name", label)})
+    except Exception:
+        return []
+    return devices
 
 
 class AudioPlayer(threading.Thread):

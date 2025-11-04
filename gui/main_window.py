@@ -15,7 +15,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from core import DeviceManager, PipelineController
 from core.conditioning import ChannelFilterSettings, FilterSettings
 from core.models import Chunk, EndOfStream
-from audio.player import AudioPlayer, AudioConfig
+from audio.player import AudioPlayer, AudioConfig, list_output_devices
+from .analysis_dock import AnalysisDock
 
 
 @dataclass
@@ -39,6 +40,7 @@ class ChannelOptionsPanel(QtWidgets.QWidget):
     """Per-channel configuration widget."""
 
     configChanged = QtCore.Signal(ChannelConfig)
+    analysisRequested = QtCore.Signal()
 
     def __init__(self, channel_id: int, channel_name: str, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -162,7 +164,9 @@ QPushButton:checked {
         self._apply_toggle_style(self.listen_btn)
         toggle_row.addWidget(self.listen_btn, 1)
         self.analyze_btn = QtWidgets.QPushButton("Analyze")
-        self._apply_toggle_style(self.analyze_btn)
+        self.analyze_btn.setStyleSheet(
+            "background-color: rgb(180, 180, 180); border: 1px solid rgb(90,90,90); padding: 4px 10px;"
+        )
         toggle_row.addWidget(self.analyze_btn, 1)
         toggle_row.addStretch(1)
         layout.addLayout(toggle_row)
@@ -177,8 +181,8 @@ QPushButton:checked {
         self.lowpass_spin.valueChanged.connect(self._on_widgets_changed)
         self.offset_spin.valueChanged.connect(self._on_widgets_changed)
         self.listen_btn.toggled.connect(self._on_widgets_changed)
-        self.analyze_btn.toggled.connect(self._on_widgets_changed)
         self.display_check.toggled.connect(self._on_display_toggled)
+        self.analyze_btn.clicked.connect(self._on_analyze_clicked)
 
     def set_channel_name(self, name: str) -> None:
         self._config.channel_name = name
@@ -205,7 +209,6 @@ QPushButton:checked {
         self.lowpass_spin.setEnabled(config.lowpass_enabled)
         self.offset_spin.setValue(config.offset_v)
         self.listen_btn.setChecked(config.listen_enabled)
-        self.analyze_btn.setChecked(config.analyze_enabled)
         self.display_check.setChecked(config.display_enabled)
         self._block_updates = False
 
@@ -249,7 +252,6 @@ QPushButton:checked {
         self._config.lowpass_enabled = self.lowpass_check.isChecked()
         self._config.lowpass_freq = float(self.lowpass_spin.value())
         self._config.listen_enabled = self.listen_btn.isChecked()
-        self._config.analyze_enabled = self.analyze_btn.isChecked()
         self._config.display_enabled = self.display_check.isChecked()
         self._emit_config()
 
@@ -263,6 +265,9 @@ QPushButton:checked {
             return
         self._config.display_enabled = checked
         self._emit_config()
+
+    def _on_analyze_clicked(self) -> None:
+        self.analysisRequested.emit()
 
 
 class ChannelViewBox(pg.ViewBox):
@@ -361,6 +366,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._audio_player_queue: Optional["queue.Queue"] = None
         self._audio_input_samplerate: float = 0.0
         self._audio_lock = threading.Lock()
+        self._audio_devices: List[Dict[str, object]] = []
+        self._audio_current_device: Optional[object] = None
         self._trigger_mode: str = "stream"
         self._trigger_channel_id: Optional[int] = None
         self._trigger_threshold: float = 0.0
@@ -392,7 +399,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_palette()
         self._style_plot()
 
-        self._build_ui()
+        scope_widget = self._create_scope_widget()
+        self.setCentralWidget(QtWidgets.QWidget(self))
+        self._analysis_dock = AnalysisDock(parent=self)
+        self._analysis_dock.set_scope_widget(scope_widget, "Scope")
+        self.addDockWidget(QtCore.Qt.TopDockWidgetArea, self._analysis_dock)
+        self._analysis_dock.select_scope()
         self._wire_placeholders()
         self._update_trigger_controls()
         self._device_manager = DeviceManager(self)
@@ -401,6 +413,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._device_manager.deviceDisconnected.connect(self._on_device_disconnected)
         self._device_manager.availableChannelsChanged.connect(self._on_available_channels)
         self._apply_device_state(False)
+        self._populate_audio_outputs()
         self._device_manager.refresh_devices()
         self.attach_controller(controller)
         self._emit_trigger_config()
@@ -415,12 +428,11 @@ class MainWindow(QtWidgets.QMainWindow):
     # UI Construction
     # ------------------------------------------------------------------
 
-    def _build_ui(self) -> None:
-        central = QtWidgets.QWidget(self)
-        grid = QtWidgets.QGridLayout(central)
+    def _create_scope_widget(self) -> QtWidgets.QWidget:
+        scope = QtWidgets.QWidget(self)
+        grid = QtWidgets.QGridLayout(scope)
         grid.setContentsMargins(8, 8, 8, 8)
         grid.setSpacing(8)
-        self.setCentralWidget(central)
 
         # Upper-left: plot area for multi-channel traces.
         self._view_box = ChannelViewBox()
@@ -616,14 +628,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_toggle_btn.clicked.connect(self._on_device_button_clicked)
         device_layout.addWidget(self.device_toggle_btn, 2, 0, 1, 2)
 
-        help_label = QtWidgets.QLabel(
-            "Select a device from the menu above, then click Connect to get started."
-        )
-        help_label.setWordWrap(True)
-        help_label.setStyleSheet("color: rgb(40,40,40); font-size: 11px;")
-        device_layout.addWidget(help_label, 3, 0, 1, 2)
-
-        bottom_layout.addWidget(self.device_group)
+        listen_row = QtWidgets.QHBoxLayout()
+        listen_row.setSpacing(6)
+        listen_row.addWidget(self._label("Listen Output:"))
+        self.listen_device_combo = QtWidgets.QComboBox()
+        self.listen_device_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+        listen_row.addWidget(self.listen_device_combo, 1)
+        device_layout.addLayout(listen_row, 3, 0, 1, 2)
 
         self.channels_group = QtWidgets.QGroupBox("Channels")
         channels_layout = QtWidgets.QVBoxLayout(self.channels_group)
@@ -655,8 +666,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.available_combo = QtWidgets.QComboBox()
         channels_layout.addWidget(self.available_combo)
 
-        bottom_layout.addWidget(self.channels_group, stretch=2)
-
         bottom_layout.addWidget(self.device_group, 1)
         bottom_layout.addWidget(self.channels_group, 2)
 
@@ -667,6 +676,8 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.setRowStretch(2, 0)
         grid.setColumnStretch(0, 5)
         grid.setColumnStretch(1, 3)
+
+        return scope
 
     def _wire_placeholders(self) -> None:
         """Connect stub widgets to stub slots for future wiring."""
@@ -683,6 +694,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self.threshold_line.sigPositionChanged.connect(self._on_threshold_line_changed)
         self.active_list.currentItemChanged.connect(self._on_active_channel_selected)
         self.trigger_single_button.clicked.connect(self._on_trigger_single_clicked)
+        if hasattr(self, "listen_device_combo"):
+            self.listen_device_combo.currentIndexChanged.connect(self._on_listen_device_changed)
+
+    def _populate_audio_outputs(self) -> None:
+        if not hasattr(self, "listen_device_combo"):
+            return
+        options = [{"id": None, "label": "System Default"}]
+        try:
+            devices = list_output_devices()
+        except Exception:
+            devices = []
+        for entry in devices:
+            label = entry.get("label") or entry.get("name") or str(entry.get("id"))
+            options.append({"id": entry.get("id"), "label": str(label)})
+        seen = set()
+        final: List[Dict[str, object]] = []
+        for opt in options:
+            key = opt.get("id")
+            if key in seen:
+                continue
+            seen.add(key)
+            final.append(opt)
+        self._audio_devices = final
+        combo = self.listen_device_combo
+        combo.blockSignals(True)
+        combo.clear()
+        for opt in final:
+            combo.addItem(opt["label"], opt)
+        if final:
+            combo.setCurrentIndex(0)
+        combo.setEnabled(len(final) > 0)
+        combo.blockSignals(False)
 
     def attach_controller(self, controller: Optional[PipelineController]) -> None:
         if controller is self._controller:
@@ -1091,6 +1134,10 @@ class MainWindow(QtWidgets.QMainWindow):
         desired = {cid: name for cid, name in zip(channel_ids, channel_names)}
         for cid, panel in list(self._channel_panels.items()):
             if cid not in desired:
+                config = self._channel_configs.get(cid)
+                if config is not None and hasattr(self, "_analysis_dock"):
+                    channel_name = config.channel_name or f"Channel {cid}"
+                    self._analysis_dock.close_tab(channel_name)
                 self.channel_opts_stack.removeWidget(panel)
                 panel.deleteLater()
                 del self._channel_panels[cid]
@@ -1104,6 +1151,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if panel is None:
                 panel = ChannelOptionsPanel(cid, name, self.channel_opts_stack)
                 panel.configChanged.connect(lambda cfg, cid=cid: self._on_channel_config_changed(cid, cfg))
+                panel.analysisRequested.connect(lambda cid=cid: self._open_analysis_for_channel(cid))
                 self.channel_opts_stack.addWidget(panel)
                 self._channel_panels[cid] = panel
             panel.set_channel_name(name)
@@ -1158,6 +1206,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if panel is None:
             panel = ChannelOptionsPanel(channel_id, name, self.channel_opts_stack)
             panel.configChanged.connect(lambda cfg, cid=channel_id: self._on_channel_config_changed(cid, cfg))
+            panel.analysisRequested.connect(lambda cid=channel_id: self._open_analysis_for_channel(cid))
             self.channel_opts_stack.addWidget(panel)
             self._channel_panels[channel_id] = panel
         panel.set_channel_name(name)
@@ -1300,6 +1349,37 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._listen_channel_id == channel_id:
                 self._clear_listen_channel(channel_id)
 
+    def _selected_output_device(self) -> Optional[object]:
+        combo = getattr(self, "listen_device_combo", None)
+        if combo is None:
+            return None
+        data = combo.currentData()
+        if isinstance(data, dict):
+            return data.get("id")
+        return None
+
+    def _on_listen_device_changed(self) -> None:
+        current = self._listen_channel_id
+        if current is None:
+            return
+        self._stop_audio_player()
+        if current not in self._channel_ids_current:
+            return
+        if not self._ensure_audio_player(show_error=False):
+            self._clear_listen_channel(current)
+        else:
+            self._flush_audio_player_queue()
+
+    def _open_analysis_for_channel(self, channel_id: int) -> None:
+        dock = getattr(self, "_analysis_dock", None)
+        if dock is None:
+            return
+        config = self._channel_configs.get(channel_id)
+        if config is None:
+            return
+        channel_name = config.channel_name or f"Channel {channel_id}"
+        dock.open_analysis(channel_name)
+
     def _set_listen_channel(self, channel_id: int) -> None:
         """Activate audio monitoring for the requested channel, disabling other listen toggles."""
         cfg = self._channel_configs.get(channel_id)
@@ -1432,13 +1512,19 @@ class MainWindow(QtWidgets.QMainWindow):
         sample_rate = int(round(self._current_sample_rate))
         if sample_rate <= 0:
             return False
+        device_id = self._selected_output_device()
         with self._audio_lock:
-            if self._audio_player is not None and abs(self._audio_input_samplerate - sample_rate) < 1e-6:
+            if (
+                self._audio_player is not None
+                and abs(self._audio_input_samplerate - sample_rate) < 1e-6
+                and self._audio_current_device == device_id
+            ):
                 return True
             player_to_stop = self._audio_player
             self._audio_player = None
             self._audio_player_queue = None
             self._audio_input_samplerate = 0.0
+            self._audio_current_device = None
         if player_to_stop is not None:
             try:
                 player_to_stop.stop()
@@ -1446,7 +1532,14 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
         queue_obj: "queue.Queue" = queue.Queue(maxsize=128)
-        config = AudioConfig(out_samplerate=44_100, out_channels=1, gain=0.7, blocksize=512, ring_seconds=0.5)
+        config = AudioConfig(
+            out_samplerate=44_100,
+            out_channels=1,
+            device=device_id,
+            gain=0.7,
+            blocksize=512,
+            ring_seconds=0.5,
+        )
         try:
             player = AudioPlayer(
                 audio_queue=queue_obj,
@@ -1462,6 +1555,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._audio_player = player
             self._audio_player_queue = queue_obj
             self._audio_input_samplerate = float(sample_rate)
+            self._audio_current_device = device_id
         self._audio_player.start()
         return True
 
@@ -1471,6 +1565,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._audio_player = None
             self._audio_player_queue = None
             self._audio_input_samplerate = 0.0
+            self._audio_current_device = None
         if player is None:
             return
         try:
