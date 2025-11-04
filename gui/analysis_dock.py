@@ -4,6 +4,8 @@ from typing import Dict, Optional
 
 from PySide6 import QtCore, QtWidgets
 
+from .analysis_tab import AnalysisTab
+
 
 class AnalysisDock(QtWidgets.QDockWidget):
     """Dockable workspace containing the scope tab plus ad-hoc analysis tabs."""
@@ -56,16 +58,12 @@ class AnalysisDock(QtWidgets.QDockWidget):
     # Analysis tab management
     # ------------------------------------------------------------------
 
-    def open_analysis(self, channel_name: str) -> QtWidgets.QWidget:
+    def open_analysis(self, channel_name: str, sample_rate: float) -> AnalysisTab:
         count = self._analysis_count.get(channel_name, 0) + 1
         self._analysis_count[channel_name] = count
         title = f"Analysis - {channel_name}" if count == 1 else f"Analysis - {channel_name} #{count}"
 
-        widget = QtWidgets.QWidget(self._tabs)
-        layout = QtWidgets.QVBoxLayout(widget)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.addStretch(1)
-
+        widget = AnalysisTab(channel_name, sample_rate, self._tabs)
         insert_index = 1 if self._scope_widget is not None else self._tabs.count()
         self._tabs.insertTab(insert_index, widget, title)
         self._tabs.setCurrentWidget(widget)

@@ -1378,7 +1378,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if config is None:
             return
         channel_name = config.channel_name or f"Channel {channel_id}"
-        dock.open_analysis(channel_name)
+        sample_rate = self._current_sample_rate
+        if sample_rate <= 0 and hasattr(self, "sample_rate_spin"):
+            try:
+                sample_rate = float(self.sample_rate_spin.value())
+            except Exception:
+                sample_rate = 0.0
+        if sample_rate <= 0:
+            sample_rate = 1.0
+        dock.open_analysis(channel_name, sample_rate)
 
     def _set_listen_channel(self, channel_id: int) -> None:
         """Activate audio monitoring for the requested channel, disabling other listen toggles."""
