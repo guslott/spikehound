@@ -17,7 +17,6 @@ def test_pipeline_controller_start_stop_cycles():
     controller = PipelineController(
         filter_settings=FilterSettings(),
         visualization_queue_size=64,
-        analysis_queue_size=16,
         audio_queue_size=16,
         logging_queue_size=64,
         dispatcher_poll_timeout=0.01,
@@ -49,7 +48,6 @@ def test_pipeline_controller_backpressure_tracks_evictions():
     controller = PipelineController(
         filter_settings=FilterSettings(),
         visualization_queue_size=1,
-        analysis_queue_size=1,
         audio_queue_size=1,
         logging_queue_size=8,
         dispatcher_poll_timeout=0.01,

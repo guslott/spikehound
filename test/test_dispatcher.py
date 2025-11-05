@@ -52,7 +52,6 @@ def test_dispatcher_filters_dc_and_notch_at_target_frequency():
 
     raw_queue: "queue.Queue" = queue.Queue()
     visualization_queue: "queue.Queue" = queue.Queue()
-    analysis_queue: "queue.Queue" = queue.Queue()
     audio_queue: "queue.Queue" = queue.Queue()
     logging_queue: "queue.Queue" = queue.Queue()
 
@@ -68,7 +67,6 @@ def test_dispatcher_filters_dc_and_notch_at_target_frequency():
     dispatcher = Dispatcher(
         raw_queue,
         visualization_queue,
-        analysis_queue,
         audio_queue,
         logging_queue,
         filter_settings=settings,
@@ -121,7 +119,6 @@ def test_dispatcher_preserves_filter_state_across_chunks():
 
     raw_queue: "queue.Queue" = queue.Queue()
     visualization_queue: "queue.Queue" = queue.Queue()
-    analysis_queue: "queue.Queue" = queue.Queue()
     audio_queue: "queue.Queue" = queue.Queue()
     logging_queue: "queue.Queue" = queue.Queue()
 
@@ -131,7 +128,6 @@ def test_dispatcher_preserves_filter_state_across_chunks():
     dispatcher = Dispatcher(
         raw_queue,
         visualization_queue,
-        analysis_queue,
         audio_queue,
         logging_queue,
         filter_settings=settings,
@@ -156,18 +152,18 @@ def test_dispatcher_preserves_filter_state_across_chunks():
 def test_dispatcher_fan_out_and_backpressure_tracking():
     raw_queue: "queue.Queue" = queue.Queue()
     visualization_queue: "queue.Queue" = queue.Queue(maxsize=1)
-    analysis_queue: "queue.Queue" = queue.Queue(maxsize=1)
     audio_queue: "queue.Queue" = queue.Queue(maxsize=1)
     logging_queue: "queue.Queue" = queue.Queue()
 
     dispatcher = Dispatcher(
         raw_queue,
         visualization_queue,
-        analysis_queue,
         audio_queue,
         logging_queue,
         filter_settings=FilterSettings(),
     )
+    analysis_queue: "queue.Queue" = queue.Queue(maxsize=1)
+    token = dispatcher.register_analysis_queue(analysis_queue)
     dispatcher.start()
 
     fs = 1_000.0
@@ -197,6 +193,10 @@ def test_dispatcher_fan_out_and_backpressure_tracking():
     assert evicted.get("analysis", 0) >= 1
     assert evicted.get("audio", 0) >= 1
     assert evicted.get("logging", 0) == 0
+
+    analysis_received = _drain_chunks(analysis_queue)
+    assert len(analysis_received) == 3
+    dispatcher.unregister_analysis_queue(token)
 
     # Logging queue should hold all raw chunks plus sentinel
     logged_chunks = _drain_chunks(logging_queue)

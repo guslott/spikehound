@@ -401,7 +401,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         scope_widget = self._create_scope_widget()
         self.setCentralWidget(QtWidgets.QWidget(self))
-        self._analysis_dock = AnalysisDock(parent=self)
+        self._analysis_dock = AnalysisDock(parent=self, controller=controller)
         self._analysis_dock.set_scope_widget(scope_widget, "Scope")
         self.addDockWidget(QtCore.Qt.TopDockWidgetArea, self._analysis_dock)
         self._analysis_dock.select_scope()
@@ -756,9 +756,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     signals.tick.disconnect(self._on_dispatcher_tick)
                 except (TypeError, RuntimeError):
                     pass
-            self._stop_visualization_drain()
 
         self._controller = controller
+        if hasattr(self, "_analysis_dock") and self._analysis_dock is not None:
+            self._analysis_dock._controller = controller
 
         if controller is None:
             return
@@ -1822,6 +1823,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._clear_listen_channel()
         self._stop_audio_router()
         self._stop_audio_player()
+        if hasattr(self, "_analysis_dock") and self._analysis_dock is not None:
+            self._analysis_dock.shutdown()
         super().closeEvent(event)
 
     def _quit_application(self) -> None:
@@ -1965,12 +1968,11 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             ring_text = "History 0 ms"
 
-        analysis_text = _format_queue(queue_depths.get("analysis"), "A")
         audio_text = _format_queue(queue_depths.get("audio"), "Au")
         logging_text = _format_queue(queue_depths.get("logging"), "L")
 
         self._status_labels["queues"].setText(
-            f"Queues {viz_queue_text} {analysis_text} {audio_text} {logging_text}\n{ring_text}"
+            f"Queues {viz_queue_text} {audio_text} {logging_text}\n{ring_text}"
         )
 
         self._status_labels["drops"].setText("")

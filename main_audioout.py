@@ -148,14 +148,12 @@ def main():
                       line_hum_freq=line_hum_freq)
 
         visualization_q: "queue.Queue" = queue.Queue(maxsize=8)
-        analysis_q: "queue.Queue" = queue.Queue(maxsize=8)
         audio_q: "queue.Queue" = queue.Queue(maxsize=64)
         logging_q: "queue.Queue" = queue.Queue(maxsize=32)
 
         disp = Dispatcher(
             raw_queue=src.data_queue,
             visualization_queue=visualization_q,
-            analysis_queue=analysis_q,
             audio_queue=audio_q,
             logging_queue=logging_q,
             filter_settings=None,

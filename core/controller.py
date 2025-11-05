@@ -17,7 +17,7 @@ else:  # pragma: no cover - runtime fallback
 
 from .conditioning import FilterSettings
 from .dispatcher import Dispatcher
-from .models import EndOfStream, TriggerConfig
+from .models import Chunk, EndOfStream, TriggerConfig
 
 
 def _registry():
@@ -215,14 +215,12 @@ class PipelineController:
         *,
         filter_settings: Optional[FilterSettings] = None,
         visualization_queue_size: int = 256,
-        analysis_queue_size: int = 256,
         audio_queue_size: int = 256,
         logging_queue_size: int = 512,
         dispatcher_poll_timeout: float = 0.05,
     ) -> None:
         self._filter_settings = filter_settings or FilterSettings()
         self.visualization_queue: "queue.Queue" = queue.Queue(maxsize=visualization_queue_size)
-        self.analysis_queue: "queue.Queue" = queue.Queue(maxsize=analysis_queue_size)
         self.audio_queue: "queue.Queue" = queue.Queue(maxsize=audio_queue_size)
         self.logging_queue: "queue.Queue" = queue.Queue(maxsize=logging_queue_size)
 
@@ -321,7 +319,6 @@ class PipelineController:
             self._dispatcher = Dispatcher(
                 raw_queue=source.data_queue,
                 visualization_queue=self.visualization_queue,
-                analysis_queue=self.analysis_queue,
                 audio_queue=self.audio_queue,
                 logging_queue=self.logging_queue,
                 filter_settings=self._filter_settings,
@@ -420,7 +417,6 @@ class PipelineController:
             self._dispatcher = Dispatcher(
                 raw_queue=driver.data_queue,
                 visualization_queue=self.visualization_queue,
-                analysis_queue=self.analysis_queue,
                 audio_queue=self.audio_queue,
                 logging_queue=self.logging_queue,
                 filter_settings=self._filter_settings,
@@ -494,24 +490,37 @@ class PipelineController:
         with self._lock:
             depths: Dict[str, dict] = {}
 
-            def _queue_status(q: "queue.Queue") -> dict:
-                size = q.qsize()
-                maxsize = q.maxsize
-                utilization = (size / maxsize) if maxsize > 0 else 0.0
-                return {
-                    "size": size,
+        def _queue_status(q: "queue.Queue") -> dict:
+            size = q.qsize()
+            maxsize = q.maxsize
+            utilization = (size / maxsize) if maxsize > 0 else 0.0
+            return {
+                "size": size,
                     "max": maxsize,
                     "utilization": utilization,
                 }
 
-            depths["visualization"] = _queue_status(self.visualization_queue)
-            if self._dispatcher is not None:
-                depths["viz_buffer"] = self._dispatcher.buffer_status()
+        depths["visualization"] = _queue_status(self.visualization_queue)
+        if self._dispatcher is not None:
+            depths["viz_buffer"] = self._dispatcher.buffer_status()
 
-            depths["analysis"] = _queue_status(self.analysis_queue)
-            depths["audio"] = _queue_status(self.audio_queue)
-            depths["logging"] = _queue_status(self.logging_queue)
-            return depths
+        depths["audio"] = _queue_status(self.audio_queue)
+        depths["logging"] = _queue_status(self.logging_queue)
+        return depths
+
+    def register_analysis_queue(self, data_queue: "queue.Queue[Chunk | EndOfStream]") -> Optional[int]:
+        with self._lock:
+            if self._dispatcher is None:
+                return None
+            return self._dispatcher.register_analysis_queue(data_queue)
+
+    def unregister_analysis_queue(self, token: Optional[int]) -> None:
+        if token is None:
+            return
+        with self._lock:
+            if self._dispatcher is None:
+                return
+            self._dispatcher.unregister_analysis_queue(token)
 
     # ------------------------------------------------------------------
     # Internals
@@ -542,7 +551,7 @@ class PipelineController:
 
     def _reset_output_queues(self) -> None:
         """Clear downstream queues so the next start() begins fresh."""
-        for q in (self.visualization_queue, self.analysis_queue, self.audio_queue, self.logging_queue):
+        for q in (self.visualization_queue, self.audio_queue, self.logging_queue):
             self._flush_queue(q)
 
     def _destroy_dispatcher(self) -> None:

@@ -42,7 +42,6 @@ class Dispatcher:
         self,
         raw_queue: "queue.Queue[Chunk | EndOfStream]",
         visualization_queue: "queue.Queue[Chunk | EndOfStream]",
-        analysis_queue: "queue.Queue[Chunk | EndOfStream]",
         audio_queue: "queue.Queue[Chunk | EndOfStream]",
         logging_queue: "queue.Queue[Chunk | EndOfStream]",
         *,
@@ -52,7 +51,6 @@ class Dispatcher:
         self._raw_queue = raw_queue
         self._output_queues: Dict[str, queue.Queue] = {
             "visualization": visualization_queue,
-            "analysis": analysis_queue,
             "audio": audio_queue,
         }
         self._logging_queue = logging_queue
@@ -80,6 +78,9 @@ class Dispatcher:
         self._channel_index_map: Dict[int, int] = {}
         self._current_trigger: Optional[TriggerConfig] = None
         self._active_channel_ids: list[int] = []
+        self._analysis_lock = threading.Lock()
+        self._analysis_queues: Dict[int, queue.Queue] = {}
+        self._next_analysis_id = 1
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -97,6 +98,7 @@ class Dispatcher:
         if self._tick_thread is not None:
             self._tick_thread.join()
             self._tick_thread = None
+        self._broadcast_end_of_stream()
 
     def join(self, timeout: Optional[float] = None) -> None:
         if self._thread is not None:
@@ -133,6 +135,24 @@ class Dispatcher:
 
     def emit_empty_tick(self) -> None:
         self.signals.tick.emit(self._empty_payload())
+
+    # Analysis registration ----------------------------------------------------
+
+    def register_analysis_queue(self, data_queue: "queue.Queue[Chunk | EndOfStream]") -> int:
+        with self._analysis_lock:
+            token = self._next_analysis_id
+            self._next_analysis_id += 1
+            self._analysis_queues[token] = data_queue
+        return token
+
+    def unregister_analysis_queue(self, token: int) -> None:
+        with self._analysis_lock:
+            queue_obj = self._analysis_queues.pop(token, None)
+        if queue_obj is not None:
+            try:
+                queue_obj.put_nowait(EndOfStream)
+            except queue.Full:
+                pass
 
     # Trigger configuration stubs -------------------------------------
 
@@ -224,6 +244,34 @@ class Dispatcher:
         self._enqueue(self._logging_queue, raw_chunk, "logging")
         for name, out_queue in self._output_queues.items():
             self._enqueue(out_queue, filtered_chunk, name)
+        self._dispatch_to_analysis(filtered_chunk)
+
+    def _dispatch_to_analysis(self, filtered_chunk: Chunk) -> None:
+        with self._analysis_lock:
+            targets = list(self._analysis_queues.items())
+        if not targets:
+            return
+        for token, queue_obj in targets:
+            try:
+                queue_obj.put_nowait(filtered_chunk)
+            except queue.Full:
+                try:
+                    _ = queue_obj.get_nowait()
+                    with self._stats_lock:
+                        self._stats.evicted["analysis"] += 1
+                except queue.Empty:
+                    pass
+                try:
+                    queue_obj.put_nowait(filtered_chunk)
+                except queue.Full:
+                    with self._stats_lock:
+                        self._stats.dropped["analysis"] += 1
+                else:
+                    with self._stats_lock:
+                        self._stats.forwarded["analysis"] += 1
+            else:
+                with self._stats_lock:
+                    self._stats.forwarded["analysis"] += 1
 
     def _enqueue(self, target_queue: queue.Queue, item: object, queue_name: str) -> None:
         try:
@@ -265,6 +313,13 @@ class Dispatcher:
                             self._stats.evicted[name] += 1
                     except queue.Empty:
                         pass
+        with self._analysis_lock:
+            queues = list(self._analysis_queues.values())
+        for q in queues:
+            try:
+                q.put_nowait(EndOfStream)
+            except queue.Full:
+                pass
 
     def _start_tick_thread(self) -> None:
         if self._tick_thread is not None and self._tick_thread.is_alive():
