@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import queue
 import threading
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
 from core.models import Chunk, EndOfStream
+from shared.event_buffer import EventRingBuffer
+from shared.types import Event
+
+from .settings import AnalysisSettings, AnalysisSettingsStore
 
 
 class AnalysisWorker(threading.Thread):
@@ -22,6 +26,18 @@ class AnalysisWorker(threading.Thread):
         self._stop_evt = threading.Event()
         self._registration_token: Optional[object] = None
         self._channel_index: Optional[int] = None
+        self._event_buffer: Optional[EventRingBuffer] = getattr(controller, "event_buffer", None)
+        self._settings_store: Optional[AnalysisSettingsStore] = getattr(controller, "analysis_settings_store", None)
+        self._settings_unsub: Optional[Callable[[], None]] = None
+        self._state_lock = threading.Lock()
+        self._event_window_ms: float = 10.0
+        self._threshold_enabled = False
+        self._threshold_value = 0.5
+        self._threshold_direction = "above"
+        self._last_window_end_sample = -10**12
+        self._event_id = 0
+        if isinstance(self._settings_store, AnalysisSettingsStore):
+            self._settings_unsub = self._settings_store.subscribe(self._on_settings_changed)
 
     def start(self) -> None:  # type: ignore[override]
         if self._controller is None:
@@ -72,6 +88,7 @@ class AnalysisWorker(threading.Thread):
             )
         except Exception:
             return
+        self._detect_events(routed_chunk)
         try:
             self.output_queue.put_nowait(routed_chunk)
         except queue.Full:
@@ -132,3 +149,139 @@ class AnalysisWorker(threading.Thread):
             except Exception:
                 pass
             self._registration_token = None
+        if self._settings_unsub:
+            self._settings_unsub()
+            self._settings_unsub = None
+
+    def publish_event(self, event: Event) -> None:
+        if self._event_buffer is not None:
+            self._event_buffer.push(event)
+
+    def _on_settings_changed(self, settings: AnalysisSettings) -> None:
+        with self._state_lock:
+            self._event_window_ms = float(settings.event_window_ms)
+
+    def configure_threshold(self, enabled: bool, value: float) -> None:
+        # Threshold 2 is intentionally disabled in the UI; only this primary control is honored.
+        direction = "above"
+        magnitude = float(value)
+        if magnitude < 0:
+            direction = "below"
+        magnitude = abs(magnitude)
+        with self._state_lock:
+            self._threshold_enabled = bool(enabled)
+            self._threshold_value = magnitude
+            self._threshold_direction = direction
+
+    def update_sample_rate(self, sample_rate: float) -> None:
+        """Refresh fallback sample rate and drop stale refractory state when it changes."""
+        sample_rate = float(sample_rate)
+        if sample_rate <= 0:
+            return
+        with self._state_lock:
+            if abs(sample_rate - self.sample_rate) < 1e-3:
+                return
+            self.sample_rate = sample_rate
+            self._last_window_end_sample = -10**12
+
+    # ------------------------------------------------------------------
+    # Event detection
+    # ------------------------------------------------------------------
+
+    def _next_event_id(self) -> int:
+        self._event_id += 1
+        return self._event_id
+
+    def _detect_events(self, chunk: Chunk) -> None:
+        with self._state_lock:
+            event_window_ms = float(self._event_window_ms)
+            threshold_enabled = bool(self._threshold_enabled)
+            threshold_value = float(self._threshold_value)
+            threshold_direction = self._threshold_direction
+            last_window_end = self._last_window_end_sample
+        if not threshold_enabled or threshold_value <= 0 or event_window_ms <= 0:
+            # No detections when the user has disabled Threshold 1.
+            return
+        if chunk.samples.size == 0:
+            return
+
+        sig = np.asarray(chunk.samples[0], dtype=np.float32)
+        n = sig.size
+        if n == 0:
+            return
+        dt = float(chunk.dt)
+        sr = (1.0 / dt) if dt > 0 else self.sample_rate
+        if sr <= 0:
+            return
+
+        half_samples = int(round((event_window_ms / 2.0) * sr / 1000.0))
+        if half_samples <= 0:
+            half_samples = 1
+        window_samples = max(1, half_samples * 2)
+
+        if threshold_direction == "above":
+            idxs = np.flatnonzero(sig >= threshold_value)
+        else:
+            idxs = np.flatnonzero(sig <= -threshold_value)
+        if idxs.size == 0:
+            return
+
+        start_sample = -1
+        channel_id = self._channel_index
+        meta = chunk.meta
+        if meta is not None and hasattr(meta, "get"):
+            try:
+                start_sample = int(meta.get("start_sample", -1))
+            except (TypeError, ValueError):
+                start_sample = -1
+            if channel_id is None:
+                try:
+                    channel_id = int(meta.get("source_channel_index"))
+                except (TypeError, ValueError):
+                    channel_id = None
+
+        events: list[tuple[Event, int]] = []
+        last_end = last_window_end
+        for idx in idxs:
+            abs_idx = idx if start_sample < 0 else start_sample + int(idx)
+            if abs_idx < last_end:
+                continue
+
+            i0 = max(0, int(idx) - half_samples)
+            i1 = min(n, int(idx) + half_samples + 1)
+            if i1 <= i0:
+                continue
+            wf = sig[i0:i1].astype(np.float32, copy=True)
+            dt_sec = 1.0 / sr
+            first_time = float(chunk.start_time) + i0 * dt_sec
+            crossing_time = float(chunk.start_time) + int(idx) * dt_sec
+            pre_count = int(idx) - i0  # clamps gracefully when the buffer lacks pre-samples
+            post_count = i1 - int(idx) - 1
+            pre_ms = pre_count * dt_sec * 1000.0
+            post_ms = post_count * dt_sec * 1000.0
+            crossing_index = abs_idx
+            event = Event(
+                id=self._next_event_id(),
+                channelId=int(channel_id) if channel_id is not None else 0,
+                thresholdValue=threshold_value if threshold_direction == "above" else -threshold_value,
+                crossingIndex=int(crossing_index),
+                crossingTimeSec=float(crossing_time),
+                firstSampleTimeSec=float(first_time),
+                sampleRateHz=float(sr),
+                windowMs=float(event_window_ms),
+                preMs=float(pre_ms),
+                postMs=float(post_ms),
+                samples=wf,
+            )
+            first_abs = crossing_index - pre_count
+            last_end = first_abs + window_samples
+            events.append((event, last_end))
+
+        if not events:
+            return
+
+        for event, new_last_end in events:
+            self.publish_event(event)
+            with self._state_lock:
+                if new_last_end > self._last_window_end_sample:
+                    self._last_window_end_sample = new_last_end

@@ -1,11 +1,15 @@
 from __future__ import annotations
-import threading
+
 import queue
+import threading
+import time
 from dataclasses import dataclass
-from typing import Optional, List, Dict
+from typing import List, Optional
+
 import numpy as np
 
-from .models import Event
+from shared.event_buffer import EventRingBuffer
+from shared.types import Event
 
 @dataclass
 class ThresholdConfig:
@@ -32,6 +36,7 @@ class RealTimeAnalyzer:
         analysis_queue: "queue.Queue",
         event_queue: "queue.Queue",
         logging_queue: "queue.Queue",
+        event_buffer: Optional[EventRingBuffer] = None,
         sample_rate: float,
         n_channels: int,
         config: ThresholdConfig,
@@ -39,6 +44,7 @@ class RealTimeAnalyzer:
         self.analysis_queue = analysis_queue
         self.event_queue = event_queue
         self.logging_queue = logging_queue
+        self._event_buffer = event_buffer
         self.sr = float(sample_rate)
         self.n_channels = int(n_channels)
         self.cfg = config
@@ -48,6 +54,7 @@ class RealTimeAnalyzer:
 
         self._thr: Optional[np.ndarray] = None  # thresholds per channel
         self._last_event_sample = np.full(self.n_channels, -10**12, dtype=np.int64)
+        self._event_id = 0
 
         # pre/post windows in samples
         self._pre = max(0, int(round(self.cfg.window_pre_s * self.sr)))
@@ -94,7 +101,8 @@ class RealTimeAnalyzer:
             if self._thr is None:
                 self._thr = self._init_thresholds(arr, noise_accum)
 
-            events = self._detect_events(arr, start_sample)
+            start_time = float(getattr(item, "start_time", time.monotonic()))
+            events = self._detect_events(arr, start_sample, start_time)
             if events:
                 # Fan-out to both queues
                 for ev in events:
@@ -132,7 +140,7 @@ class RealTimeAnalyzer:
         thr = self.cfg.auto_k_sigma * sigma
         return thr.astype(np.float32)
 
-    def _detect_events(self, arr: np.ndarray, start_sample: int) -> List[Event]:
+    def _detect_events(self, arr: np.ndarray, start_sample: int, start_time: float) -> List[Event]:
         """
         Simple threshold crossing detector with refractory and window capture.
         """
@@ -173,22 +181,37 @@ class RealTimeAnalyzer:
 
             # build events with windows
             for i in keep:
-                i0 = max(0, int(i) - self._pre)
-                i1 = min(n, int(i) + self._post)
+                i_idx = int(i)
+                i0 = max(0, i_idx - self._pre)
+                i1 = min(n, i_idx + self._post)
                 wf = x[i0:i1].copy()  # (window,)
-                amp = float(x[int(i)])
+                abs_index = start_sample + i_idx
+                sr = self.sr if self.sr > 0 else 1.0
+                window_ms = 1000.0 * (wf.size / sr)
+                pre_ms = 1000.0 * (self._pre / sr)
+                post_ms = 1000.0 * (self._post / sr)
+                crossing_time = start_time + (i_idx / sr)
+                crossing_value = float(x[i_idx])
+                threshold_value = -thr if crossing_value < 0 else thr
                 ev = Event(
-                    channel=c,
-                    sample_index=start_sample + int(i),
-                    amplitude=amp,
-                    waveform=wf,
-                    properties={
-                        "pre_s": self._pre / self.sr,
-                        "post_s": self._post / self.sr,
-                        "threshold": thr,
-                        "polarity": self.cfg.polarity,
-                    },
+                    id=self._next_event_id(),
+                    channelId=int(c),
+                    thresholdValue=float(threshold_value),
+                    crossingIndex=int(abs_index),
+                    crossingTimeSec=float(crossing_time),
+                    firstSampleTimeSec=float(start_time),
+                    sampleRateHz=float(self.sr),
+                    windowMs=float(window_ms),
+                    preMs=float(pre_ms),
+                    postMs=float(post_ms),
+                    samples=wf,
                 )
                 events.append(ev)
+                if self._event_buffer is not None:
+                    self._event_buffer.push(ev)
 
         return events
+
+    def _next_event_id(self) -> int:
+        self._event_id += 1
+        return self._event_id

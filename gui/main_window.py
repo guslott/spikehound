@@ -369,6 +369,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ]
         self._next_color_index = 0
         self._current_sample_rate: float = 0.0
+        self._analysis_sample_rate: float = 0.0
         self._current_window_sec: float = 1.0
         self._dispatcher_signals: Optional[QtCore.QObject] = None
         self._drag_channel_id: Optional[int] = None
@@ -2218,6 +2219,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_status(viz_depth=0)
         if self._listen_channel_id is not None:
             self._ensure_audio_player()
+        self._maybe_update_analysis_sample_rate(sample_rate)
+
+    def _maybe_update_analysis_sample_rate(self, sample_rate: float) -> None:
+        if sample_rate <= 0:
+            return
+        if abs(sample_rate - self._analysis_sample_rate) < 1e-3:
+            return
+        self._analysis_sample_rate = float(sample_rate)
+        dock = getattr(self, "_analysis_dock", None)
+        if isinstance(dock, AnalysisDock):
+            dock.update_sample_rate(sample_rate)
 
     def _update_trigger_sample_parameters(self, sample_rate: float) -> None:
         self._trigger_last_sample_rate = sample_rate
@@ -2427,6 +2439,8 @@ class MainWindow(QtWidgets.QMainWindow):
         window_sec = float(status.get("window_sec", 0.0))
         channel_ids = list(payload.get("channel_ids", []))
         channel_names = list(payload.get("channel_names", []))
+        if sample_rate > 0:
+            self._maybe_update_analysis_sample_rate(sample_rate)
 
         data = np.asarray(samples) if samples is not None else np.zeros((0, 0), dtype=np.float32)
         times_arr = np.asarray(times) if times is not None else np.zeros(0, dtype=np.float32)

@@ -32,6 +32,7 @@ class AnalysisDock(QtWidgets.QDockWidget):
         self._tab_info: Dict[QtWidgets.QWidget, Dict[str, object]] = {}
         self._analysis_count: Dict[str, int] = {}
         self._controller = controller
+        self._last_sample_rate: float = 0.0
 
     # ------------------------------------------------------------------
     # Scope management
@@ -69,14 +70,30 @@ class AnalysisDock(QtWidgets.QDockWidget):
         self._analysis_count[channel_name] = count
         title = f"Analysis - {channel_name}" if count == 1 else f"Analysis - {channel_name} #{count}"
 
-        widget = AnalysisTab(channel_name, sample_rate, self._tabs)
+        widget = AnalysisTab(channel_name, sample_rate, self._tabs, controller=self._controller)
         if worker is not None:
             widget.set_analysis_queue(worker.output_queue)
+            widget.set_worker(worker)
         insert_index = 1 if self._scope_widget is not None else self._tabs.count()
         self._tabs.insertTab(insert_index, widget, title)
         self._tabs.setCurrentWidget(widget)
         self._tab_info[widget] = {"channel": channel_name, "worker": worker}
+        if sample_rate > 0:
+            self._last_sample_rate = float(sample_rate)
         return widget
+
+    def update_sample_rate(self, sample_rate: float) -> None:
+        if sample_rate <= 0:
+            return
+        if abs(sample_rate - self._last_sample_rate) < 1e-3:
+            return
+        self._last_sample_rate = float(sample_rate)
+        for widget, info in list(self._tab_info.items()):
+            if isinstance(widget, AnalysisTab):
+                widget.set_channel_info(widget.channel_name, sample_rate)
+            worker = info.get("worker") if isinstance(info, dict) else None
+            if isinstance(worker, AnalysisWorker):
+                worker.update_sample_rate(sample_rate)
 
     def close_tab(self, channel_name: str) -> None:
         removed = False

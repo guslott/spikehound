@@ -18,6 +18,8 @@ else:  # pragma: no cover - runtime fallback
 from .conditioning import FilterSettings
 from .dispatcher import Dispatcher
 from .models import Chunk, EndOfStream, TriggerConfig
+from analysis.settings import AnalysisSettingsStore
+from shared.event_buffer import AnalysisEvents, EventRingBuffer
 
 
 def _registry():
@@ -223,6 +225,9 @@ class PipelineController:
         self.visualization_queue: "queue.Queue" = queue.Queue(maxsize=visualization_queue_size)
         self.audio_queue: "queue.Queue" = queue.Queue(maxsize=audio_queue_size)
         self.logging_queue: "queue.Queue" = queue.Queue(maxsize=logging_queue_size)
+        self._analysis_settings = AnalysisSettingsStore()
+        self._event_buffer = EventRingBuffer(capacity=1000)
+        self._analysis_events = AnalysisEvents(self._event_buffer)
 
         self._dispatcher_timeout = dispatcher_poll_timeout
         self._dispatcher: Optional[Dispatcher] = None
@@ -256,6 +261,18 @@ class PipelineController:
     @property
     def filter_settings(self) -> FilterSettings:
         return self._filter_settings
+
+    @property
+    def analysis_settings_store(self) -> AnalysisSettingsStore:
+        return self._analysis_settings
+
+    @property
+    def event_buffer(self) -> EventRingBuffer:
+        return self._event_buffer
+
+    @property
+    def analysis_events(self) -> AnalysisEvents:
+        return self._analysis_events
 
     @property
     def sample_rate(self) -> Optional[float]:
@@ -376,6 +393,18 @@ class PipelineController:
             self._filter_settings = settings
             if self._dispatcher is not None:
                 self._dispatcher.update_filter_settings(settings)
+
+    def update_analysis_settings(self, *, event_window_ms: Optional[float] = None) -> None:
+        updates: Dict[str, float] = {}
+        if event_window_ms is not None:
+            updates["event_window_ms"] = float(event_window_ms)
+        if not updates:
+            return
+        with self._lock:
+            self._analysis_settings.update(**updates)
+
+    def pull_analysis_events(self, last_event_id: Optional[int] = None):
+        return self._analysis_events.pull_events(last_event_id)
 
     # Trigger configuration placeholder ---------------------------------
 
@@ -553,6 +582,7 @@ class PipelineController:
         """Clear downstream queues so the next start() begins fresh."""
         for q in (self.visualization_queue, self.audio_queue, self.logging_queue):
             self._flush_queue(q)
+        self._event_buffer.clear()
 
     def _destroy_dispatcher(self) -> None:
         if self._dispatcher is None:

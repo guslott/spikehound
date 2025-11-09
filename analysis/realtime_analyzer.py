@@ -9,7 +9,10 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from .models import Event, ThresholdConfig
+from shared.event_buffer import EventRingBuffer
+from shared.types import Event
+
+from .models import ThresholdConfig
 
 
 @dataclass
@@ -58,6 +61,7 @@ class RealTimeAnalyzer:
         analysis_queue: "queue.Queue",
         event_queue: "queue.Queue",
         logging_queue: "queue.Queue",
+        event_buffer: Optional[EventRingBuffer] = None,
         sample_rate: float,
         n_channels: int,
         config: ThresholdConfig,
@@ -65,6 +69,7 @@ class RealTimeAnalyzer:
         self.analysis_queue = analysis_queue
         self.event_queue = event_queue
         self.logging_queue = logging_queue
+        self._event_buffer = event_buffer
         self.sr = float(sample_rate)
         self.nch = int(n_channels)
         self.cfg = config
@@ -76,6 +81,7 @@ class RealTimeAnalyzer:
         self._last_fire = np.full(self.nch, -1e9, dtype=np.float64)  # last event time (s)
         self._noise_mad = np.full(self.nch, np.nan, dtype=np.float32)
         self._auto_th = None  # computed absolute thresholds (if auto)
+        self._event_id = 0
 
         # Waveform window in samples
         self._pre = max(0, int(round(self.cfg.window_pre_s * self.sr)))
@@ -198,26 +204,30 @@ class RealTimeAnalyzer:
                 i0 = max(0, idx - self._pre)
                 i1 = min(F, idx + self._post)
                 wf = sig[i0:i1].astype(np.float32, copy=True)
-
-                # Basic properties
-                peak_amp = float(np.max(np.abs(wf))) if wf.size else 0.0
-                energy = float(np.sum(wf * wf))
-                properties = {
-                    "peak_amp": peak_amp,
-                    "energy": energy,
-                    "threshold": float(th[c]),
-                }
-
                 # Best-effort absolute sample index
                 abs_index = -1 if ch_view.start_sample < 0 else (ch_view.start_sample + int(idx))
-
+                sr = self.sr if self.sr > 0 else 1.0
+                window_ms = 1000.0 * (wf.size / sr)
+                pre_ms = 1000.0 * (self._pre / sr)
+                post_ms = 1000.0 * (self._post / sr)
+                crossing_value = float(sig[idx])
+                threshold_value = -float(th[c]) if crossing_value < 0 else float(th[c])
                 ev = Event(
-                    timestamp_s=float(t),
-                    channel=int(c),
-                    sample_index=int(abs_index),
-                    waveform=wf,
-                    properties=properties,
+                    id=self._next_event_id(),
+                    channelId=int(c),
+                    thresholdValue=threshold_value,
+                    crossingIndex=int(abs_index),
+                    crossingTimeSec=float(t),
+                    firstSampleTimeSec=float(ch_view.start_time),
+                    sampleRateHz=float(self.sr),
+                    windowMs=float(window_ms),
+                    preMs=float(pre_ms),
+                    postMs=float(post_ms),
+                    samples=wf,
                 )
+
+                if self._event_buffer is not None:
+                    self._event_buffer.push(ev)
 
                 # Non-blocking puts (drop if queues are full; UI stays responsive)
                 try:
@@ -228,6 +238,10 @@ class RealTimeAnalyzer:
                     self.logging_queue.put_nowait(ev)
                 except queue.Full:
                     pass
+
+    def _next_event_id(self) -> int:
+        self._event_id += 1
+        return self._event_id
 
     def _run(self) -> None:
         """
