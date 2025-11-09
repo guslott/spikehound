@@ -4,6 +4,7 @@ import queue
 import threading
 import time
 from collections import deque
+from pathlib import Path
 
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Sequence
@@ -71,8 +72,8 @@ QPushButton:checked {
 
     def _build_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
 
         self._title_label = QtWidgets.QLabel("")
         self._title_label.setStyleSheet("font-weight: bold; font-size: 13px;")
@@ -80,6 +81,7 @@ QPushButton:checked {
 
         # Visual identity controls
         color_row = QtWidgets.QHBoxLayout()
+        color_row.setSpacing(4)
         color_row.addWidget(QtWidgets.QLabel("Color"))
         self.color_btn = QtWidgets.QPushButton()
         self.color_btn.setFixedWidth(48)
@@ -94,6 +96,7 @@ QPushButton:checked {
 
         # Plot scaling
         range_row = QtWidgets.QHBoxLayout()
+        range_row.setSpacing(4)
         range_row.addWidget(QtWidgets.QLabel("Vertical Range (±V)"))
         self.range_combo = QtWidgets.QComboBox()
         self.range_combo.setMaximumWidth(120)
@@ -104,6 +107,7 @@ QPushButton:checked {
 
         # DC offset adjustment
         offset_row = QtWidgets.QHBoxLayout()
+        offset_row.setSpacing(4)
         offset_row.addWidget(QtWidgets.QLabel("Vertical Offset (V)"))
         self.offset_spin = QtWidgets.QDoubleSpinBox()
         self.offset_spin.setRange(-10_000.0, 10_000.0)
@@ -114,7 +118,14 @@ QPushButton:checked {
         layout.addLayout(offset_row)
 
         # Filtering controls
+        filters_layout = QtWidgets.QVBoxLayout()
+        filters_layout.setContentsMargins(0, 0, 0, 0)
+        filters_layout.setSpacing(0)
+        layout.addLayout(filters_layout)
+
         notch_row = QtWidgets.QHBoxLayout()
+        notch_row.setContentsMargins(0, 0, 0, 0)
+        notch_row.setSpacing(4)
         self.notch_check = QtWidgets.QCheckBox("Notch Filter")
         notch_row.addWidget(self.notch_check)
         notch_row.addStretch(1)
@@ -126,9 +137,11 @@ QPushButton:checked {
         self.notch_spin.setSingleStep(1.0)
         self.notch_spin.setMaximumWidth(110)
         notch_row.addWidget(self.notch_spin)
-        layout.addLayout(notch_row)
+        filters_layout.addLayout(notch_row)
 
         hp_row = QtWidgets.QHBoxLayout()
+        hp_row.setContentsMargins(0, 0, 0, 0)
+        hp_row.setSpacing(4)
         self.highpass_check = QtWidgets.QCheckBox("High-pass")
         hp_row.addWidget(self.highpass_check)
         hp_row.addStretch(1)
@@ -140,9 +153,11 @@ QPushButton:checked {
         self.highpass_spin.setSingleStep(1.0)
         self.highpass_spin.setMaximumWidth(110)
         hp_row.addWidget(self.highpass_spin)
-        layout.addLayout(hp_row)
+        filters_layout.addLayout(hp_row)
 
         lp_row = QtWidgets.QHBoxLayout()
+        lp_row.setContentsMargins(0, 0, 0, 0)
+        lp_row.setSpacing(4)
         self.lowpass_check = QtWidgets.QCheckBox("Low-pass")
         lp_row.addWidget(self.lowpass_check)
         lp_row.addStretch(1)
@@ -154,7 +169,7 @@ QPushButton:checked {
         self.lowpass_spin.setSingleStep(10.0)
         self.lowpass_spin.setMaximumWidth(110)
         lp_row.addWidget(self.lowpass_spin)
-        layout.addLayout(lp_row)
+        filters_layout.addLayout(lp_row)
 
         layout.addStretch(1)
 
@@ -395,12 +410,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chunk_accum_samples: int = 0
         self._chunk_rate_window: float = 1.0
         self._chunk_last_rate_update = time.perf_counter()
+        self._splash_pixmap: Optional[QtGui.QPixmap] = None
+        self._splash_label: Optional[QtWidgets.QLabel] = None
+        self._splash_aspect_ratio: float = 1.0
 
         self._apply_palette()
         self._style_plot()
 
         scope_widget = self._create_scope_widget()
-        self.setCentralWidget(QtWidgets.QWidget(self))
+        central_placeholder = QtWidgets.QWidget(self)
+        central_placeholder.setSizePolicy(
+            QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        )
+        central_placeholder.setMinimumHeight(0)
+        central_placeholder.setMaximumHeight(0)
+        central_placeholder.setVisible(False)
+        self._central_placeholder = central_placeholder
+        self.setCentralWidget(central_placeholder)
         self._analysis_dock = AnalysisDock(parent=self, controller=controller)
         self._analysis_dock.set_scope_widget(scope_widget, "Scope")
         self.addDockWidget(QtCore.Qt.TopDockWidgetArea, self._analysis_dock)
@@ -417,6 +443,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._device_manager.refresh_devices()
         self.attach_controller(controller)
         self._emit_trigger_config()
+        QtCore.QTimer.singleShot(0, self._update_splash_pixmap)
 
         # Global shortcuts for quitting/closing
         quit_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Quit), self)
@@ -463,19 +490,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._view_box.channelDragged.connect(self._on_plot_channel_dragged)
         self._view_box.channelDragFinished.connect(self._on_plot_drag_finished)
 
-        status_row = QtWidgets.QHBoxLayout()
-        status_row.setContentsMargins(0, 0, 0, 0)
-        status_row.setSpacing(12)
         self._status_labels = {}
-        for key in ("sr", "chunk", "queues", "drops"):
-            label = QtWidgets.QLabel("SR: 0 Hz" if key == "sr" else "…")
-            label.setStyleSheet("color: rgb(50,50,50); font-size: 11px;")
-            label.setWordWrap(True)
-            label.setMinimumHeight(28)
-            status_row.addWidget(label)
-            self._status_labels[key] = label
-        status_row.addStretch(1)
-        grid.addLayout(status_row, 1, 0, 1, 2)
 
         # Upper-right: stacked control boxes (Recording, Trigger, Channel Options).
         side_panel = QtWidgets.QWidget()
@@ -483,6 +498,26 @@ class MainWindow(QtWidgets.QMainWindow):
         side_layout = QtWidgets.QVBoxLayout(side_panel)
         side_layout.setContentsMargins(0, 0, 0, 0)
         side_layout.setSpacing(8)
+
+        self._splash_label = QtWidgets.QLabel()
+        self._splash_label.setObjectName("splashLabel")
+        self._splash_label.setAlignment(QtCore.Qt.AlignCenter)
+        self._splash_label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self._splash_label.setContentsMargins(0, 0, 0, 0)
+        self._splash_label.setStyleSheet(
+            "#splashLabel { border: 2px solid rgb(0,0,0); background-color: rgb(0,0,0); padding: 0px; margin: 0px; }"
+        )
+        self._splash_pixmap = self._load_splash_pixmap()
+        if self._splash_pixmap is None:
+            self._splash_label.setText("Manlius Pebble Hill School\nCornell University")
+            self._splash_label.setWordWrap(True)
+            self._splash_label.setStyleSheet(
+                "#splashLabel { border: 2px solid rgb(0,0,0); background-color: rgb(0,0,0); color: rgb(240,240,240); padding: 6px; font-weight: bold; }"
+            )
+        else:
+            self._update_splash_pixmap()
+        side_layout.addWidget(self._splash_label)
+        side_layout.addSpacing(10)
 
         self.record_group = QtWidgets.QGroupBox("Recording")
         record_layout = QtWidgets.QVBoxLayout(self.record_group)
@@ -513,6 +548,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.trigger_group = QtWidgets.QGroupBox("Trigger")
         trigger_layout = QtWidgets.QGridLayout(self.trigger_group)
+        trigger_layout.setContentsMargins(8, 8, 8, 8)
+        trigger_layout.setVerticalSpacing(4)
+        trigger_layout.setHorizontalSpacing(6)
 
         row = 0
         trigger_layout.addWidget(self._label("Channel"), row, 0)
@@ -524,6 +562,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         trigger_layout.addWidget(self._label("Mode"), row, 0)
         mode_layout = QtWidgets.QVBoxLayout()
+        mode_layout.setSpacing(2)
         self.trigger_mode_continuous = QtWidgets.QRadioButton("No Trigger (Stream)")
         self.trigger_mode_single = QtWidgets.QRadioButton("Single")
         self.trigger_mode_single.setEnabled(False)
@@ -532,7 +571,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trigger_mode_continuous.setChecked(True)
         mode_layout.addWidget(self.trigger_mode_continuous)
         single_row = QtWidgets.QHBoxLayout()
-        single_row.setSpacing(4)
+        single_row.setSpacing(3)
         self.trigger_single_button = QtWidgets.QPushButton("Trigger Once")
         self.trigger_single_button.setEnabled(False)
         single_row.addWidget(self.trigger_mode_single)
@@ -544,6 +583,7 @@ class MainWindow(QtWidgets.QMainWindow):
         row += 1
 
         threshold_box = QtWidgets.QHBoxLayout()
+        threshold_box.setSpacing(4)
         threshold_box.addWidget(self._label("Threshold"))
         self.threshold_spin = QtWidgets.QDoubleSpinBox()
         self.threshold_spin.setRange(-10.0, 10.0)
@@ -556,6 +596,7 @@ class MainWindow(QtWidgets.QMainWindow):
         row += 1
 
         pretrig_box = QtWidgets.QHBoxLayout()
+        pretrig_box.setSpacing(4)
         pretrig_box.addWidget(self._label("Pre-trigger (s)"))
         self.pretrigger_combo = QtWidgets.QComboBox()
         self.pretrigger_combo.setMaximumWidth(110)
@@ -567,6 +608,7 @@ class MainWindow(QtWidgets.QMainWindow):
         row += 1
 
         window_box = QtWidgets.QHBoxLayout()
+        window_box.setSpacing(4)
         window_box.addWidget(self._label("Window Width (s)"))
         self.window_combo = QtWidgets.QComboBox()
         self.window_combo.setMaximumWidth(110)
@@ -597,7 +639,7 @@ class MainWindow(QtWidgets.QMainWindow):
         channel_opts_layout.addWidget(self.channel_opts_stack)
 
         side_layout.addWidget(self.channel_opts_group, 1)
-        grid.addWidget(side_panel, 0, 1, 3, 1)
+        grid.addWidget(side_panel, 0, 1, 2, 1)
 
         # Bottom row (spanning full width): device / channel controls.
         bottom_panel = QtWidgets.QWidget()
@@ -669,11 +711,10 @@ class MainWindow(QtWidgets.QMainWindow):
         bottom_layout.addWidget(self.device_group, 1)
         bottom_layout.addWidget(self.channels_group, 2)
 
-        grid.addWidget(bottom_panel, 2, 0)
+        grid.addWidget(bottom_panel, 1, 0)
 
         grid.setRowStretch(0, 1)
         grid.setRowStretch(1, 0)
-        grid.setRowStretch(2, 0)
         grid.setColumnStretch(0, 5)
         grid.setColumnStretch(1, 3)
 
@@ -896,6 +937,55 @@ class MainWindow(QtWidgets.QMainWindow):
     def _style_plot(self) -> None:
         pg.setConfigOption("foreground", (0, 0, 139))
         pg.setConfigOptions(antialias=False)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._update_splash_pixmap()
+
+    def _load_splash_pixmap(self) -> Optional[QtGui.QPixmap]:
+        splash_path = Path(__file__).resolve().parent.parent / "media" / "mph_cornell_splash.png"
+        if not splash_path.exists():
+            return None
+        pixmap = QtGui.QPixmap(str(splash_path))
+        if pixmap.isNull():
+            return None
+        if pixmap.height() > 0:
+            self._splash_aspect_ratio = pixmap.width() / float(pixmap.height())
+        return pixmap
+
+    def _update_splash_pixmap(self) -> None:
+        if self._splash_label is None or self._splash_pixmap is None or self._splash_pixmap.isNull():
+            return
+
+        label_rect = self._splash_label.contentsRect()
+        available_width = label_rect.width()
+        if available_width <= 0:
+            available_width = self._splash_label.width()
+        if available_width <= 0 and self._splash_label.parentWidget() is not None:
+            available_width = self._splash_label.parentWidget().width()
+        if available_width <= 0:
+            available_width = 200
+
+        border_px = 4  # 2 px on each side defined in stylesheet
+        available_width = int(max(50, available_width - border_px))
+
+        aspect = self._splash_aspect_ratio if self._splash_aspect_ratio > 0 else self._splash_pixmap.width() / max(1, self._splash_pixmap.height())
+        target_height = max(1, int(round(available_width / aspect)))
+
+        scaled = self._splash_pixmap.scaled(
+            available_width,
+            target_height,
+            QtCore.Qt.KeepAspectRatio,
+            QtCore.Qt.SmoothTransformation,
+        )
+        if scaled.isNull():
+            return
+
+        total_height = scaled.height() + border_px
+        self._splash_label.setMinimumHeight(total_height)
+        self._splash_label.setMaximumHeight(total_height)
+        self._splash_label.setPixmap(scaled)
+        self._splash_label.updateGeometry()
 
     def _label(self, text: str) -> QtWidgets.QLabel:
         label = QtWidgets.QLabel(text)
@@ -1940,10 +2030,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 return f"{label}:{size}/∞ (0%)"
             return f"{label}:{size}/{maxsize} ({util:3.0f}%)"
 
-        self._status_labels["sr"].setText(
+        def _set_status_text(key: str, text: str) -> None:
+            label = self._status_labels.get(key)
+            if label is not None:
+                label.setText(text)
+
+        _set_status_text(
+            "sr",
             f"SR: {sr:,.0f} Hz\n"
             f"Drops V:{drops.get('visualization', 0)} "
-            f"L:{drops.get('logging', 0)} Evict:{evicted.get('visualization', 0)}"
+            f"L:{drops.get('logging', 0)} Evict:{evicted.get('visualization', 0)}",
         )
 
         chunk_line = f"Chunks/s: {self._chunk_rate:5.1f}"
@@ -1951,7 +2047,7 @@ class MainWindow(QtWidgets.QMainWindow):
             chunk_line = f"{chunk_line}\n{chunk_suffix}"
         else:
             chunk_line = f"{chunk_line}\n"
-        self._status_labels["chunk"].setText(chunk_line)
+        _set_status_text("chunk", chunk_line)
 
         viz_queue_text = _format_queue(queue_depths.get("visualization"), "V")
 
@@ -1971,11 +2067,8 @@ class MainWindow(QtWidgets.QMainWindow):
         audio_text = _format_queue(queue_depths.get("audio"), "Au")
         logging_text = _format_queue(queue_depths.get("logging"), "L")
 
-        self._status_labels["queues"].setText(
-            f"Queues {viz_queue_text} {audio_text} {logging_text}\n{ring_text}"
-        )
-
-        self._status_labels["drops"].setText("")
+        _set_status_text("queues", f"Queues {viz_queue_text} {audio_text} {logging_text}\n{ring_text}")
+        _set_status_text("drops", "")
 
     # ------------------------------------------------------------------
     # Placeholder API (to be implemented later)
