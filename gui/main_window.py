@@ -465,6 +465,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # Upper-left: plot area for multi-channel traces.
         self._view_box = ChannelViewBox()
         self.plot_widget = pg.PlotWidget(viewBox=self._view_box, enableMenu=False)
+        try:
+            # Hide pyqtgraph's default auto-range button to avoid distracting flashes
+            self.plot_widget.hideButtons()
+        except Exception:
+            pass
         self.plot_widget.setMenuEnabled(False)
         self.plot_widget.setBackground(QtGui.QColor(211, 230, 204))
         self.plot_widget.setLabel("bottom", "Time", units="s")

@@ -122,7 +122,7 @@ class SimulatedPhysiologySource(BaseSource):
             if peak > 1e-12:
                 template /= peak
 
-            rate_hz = 5 + rng.random() * 20
+            rate_hz = (5 + rng.random() * 20) * 0.5
             base_amp_prox = 0.2 + rng.random() * 1.0
             distal_ratio = 0.5 + rng.random() * 0.7  # 0.5–1.2 relative to prox
             velocity_m_per_s = 10.0 + rng.random() * 50.0

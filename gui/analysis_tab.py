@@ -65,6 +65,10 @@ class AnalysisTab(QtWidgets.QWidget):
         layout.addWidget(self.title_label)
 
         self.plot_widget = pg.PlotWidget(enableMenu=False)
+        try:
+            self.plot_widget.hideButtons()
+        except Exception:
+            pass
         self.plot_widget.setBackground(pg.mkColor(236, 239, 244))
         self.plot_widget.setAntialiasing(False)
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
@@ -317,6 +321,8 @@ class AnalysisTab(QtWidgets.QWidget):
         finally:
             spin.blockSignals(False)
             self._in_threshold_update = False
+        if spin is self.threshold1_spin:
+            self._notify_threshold_change()
 
     def _on_timer(self) -> None:
         if self._analysis_queue is None:
