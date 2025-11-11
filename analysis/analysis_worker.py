@@ -260,6 +260,8 @@ class AnalysisWorker(threading.Thread):
             energy = float(np.sum(wf.astype(np.float32) ** 2))
             window_sec = max(1e-12, wf.size * dt_sec)
             energy_density = energy / window_sec
+            peak_freq = _peak_frequency_sinc(wf, sr)
+            peak_wavelength = 1.0 / peak_freq if peak_freq > 1e-9 else 0.0
             event = Event(
                 id=self._next_event_id(),
                 channelId=int(channel_id) if channel_id is not None else 0,
@@ -278,6 +280,8 @@ class AnalysisWorker(threading.Thread):
                 props["energy"] = energy
                 props["window_sec"] = window_sec
                 props["energy_density"] = energy_density
+                props["peak_freq_hz"] = peak_freq
+                props["peak_wavelength_s"] = peak_wavelength
             first_abs = crossing_index - pre_count
             last_end = first_abs + window_samples
             events.append((event, last_end))
@@ -290,3 +294,31 @@ class AnalysisWorker(threading.Thread):
             with self._state_lock:
                 if new_last_end > self._last_window_end_sample:
                     self._last_window_end_sample = new_last_end
+def _peak_frequency_sinc(samples: np.ndarray, sr: float) -> float:
+    if samples.size == 0 or sr <= 0:
+        return 0.0
+    x = np.asarray(samples, dtype=np.float64)
+    x -= np.median(x)
+    window = np.blackman(x.size)
+    tapered = x * window
+    n_fft_min = max(2048, x.size * 8)
+    n_fft = 1 << max(0, int(np.ceil(np.log2(n_fft_min))))
+    spectrum = np.fft.rfft(tapered, n=n_fft)
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / sr)
+    mags = np.abs(spectrum)
+    if mags.size <= 1:
+        return 0.0
+    mags[freqs < 50.0] = 0.0
+    peak_idx = int(np.argmax(mags))
+    if peak_idx <= 0 or peak_idx >= mags.size - 1:
+        return float(max(0.0, freqs[peak_idx]))
+    alpha = mags[peak_idx - 1]
+    beta = mags[peak_idx]
+    gamma = mags[peak_idx + 1]
+    denom = max((alpha - 2 * beta + gamma), 1e-12)
+    delta = 0.5 * (alpha - gamma) / denom
+    peak_bin = peak_idx + delta
+    freq = peak_bin * sr / n_fft
+    if freq < 50.0:
+        return 0.0
+    return float(freq)

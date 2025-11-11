@@ -118,6 +118,11 @@ class AnalysisTab(QtWidgets.QWidget):
         self._t0_event: Optional[float] = None
         self._metric_events: list[dict[str, float]] = []
         self._max_metric_events = 10_000
+        self._viz_paused = False
+        self._cached_raw_times: Optional[np.ndarray] = None
+        self._cached_raw_samples: Optional[np.ndarray] = None
+        self._last_window_start: float = 0.0
+        self._last_window_width: float = 0.5
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -140,6 +145,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self.plot_widget.setLabel("left", "Amplitude", units="V")
         self.plot_widget.getPlotItem().setXRange(0.0, 1.0, padding=0.0)
         self.plot_widget.getPlotItem().setYRange(-1.0, 1.0, padding=0.0)
+        self.plot_widget.setMouseEnabled(x=False, y=False)
         layout.addWidget(self.plot_widget, stretch=4)
 
         self.metrics_plot = pg.PlotWidget(enableMenu=False)
@@ -161,7 +167,14 @@ class AnalysisTab(QtWidgets.QWidget):
         controls_layout.setSpacing(16)
 
         size_layout = QtWidgets.QVBoxLayout()
-        size_layout.setSpacing(8)
+        size_layout.setSpacing(4)
+
+        self.pause_viz_btn = QtWidgets.QPushButton("Pause Viz")
+        self.pause_viz_btn.setCheckable(True)
+        self.pause_viz_btn.setToolTip("Pause/resume updating the raw trace (analysis continues).")
+        self.pause_viz_btn.toggled.connect(self._on_pause_viz_toggled)
+        size_layout.addWidget(self.pause_viz_btn)
+
         width_row = QtWidgets.QHBoxLayout()
         width_row.setSpacing(6)
         width_row.addWidget(QtWidgets.QLabel("Width (s)"))
@@ -248,9 +261,10 @@ class AnalysisTab(QtWidgets.QWidget):
         metric_row.setSpacing(6)
         metric_row.addWidget(QtWidgets.QLabel("Vertical (Y) Metric"))
         self.metric_combo = QtWidgets.QComboBox()
-        for label in ("Max in window (V)", "Energy Density (V²/s)", "Min in window (V)"):
+        for label in ("Max in window (V)", "Min in window (V)", "Energy Density (V²/s)", "Peak Frequency (Hz)", "Peak Wavelength (s)"):
             self.metric_combo.addItem(label)
         self.metric_combo.setCurrentIndex(0)
+        self.metric_combo.setMinimumWidth(180)
         self.metric_combo.currentIndexChanged.connect(self._on_axis_metric_changed)
         metric_row.addWidget(self.metric_combo)
         metrics_layout.addLayout(metric_row)
@@ -259,8 +273,9 @@ class AnalysisTab(QtWidgets.QWidget):
         xaxis_row.setSpacing(6)
         xaxis_row.addWidget(QtWidgets.QLabel("Horizontal (X) Axis"))
         self.metric_xaxis_combo = QtWidgets.QComboBox()
-        for label in ("Time (s)", "Energy Density (V²/s)", "Max in window (V)", "Min in window (V)"):
+        for label in ("Time (s)", "Max in window (V)", "Min in window (V)", "Energy Density (V²/s)", "Peak Frequency (Hz)", "Peak Wavelength (s)"):
             self.metric_xaxis_combo.addItem(label)
+        self.metric_xaxis_combo.setMinimumWidth(180)
         self.metric_xaxis_combo.currentIndexChanged.connect(self._on_axis_metric_changed)
         xaxis_row.addWidget(self.metric_xaxis_combo)
         metrics_layout.addLayout(xaxis_row)
@@ -464,7 +479,7 @@ class AnalysisTab(QtWidgets.QWidget):
         width = float(self.width_combo.currentData() or 0.5)
         plot_item = self.plot_widget.getPlotItem()
         plot_item.setXRange(0.0, width, padding=0.0)
-        if self._selected_y_metric() in {"ed", "max", "min"}:
+        if self._selected_y_metric() in {"ed", "max", "min", "freq", "period"}:
             # Metrics overlay controls the Y range; leave amplitude height unchanged.
             pass
         else:
@@ -578,8 +593,11 @@ class AnalysisTab(QtWidgets.QWidget):
             self._latest_sample_index = None
             self._window_start_index = None
         times = np.arange(recent.size, dtype=np.float32) * self._dt
-        self.raw_curve.setData(times, recent, skipFiniteCheck=True)
-        self.event_curve.clear()
+        self._cached_raw_times = times
+        self._cached_raw_samples = recent
+        if not self._viz_paused:
+            self.raw_curve.setData(times, recent, skipFiniteCheck=True)
+            self.event_curve.clear()
 
         plot_item = self.plot_widget.getPlotItem()
         plot_item.setXRange(0.0, width, padding=0.0)
@@ -594,6 +612,20 @@ class AnalysisTab(QtWidgets.QWidget):
         if last_id is not None:
             self._last_event_id = last_id
         return events
+
+    def _on_pause_viz_toggled(self, checked: bool) -> None:
+        self._viz_paused = bool(checked)
+        if not self._viz_paused:
+            self._refresh_raw_plot()
+            self._refresh_overlay_positions(self._last_window_start, self._last_window_width, self._window_start_index)
+
+    def _refresh_raw_plot(self) -> None:
+        if self._viz_paused:
+            return
+        if self._cached_raw_times is None or self._cached_raw_samples is None:
+            return
+        self.raw_curve.setData(self._cached_raw_times, self._cached_raw_samples, skipFiniteCheck=True)
+        self.event_curve.clear()
 
     def _acquire_overlay_item(self) -> pg.PlotCurveItem:
         if self._overlay_pool:
@@ -621,6 +653,8 @@ class AnalysisTab(QtWidgets.QWidget):
         else:
             window_start = self._latest_sample_time - width_setting
         width_in_use = max(width_setting, self._latest_sample_time - window_start)
+        self._last_window_start = float(window_start)
+        self._last_window_width = float(width_in_use)
         window_start_idx = self._window_start_index
         channel_idx = self._channel_index
         new_events = self._pull_new_events()
@@ -630,15 +664,19 @@ class AnalysisTab(QtWidgets.QWidget):
             overlay = self._build_overlay(event)
             if overlay is None:
                 continue
-            if not self._apply_overlay_view(overlay, window_start, width_in_use, window_start_idx):
-                self._release_overlay_item(overlay.get("item"))
-                continue
+            if not self._viz_paused:
+                if not self._apply_overlay_view(overlay, window_start, width_in_use, window_start_idx):
+                    self._release_overlay_item(overlay.get("item"))
+                    continue
             self._event_overlays.append(overlay)
             self._record_overlay_metrics(overlay)
-        self._refresh_overlay_positions(window_start, width_in_use, window_start_idx)
+        if not self._viz_paused:
+            self._refresh_overlay_positions(window_start, width_in_use, window_start_idx)
         self._update_metric_points()
 
     def _refresh_overlay_positions(self, window_start: float, width: float, window_start_idx: Optional[int]) -> None:
+        if self._viz_paused:
+            return
         if not self._event_overlays:
             return
         kept: list[dict[str, object]] = []
@@ -696,12 +734,20 @@ class AnalysisTab(QtWidgets.QWidget):
             return "max"
         if "min" in label:
             return "min"
+        if "frequency" in label:
+            return "freq"
+        if "wavelength" in label:
+            return "period"
         return "ed"
 
     def _selected_x_metric(self) -> str:
         label = self.metric_xaxis_combo.currentText().lower()
         if "time" in label:
             return "time"
+        if "frequency" in label:
+            return "freq"
+        if "wavelength" in label:
+            return "period"
         if "max" in label:
             return "max"
         if "min" in label:
@@ -712,16 +758,24 @@ class AnalysisTab(QtWidgets.QWidget):
         metric = self._selected_y_metric()
         if metric == "ed":
             self.metrics_plot.setLabel("left", "Energy Density (V²/s)")
-        else:
+        elif metric in {"max", "min"}:
             self.metrics_plot.setLabel("left", "Amplitude (V)")
+        elif metric == "freq":
+            self.metrics_plot.setLabel("left", "Peak Frequency (Hz)")
+        else:
+            self.metrics_plot.setLabel("left", "Peak Wavelength (s)")
         x_metric = self._selected_x_metric()
         if x_metric == "time":
             self.metrics_plot.setLabel("bottom", "Time (s)")
         elif x_metric == "ed":
             self.metrics_plot.setLabel("bottom", "Energy Density (V²/s)")
-        else:
+        elif x_metric in {"max", "min"}:
             self.metrics_plot.setLabel("bottom", "Amplitude (V)")
-        if metric in {"ed", "max", "min"}:
+        elif x_metric == "freq":
+            self.metrics_plot.setLabel("bottom", "Peak Frequency (Hz)")
+        else:
+            self.metrics_plot.setLabel("bottom", "Peak Wavelength (s)")
+        if metric in {"ed", "max", "min", "freq", "period"}:
             self.energy_scatter.show()
             self._update_metric_points()
         else:
@@ -736,7 +790,7 @@ class AnalysisTab(QtWidgets.QWidget):
     def _update_metric_points(self) -> None:
         y_key = self._selected_y_metric()
         x_key = self._selected_x_metric()
-        if y_key not in {"ed", "max", "min"}:
+        if y_key not in {"ed", "max", "min", "freq", "period"}:
             self.energy_scatter.hide()
             return
         xs: list[float] = []
@@ -768,7 +822,7 @@ class AnalysisTab(QtWidgets.QWidget):
             self._t0_event = float(metric_time)
         rel_time = max(0.0, float(metric_time) - (self._t0_event or 0.0))
         record: dict[str, float] = {"time": rel_time}
-        for key in ("ed", "max", "min"):
+        for key in ("ed", "max", "min", "freq", "period"):
             value = metrics.get(key)
             if value is None:
                 continue
@@ -822,11 +876,13 @@ class AnalysisTab(QtWidgets.QWidget):
             ed = _energy_density(x, sr)
             mx, mn = _min_max(x)
             fpk = _peak_frequency_sinc(x, sr)
+            period = 1.0 / fpk if fpk > 1e-9 else 0.0
             metrics = {
                 "ed": float(ed),
                 "max": float(mx),
                 "min": float(mn),
-                "peak_freq_hz": float(fpk),
+                "freq": float(fpk),
+                "period": float(period),
             }
         return {
             "item": curve,
