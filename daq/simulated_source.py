@@ -74,8 +74,15 @@ class SimulatedPhysiologySource(BaseSource):
         self._units.clear()
         rng = np.random.default_rng()  # independent RNG per session
 
+        classes = [
+            {"amp": (0.1, 0.2), "width": (0.0006, 0.0010)},
+            {"amp": (0.3, 0.5), "width": (0.0010, 0.0018)},
+            {"amp": (0.6, 0.9), "width": (0.0015, 0.0025)},
+            {"amp": (1.0, 1.5), "width": (0.0025, 0.0048)},
+        ]
         for i in range(num_units):
-            spike_duration_s = 0.0012 + rng.random() * 0.0018
+            cls = classes[i % len(classes)]
+            spike_duration_s = cls["width"][0] + rng.random() * (cls["width"][1] - cls["width"][0])
             spike_len = max(8, int(spike_duration_s * sample_rate))
             t_spike = np.linspace(-1, 1, spike_len)
             template = (1 - t_spike**2) * np.exp(-t_spike**2 / 0.5)
@@ -122,8 +129,9 @@ class SimulatedPhysiologySource(BaseSource):
             if peak > 1e-12:
                 template /= peak
 
-            rate_hz = (5 + rng.random() * 20) * 0.5
-            base_amp_prox = 0.2 + rng.random() * 1.0
+            rate_hz = 2.0 + rng.random()
+            amp_min, amp_max = cls["amp"]
+            base_amp_prox = amp_min + rng.random() * (amp_max - amp_min)
             distal_ratio = 0.5 + rng.random() * 0.7  # 0.5–1.2 relative to prox
             velocity_m_per_s = 10.0 + rng.random() * 50.0
             syn_delay_s = 0.002 + rng.random() * 0.004  # 2–6 ms

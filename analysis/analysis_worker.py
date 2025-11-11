@@ -163,14 +163,11 @@ class AnalysisWorker(threading.Thread):
 
     def configure_threshold(self, enabled: bool, value: float) -> None:
         # Threshold 2 is intentionally disabled in the UI; only this primary control is honored.
-        direction = "above"
-        magnitude = float(value)
-        if magnitude < 0:
-            direction = "below"
-        magnitude = abs(magnitude)
+        numeric_value = float(value)
+        direction = "above" if numeric_value >= 0 else "below"
         with self._state_lock:
             self._threshold_enabled = bool(enabled)
-            self._threshold_value = magnitude
+            self._threshold_value = numeric_value
             self._threshold_direction = direction
 
     def update_sample_rate(self, sample_rate: float) -> None:
@@ -199,7 +196,7 @@ class AnalysisWorker(threading.Thread):
             threshold_value = float(self._threshold_value)
             threshold_direction = self._threshold_direction
             last_window_end = self._last_window_end_sample
-        if not threshold_enabled or threshold_value <= 0 or event_window_ms <= 0:
+        if not threshold_enabled or threshold_value == 0.0 or event_window_ms <= 0:
             # No detections when the user has disabled Threshold 1.
             return
         if chunk.samples.size == 0:
@@ -219,10 +216,10 @@ class AnalysisWorker(threading.Thread):
             half_samples = 1
         window_samples = max(1, half_samples * 2)
 
-        if threshold_direction == "above":
+        if threshold_value > 0:
             idxs = np.flatnonzero(sig >= threshold_value)
         else:
-            idxs = np.flatnonzero(sig <= -threshold_value)
+            idxs = np.flatnonzero(sig <= threshold_value)
         if idxs.size == 0:
             return
 
@@ -266,7 +263,7 @@ class AnalysisWorker(threading.Thread):
             event = Event(
                 id=self._next_event_id(),
                 channelId=int(channel_id) if channel_id is not None else 0,
-                thresholdValue=threshold_value if threshold_direction == "above" else -threshold_value,
+                thresholdValue=threshold_value,
                 crossingIndex=int(crossing_index),
                 crossingTimeSec=float(crossing_time),
                 firstSampleTimeSec=float(first_time),
