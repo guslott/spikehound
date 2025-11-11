@@ -87,7 +87,14 @@ class Chunk:
 
 @dataclass(frozen=True)
 class Event:
-    """Detected feature emitted by the analyzer."""
+    """Detected feature emitted by the analyzer.
+
+    ``properties`` may include:
+      • ``peak_amp`` – peak absolute amplitude (float)
+      • ``energy`` – sum of squared samples (float)
+      • ``window_sec`` – waveform window duration in seconds (float)
+      • ``energy_density`` – energy divided by ``window_sec`` (float)
+    """
 
     t: float
     chan: int

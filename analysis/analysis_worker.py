@@ -260,6 +260,9 @@ class AnalysisWorker(threading.Thread):
             pre_ms = pre_count * dt_sec * 1000.0
             post_ms = post_count * dt_sec * 1000.0
             crossing_index = abs_idx
+            energy = float(np.sum(wf.astype(np.float32) ** 2))
+            window_sec = max(1e-12, wf.size * dt_sec)
+            energy_density = energy / window_sec
             event = Event(
                 id=self._next_event_id(),
                 channelId=int(channel_id) if channel_id is not None else 0,
@@ -273,6 +276,11 @@ class AnalysisWorker(threading.Thread):
                 postMs=float(post_ms),
                 samples=wf,
             )
+            props = getattr(event, "properties", None)
+            if isinstance(props, dict):
+                props["energy"] = energy
+                props["window_sec"] = window_sec
+                props["energy_density"] = energy_density
             first_abs = crossing_index - pre_count
             last_end = first_abs + window_samples
             events.append((event, last_end))

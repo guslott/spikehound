@@ -104,6 +104,8 @@ class AnalysisDock(QtWidgets.QDockWidget):
             index = self._tabs.indexOf(widget)
             if index >= 0:
                 self._tabs.removeTab(index)
+            if hasattr(widget, "_release_metrics"):
+                widget._release_metrics()
             widget.deleteLater()
             worker = info.get("worker") if isinstance(info, dict) else None
             if isinstance(worker, AnalysisWorker):
@@ -142,6 +144,8 @@ class AnalysisDock(QtWidgets.QDockWidget):
                 self._analysis_count[mapped_name] = current
             else:
                 self._analysis_count.pop(mapped_name, None)
+        if hasattr(widget, "_release_metrics"):
+            widget._release_metrics()
         widget.deleteLater()
         if not self._tab_info:
             self.select_scope()

@@ -54,6 +54,9 @@ class AnalysisTab(QtWidgets.QWidget):
             self._analysis_events = getattr(controller, "analysis_events", None)
             self._event_buffer = getattr(controller, "event_buffer", None)
         self._event_window_ms = self._initial_event_window_ms()
+        self._energy_times: list[float] = []
+        self._energy_vals: list[float] = []
+        self._t0_event: Optional[float] = None
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -76,7 +79,20 @@ class AnalysisTab(QtWidgets.QWidget):
         self.plot_widget.setLabel("left", "Amplitude", units="V")
         self.plot_widget.getPlotItem().setXRange(0.0, 1.0, padding=0.0)
         self.plot_widget.getPlotItem().setYRange(-1.0, 1.0, padding=0.0)
-        layout.addWidget(self.plot_widget, stretch=1)
+        layout.addWidget(self.plot_widget, stretch=2)
+
+        self.metrics_plot = pg.PlotWidget(enableMenu=False)
+        try:
+            self.metrics_plot.hideButtons()
+        except Exception:
+            pass
+        self.metrics_plot.setBackground(pg.mkColor(245, 246, 250))
+        self.metrics_plot.setLabel("bottom", "Time (s)")
+        self.metrics_plot.setLabel("left", "Energy Density (V^2/s)")
+        self.metrics_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.energy_scatter = pg.ScatterPlotItem(size=6, brush=pg.mkBrush(220, 0, 0, 170), pen=None, name="Energy Density")
+        self.metrics_plot.addItem(self.energy_scatter)
+        layout.addWidget(self.metrics_plot, stretch=1)
 
         controls = QtWidgets.QGroupBox("Display")
         controls_layout = QtWidgets.QHBoxLayout()
@@ -155,6 +171,33 @@ class AnalysisTab(QtWidgets.QWidget):
         threshold_layout.addLayout(event_window_row)
 
         controls_layout.addLayout(threshold_layout)
+
+        metrics_layout = QtWidgets.QVBoxLayout()
+        metrics_layout.setSpacing(4)
+        metrics_label = QtWidgets.QLabel("Metrics")
+        metrics_label.setStyleSheet("font-weight: bold;")
+        metrics_layout.addWidget(metrics_label)
+
+        self.metrics_autorange = QtWidgets.QCheckBox("Auto-range")
+        self.metrics_autorange.setChecked(True)
+        self.metrics_autorange.toggled.connect(self._update_metrics_axis)
+        metrics_layout.addWidget(self.metrics_autorange)
+
+        metric_row = QtWidgets.QHBoxLayout()
+        metric_row.setSpacing(6)
+        metric_row.addWidget(QtWidgets.QLabel("Metric"))
+        self.metric_combo = QtWidgets.QComboBox()
+        self.metric_combo.addItem("Energy Density")
+        self.metric_combo.setEnabled(False)
+        metric_row.addWidget(self.metric_combo)
+        metrics_layout.addLayout(metric_row)
+
+        self.metrics_clear_btn = QtWidgets.QPushButton("Clear metrics")
+        self.metrics_clear_btn.clicked.connect(self._clear_metrics)
+        metrics_layout.addWidget(self.metrics_clear_btn)
+        metrics_layout.addStretch(1)
+
+        controls_layout.addLayout(metrics_layout)
         controls_layout.addStretch(1)
 
         controls.setLayout(controls_layout)
@@ -391,6 +434,7 @@ class AnalysisTab(QtWidgets.QWidget):
     def _notify_threshold_change(self) -> None:
         if self._worker is None:
             return
+        self._clear_metrics()
         enabled = self.threshold1_check.isChecked()
         value = float(self.threshold1_spin.value())
         # Threshold 2 remains disabled; only Threshold 1 updates the worker.
@@ -500,7 +544,9 @@ class AnalysisTab(QtWidgets.QWidget):
         width_in_use = max(width_setting, self._latest_sample_time - window_start)
         window_start_idx = self._window_start_index
         channel_idx = self._channel_index
-        for event in self._pull_new_events():
+        new_events = self._pull_new_events()
+        self._ingest_event_metrics(new_events)
+        for event in new_events:
             if channel_idx is not None and event.channelId != channel_idx:
                 continue
             overlay = self._build_overlay(event)
@@ -534,6 +580,80 @@ class AnalysisTab(QtWidgets.QWidget):
         for overlay in self._event_overlays:
             self._release_overlay_item(overlay.get("item"))
         self._event_overlays.clear()
+
+    def _ingest_event_metrics(self, events: list[Event]) -> None:
+        if not events:
+            return
+        updated = False
+        max_points = 10_000
+        for event in events:
+            props = getattr(event, "properties", None)
+            density = None
+            if isinstance(props, dict):
+                density = props.get("energy_density")
+            if density is None:
+                continue
+            try:
+                density_val = float(density)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(density_val):
+                continue
+            event_time = getattr(event, "crossingTimeSec", getattr(event, "t", None))
+            if event_time is None:
+                continue
+            event_time = float(event_time)
+            if self._t0_event is None:
+                self._t0_event = event_time
+            rel_time = max(0.0, event_time - (self._t0_event or 0.0))
+            self._energy_times.append(rel_time)
+            self._energy_vals.append(density_val)
+            if len(self._energy_times) > max_points:
+                overflow = len(self._energy_times) - max_points
+                del self._energy_times[:overflow]
+                del self._energy_vals[:overflow]
+            updated = True
+        if updated:
+            self.energy_scatter.setData(self._energy_times, self._energy_vals)
+            if self.metrics_autorange.isChecked():
+                self.metrics_plot.enableAutoRange(pg.ViewBox.XYAxes, enable=True)
+            else:
+                self._update_metrics_axis()
+
+    def _update_metrics_axis(self) -> None:
+        if not getattr(self, "metrics_autorange", None):
+            return
+        if not self.metrics_autorange.isChecked():
+            return
+        plot_item = self.metrics_plot.getPlotItem()
+        if not self._energy_times or not self._energy_vals:
+            plot_item.enableAutoRange()
+            return
+        max_time = max(self._energy_times)
+        min_y = min(self._energy_vals)
+        max_y = max(self._energy_vals)
+        if min_y == max_y:
+            span = max(1e-6, abs(min_y))
+            min_y -= span * 0.5
+            max_y += span * 0.5
+        plot_item.setXRange(0.0, max(max_time, 1e-3), padding=0.05)
+        plot_item.setYRange(min_y, max_y, padding=0.1)
+
+    def _clear_metrics(self) -> None:
+        self._energy_times.clear()
+        self._energy_vals.clear()
+        self._t0_event = None
+        if hasattr(self, "energy_scatter"):
+            self.energy_scatter.clear()
+        if hasattr(self, "metrics_plot"):
+            self.metrics_plot.getPlotItem().enableAutoRange()
+
+    def get_energy_density_points(self) -> list[tuple[float, float]]:
+        return list(zip(self._energy_times, self._energy_vals))
+
+    def _release_metrics(self) -> None:
+        self._energy_times = []
+        self._energy_vals = []
 
     def _build_overlay(self, event: Event) -> Optional[dict[str, object]]:
         samples = np.asarray(event.samples, dtype=np.float32)

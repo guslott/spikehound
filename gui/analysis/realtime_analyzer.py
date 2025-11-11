@@ -193,6 +193,9 @@ class RealTimeAnalyzer:
                 crossing_time = start_time + (i_idx / sr)
                 crossing_value = float(x[i_idx])
                 threshold_value = -thr if crossing_value < 0 else thr
+                energy = float(np.sum(wf.astype(np.float32) ** 2))
+                window_sec = max(1e-12, wf.size / sr)
+                energy_density = energy / window_sec
                 ev = Event(
                     id=self._next_event_id(),
                     channelId=int(c),
@@ -206,6 +209,11 @@ class RealTimeAnalyzer:
                     postMs=float(post_ms),
                     samples=wf,
                 )
+                props = getattr(ev, "properties", None)
+                if isinstance(props, dict):
+                    props["energy"] = energy
+                    props["window_sec"] = window_sec
+                    props["energy_density"] = energy_density
                 events.append(ev)
                 if self._event_buffer is not None:
                     self._event_buffer.push(ev)

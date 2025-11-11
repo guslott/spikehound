@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Dict
 
 import numpy as np
 
@@ -23,6 +24,7 @@ class Event:
     preMs: float
     postMs: float
     samples: np.ndarray = field(repr=False)
+    properties: Dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.channelId < 0:
@@ -39,3 +41,4 @@ class Event:
         if arr.ndim != 1:
             raise ValueError("samples must be a 1D array")
         object.__setattr__(self, "samples", np.array(arr, copy=True, order="C"))
+        object.__setattr__(self, "properties", dict(self.properties))
