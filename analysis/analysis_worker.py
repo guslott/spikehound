@@ -34,6 +34,8 @@ class AnalysisWorker(threading.Thread):
         self._threshold_enabled = False
         self._threshold_value = 0.5
         self._threshold_direction = "above"
+        self._secondary_threshold_enabled = False
+        self._secondary_threshold_value = 0.0
         self._last_window_end_sample = -10**12
         self._event_id = 0
         if isinstance(self._settings_store, AnalysisSettingsStore):
@@ -161,14 +163,26 @@ class AnalysisWorker(threading.Thread):
         with self._state_lock:
             self._event_window_ms = float(settings.event_window_ms)
 
-    def configure_threshold(self, enabled: bool, value: float) -> None:
-        # Threshold 2 is intentionally disabled in the UI; only this primary control is honored.
+    def configure_threshold(
+        self,
+        enabled: bool,
+        value: float,
+        *,
+        secondary_enabled: Optional[bool] = None,
+        secondary_value: Optional[float] = None,
+    ) -> None:
         numeric_value = float(value)
         direction = "above" if numeric_value >= 0 else "below"
+        secondary_flag = bool(secondary_enabled) if secondary_enabled is not None else False
+        secondary_numeric = float(secondary_value) if secondary_value is not None else 0.0
+        if not enabled:
+            secondary_flag = False
         with self._state_lock:
             self._threshold_enabled = bool(enabled)
             self._threshold_value = numeric_value
             self._threshold_direction = direction
+            self._secondary_threshold_enabled = secondary_flag
+            self._secondary_threshold_value = secondary_numeric
 
     def update_sample_rate(self, sample_rate: float) -> None:
         """Refresh fallback sample rate and drop stale refractory state when it changes."""
@@ -195,6 +209,8 @@ class AnalysisWorker(threading.Thread):
             threshold_enabled = bool(self._threshold_enabled)
             threshold_value = float(self._threshold_value)
             threshold_direction = self._threshold_direction
+            secondary_enabled = bool(self._secondary_threshold_enabled)
+            secondary_value = float(self._secondary_threshold_value)
             last_window_end = self._last_window_end_sample
         if not threshold_enabled or threshold_value == 0.0 or event_window_ms <= 0:
             # No detections when the user has disabled Threshold 1.
@@ -237,6 +253,8 @@ class AnalysisWorker(threading.Thread):
                 except (TypeError, ValueError):
                     channel_id = None
 
+        use_secondary = threshold_enabled and secondary_enabled
+
         events: list[tuple[Event, int]] = []
         last_end = last_window_end
         for idx in idxs:
@@ -257,6 +275,10 @@ class AnalysisWorker(threading.Thread):
             pre_ms = pre_count * dt_sec * 1000.0
             post_ms = post_count * dt_sec * 1000.0
             crossing_index = abs_idx
+            first_abs = crossing_index - pre_count
+            candidate_last_end = first_abs + window_samples
+            if use_secondary and self._waveform_crosses_threshold(wf, secondary_value):
+                continue
             energy = float(np.sum(wf.astype(np.float32) ** 2))
             window_sec = max(1e-12, wf.size * dt_sec)
             energy_density = energy / window_sec
@@ -282,8 +304,7 @@ class AnalysisWorker(threading.Thread):
                 props["energy_density"] = energy_density
                 props["peak_freq_hz"] = peak_freq
                 props["peak_wavelength_s"] = peak_wavelength
-            first_abs = crossing_index - pre_count
-            last_end = first_abs + window_samples
+            last_end = candidate_last_end
             events.append((event, last_end))
 
         if not events:
@@ -294,6 +315,15 @@ class AnalysisWorker(threading.Thread):
             with self._state_lock:
                 if new_last_end > self._last_window_end_sample:
                     self._last_window_end_sample = new_last_end
+
+    @staticmethod
+    def _waveform_crosses_threshold(waveform: np.ndarray, threshold: float) -> bool:
+        if waveform.size == 0:
+            return False
+        if threshold >= 0:
+            return bool(np.nanmax(waveform) >= threshold)
+        return bool(np.nanmin(waveform) <= threshold)
+
 def _peak_frequency_sinc(samples: np.ndarray, sr: float) -> float:
     if samples.size == 0 or sr <= 0:
         return 0.0

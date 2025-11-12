@@ -215,17 +215,13 @@ class AnalysisTab(QtWidgets.QWidget):
         t1_row.addWidget(self.threshold1_spin)
         threshold_layout.addLayout(t1_row)
 
-        # TODO: Second threshold temporarily disabled; will re-enable in a later feature.
         self.threshold2_check = QtWidgets.QCheckBox("Threshold 2")
-        self.threshold2_check.setEnabled(False)
-        self.threshold2_check.setStyleSheet("color: rgb(130, 130, 130);")
+        self.threshold2_check.setEnabled(True)
         self.threshold2_spin = QtWidgets.QDoubleSpinBox()
         self.threshold2_spin.setDecimals(3)
         self.threshold2_spin.setMinimumWidth(90)
         self.threshold2_spin.setRange(-10.0, 10.0)
         self.threshold2_spin.setValue(-0.5)
-        self.threshold2_spin.setEnabled(False)
-        self.threshold2_spin.setStyleSheet("color: rgb(130, 130, 130);")
         t2_row = QtWidgets.QHBoxLayout()
         t2_row.setSpacing(6)
         t2_row.addWidget(self.threshold2_check)
@@ -296,15 +292,15 @@ class AnalysisTab(QtWidgets.QWidget):
         self.raw_curve = self.plot_widget.plot(pen=pg.mkPen((30, 144, 255), width=2))
         self.event_curve = self.plot_widget.plot(pen=pg.mkPen((200, 0, 0), width=2))
 
-        self.threshold1_line = pg.InfiniteLine(angle=0, movable=True, pen=pg.mkPen((128, 0, 128), width=2))
+        self.threshold1_line = pg.InfiniteLine(angle=0, movable=True, pen=pg.mkPen((128, 0, 128), width=3))
         self.threshold1_line.setZValue(10)
         self.threshold1_line.setVisible(False)
         self.plot_widget.addItem(self.threshold1_line)
 
         self.threshold2_line = pg.InfiniteLine(
             angle=0,
-            movable=False,
-            pen=pg.mkPen((150, 150, 150), width=2, style=QtCore.Qt.DashLine),
+            movable=True,
+            pen=pg.mkPen((150, 150, 150), width=3, style=QtCore.Qt.DashLine),
         )
         self.threshold2_line.setZValue(10)
         self.threshold2_line.setVisible(False)
@@ -315,10 +311,15 @@ class AnalysisTab(QtWidgets.QWidget):
         self.width_combo.currentIndexChanged.connect(self._apply_ranges)
         self.height_combo.currentIndexChanged.connect(self._apply_ranges)
         self.threshold1_check.toggled.connect(lambda checked: self._toggle_threshold(self.threshold1_line, self.threshold1_spin, checked))
-        self.threshold1_check.toggled.connect(lambda _: self._notify_threshold_change())
+        self.threshold1_check.toggled.connect(self._on_threshold1_toggled)
         self.threshold1_spin.valueChanged.connect(lambda val: self._update_threshold_from_spin(self.threshold1_line, val))
         self.threshold1_spin.valueChanged.connect(lambda _: self._notify_threshold_change())
         self.threshold1_line.sigPositionChanged.connect(lambda _: self._update_spin_from_line(self.threshold1_line, self.threshold1_spin))
+        self.threshold2_check.toggled.connect(self._on_threshold2_toggled)
+        self.threshold2_check.toggled.connect(lambda checked: self._toggle_threshold(self.threshold2_line, self.threshold2_spin, checked))
+        self.threshold2_spin.valueChanged.connect(lambda val: self._update_threshold_from_spin(self.threshold2_line, val))
+        self.threshold2_spin.valueChanged.connect(lambda _: self._notify_threshold_change())
+        self.threshold2_line.sigPositionChanged.connect(lambda _: self._update_spin_from_line(self.threshold2_line, self.threshold2_spin))
         self.event_window_combo.currentIndexChanged.connect(self._on_event_window_changed)
 
         self._timer = QtCore.QTimer(self)
@@ -454,7 +455,7 @@ class AnalysisTab(QtWidgets.QWidget):
         finally:
             spin.blockSignals(False)
             self._in_threshold_update = False
-        if spin is self.threshold1_spin:
+        if spin in (self.threshold1_spin, self.threshold2_spin):
             self._notify_threshold_change()
 
     def _on_timer(self) -> None:
@@ -525,15 +526,32 @@ class AnalysisTab(QtWidgets.QWidget):
                 pass
         self._notify_threshold_change()
 
+    def _on_threshold1_toggled(self, checked: bool) -> None:
+        self.threshold2_check.setEnabled(checked)
+        self.threshold2_spin.setEnabled(checked and self.threshold2_check.isChecked())
+        if not checked:
+            self.threshold2_check.setChecked(False)
+        self._notify_threshold_change()
+
+    def _on_threshold2_toggled(self, checked: bool) -> None:
+        self.threshold2_spin.setEnabled(checked)
+        self._notify_threshold_change()
+
     def _notify_threshold_change(self) -> None:
         if self._worker is None:
             return
         self._clear_metrics()
         enabled = self.threshold1_check.isChecked()
         value = float(self.threshold1_spin.value())
-        # Threshold 2 remains disabled; only Threshold 1 updates the worker.
+        secondary_enabled = enabled and self.threshold2_check.isChecked()
+        secondary_value = float(self.threshold2_spin.value())
         try:
-            self._worker.configure_threshold(enabled, value)
+            self._worker.configure_threshold(
+                enabled,
+                value,
+                secondary_enabled=secondary_enabled,
+                secondary_value=secondary_value,
+            )
         except Exception:
             pass
 

@@ -90,6 +90,60 @@ def test_worker_window_copy_and_timing() -> None:
     assert ev.firstSampleTimeSec == pytest.approx(expected_first, rel=1e-7)
 
 
+def test_worker_rejects_event_crossing_secondary_threshold() -> None:
+    controller = _DummyController()
+    worker = AnalysisWorker(controller, "ch0", sample_rate=20_000)
+    worker._channel_index = 0
+    worker.configure_threshold(True, 0.25, secondary_enabled=True, secondary_value=0.5)
+
+    sr = 20_000
+    dt = 1.0 / sr
+    data = np.zeros((1, 400), dtype=np.float32)
+    crossing_idx = 200
+    data[0, crossing_idx] = 0.3  # crosses primary threshold
+    data[0, crossing_idx + 10] = 0.6  # exceeds secondary threshold inside the window
+    chunk = Chunk(
+        samples=data,
+        start_time=0.0,
+        dt=dt,
+        seq=0,
+        channel_names=("ch0",),
+        units="V",
+        meta={"start_sample": 0},
+    )
+
+    worker._detect_events(chunk)
+    assert controller.event_buffer.drain() == []
+
+
+def test_worker_accepts_event_when_secondary_not_crossed() -> None:
+    controller = _DummyController()
+    worker = AnalysisWorker(controller, "ch0", sample_rate=20_000)
+    worker._channel_index = 0
+    worker.configure_threshold(True, 0.25, secondary_enabled=True, secondary_value=0.5)
+
+    sr = 20_000
+    dt = 1.0 / sr
+    data = np.zeros((1, 400), dtype=np.float32)
+    crossing_idx = 200
+    data[0, crossing_idx] = 0.4  # crosses primary threshold
+    data[0, crossing_idx + 10] = 0.45  # stays below secondary threshold
+    chunk = Chunk(
+        samples=data,
+        start_time=0.0,
+        dt=dt,
+        seq=0,
+        channel_names=("ch0",),
+        units="V",
+        meta={"start_sample": 0},
+    )
+
+    worker._detect_events(chunk)
+    events = controller.event_buffer.drain()
+    assert len(events) == 1
+    assert events[0].crossingIndex == crossing_idx
+
+
 def test_analysis_events_pull_since() -> None:
     buf = EventRingBuffer(capacity=2)
     bus = AnalysisEvents(buf)
