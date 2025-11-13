@@ -126,7 +126,7 @@ class AnalysisTab(QtWidgets.QWidget):
             pass
         self.metrics_plot.setBackground(pg.mkColor(245, 246, 250))
         self.metrics_plot.setLabel("bottom", "Time (s)")
-        self.metrics_plot.setLabel("left", "Energy Density (V^2/s)")
+        self.metrics_plot.setLabel("left", "Max Amplitude (V)")
         self.metrics_plot.showGrid(x=True, y=True, alpha=0.3)
         self.energy_scatter = pg.ScatterPlotItem(size=6, brush=pg.mkBrush(220, 0, 0, 170), pen=None, name="Energy Density")
         self.metrics_plot.addItem(self.energy_scatter)
@@ -306,6 +306,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._timer.timeout.connect(self._on_timer)
         self._timer.start()
         self._in_threshold_update = False
+        self._on_axis_metric_changed()
         self._apply_ranges()
 
     # ------------------------------------------------------------------

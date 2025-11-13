@@ -7,17 +7,19 @@ from collections import deque
 from pathlib import Path
 
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from core import DeviceManager, PipelineController
+from shared.app_settings import AppSettings
 from core.conditioning import ChannelFilterSettings, FilterSettings
 from core.models import Chunk, EndOfStream
-from audio.player import AudioPlayer, AudioConfig, list_output_devices
+from audio.player import AudioPlayer, AudioConfig
 from .analysis_dock import AnalysisDock
+from .settings_tab import SettingsTab
 
 
 @dataclass
@@ -341,6 +343,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if controller is None:
             controller = PipelineController()
         self._controller: Optional[PipelineController] = None
+        self._app_settings_unsub: Optional[Callable[[], None]] = None
         self.setWindowTitle("SpikeHound - Manlius Pebble Hill School & Cornell University")
         self.resize(1100, 720)
         self.statusBar()
@@ -382,8 +385,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._audio_player_queue: Optional["queue.Queue"] = None
         self._audio_input_samplerate: float = 0.0
         self._audio_lock = threading.Lock()
-        self._audio_devices: List[Dict[str, object]] = []
         self._audio_current_device: Optional[object] = None
+        self._listen_device_key: Optional[str] = None
         self._trigger_mode: str = "stream"
         self._trigger_channel_id: Optional[int] = None
         self._trigger_threshold: float = 0.0
@@ -411,10 +414,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chunk_accum_samples: int = 0
         self._chunk_rate_window: float = 1.0
         self._chunk_last_rate_update = time.perf_counter()
+        self._window_combo_user_set = False
+        self._window_combo_suppress = False
         self._splash_pixmap: Optional[QtGui.QPixmap] = None
         self._splash_label: Optional[QtWidgets.QLabel] = None
         self._splash_aspect_ratio: float = 1.0
 
+        self._settings_tab: Optional[SettingsTab] = None
         self._apply_palette()
         self._style_plot()
 
@@ -431,6 +437,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._analysis_dock = AnalysisDock(parent=self, controller=controller)
         self._analysis_dock.set_scope_widget(scope_widget, "Scope")
         self.addDockWidget(QtCore.Qt.TopDockWidgetArea, self._analysis_dock)
+        self._analysis_dock.settingsClosed.connect(self._on_settings_tab_closed)
         self._analysis_dock.select_scope()
         self._wire_placeholders()
         self._update_trigger_controls()
@@ -440,9 +447,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._device_manager.deviceDisconnected.connect(self._on_device_disconnected)
         self._device_manager.availableChannelsChanged.connect(self._on_available_channels)
         self._apply_device_state(False)
-        self._populate_audio_outputs()
         self._device_manager.refresh_devices()
         self.attach_controller(controller)
+        app_settings = controller.app_settings if controller is not None else None
+        if app_settings is not None:
+            self.set_plot_refresh_hz(float(app_settings.plot_refresh_hz))
+            if not self._window_combo_user_set:
+                self._set_window_combo_value(float(app_settings.default_window_sec))
+            self._apply_listen_output_preference(app_settings.listen_output_key)
+        self._bind_app_settings_store()
         self._emit_trigger_config()
         QtCore.QTimer.singleShot(0, self._update_splash_pixmap)
 
@@ -451,6 +464,25 @@ class MainWindow(QtWidgets.QMainWindow):
         quit_shortcut.activated.connect(self._quit_application)
         close_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Close), self)
         close_shortcut.activated.connect(self.close)
+
+    @property
+    def chunk_rate(self) -> float:
+        return float(getattr(self, "_chunk_rate", 0.0))
+
+    @property
+    def plot_refresh_hz(self) -> float:
+        return float(getattr(self, "_plot_refresh_hz", 0.0))
+
+    def set_plot_refresh_hz(self, hz: float) -> None:
+        hz = max(1.0, float(hz))
+        self._plot_refresh_hz = hz
+        self._plot_interval = 1.0 / hz
+
+    def set_default_window_sec(self, value: float) -> None:
+        value = max(0.05, float(value))
+        if self._device_connected:
+            return
+        self._set_window_combo_value(value)
 
     # ------------------------------------------------------------------
     # UI Construction
@@ -678,10 +710,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         listen_row = QtWidgets.QHBoxLayout()
         listen_row.setSpacing(6)
-        listen_row.addWidget(self._label("Listen Output:"))
-        self.listen_device_combo = QtWidgets.QComboBox()
-        self.listen_device_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
-        listen_row.addWidget(self.listen_device_combo, 1)
+        listen_row.addStretch(1)
+        self.settings_toggle_btn = QtWidgets.QPushButton("Settings")
+        self.settings_toggle_btn.setCheckable(True)
+        self.settings_toggle_btn.toggled.connect(self._toggle_settings_tab)
+        listen_row.addWidget(self.settings_toggle_btn)
         device_layout.addLayout(listen_row, 3, 0, 1, 2)
 
         self.channels_group = QtWidgets.QGroupBox("Channels")
@@ -741,38 +774,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.threshold_line.sigPositionChanged.connect(self._on_threshold_line_changed)
         self.active_list.currentItemChanged.connect(self._on_active_channel_selected)
         self.trigger_single_button.clicked.connect(self._on_trigger_single_clicked)
-        if hasattr(self, "listen_device_combo"):
-            self.listen_device_combo.currentIndexChanged.connect(self._on_listen_device_changed)
-
-    def _populate_audio_outputs(self) -> None:
-        if not hasattr(self, "listen_device_combo"):
-            return
-        options = [{"id": None, "label": "System Default"}]
-        try:
-            devices = list_output_devices()
-        except Exception:
-            devices = []
-        for entry in devices:
-            label = entry.get("label") or entry.get("name") or str(entry.get("id"))
-            options.append({"id": entry.get("id"), "label": str(label)})
-        seen = set()
-        final: List[Dict[str, object]] = []
-        for opt in options:
-            key = opt.get("id")
-            if key in seen:
-                continue
-            seen.add(key)
-            final.append(opt)
-        self._audio_devices = final
-        combo = self.listen_device_combo
-        combo.blockSignals(True)
-        combo.clear()
-        for opt in final:
-            combo.addItem(opt["label"], opt)
-        if final:
-            combo.setCurrentIndex(0)
-        combo.setEnabled(len(final) > 0)
-        combo.blockSignals(False)
 
     def attach_controller(self, controller: Optional[PipelineController]) -> None:
         if controller is self._controller:
@@ -818,6 +819,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._bind_dispatcher_signals()
         self._ensure_audio_router()
         self._update_status(0)
+        self._bind_app_settings_store()
 
     def _bind_dispatcher_signals(self) -> None:
         if self._controller is None:
@@ -1105,6 +1107,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 channels = self._device_manager.get_available_channels()
                 self._controller.attach_source(driver, self.sample_rate_spin.value(), channels)
                 self._bind_dispatcher_signals()
+                self._bind_app_settings_store()
         self._update_channel_buttons()
 
     def _on_device_disconnected(self) -> None:
@@ -1454,26 +1457,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._listen_channel_id == channel_id:
                 self._clear_listen_channel(channel_id)
 
-    def _selected_output_device(self) -> Optional[object]:
-        combo = getattr(self, "listen_device_combo", None)
-        if combo is None:
-            return None
-        data = combo.currentData()
-        if isinstance(data, dict):
-            return data.get("id")
-        return None
-
-    def _on_listen_device_changed(self) -> None:
-        current = self._listen_channel_id
-        if current is None:
-            return
-        self._stop_audio_player()
-        if current not in self._channel_ids_current:
-            return
-        if not self._ensure_audio_player(show_error=False):
-            self._clear_listen_channel(current)
-        else:
-            self._flush_audio_player_queue()
+    def _selected_output_device(self) -> Optional[str]:
+        return getattr(self, "_listen_device_key", None)
 
     def _open_analysis_for_channel(self, channel_id: int) -> None:
         dock = getattr(self, "_analysis_dock", None)
@@ -1934,9 +1919,26 @@ class MainWindow(QtWidgets.QMainWindow):
     def _quit_application(self) -> None:
         QtWidgets.QApplication.instance().exit()
 
-    def _on_window_changed(self) -> None:
-        value = float(self.window_combo.currentData() or 0.0)
-        self._current_window_sec = max(value, 1e-3)
+    def _set_window_combo_value(self, value: float) -> None:
+        if not hasattr(self, "window_combo"):
+            return
+        target = max(float(value), 0.05)
+        idx = -1
+        for i in range(self.window_combo.count()):
+            data = self.window_combo.itemData(i)
+            if data is not None and abs(float(data) - target) < 1e-6:
+                idx = i
+                break
+        if idx < 0:
+            self.window_combo.addItem(f"{target:.2f}", target)
+            idx = self.window_combo.count() - 1
+        self._window_combo_suppress = True
+        self.window_combo.setCurrentIndex(idx)
+        self._window_combo_suppress = False
+        self._apply_window_value(target)
+
+    def _apply_window_value(self, value: float) -> None:
+        self._current_window_sec = max(float(value), 1e-3)
         plot_item = self.plot_widget.getPlotItem()
         plot_item.setXRange(0.0, self._current_window_sec, padding=0.0)
         if self._controller is not None:
@@ -1944,6 +1946,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_status(viz_depth=0)
         if self._trigger_last_sample_rate > 0:
             self._update_trigger_sample_parameters(self._trigger_last_sample_rate)
+
+    def _on_window_changed(self) -> None:
+        value = float(self.window_combo.currentData() or 0.0)
+        if self._window_combo_suppress:
+            self._apply_window_value(value)
+            return
+        self._window_combo_user_set = True
+        self._apply_window_value(value)
 
     def _on_threshold_line_changed(self) -> None:
         value = float(self.threshold_line.value())
@@ -2048,6 +2058,18 @@ class MainWindow(QtWidgets.QMainWindow):
             label = self._status_labels.get(key)
             if label is not None:
                 label.setText(text)
+
+    def health_snapshot(self) -> dict:
+        controller = self._controller
+        stats = controller.dispatcher_stats() if controller is not None else {}
+        queues = controller.queue_depths() if controller is not None else {}
+        return {
+            "chunk_rate": float(getattr(self, "_chunk_rate", 0.0)),
+            "plot_refresh_hz": float(getattr(self, "_plot_refresh_hz", 0.0)),
+            "sample_rate": float(getattr(self, "_current_sample_rate", 0.0)),
+            "dispatcher": stats,
+            "queues": queues,
+        }
 
         _set_status_text(
             "sr",
@@ -2520,3 +2542,72 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_record_toggled(self, enabled: bool) -> None:
         """Placeholder slot that will route a record toggle to the controller."""
         self.recordToggled.emit(enabled)
+
+    def _bind_app_settings_store(self) -> None:
+        controller = self._controller
+        if controller is None or not hasattr(controller, "app_settings_store"):
+            if self._app_settings_unsub:
+                self._app_settings_unsub()
+                self._app_settings_unsub = None
+            return
+        store = controller.app_settings_store
+        if self._app_settings_unsub:
+            self._app_settings_unsub()
+        def _apply(settings: AppSettings) -> None:
+            try:
+                self.set_plot_refresh_hz(float(settings.plot_refresh_hz))
+            except Exception:
+                pass
+            if not self._device_connected and not self._window_combo_user_set:
+                self._set_window_combo_value(float(settings.default_window_sec))
+            self._apply_listen_output_preference(settings.listen_output_key)
+        self._app_settings_unsub = store.subscribe(_apply)
+
+    def _apply_listen_output_preference(self, key: Optional[str]) -> None:
+        prev = getattr(self, "_listen_device_key", None)
+        self._listen_device_key = key
+        if self._settings_tab is not None:
+            self._settings_tab.set_listen_device(key)
+        if prev == key:
+            return
+        if self._listen_channel_id is None:
+            return
+        self._stop_audio_player()
+        current = self._listen_channel_id
+        if current is None:
+            return
+        if not self._ensure_audio_player(show_error=False):
+            self._clear_listen_channel(current)
+        else:
+            self._flush_audio_player_queue()
+
+    def set_listen_output_device(self, device_key: Optional[str]) -> None:
+        normalized = None if device_key in (None, "") else str(device_key)
+        self._apply_listen_output_preference(normalized)
+        controller = self._controller
+        if controller is not None:
+            try:
+                controller.update_app_settings(listen_output_key=normalized)
+            except Exception:
+                pass
+    def _toggle_settings_tab(self, checked: bool) -> None:
+        dock = getattr(self, "_analysis_dock", None)
+        controller = self._controller
+        if dock is None or controller is None:
+            self.settings_toggle_btn.blockSignals(True)
+            self.settings_toggle_btn.setChecked(False)
+            self.settings_toggle_btn.blockSignals(False)
+            return
+        if checked:
+            if self._settings_tab is None:
+                self._settings_tab = SettingsTab(controller, self)
+                self._settings_tab.set_listen_device(self._listen_device_key)
+            dock.open_settings(self._settings_tab)
+        else:
+            dock.close_settings()
+
+    def _on_settings_tab_closed(self) -> None:
+        if hasattr(self, "settings_toggle_btn"):
+            self.settings_toggle_btn.blockSignals(True)
+            self.settings_toggle_btn.setChecked(False)
+            self.settings_toggle_btn.blockSignals(False)

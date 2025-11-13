@@ -17,8 +17,6 @@ if __name__ == "__main__":
 
 #TODO Notes:
 # - Add spectrogram view in analysis mode
-# - Add a debug/settings tab that optionally pops up to describe the health of the 
-#       application as well as the settings like output source, etc.
 # - Button to export of events list to CSV
 # - Buttons to pop up windows for screen shotting
 # - DAQ devices need to provide discrete sample rate settings rather than arbitrary ones

@@ -19,6 +19,7 @@ from .conditioning import FilterSettings
 from .dispatcher import Dispatcher
 from .models import Chunk, EndOfStream, TriggerConfig
 from analysis.settings import AnalysisSettingsStore
+from shared.app_settings import AppSettings, AppSettingsStore
 from shared.event_buffer import AnalysisEvents, EventRingBuffer
 
 
@@ -226,6 +227,7 @@ class PipelineController:
         self.audio_queue: "queue.Queue" = queue.Queue(maxsize=audio_queue_size)
         self.logging_queue: "queue.Queue" = queue.Queue(maxsize=logging_queue_size)
         self._analysis_settings = AnalysisSettingsStore()
+        self._app_settings_store = AppSettingsStore()
         self._event_buffer = EventRingBuffer(capacity=1000)
         self._analysis_events = AnalysisEvents(self._event_buffer)
 
@@ -273,6 +275,17 @@ class PipelineController:
     @property
     def analysis_events(self) -> AnalysisEvents:
         return self._analysis_events
+
+    @property
+    def app_settings_store(self) -> AppSettingsStore:
+        return self._app_settings_store
+
+    @property
+    def app_settings(self) -> AppSettings:
+        return self._app_settings_store.get()
+
+    def update_app_settings(self, **kwargs) -> AppSettings:
+        return self._app_settings_store.update(**kwargs)
 
     @property
     def sample_rate(self) -> Optional[float]:

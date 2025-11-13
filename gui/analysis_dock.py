@@ -11,6 +11,8 @@ from analysis.analysis_worker import AnalysisWorker
 class AnalysisDock(QtWidgets.QDockWidget):
     """Dockable workspace containing the scope tab plus ad-hoc analysis tabs."""
 
+    settingsClosed = QtCore.Signal()
+
     def __init__(self, title: str = "Workspace", parent: Optional[QtWidgets.QWidget] = None, *, controller=None) -> None:
         super().__init__(title, parent)
         self.setObjectName("AnalysisDock")
@@ -33,6 +35,7 @@ class AnalysisDock(QtWidgets.QDockWidget):
         self._analysis_count: Dict[str, int] = {}
         self._controller = controller
         self._last_sample_rate: float = 0.0
+        self._settings_widget: Optional[QtWidgets.QWidget] = None
 
     # ------------------------------------------------------------------
     # Scope management
@@ -129,6 +132,11 @@ class AnalysisDock(QtWidgets.QDockWidget):
         if widget is self._scope_widget:
             self._tabs.setCurrentIndex(index)
             return
+        if widget is self._settings_widget:
+            self.close_settings()
+            if not self._tab_info:
+                self.select_scope()
+            return
         self._tabs.removeTab(index)
         info = self._tab_info.pop(widget, None)
         worker = None
@@ -167,4 +175,32 @@ class AnalysisDock(QtWidgets.QDockWidget):
             widget.deleteLater()
         self._tab_info.clear()
         self._analysis_count.clear()
+        if self._settings_widget is not None:
+            self.close_settings()
         self.select_scope()
+
+    def open_settings(self, widget: QtWidgets.QWidget, title: str = "Settings & Debug") -> None:
+        if widget is None:
+            return
+        if widget is self._settings_widget:
+            idx = self._tabs.indexOf(widget)
+            if idx >= 0:
+                self._tabs.setCurrentIndex(idx)
+            return
+        self.close_settings()
+        self._settings_widget = widget
+        widget.setParent(self._tabs)
+        insert_index = 1 if self._scope_widget is not None else 0
+        self._tabs.insertTab(insert_index, widget, title)
+        self._tabs.setCurrentIndex(insert_index)
+
+    def close_settings(self) -> None:
+        widget = self._settings_widget
+        if widget is None:
+            return
+        idx = self._tabs.indexOf(widget)
+        if idx >= 0:
+            self._tabs.removeTab(idx)
+        widget.setParent(None)
+        self._settings_widget = None
+        self.settingsClosed.emit()

@@ -1,0 +1,87 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+import threading
+from typing import Callable, Dict, Optional
+
+from PySide6.QtCore import QSettings
+
+
+@dataclass(frozen=True)
+class AppSettings:
+    plot_refresh_hz: float = 40.0
+    default_window_sec: float = 1.0
+    listen_output_key: Optional[str] = None
+
+
+class AppSettingsStore:
+    """Thread-safe persistent settings store for application-wide preferences."""
+
+    def __init__(self, *, organization: str = "SpikeHound", application: str = "SpikeHound") -> None:
+        self._lock = threading.Lock()
+        self._subscribers: Dict[int, Callable[[AppSettings], None]] = {}
+        self._next_token = 0
+        self._settings = self._load_settings(organization, application)
+        self._qsettings = QSettings(organization, application)
+
+    def _load_settings(self, organization: str, application: str) -> AppSettings:
+        qsettings = QSettings(organization, application)
+        try:
+            refresh = float(qsettings.value("plot_refresh_hz", AppSettings.plot_refresh_hz))
+        except (TypeError, ValueError):
+            refresh = AppSettings.plot_refresh_hz
+        try:
+            window_sec = float(qsettings.value("default_window_sec", AppSettings.default_window_sec))
+        except (TypeError, ValueError):
+            window_sec = AppSettings.default_window_sec
+        listen = qsettings.value("listen_output_key", AppSettings.listen_output_key)
+        if listen is not None:
+            listen = str(listen)
+        return AppSettings(
+            plot_refresh_hz=refresh,
+            default_window_sec=window_sec,
+            listen_output_key=listen,
+        )
+
+    def get(self) -> AppSettings:
+        with self._lock:
+            return self._settings
+
+    def update(self, **kwargs) -> AppSettings:
+        with self._lock:
+            new_settings = replace(self._settings, **kwargs)
+            self._settings = new_settings
+            callbacks = list(self._subscribers.values())
+            self._persist(new_settings)
+        for callback in callbacks:
+            try:
+                callback(new_settings)
+            except Exception:
+                continue
+        return new_settings
+
+    def subscribe(self, callback: Callable[[AppSettings], None], *, replay: bool = True) -> Callable[[], None]:
+        with self._lock:
+            token = self._next_token
+            self._next_token += 1
+            self._subscribers[token] = callback
+            snapshot = self._settings
+        if replay:
+            callback(snapshot)
+
+        def unsubscribe() -> None:
+            with self._lock:
+                self._subscribers.pop(token, None)
+
+        return unsubscribe
+
+    def _persist(self, settings: AppSettings) -> None:
+        self._qsettings.setValue("plot_refresh_hz", settings.plot_refresh_hz)
+        self._qsettings.setValue("default_window_sec", settings.default_window_sec)
+        if settings.listen_output_key is None:
+            self._qsettings.remove("listen_output_key")
+        else:
+            self._qsettings.setValue("listen_output_key", settings.listen_output_key)
+
+
+__all__ = ["AppSettings", "AppSettingsStore"]
