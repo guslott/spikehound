@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict
 
@@ -25,6 +26,7 @@ class Event:
     postMs: float
     samples: np.ndarray = field(repr=False)
     properties: Dict[str, float] = field(default_factory=dict)
+    intervalSinceLastSec: float = field(default=float("nan"))
 
     def __post_init__(self) -> None:
         if self.channelId < 0:
@@ -37,8 +39,13 @@ class Event:
             if value < 0:
                 raise ValueError(f"{name} must be non-negative")
 
+        interval = float(self.intervalSinceLastSec)
+        if math.isfinite(interval) and interval < 0:
+            raise ValueError("intervalSinceLastSec must be non-negative")
+
         arr = np.asarray(self.samples, dtype=np.float32)
         if arr.ndim != 1:
             raise ValueError("samples must be a 1D array")
         object.__setattr__(self, "samples", np.array(arr, copy=True, order="C"))
         object.__setattr__(self, "properties", dict(self.properties))
+        object.__setattr__(self, "intervalSinceLastSec", interval)

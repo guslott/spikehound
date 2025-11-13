@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from analysis.analysis_worker import AnalysisWorker
+from analysis.analysis_worker import AnalysisWorker, _peak_frequency_sinc
 from analysis.settings import AnalysisSettingsStore
 from core.models import Chunk
 from shared.event_buffer import AnalysisEvents, EventRingBuffer
@@ -143,6 +143,74 @@ def test_worker_accepts_event_when_secondary_not_crossed() -> None:
     assert len(events) == 1
     assert events[0].crossingIndex == crossing_idx
 
+
+def test_worker_tracks_interval_since_last_event() -> None:
+    controller = _DummyController()
+    worker = AnalysisWorker(controller, "ch0", sample_rate=20_000)
+    worker._channel_index = 0
+    worker.configure_threshold(True, 0.25)
+
+    sr = 20_000
+    dt = 1.0 / sr
+    data = np.zeros((1, 800), dtype=np.float32)
+    first_idx = 200
+    second_idx = 600
+    data[0, first_idx] = 0.4
+    data[0, second_idx] = 0.45
+    chunk = Chunk(
+        samples=data,
+        start_time=0.0,
+        dt=dt,
+        seq=0,
+        channel_names=("ch0",),
+        units="V",
+        meta={"start_sample": 0},
+    )
+
+    worker._detect_events(chunk)
+    events = controller.event_buffer.drain()
+    assert len(events) == 2
+    first_event, second_event = events
+    assert np.isnan(first_event.intervalSinceLastSec)
+    expected_interval = (second_idx - first_idx) * dt
+    assert second_event.intervalSinceLastSec == pytest.approx(expected_interval, rel=1e-6)
+    assert second_event.properties.get("interval_sec") == pytest.approx(expected_interval, rel=1e-6)
+
+
+def test_peak_frequency_sinc_detects_clean_tone() -> None:
+    sr = 20_000
+    duration = 0.01
+    freq = 250.0
+    t = np.arange(int(sr * duration)) / sr
+    wave = 0.6 * np.sin(2 * np.pi * freq * t)
+    center = len(wave) // 2
+    assert _peak_frequency_sinc(wave, sr, center_index=center) == pytest.approx(freq, rel=0.05)
+
+
+def test_peak_frequency_sinc_ignores_dc_and_slope() -> None:
+    sr = 20_000
+    duration = 0.012
+    freq = 180.0
+    t = np.arange(int(sr * duration)) / sr
+    wave = 0.4 * np.sin(2 * np.pi * freq * t)
+    wave += 0.3  # DC offset
+    wave += 0.05 * (t - t.mean())  # linear drift
+    center = len(wave) // 2
+    assert _peak_frequency_sinc(wave, sr, center_index=center) == pytest.approx(freq, rel=0.08)
+
+
+def test_peak_frequency_sinc_focuses_on_localized_event() -> None:
+    sr = 20_000
+    samples = int(sr * 0.02)
+    wave = np.zeros(samples, dtype=np.float64)
+    burst_len = int(sr * 0.004)
+    start = samples // 2 - burst_len // 2
+    t = np.arange(burst_len) / sr
+    freq = 220.0
+    burst = np.sin(2 * np.pi * freq * t) * np.hanning(burst_len)
+    wave[start : start + burst_len] = burst
+    center = start + burst_len // 2
+    assert _peak_frequency_sinc(wave, sr, center_index=center) == pytest.approx(freq, rel=0.1)
 
 def test_analysis_events_pull_since() -> None:
     buf = EventRingBuffer(capacity=2)

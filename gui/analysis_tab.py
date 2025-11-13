@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-import math
 import queue
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING, Sequence
 
 import numpy as np
 
 import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
+from analysis.analysis_worker import _peak_frequency_sinc
+from analysis.models import AnalysisBatch
 from core.models import Chunk, EndOfStream
 from shared.types import Event
 
@@ -44,39 +45,11 @@ def _min_max(x: np.ndarray) -> tuple[float, float]:
     return float(np.max(arr)), float(np.min(arr))
 
 
-def _peak_frequency_sinc(x: np.ndarray, sr: float) -> float:
-    arr = np.asarray(x, dtype=np.float32)
-    if arr.size == 0 or sr <= 0:
-        return 0.0
-    samples = arr.astype(np.float64)
-    samples -= np.median(samples)
-    window = _blackman(samples.size)
-    tapered = samples * window
-    n_fft_min = max(2048, samples.size * 8)
-    n_fft = 1 << max(0, int(math.ceil(math.log2(n_fft_min))))
-    spectrum = np.fft.rfft(tapered, n=n_fft)
-    mags = np.abs(spectrum)
-    mags[0] = 0.0
-    if mags.size <= 1:
-        return 0.0
-    peak_idx = int(np.argmax(mags))
-    if peak_idx <= 0 or peak_idx >= mags.size - 1:
-        peak_freq = peak_idx * sr / n_fft
-        return float(peak_freq)
-    alpha = mags[peak_idx - 1]
-    beta = mags[peak_idx]
-    gamma = mags[peak_idx + 1]
-    denom = max((alpha - 2 * beta + gamma), 1e-12)
-    delta = 0.5 * (alpha - gamma) / denom
-    peak_bin = peak_idx + delta
-    peak_freq = peak_bin * sr / n_fft
-    return float(max(0.0, peak_freq))
-
 if TYPE_CHECKING:
     from analysis.analysis_worker import AnalysisWorker
     from analysis.settings import AnalysisSettingsStore
     from core.controller import PipelineController
-    from shared.event_buffer import AnalysisEvents, EventRingBuffer
+    from shared.event_buffer import EventRingBuffer
 
 
 class AnalysisTab(QtWidgets.QWidget):
@@ -98,10 +71,8 @@ class AnalysisTab(QtWidgets.QWidget):
         self._init_buffer()
         self._controller = controller
         self._analysis_settings: Optional["AnalysisSettingsStore"] = None
-        self._analysis_events: Optional["AnalysisEvents"] = None
         self._event_buffer: Optional["EventRingBuffer"] = None
         self._worker: Optional["AnalysisWorker"] = None
-        self._last_event_id: Optional[int] = None
         self._event_overlays: list[dict[str, object]] = []
         self._overlay_pool: list[pg.PlotCurveItem] = []
         self._overlay_pen = pg.mkPen((220, 0, 0), width=2)
@@ -112,7 +83,6 @@ class AnalysisTab(QtWidgets.QWidget):
         self._window_start_index: Optional[int] = None
         if controller is not None:
             self._analysis_settings = getattr(controller, "analysis_settings_store", None)
-            self._analysis_events = getattr(controller, "analysis_events", None)
             self._event_buffer = getattr(controller, "event_buffer", None)
         self._event_window_ms = self._initial_event_window_ms()
         self._t0_event: Optional[float] = None
@@ -123,6 +93,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._cached_raw_samples: Optional[np.ndarray] = None
         self._last_window_start: float = 0.0
         self._last_window_width: float = 0.5
+        self._fallback_start_sample: int = 0
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -257,7 +228,14 @@ class AnalysisTab(QtWidgets.QWidget):
         metric_row.setSpacing(6)
         metric_row.addWidget(QtWidgets.QLabel("Vertical (Y) Metric"))
         self.metric_combo = QtWidgets.QComboBox()
-        for label in ("Max in window (V)", "Min in window (V)", "Energy Density (V²/s)", "Peak Frequency (Hz)", "Peak Wavelength (s)"):
+        for label in (
+            "Max in window (V)",
+            "Min in window (V)",
+            "Energy Density (V²/s)",
+            "Peak Frequency (Hz)",
+            "Peak Wavelength (s)",
+            "Interval since last event (s)",
+        ):
             self.metric_combo.addItem(label)
         self.metric_combo.setCurrentIndex(0)
         self.metric_combo.setMinimumWidth(180)
@@ -461,7 +439,7 @@ class AnalysisTab(QtWidgets.QWidget):
     def _on_timer(self) -> None:
         if self._analysis_queue is None:
             return
-        latest: Optional[Chunk] = None
+        latest: Optional[AnalysisBatch] = None
         while True:
             try:
                 item = self._analysis_queue.get_nowait()
@@ -469,18 +447,22 @@ class AnalysisTab(QtWidgets.QWidget):
                 break
             if item is EndOfStream:
                 continue
-            if isinstance(item, Chunk):
+            if isinstance(item, AnalysisBatch):
                 latest = item
+            elif isinstance(item, Chunk):
+                meta = getattr(item, "meta", None)
+                events_from_meta = ()
+                if meta is not None and hasattr(meta, "get"):
+                    events_from_meta = tuple(meta.get("analysis_events") or ())
+                latest = AnalysisBatch(chunk=item, events=events_from_meta)
         if latest is not None:
-            self._render_chunk(latest)
-        else:
-            self._update_event_overlays()
+            self._render_batch(latest)
 
     def _apply_ranges(self) -> None:
         width = float(self.width_combo.currentData() or 0.5)
         plot_item = self.plot_widget.getPlotItem()
         plot_item.setXRange(0.0, width, padding=0.0)
-        if self._selected_y_metric() in {"ed", "max", "min", "freq", "period"}:
+        if self._selected_y_metric() in {"ed", "max", "min", "freq", "period", "interval"}:
             # Metrics overlay controls the Y range; leave amplitude height unchanged.
             pass
         else:
@@ -489,7 +471,11 @@ class AnalysisTab(QtWidgets.QWidget):
         self._ensure_buffer_capacity(max(width, 1.0))
         if self.threshold1_check.isChecked():
             self.threshold1_line.setValue(float(self.threshold1_spin.value()))
-        self._update_event_overlays()
+        if self._window_start_time is not None:
+            self._last_window_start = float(self._window_start_time)
+        self._last_window_width = float(width)
+        if not self._viz_paused:
+            self._refresh_overlay_positions(self._last_window_start, self._last_window_width, self._window_start_index)
 
     def _initial_event_window_ms(self) -> float:
         if self._analysis_settings is None:
@@ -555,7 +541,8 @@ class AnalysisTab(QtWidgets.QWidget):
         except Exception:
             pass
 
-    def _render_chunk(self, chunk: Chunk) -> None:
+    def _render_batch(self, batch: AnalysisBatch) -> None:
+        chunk = batch.chunk
         try:
             data = np.array(chunk.samples, dtype=np.float32)
         except Exception:
@@ -588,6 +575,8 @@ class AnalysisTab(QtWidgets.QWidget):
                 start_sample = int(start_sample_val) if start_sample_val is not None else None
             except (TypeError, ValueError):
                 start_sample = None
+        if start_sample is None:
+            start_sample = self._fallback_start_sample
         try:
             chunk_dt = float(chunk.dt)
         except Exception:
@@ -607,6 +596,7 @@ class AnalysisTab(QtWidgets.QWidget):
         if start_sample is not None and start_sample >= 0:
             self._latest_sample_index = start_sample + frames - 1
             self._window_start_index = self._latest_sample_index - (span_samples - 1)
+            self._fallback_start_sample = start_sample + frames
         else:
             self._latest_sample_index = None
             self._window_start_index = None
@@ -621,15 +611,26 @@ class AnalysisTab(QtWidgets.QWidget):
         plot_item.setXRange(0.0, width, padding=0.0)
         height = float(self.height_combo.currentData() or 1.0)
         plot_item.setYRange(-height, height, padding=0.0)
-        self._update_event_overlays()
 
-    def _pull_new_events(self) -> list[Event]:
-        if self._analysis_events is None:
-            return []
-        events, last_id = self._analysis_events.pull_events(self._last_event_id)
-        if last_id is not None:
-            self._last_event_id = last_id
-        return events
+        if self._window_start_time is not None:
+            window_start = float(self._window_start_time)
+        elif self._latest_sample_time is not None:
+            window_start = float(self._latest_sample_time - width)
+        else:
+            window_start = 0.0
+        if self._latest_sample_time is not None:
+            width_in_use = max(width, float(self._latest_sample_time) - window_start)
+        else:
+            width_in_use = width
+        self._last_window_start = float(window_start)
+        self._last_window_width = float(width_in_use)
+
+        events = batch.events or ()
+        if not events:
+            meta = getattr(batch.chunk, "meta", None)
+            if meta is not None and hasattr(meta, "get"):
+                events = tuple(meta.get("analysis_events") or ())
+        self._handle_batch_events(events, window_start, width_in_use, self._window_start_index)
 
     def _on_pause_viz_toggled(self, checked: bool) -> None:
         self._viz_paused = bool(checked)
@@ -662,35 +663,27 @@ class AnalysisTab(QtWidgets.QWidget):
         item.setData([], [])
         self._overlay_pool.append(item)
 
-    def _update_event_overlays(self) -> None:
-        if self._analysis_events is None or self._latest_sample_time is None:
-            return
-        width_setting = float(self.width_combo.currentData() or 0.5)
-        if self._window_start_time is not None:
-            window_start = self._window_start_time
-        else:
-            window_start = self._latest_sample_time - width_setting
-        width_in_use = max(width_setting, self._latest_sample_time - window_start)
-        self._last_window_start = float(window_start)
-        self._last_window_width = float(width_in_use)
-        window_start_idx = self._window_start_index
-        channel_idx = self._channel_index
-        new_events = self._pull_new_events()
-        for event in new_events:
-            if channel_idx is not None and event.channelId != channel_idx:
-                continue
-            overlay = self._build_overlay(event)
-            if overlay is None:
-                continue
-            if not self._viz_paused:
-                if not self._apply_overlay_view(overlay, window_start, width_in_use, window_start_idx):
-                    self._release_overlay_item(overlay.get("item"))
+    def _handle_batch_events(
+        self,
+        events: Sequence[Event],
+        window_start: float,
+        width: float,
+        window_start_idx: Optional[int],
+    ) -> None:
+        if events:
+            for event in events:
+                overlay = self._build_overlay(event)
+                if overlay is None:
                     continue
-            self._event_overlays.append(overlay)
-            self._record_overlay_metrics(overlay)
+                if not self._viz_paused:
+                    if not self._apply_overlay_view(overlay, window_start, width, window_start_idx):
+                        self._release_overlay_item(overlay.get("item"))
+                        continue
+                self._event_overlays.append(overlay)
+                self._record_overlay_metrics(overlay)
+            self._update_metric_points()
         if not self._viz_paused:
-            self._refresh_overlay_positions(window_start, width_in_use, window_start_idx)
-        self._update_metric_points()
+            self._refresh_overlay_positions(window_start, width, window_start_idx)
 
     def _refresh_overlay_positions(self, window_start: float, width: float, window_start_idx: Optional[int]) -> None:
         if self._viz_paused:
@@ -748,6 +741,8 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def _selected_y_metric(self) -> str:
         label = self.metric_combo.currentText().lower()
+        if "interval" in label:
+            return "interval"
         if "max" in label:
             return "max"
         if "min" in label:
@@ -780,8 +775,12 @@ class AnalysisTab(QtWidgets.QWidget):
             self.metrics_plot.setLabel("left", "Amplitude (V)")
         elif metric == "freq":
             self.metrics_plot.setLabel("left", "Peak Frequency (Hz)")
-        else:
+        elif metric == "period":
             self.metrics_plot.setLabel("left", "Peak Wavelength (s)")
+        elif metric == "interval":
+            self.metrics_plot.setLabel("left", "Interval (s)")
+        else:
+            self.metrics_plot.setLabel("left", "Value")
         x_metric = self._selected_x_metric()
         if x_metric == "time":
             self.metrics_plot.setLabel("bottom", "Time (s)")
@@ -793,7 +792,7 @@ class AnalysisTab(QtWidgets.QWidget):
             self.metrics_plot.setLabel("bottom", "Peak Frequency (Hz)")
         else:
             self.metrics_plot.setLabel("bottom", "Peak Wavelength (s)")
-        if metric in {"ed", "max", "min", "freq", "period"}:
+        if metric in {"ed", "max", "min", "freq", "period", "interval"}:
             self.energy_scatter.show()
             self._update_metric_points()
         else:
@@ -808,7 +807,7 @@ class AnalysisTab(QtWidgets.QWidget):
     def _update_metric_points(self) -> None:
         y_key = self._selected_y_metric()
         x_key = self._selected_x_metric()
-        if y_key not in {"ed", "max", "min", "freq", "period"}:
+        if y_key not in {"ed", "max", "min", "freq", "period", "interval"}:
             self.energy_scatter.hide()
             return
         xs: list[float] = []
@@ -840,7 +839,7 @@ class AnalysisTab(QtWidgets.QWidget):
             self._t0_event = float(metric_time)
         rel_time = max(0.0, float(metric_time) - (self._t0_event or 0.0))
         record: dict[str, float] = {"time": rel_time}
-        for key in ("ed", "max", "min", "freq", "period"):
+        for key in ("ed", "max", "min", "freq", "period", "interval"):
             value = metrics.get(key)
             if value is None:
                 continue
@@ -889,19 +888,36 @@ class AnalysisTab(QtWidgets.QWidget):
         peak_idx = int(np.clip(peak_idx, 0, samples.size - 1))
         peak_time = float(times[peak_idx]) if times.size else float(event.crossingTimeSec)
         curve = self._acquire_overlay_item()
-        metrics = None
+        metrics: Optional[dict[str, float]] = None
+        metric_values: dict[str, float] = {}
         if samples.size >= 4:
             ed = _energy_density(x, sr)
             mx, mn = _min_max(x)
-            fpk = _peak_frequency_sinc(x, sr)
+            fpk = _peak_frequency_sinc(x, sr, center_index=cross_idx)
             period = 1.0 / fpk if fpk > 1e-9 else 0.0
-            metrics = {
-                "ed": float(ed),
-                "max": float(mx),
-                "min": float(mn),
-                "freq": float(fpk),
-                "period": float(period),
-            }
+            metric_values.update(
+                {
+                    "ed": float(ed),
+                    "max": float(mx),
+                    "min": float(mn),
+                    "freq": float(fpk),
+                    "period": float(period),
+                }
+            )
+        interval_val = float(getattr(event, "intervalSinceLastSec", float("nan")))
+        if not np.isfinite(interval_val):
+            props = getattr(event, "properties", None)
+            if isinstance(props, dict):
+                try:
+                    interval_candidate = props.get("interval_sec")
+                    if interval_candidate is not None:
+                        interval_val = float(interval_candidate)
+                except (TypeError, ValueError):
+                    interval_val = float("nan")
+        if np.isfinite(interval_val) and interval_val >= 0.0:
+            metric_values["interval"] = float(interval_val)
+        if metric_values:
+            metrics = metric_values
         return {
             "item": curve,
             "times": times,

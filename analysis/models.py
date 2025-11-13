@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 import numpy as np
 
+from core.models import Chunk
 from shared.types import Event
 
 
@@ -21,4 +22,12 @@ class ThresholdConfig:
     window_post_s: float = 0.004  # seconds after threshold crossing to include in waveform
 
 
-__all__ = ["Event", "ThresholdConfig"]
+@dataclass(frozen=True)
+class AnalysisBatch:
+    """Chunk routed to a single channel plus the events detected within that chunk."""
+
+    chunk: Chunk
+    events: Sequence[Event]
+
+
+__all__ = ["Event", "ThresholdConfig", "AnalysisBatch"]

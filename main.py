@@ -17,3 +17,4 @@ if __name__ == "__main__":
 
 #TODO Notes:
 # - Add spectrogram view in analysis mode
+# - add dt between events to event list

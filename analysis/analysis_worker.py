@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import queue
 import threading
 from typing import Callable, Optional
@@ -10,6 +11,7 @@ from core.models import Chunk, EndOfStream
 from shared.event_buffer import EventRingBuffer
 from shared.types import Event
 
+from .models import AnalysisBatch
 from .settings import AnalysisSettings, AnalysisSettingsStore
 
 
@@ -22,13 +24,14 @@ class AnalysisWorker(threading.Thread):
         self.channel_name = channel_name
         self.sample_rate = float(sample_rate)
         self.input_queue: "queue.Queue[Chunk | EndOfStream]" = queue.Queue(maxsize=queue_size)
-        self.output_queue: "queue.Queue[Chunk | EndOfStream]" = queue.Queue(maxsize=queue_size)
+        self.output_queue: "queue.Queue[AnalysisBatch | EndOfStream]" = queue.Queue(maxsize=queue_size)
         self._stop_evt = threading.Event()
         self._registration_token: Optional[object] = None
         self._channel_index: Optional[int] = None
         self._event_buffer: Optional[EventRingBuffer] = getattr(controller, "event_buffer", None)
         self._settings_store: Optional[AnalysisSettingsStore] = getattr(controller, "analysis_settings_store", None)
         self._settings_unsub: Optional[Callable[[], None]] = None
+        self._next_start_sample: int = 0
         self._state_lock = threading.Lock()
         self._event_window_ms: float = 10.0
         self._threshold_enabled = False
@@ -37,6 +40,7 @@ class AnalysisWorker(threading.Thread):
         self._secondary_threshold_enabled = False
         self._secondary_threshold_value = 0.0
         self._last_window_end_sample = -10**12
+        self._last_crossing_time_sec: Optional[float] = None
         self._event_id = 0
         if isinstance(self._settings_store, AnalysisSettingsStore):
             self._settings_unsub = self._settings_store.subscribe(self._on_settings_changed)
@@ -78,6 +82,15 @@ class AnalysisWorker(threading.Thread):
         meta = dict(chunk.meta or {})
         meta.setdefault("source_channel_index", idx)
         meta.setdefault("source_channel_name", source_name)
+        start_sample = meta.get("start_sample")
+        try:
+            start_sample_int = int(start_sample)
+        except (TypeError, ValueError):
+            start_sample_int = -1
+        if start_sample_int < 0:
+            start_sample_int = self._next_start_sample
+            meta["start_sample"] = start_sample_int
+        self._next_start_sample = start_sample_int + samples.shape[1]
         try:
             routed_chunk = Chunk(
                 samples=samples,
@@ -90,16 +103,33 @@ class AnalysisWorker(threading.Thread):
             )
         except Exception:
             return
-        self._detect_events(routed_chunk)
+        events = self._detect_events(routed_chunk)
+        events_tuple = tuple(events)
+        if events_tuple:
+            meta_with_events = dict(routed_chunk.meta or {})
+            meta_with_events["analysis_events"] = events_tuple
+            try:
+                routed_chunk = Chunk(
+                    samples=routed_chunk.samples,
+                    start_time=routed_chunk.start_time,
+                    dt=routed_chunk.dt,
+                    seq=routed_chunk.seq,
+                    channel_names=routed_chunk.channel_names,
+                    units=routed_chunk.units,
+                    meta=meta_with_events,
+                )
+            except Exception:
+                pass
+        batch = AnalysisBatch(chunk=routed_chunk, events=events_tuple)
         try:
-            self.output_queue.put_nowait(routed_chunk)
+            self.output_queue.put_nowait(batch)
         except queue.Full:
             try:
                 _ = self.output_queue.get_nowait()
             except queue.Empty:
                 pass
             try:
-                self.output_queue.put_nowait(routed_chunk)
+                self.output_queue.put_nowait(batch)
             except queue.Full:
                 pass
 
@@ -203,7 +233,7 @@ class AnalysisWorker(threading.Thread):
         self._event_id += 1
         return self._event_id
 
-    def _detect_events(self, chunk: Chunk) -> None:
+    def _detect_events(self, chunk: Chunk) -> list[Event]:
         with self._state_lock:
             event_window_ms = float(self._event_window_ms)
             threshold_enabled = bool(self._threshold_enabled)
@@ -212,20 +242,20 @@ class AnalysisWorker(threading.Thread):
             secondary_enabled = bool(self._secondary_threshold_enabled)
             secondary_value = float(self._secondary_threshold_value)
             last_window_end = self._last_window_end_sample
+            last_crossing_time = self._last_crossing_time_sec
         if not threshold_enabled or threshold_value == 0.0 or event_window_ms <= 0:
-            # No detections when the user has disabled Threshold 1.
-            return
+            return []
         if chunk.samples.size == 0:
-            return
+            return []
 
         sig = np.asarray(chunk.samples[0], dtype=np.float32)
         n = sig.size
         if n == 0:
-            return
+            return []
         dt = float(chunk.dt)
         sr = (1.0 / dt) if dt > 0 else self.sample_rate
         if sr <= 0:
-            return
+            return []
 
         half_samples = int(round((event_window_ms / 2.0) * sr / 1000.0))
         if half_samples <= 0:
@@ -237,7 +267,7 @@ class AnalysisWorker(threading.Thread):
         else:
             idxs = np.flatnonzero(sig <= threshold_value)
         if idxs.size == 0:
-            return
+            return []
 
         start_sample = -1
         channel_id = self._channel_index
@@ -255,8 +285,9 @@ class AnalysisWorker(threading.Thread):
 
         use_secondary = threshold_enabled and secondary_enabled
 
-        events: list[tuple[Event, int]] = []
+        events: list[tuple[Event, int, float]] = []
         last_end = last_window_end
+        prev_crossing_time = last_crossing_time
         for idx in idxs:
             abs_idx = idx if start_sample < 0 else start_sample + int(idx)
             if abs_idx < last_end:
@@ -270,7 +301,7 @@ class AnalysisWorker(threading.Thread):
             dt_sec = 1.0 / sr
             first_time = float(chunk.start_time) + i0 * dt_sec
             crossing_time = float(chunk.start_time) + int(idx) * dt_sec
-            pre_count = int(idx) - i0  # clamps gracefully when the buffer lacks pre-samples
+            pre_count = int(idx) - i0
             post_count = i1 - int(idx) - 1
             pre_ms = pre_count * dt_sec * 1000.0
             post_ms = post_count * dt_sec * 1000.0
@@ -279,10 +310,32 @@ class AnalysisWorker(threading.Thread):
             candidate_last_end = first_abs + window_samples
             if use_secondary and self._waveform_crosses_threshold(wf, secondary_value):
                 continue
+            interval_sec = float("nan")
+            if prev_crossing_time is not None:
+                delta = float(crossing_time) - float(prev_crossing_time)
+                if delta < 0:
+                    delta = 0.0
+                interval_sec = delta
+            if pre_count > 0:
+                baseline = float(np.median(wf[:pre_count]))
+            else:
+                baseline = float(np.median(wf))
+            centered_wf = wf.astype(np.float64) - baseline
+            search_radius = max(1, int(round(0.001 * sr)))
+            peak_window_start = max(0, pre_count - search_radius)
+            peak_window_end = min(wf.size, pre_count + search_radius + 1)
+            if peak_window_end <= peak_window_start:
+                peak_window_end = min(wf.size, peak_window_start + 1)
+            window_slice = centered_wf[peak_window_start:peak_window_end]
+            if window_slice.size:
+                local_idx = int(np.argmax(np.abs(window_slice)))
+                peak_idx = peak_window_start + local_idx
+            else:
+                peak_idx = pre_count
             energy = float(np.sum(wf.astype(np.float32) ** 2))
             window_sec = max(1e-12, wf.size * dt_sec)
             energy_density = energy / window_sec
-            peak_freq = _peak_frequency_sinc(wf, sr)
+            peak_freq = _peak_frequency_sinc(centered_wf, sr, center_index=peak_idx)
             peak_wavelength = 1.0 / peak_freq if peak_freq > 1e-9 else 0.0
             event = Event(
                 id=self._next_event_id(),
@@ -296,6 +349,7 @@ class AnalysisWorker(threading.Thread):
                 preMs=float(pre_ms),
                 postMs=float(post_ms),
                 samples=wf,
+                intervalSinceLastSec=float(interval_sec),
             )
             props = getattr(event, "properties", None)
             if isinstance(props, dict):
@@ -304,17 +358,24 @@ class AnalysisWorker(threading.Thread):
                 props["energy_density"] = energy_density
                 props["peak_freq_hz"] = peak_freq
                 props["peak_wavelength_s"] = peak_wavelength
+                if np.isfinite(interval_sec):
+                    props["interval_sec"] = float(interval_sec)
             last_end = candidate_last_end
-            events.append((event, last_end))
+            events.append((event, last_end, float(crossing_time)))
+            prev_crossing_time = float(crossing_time)
 
         if not events:
-            return
+            return []
 
-        for event, new_last_end in events:
+        collected: list[Event] = []
+        for event, new_last_end, crossing_time in events:
             self.publish_event(event)
             with self._state_lock:
                 if new_last_end > self._last_window_end_sample:
                     self._last_window_end_sample = new_last_end
+                self._last_crossing_time_sec = float(crossing_time)
+            collected.append(event)
+        return collected
 
     @staticmethod
     def _waveform_crosses_threshold(waveform: np.ndarray, threshold: float) -> bool:
@@ -324,31 +385,124 @@ class AnalysisWorker(threading.Thread):
             return bool(np.nanmax(waveform) >= threshold)
         return bool(np.nanmin(waveform) <= threshold)
 
-def _peak_frequency_sinc(samples: np.ndarray, sr: float) -> float:
-    if samples.size == 0 or sr <= 0:
+def _peak_frequency_sinc(
+    samples: np.ndarray,
+    sr: float,
+    *,
+    min_hz: float = 50.0,
+    center_index: Optional[int] = None,
+) -> float:
+    if sr <= 0:
         return 0.0
-    x = np.asarray(samples, dtype=np.float64)
-    x -= np.median(x)
-    window = np.blackman(x.size)
-    tapered = x * window
-    n_fft_min = max(2048, x.size * 8)
-    n_fft = 1 << max(0, int(np.ceil(np.log2(n_fft_min))))
+    data = np.asarray(samples, dtype=np.float64)
+    if data.size < 8:
+        return 0.0
+    if not np.any(np.isfinite(data)):
+        return 0.0
+
+    data = np.nan_to_num(data, nan=0.0, copy=False)
+    center = (
+        int(center_index)
+        if center_index is not None and 0 <= int(center_index) < data.size
+        else int(np.argmax(np.abs(data)))
+    )
+
+    span = max(64, int(round(sr * 0.008)))  # ~8 ms window
+    half = span // 2
+    start = max(0, center - half)
+    end = min(data.size, start + span)
+    if end - start < 32:
+        return 0.0
+    segment = data[start:end].copy()
+
+    # Remove mean and linear trend to suppress low-frequency energy
+    segment -= np.mean(segment)
+    idxs = np.arange(segment.size, dtype=np.float64)
+    centered = idxs - idxs.mean()
+    denom = float(np.dot(centered, centered))
+    if denom > 0:
+        slope = float(np.dot(centered, segment) / denom)
+        segment -= slope * centered
+
+    if not np.any(segment):
+        return 0.0
+
+    window = np.hanning(segment.size)
+    tapered = segment * window
+    target = max(4096, segment.size * 8)
+    n_fft = 1 << int(math.ceil(math.log2(target)))
     spectrum = np.fft.rfft(tapered, n=n_fft)
-    freqs = np.fft.rfftfreq(n_fft, d=1.0 / sr)
     mags = np.abs(spectrum)
-    if mags.size <= 1:
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / sr)
+    if freqs.size != mags.size or mags.size <= 1:
         return 0.0
-    mags[freqs < 50.0] = 0.0
-    peak_idx = int(np.argmax(mags))
-    if peak_idx <= 0 or peak_idx >= mags.size - 1:
-        return float(max(0.0, freqs[peak_idx]))
-    alpha = mags[peak_idx - 1]
-    beta = mags[peak_idx]
-    gamma = mags[peak_idx + 1]
-    denom = max((alpha - 2 * beta + gamma), 1e-12)
-    delta = 0.5 * (alpha - gamma) / denom
-    peak_bin = peak_idx + delta
-    freq = peak_bin * sr / n_fft
-    if freq < 50.0:
+
+    max_freq = min(sr / 6.0, 1000.0)
+    valid = (freqs >= max(min_hz, 1.0)) & (freqs <= max_freq)
+    if not np.any(valid):
         return 0.0
-    return float(freq)
+    mags = mags[valid]
+    freqs = freqs[valid]
+    if not np.any(np.isfinite(mags)):
+        return 0.0
+    power = mags * mags
+    if power.size >= 3:
+        kernel = np.array([0.25, 0.5, 0.25], dtype=np.float64)
+        power = np.convolve(power, kernel, mode="same")
+    peak_idx = int(np.argmax(power))
+    peak_freq = freqs[peak_idx]
+
+    # Quadratic interpolation for sub-bin precision when neighbors exist
+    if 0 < peak_idx < mags.size - 1:
+        alpha, beta, gamma = mags[peak_idx - 1 : peak_idx + 2]
+        denom = alpha - 2 * beta + gamma
+        if abs(denom) > 1e-12:
+            delta = 0.5 * (alpha - gamma) / denom
+            delta = float(np.clip(delta, -1.0, 1.0))
+            bin_width = freqs[1] - freqs[0]
+            peak_freq += delta * bin_width
+
+    peak_freq = float(max(0.0, peak_freq))
+    if peak_freq >= max_freq * 0.98 or peak_freq <= min_hz * 1.02:
+        return _autocorr_frequency(segment, sr, min_hz, max_hz=max_freq)
+    auto_freq = _autocorr_frequency(segment, sr, min_hz, max_hz=max_freq)
+    if auto_freq <= 0.0:
+        return peak_freq
+    if peak_freq < min_hz:
+        return auto_freq
+    rel_diff = abs(auto_freq - peak_freq) / max(min(auto_freq, peak_freq), 1e-6)
+    if rel_diff > 0.25:
+        return auto_freq
+    return peak_freq
+
+
+def _autocorr_frequency(segment: np.ndarray, sr: float, min_hz: float, max_hz: float) -> float:
+    if sr <= 0 or segment.size < 2 or max_hz <= min_hz:
+        return 0.0
+    data = np.asarray(segment, dtype=np.float64)
+    if not np.any(np.isfinite(data)):
+        return 0.0
+    corr = np.correlate(data, data, mode="full")
+    corr = corr[corr.size // 2 :]
+    if corr.size <= 1:
+        return 0.0
+    counts = np.arange(corr.size, 0, -1, dtype=np.float64)
+    corr = corr / counts
+    corr[0] = 0.0
+    max_period = min(int(sr / max(min_hz, 1e-6)), corr.size - 1)
+    min_period = max(1, int(sr / max(max_hz, 1e-6)))
+    if max_period <= min_period:
+        return 0.0
+    segment_corr = corr[min_period : max_period + 1]
+    lags = np.arange(min_period, max_period + 1, dtype=np.float64)
+    if segment_corr.size != lags.size or not np.any(np.isfinite(segment_corr)):
+        return 0.0
+    scores = segment_corr * np.sqrt(np.maximum(1.0, lags))
+    best_idx = int(np.argmax(scores))
+    if best_idx <= 0 or best_idx >= segment_corr.size - 1:
+        return 0.0
+    lag = int(lags[best_idx])
+    if lag <= 0:
+        return 0.0
+    freq = sr / lag
+    return float(freq if freq >= min_hz else 0.0)
