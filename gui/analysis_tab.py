@@ -134,8 +134,8 @@ class AnalysisTab(QtWidgets.QWidget):
 
         controls = QtWidgets.QGroupBox("Display")
         controls_layout = QtWidgets.QHBoxLayout()
-        controls_layout.setContentsMargins(14, 14, 14, 12)
-        controls_layout.setSpacing(16)
+        controls_layout.setContentsMargins(8, 10, 8, 10)
+        controls_layout.setSpacing(12)
 
         size_layout = QtWidgets.QVBoxLayout()
         size_layout.setSpacing(4)
@@ -144,6 +144,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self.pause_viz_btn.setCheckable(True)
         self.pause_viz_btn.setToolTip("Pause/resume updating the raw trace (analysis continues).")
         self.pause_viz_btn.toggled.connect(self._on_pause_viz_toggled)
+        self.pause_viz_btn.setFixedWidth(90)
         size_layout.addWidget(self.pause_viz_btn)
 
         width_row = QtWidgets.QHBoxLayout()
@@ -151,7 +152,7 @@ class AnalysisTab(QtWidgets.QWidget):
         width_row.addWidget(QtWidgets.QLabel("Width (s)"))
         self.width_combo = QtWidgets.QComboBox()
         self.width_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
-        self.width_combo.setMinimumWidth(110)
+        self.width_combo.setFixedWidth(80)
         for value in (0.2, 0.5, 1.0, 2.0, 5.0):
             self.width_combo.addItem(f"{value:.1f}", value)
         self.width_combo.setCurrentIndex(1)
@@ -163,7 +164,7 @@ class AnalysisTab(QtWidgets.QWidget):
         height_row.addWidget(QtWidgets.QLabel("Height (±V)"))
         self.height_combo = QtWidgets.QComboBox()
         self.height_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
-        self.height_combo.setMinimumWidth(110)
+        self.height_combo.setFixedWidth(80)
         for value in (0.1, 0.2, 0.5, 1.0, 2.0, 5.0):
             self.height_combo.addItem(f"{value:.1f}", value)
         self.height_combo.setCurrentIndex(3)
@@ -771,8 +772,10 @@ class AnalysisTab(QtWidgets.QWidget):
         metric = self._selected_y_metric()
         if metric == "ed":
             self.metrics_plot.setLabel("left", "Energy Density (V²/s)")
-        elif metric in {"max", "min"}:
-            self.metrics_plot.setLabel("left", "Amplitude (V)")
+        elif metric == "max":
+            self.metrics_plot.setLabel("left", "Max Amplitude (V)")
+        elif metric == "min":
+            self.metrics_plot.setLabel("left", "Min Amplitude (V)")
         elif metric == "freq":
             self.metrics_plot.setLabel("left", "Peak Frequency (Hz)")
         elif metric == "period":
@@ -786,8 +789,10 @@ class AnalysisTab(QtWidgets.QWidget):
             self.metrics_plot.setLabel("bottom", "Time (s)")
         elif x_metric == "ed":
             self.metrics_plot.setLabel("bottom", "Energy Density (V²/s)")
-        elif x_metric in {"max", "min"}:
-            self.metrics_plot.setLabel("bottom", "Amplitude (V)")
+        elif x_metric == "max":
+            self.metrics_plot.setLabel("bottom", "Max Amplitude (V)")
+        elif x_metric == "min":
+            self.metrics_plot.setLabel("bottom", "Min Amplitude (V)")
         elif x_metric == "freq":
             self.metrics_plot.setLabel("bottom", "Peak Frequency (Hz)")
         else:

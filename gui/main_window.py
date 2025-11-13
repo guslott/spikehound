@@ -1113,6 +1113,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._controller is not None:
             self._controller.detach_device()
             self._controller.clear_active_channels()
+            self._drain_visualization_queue()
         if self._dispatcher_signals is not None:
             try:
                 self._dispatcher_signals.tick.disconnect(self._on_dispatcher_tick)
@@ -1120,6 +1121,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
             self._dispatcher_signals = None
         self._clear_listen_channel()
+        self._stop_audio_router()
         self._reset_trigger_state()
         self.available_combo.clear()
         self.active_list.clear()
@@ -1127,6 +1129,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.set_trigger_channels([])
         self._update_channel_buttons()
         self._publish_active_channels()
+        self._clear_scope_display()
+        if hasattr(self, "_analysis_dock") and self._analysis_dock is not None:
+            try:
+                self._analysis_dock.shutdown()
+            except Exception:
+                pass
 
     def _on_available_channels(self, channels: Sequence[object]) -> None:
         self.available_combo.clear()
@@ -2126,6 +2134,39 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_status(viz_depth=0)
         if self._controller is not None:
             self._controller.update_window_span(self._current_window_sec)
+
+    def _clear_scope_display(self) -> None:
+        plot_item = self.plot_widget.getPlotItem()
+        for curve in list(self._curve_map.values()):
+            try:
+                plot_item.removeItem(curve)
+            except Exception:
+                pass
+        self._curve_map.clear()
+        for curve in self._curves:
+            try:
+                curve.clear()
+            except Exception:
+                pass
+        self._curves = []
+        self._channel_display_buffers.clear()
+        self._channel_ids_current = []
+        self._channel_names = []
+        self._active_channel_id = None
+        self._apply_active_channel_style()
+        default_window = float(self.window_combo.currentData() or 1.0)
+        self._current_window_sec = max(default_window, 1e-3)
+        plot_item.setXRange(0.0, self._current_window_sec, padding=0.0)
+        self._update_plot_y_range()
+        self.threshold_line.setVisible(False)
+        self.pretrigger_line.setVisible(False)
+        self._current_sample_rate = 0.0
+        self._chunk_rate = 0.0
+        self._chunk_mean_samples = 0.0
+        self._chunk_accum_count = 0
+        self._chunk_accum_samples = 0
+        self._chunk_last_rate_update = time.perf_counter()
+        self._update_status(viz_depth=0)
 
     def _ensure_curves_for_ids(self, channel_ids: Sequence[int], channel_names: Sequence[str]) -> None:
         """Synchronize the pyqtgraph PlotCurveItems with the current active channel list."""

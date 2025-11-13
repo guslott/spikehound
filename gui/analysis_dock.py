@@ -157,6 +157,11 @@ class AnalysisDock(QtWidgets.QDockWidget):
             worker = info.get("worker") if isinstance(info, dict) else None
             if isinstance(worker, AnalysisWorker):
                 worker.stop()
+            if hasattr(widget, "_release_metrics"):
+                try:
+                    widget._release_metrics()
+                except Exception:
+                    pass
             if self._tabs.indexOf(widget) >= 0:
                 self._tabs.removeTab(self._tabs.indexOf(widget))
             widget.deleteLater()
