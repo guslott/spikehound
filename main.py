@@ -20,3 +20,11 @@ if __name__ == "__main__":
 # - Button to export of events list to CSV
 # - Buttons to pop up windows for screen shotting
 # - DAQ devices need to provide discrete sample rate settings rather than arbitrary ones
+
+# - Features supporting individual spike classes.
+#   - Option to view waveforms of individual all overlayed together in a plot aligned to their peaks
+#       - Should shrink the analysis scatter to left and create an axis that shows the spikes together
+#       - Support exporting these spikes in a class separately to a CSV file
+
+# - Feature for cross channel correlation
+#   - Spike triggered averaging of one channel based on spikes detected in another channel

@@ -106,8 +106,10 @@ class SettingsTab(QtWidgets.QWidget):
         layout.setContentsMargins(12, 10, 12, 10)
         layout.addWidget(QtWidgets.QLabel("SpikeHound"))
         layout.addWidget(QtWidgets.QLabel("Dr. Gus Lott & Taylor Mangoba"))
-        layout.addWidget(QtWidgets.QLabel("License: MIT"))
-        link = QtWidgets.QLabel('<a href="https://github.com/guslott/spikehound">GitHub Repository</a>')
+        layout.addWidget(QtWidgets.QLabel("License: 0BSD"))
+        link = QtWidgets.QLabel(
+            '<span>Github Repo: <a href="https://github.com/guslott/spikehound/">github.com/guslott/spikehound/</a></span>'
+        )
         link.setOpenExternalLinks(True)
         layout.addWidget(link)
         return box
