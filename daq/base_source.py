@@ -349,6 +349,23 @@ class BaseSource(ABC):
                     idx = [self._index_of_channel_id(cid) for cid in self._active_channel_ids]
                     data = data[:, idx]
                     frames, chans = data.shape
+                elif chans < expected_chans:
+                    actual_ids = None
+                    if meta is not None:
+                        actual_ids = meta.get("active_channel_ids")
+                    if isinstance(actual_ids, Sequence):
+                        out = np.zeros((frames, expected_chans), dtype=data.dtype)
+                        id_to_col = {cid: i for i, cid in enumerate(actual_ids)}
+                        for out_idx, cid in enumerate(self._active_channel_ids):
+                            src_idx = id_to_col.get(cid)
+                            if src_idx is not None and src_idx < chans:
+                                out[:, out_idx] = data[:, src_idx]
+                        data = out
+                        chans = data.shape[1]
+                    else:
+                        raise ValueError(
+                            f"data has {chans} channels, expected {expected_chans}."
+                        )
                 else:
                     raise ValueError(
                         f"data has {chans} channels, expected {expected_chans}."

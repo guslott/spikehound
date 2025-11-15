@@ -286,7 +286,8 @@ class SimulatedPhysiologySource(BaseSource):
                     data_chunk += hum[:, None]
                     self._line_hum_phase = (self._line_hum_phase + self._line_hum_omega * chunk_size) % (2.0 * np.pi)
 
-                self.emit_array(data_chunk, mono_time=loop_start)
+                chunk_meta = {"active_channel_ids": list(active_ids)}
+                self.emit_array(data_chunk, mono_time=loop_start, meta=chunk_meta)
 
                 # Advance buffers for the next chunk
                 if chunk_size < buf_len:

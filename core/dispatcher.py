@@ -71,6 +71,7 @@ class Dispatcher:
         self._buffer_len: int = 0
         self._write_idx: int = 0
         self._filled: int = 0
+        self._latest_sample_index: int = -1
         self._sample_rate: Optional[float] = None
         self._window_sec: float = 0.2
         self._channel_names: tuple[str, ...] = tuple()
@@ -115,6 +116,7 @@ class Dispatcher:
         with self._ring_lock:
             self._active_channel_ids = []
             self._filled = 0
+            self._latest_sample_index = -1
 
     def set_channel_layout(self, channel_ids: Sequence[int], channel_names: Sequence[str]) -> None:
         with self._ring_lock:
@@ -125,6 +127,7 @@ class Dispatcher:
             self._buffer_len = 0
             self._write_idx = 0
             self._filled = 0
+            self._latest_sample_index = -1
 
     def reset_buffers(self) -> None:
         with self._ring_lock:
@@ -132,6 +135,7 @@ class Dispatcher:
                 self._ring_buffer.fill(0.0)
             self._write_idx = 0
             self._filled = 0
+            self._latest_sample_index = -1
 
     def emit_empty_tick(self) -> None:
         self.signals.tick.emit(self._empty_payload())
@@ -387,6 +391,112 @@ class Dispatcher:
                 "status": status,
             }
 
+    def collect_window(
+        self,
+        start_index: int,
+        window_samples: int,
+        channel_id: int,
+        *,
+        return_info: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, int, int]:
+        """Return a window of samples for channel_id starting at start_index.
+
+        When ``return_info`` is True, the method returns a tuple of
+        (samples, missing_prefix, missing_suffix) where the missing values
+        indicate how many samples at the start/end were unavailable.
+        """
+        window_samples = int(window_samples)
+        if window_samples <= 0:
+            result = np.empty(0, dtype=np.float32)
+            if return_info:
+                return result, 0, 0
+            return result
+        with self._ring_lock:
+            if (
+                self._ring_buffer is None
+                or self._filled == 0
+                or self._latest_sample_index < 0
+                or self._buffer_len <= 0
+            ):
+                zeros = np.zeros(window_samples, dtype=np.float32)
+                if return_info:
+                    return zeros, window_samples, window_samples
+                return zeros
+            channel_idx = self._channel_index_map.get(int(channel_id))
+            if channel_idx is None or not (0 <= channel_idx < self._ring_buffer.shape[0]):
+                zeros = np.zeros(window_samples, dtype=np.float32)
+                if return_info:
+                    return zeros, window_samples, window_samples
+                return zeros
+            if self._filled < window_samples:
+                zeros = np.zeros(window_samples, dtype=np.float32)
+                if return_info:
+                    return zeros, window_samples, window_samples
+                return zeros
+            start_idx = int(start_index)
+            if start_idx < 0:
+                zeros = np.zeros(window_samples, dtype=np.float32)
+                if return_info:
+                    return zeros, window_samples, window_samples
+                return zeros
+            earliest = self._latest_sample_index - (self._filled - 1)
+            latest = self._latest_sample_index + 1  # exclusive
+            desired_start = start_idx
+            desired_end = start_idx + window_samples
+            actual_start = max(desired_start, earliest)
+            actual_end = min(desired_end, latest)
+            if actual_start >= actual_end:
+                zeros = np.zeros(window_samples, dtype=np.float32)
+                if return_info:
+                    return zeros, window_samples, window_samples
+                return zeros
+            missing_prefix = max(0, earliest - desired_start)
+            missing_suffix = max(0, desired_end - latest)
+            available_count = window_samples - missing_prefix - missing_suffix
+            if available_count <= 0:
+                zeros = np.zeros(window_samples, dtype=np.float32)
+                if return_info:
+                    return zeros, window_samples, window_samples
+                return zeros
+            buffer_len = self._buffer_len
+            if buffer_len <= 0:
+                zeros = np.zeros(window_samples, dtype=np.float32)
+                if return_info:
+                    return zeros, window_samples, window_samples
+                return zeros
+            start_ptr = (self._write_idx - self._filled) % buffer_len
+            start_offset = actual_start - earliest
+            start_pos = (start_ptr + start_offset) % buffer_len
+            channel_data = self._ring_buffer[channel_idx]
+            extracted: np.ndarray
+            if start_pos + available_count <= buffer_len:
+                extracted = channel_data[start_pos : start_pos + available_count].copy()
+            else:
+                first = buffer_len - start_pos
+                take_first = min(first, available_count)
+                part1 = channel_data[start_pos : start_pos + take_first].copy()
+                remaining = available_count - take_first
+                if remaining > 0:
+                    part2 = channel_data[:remaining].copy()
+                    extracted = np.concatenate((part1, part2), axis=0)
+                else:
+                    extracted = part1
+            if extracted.size > available_count:
+                extracted = extracted[:available_count]
+            result = np.empty(window_samples, dtype=np.float32)
+            pos = 0
+            if missing_prefix > 0:
+                result[:missing_prefix] = 0.0
+                pos = missing_prefix
+            if extracted.size:
+                result[pos : pos + extracted.size] = extracted
+                pos += extracted.size
+            if pos < window_samples:
+                result[pos:] = 0.0
+            if return_info:
+                return result, missing_prefix, missing_suffix
+            return result
+
     def _update_ring_buffer(self, chunk: Chunk) -> None:
         with self._ring_lock:
             self._ensure_buffer_for_chunk_locked(chunk)
@@ -395,16 +505,32 @@ class Dispatcher:
 
             data = chunk.samples
             frames = data.shape[1]
+            if frames <= 0:
+                return
             buffer_len = self._buffer_len
 
             if not self._channel_ids or len(self._channel_ids) != data.shape[0]:
                 self._channel_ids = tuple(self._active_channel_ids) if self._active_channel_ids else tuple(range(data.shape[0]))
                 self._channel_index_map = {cid: idx for idx, cid in enumerate(self._channel_ids)}
 
+            start_sample = None
+            meta = chunk.meta
+            if meta is not None:
+                raw_start = meta.get("start_sample")
+                if raw_start is not None:
+                    try:
+                        start_sample = int(raw_start)
+                    except (TypeError, ValueError):
+                        start_sample = None
+            if start_sample is None:
+                start_sample = chunk.seq * chunk.n_samples
+            end_sample = int(start_sample) + frames - 1
+
             if frames >= buffer_len:
                 self._ring_buffer[:, :] = data[:, -buffer_len:]
                 self._write_idx = 0
                 self._filled = buffer_len
+                self._latest_sample_index = end_sample
                 return
 
             end = self._write_idx + frames
@@ -416,6 +542,7 @@ class Dispatcher:
                 self._ring_buffer[:, : frames - first] = data[:, first:]
             self._write_idx = (self._write_idx + frames) % buffer_len
             self._filled = min(buffer_len, self._filled + frames)
+            self._latest_sample_index = end_sample
 
     def _ensure_buffer_for_chunk_locked(self, chunk: Chunk) -> None:
         prev_sample_rate = self._sample_rate
@@ -442,6 +569,7 @@ class Dispatcher:
             self._buffer_len = desired_len
             self._write_idx = 0
             self._filled = 0
+            self._latest_sample_index = -1
         else:
             self._ensure_buffer_capacity_locked()
 

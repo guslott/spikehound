@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from analysis.settings import AnalysisSettingsStore
     from core.controller import PipelineController
     from shared.event_buffer import EventRingBuffer
+    from daq.base_source import ChannelInfo
 
 
 class ClusterRectROI(pg.ROI):
@@ -163,6 +164,15 @@ class AnalysisTab(QtWidgets.QWidget):
         self._cluster_id_counter: int = 0
         self._cluster_items: dict[int, QtWidgets.QListWidgetItem] = {}
         self._selected_cluster_id: int | None = None
+        self._sta_enabled: bool = False
+        self._sta_windows: list[np.ndarray] = []
+        self._sta_time_axis: np.ndarray | None = None
+        self._sta_window_ms: float = 50.0
+        self._sta_source_cluster_id: int | None = None
+        self._sta_target_channel_id: int | None = None
+        self._sta_max_events: int = 1000
+        self._sta_pending_events: dict[int, tuple[Event, int]] = {}
+        self._sta_retry_limit: int = 10
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -172,6 +182,11 @@ class AnalysisTab(QtWidgets.QWidget):
         self.title_label.setAlignment(QtCore.Qt.AlignCenter)
         self.title_label.setStyleSheet("font-weight: bold; font-size: 13px;")
         layout.addWidget(self.title_label)
+
+        self.raw_row_widget = QtWidgets.QWidget(self)
+        self.raw_row_layout = QtWidgets.QHBoxLayout(self.raw_row_widget)
+        self.raw_row_layout.setContentsMargins(0, 0, 0, 0)
+        self.raw_row_layout.setSpacing(6)
 
         self.plot_widget = pg.PlotWidget(enableMenu=False)
         try:
@@ -183,10 +198,27 @@ class AnalysisTab(QtWidgets.QWidget):
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self.plot_widget.setLabel("bottom", "Time", units="s")
         self.plot_widget.setLabel("left", "Amplitude", units="V")
-        self.plot_widget.getPlotItem().setXRange(0.0, 1.0, padding=0.0)
-        self.plot_widget.getPlotItem().setYRange(-1.0, 1.0, padding=0.0)
+        plot_item = self.plot_widget.getPlotItem()
+        plot_item.setXRange(0.0, 1.0, padding=0.0)
+        plot_item.setYRange(-1.0, 1.0, padding=0.0)
         self.plot_widget.setMouseEnabled(x=False, y=False)
-        layout.addWidget(self.plot_widget, stretch=4)
+        self.raw_row_layout.addWidget(self.plot_widget, stretch=7)
+
+        self.sta_plot = pg.PlotWidget(enableMenu=False)
+        try:
+            self.sta_plot.hideButtons()
+        except Exception:
+            pass
+        self.sta_plot.setBackground(pg.mkColor(250, 250, 252))
+        self.sta_plot.showGrid(x=True, y=True, alpha=0.25)
+        self.sta_plot.setLabel("bottom", "Lag", units="s")
+        self.sta_plot.setLabel("left", "Amplitude", units="V")
+        self.sta_plot.setMouseEnabled(x=False, y=False)
+        self.raw_row_layout.addWidget(self.sta_plot, stretch=3)
+        self.sta_plot.setAntialiasing(False)
+
+        layout.addWidget(self.raw_row_widget, stretch=4)
+        self._hide_sta_plot()
 
         self.metrics_plot = pg.PlotWidget(enableMenu=False)
         try:
@@ -334,10 +366,54 @@ class AnalysisTab(QtWidgets.QWidget):
         metrics_layout.addStretch(1)
 
         controls_layout.addLayout(metrics_layout)
+
+        sta_layout = QtWidgets.QVBoxLayout()
+        sta_layout.setSpacing(4)
+
+        self.sta_enable_check = QtWidgets.QCheckBox("Enable Cross Channel Correlation")
+        self.sta_enable_check.setChecked(False)
+        self.sta_enable_check.toggled.connect(self._on_sta_toggled)
+        sta_layout.addWidget(self.sta_enable_check)
+
+        sta_source_row = QtWidgets.QHBoxLayout()
+        sta_source_row.setSpacing(6)
+        sta_source_row.addWidget(QtWidgets.QLabel("Event source"))
+        self.sta_source_combo = QtWidgets.QComboBox()
+        self.sta_source_combo.addItem("All events")
+        self.sta_source_combo.currentIndexChanged.connect(self._on_sta_source_changed)
+        sta_source_row.addWidget(self.sta_source_combo)
+        sta_layout.addLayout(sta_source_row)
+
+        sta_channel_row = QtWidgets.QHBoxLayout()
+        sta_channel_row.setSpacing(6)
+        sta_channel_row.addWidget(QtWidgets.QLabel("Signal channel"))
+        self.sta_channel_combo = QtWidgets.QComboBox()
+        self.sta_channel_combo.currentIndexChanged.connect(self._on_sta_channel_changed)
+        sta_channel_row.addWidget(self.sta_channel_combo)
+        sta_layout.addLayout(sta_channel_row)
+
+        sta_window_row = QtWidgets.QHBoxLayout()
+        sta_window_row.setSpacing(6)
+        sta_window_row.addWidget(QtWidgets.QLabel("Window (ms)"))
+        self.sta_window_combo = QtWidgets.QComboBox()
+        for label, value in (("20", 20.0), ("50", 50.0), ("100", 100.0)):
+            self.sta_window_combo.addItem(label, value)
+        self.sta_window_combo.setCurrentIndex(1)
+        self.sta_window_combo.currentIndexChanged.connect(self._on_sta_window_changed)
+        sta_window_row.addWidget(self.sta_window_combo)
+        sta_layout.addLayout(sta_window_row)
+
+        self.sta_clear_btn = QtWidgets.QPushButton("Clear STA")
+        self.sta_clear_btn.clicked.connect(self._on_sta_clear_clicked)
+        sta_layout.addWidget(self.sta_clear_btn)
+        sta_layout.addStretch(1)
+
+        controls_layout.addLayout(sta_layout)
         controls_layout.addStretch(1)
 
         controls.setLayout(controls_layout)
         layout.addWidget(controls, stretch=2)
+        self._refresh_sta_source_options()
 
         self.metrics_container = QtWidgets.QWidget(self)
         metrics_container_layout = QtWidgets.QHBoxLayout(self.metrics_container)
@@ -504,6 +580,9 @@ class AnalysisTab(QtWidgets.QWidget):
             except AttributeError:
                 pass
         self._notify_threshold_change()
+
+    def set_sta_channels(self, channels: Sequence["ChannelInfo"]) -> None:
+        self._refresh_sta_channel_options(channels)
 
     def peek_all_events(self) -> list[Event]:
         if self._event_buffer is None:
@@ -809,6 +888,7 @@ class AnalysisTab(QtWidgets.QWidget):
         width: float,
         window_start_idx: Optional[int],
     ) -> None:
+        pending_sta = bool(getattr(self, "_sta_pending_events", None))
         if events:
             for event in events:
                 overlay = self._build_overlay(event)
@@ -821,6 +901,10 @@ class AnalysisTab(QtWidgets.QWidget):
                 self._event_overlays.append(overlay)
                 self._record_overlay_metrics(overlay)
             self._update_metric_points()
+            if self._sta_enabled:
+                self._sta_handle_events(events)
+        elif self._sta_enabled and pending_sta:
+            self._sta_handle_events(())
         if not self._viz_paused:
             self._refresh_overlay_positions(window_start, width, window_start_idx)
 
@@ -995,6 +1079,60 @@ class AnalysisTab(QtWidgets.QWidget):
             self.metrics_container_layout.setStretchFactor(self.metrics_plot, 1)
             self.metrics_container_layout.setStretchFactor(self.cluster_panel, 0)
 
+    def _refresh_sta_source_options(self) -> None:
+        """Populate the STA event source combo: 'All events' + spike classes."""
+        if not hasattr(self, "sta_source_combo"):
+            return
+        previous_selection = self._sta_source_cluster_id
+        was_blocked = self.sta_source_combo.blockSignals(True)
+        self.sta_source_combo.clear()
+        self.sta_source_combo.addItem("All events", None)
+        for cluster in self._clusters:
+            self.sta_source_combo.addItem(cluster.name, cluster.id)
+        target_index = self.sta_source_combo.findData(previous_selection)
+        if target_index >= 0:
+            self.sta_source_combo.setCurrentIndex(target_index)
+        else:
+            self.sta_source_combo.setCurrentIndex(0)
+        current_data = self.sta_source_combo.currentData()
+        self._sta_source_cluster_id = current_data if isinstance(current_data, int) else None
+        self.sta_source_combo.blockSignals(was_blocked)
+
+    def _refresh_sta_channel_options(self, channels: Sequence["ChannelInfo"]) -> None:
+        """Populate the STA signal channel combo from the active channels."""
+        combo = getattr(self, "sta_channel_combo", None)
+        if combo is None:
+            return
+        previous = self._sta_target_channel_id
+        block_state = combo.blockSignals(True)
+        combo.clear()
+        for ch in channels:
+            cid = getattr(ch, "id", None)
+            name = getattr(ch, "name", f"Channel {cid}")
+            combo.addItem(str(name), cid)
+        combo.blockSignals(block_state)
+        target_index = combo.findData(previous) if previous is not None else -1
+        if target_index < 0 and self._channel_index is not None:
+            target_index = combo.findData(int(self._channel_index))
+        if target_index < 0 and combo.count():
+            target_index = 0
+        if target_index >= 0:
+            combo.setCurrentIndex(target_index)
+            data = combo.itemData(target_index)
+            self._sta_target_channel_id = data if isinstance(data, int) else None
+        else:
+            self._sta_target_channel_id = None
+
+    def _show_sta_plot(self) -> None:
+        self.sta_plot.show()
+        self.raw_row_layout.setStretchFactor(self.plot_widget, 7)
+        self.raw_row_layout.setStretchFactor(self.sta_plot, 3)
+
+    def _hide_sta_plot(self) -> None:
+        self.sta_plot.hide()
+        self.raw_row_layout.setStretchFactor(self.plot_widget, 10)
+        self.raw_row_layout.setStretchFactor(self.sta_plot, 0)
+
     def _get_cluster_for_event(self, event_id: int | None) -> MetricCluster | None:
         if event_id is None:
             return None
@@ -1031,6 +1169,157 @@ class AnalysisTab(QtWidgets.QWidget):
         self._update_cluster_button_states()
         self._refresh_overlay_colors()
 
+    def _on_sta_toggled(self, checked: bool) -> None:
+        self._sta_enabled = bool(checked)
+        if self._sta_enabled:
+            self._show_sta_plot()
+            self._on_sta_clear_clicked()
+        else:
+            self._hide_sta_plot()
+            self._sta_windows.clear()
+            self._sta_time_axis = None
+            self.sta_plot.clear()
+            self._sta_pending_events.clear()
+
+    def _on_sta_source_changed(self, index: int) -> None:
+        if index < 0:
+            self._sta_source_cluster_id = None
+        else:
+            data = self.sta_source_combo.itemData(index)
+            self._sta_source_cluster_id = data if isinstance(data, int) else None
+        self._on_sta_clear_clicked()
+
+    def _on_sta_channel_changed(self, index: int) -> None:
+        if index < 0:
+            self._sta_target_channel_id = None
+        else:
+            data = self.sta_channel_combo.itemData(index)
+            if isinstance(data, int):
+                self._sta_target_channel_id = data
+            else:
+                self._sta_target_channel_id = index if self.sta_channel_combo.count() else None
+        self._on_sta_clear_clicked()
+
+    def _on_sta_window_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        value = self.sta_window_combo.itemData(index)
+        if value is None:
+            try:
+                value = float(self.sta_window_combo.currentText())
+            except ValueError:
+                value = self._sta_window_ms
+        self._sta_window_ms = float(value)
+        self._on_sta_clear_clicked()
+
+    def _on_sta_clear_clicked(self) -> None:
+        self._sta_windows.clear()
+        self._sta_time_axis = None
+        self.sta_plot.clear()
+        self._sta_pending_events.clear()
+        if self._sta_enabled:
+            self._refresh_sta_plot()
+
+    def _sta_handle_events(self, events: Sequence[Event]) -> None:
+        if not self._sta_enabled:
+            return
+        controller = self._controller
+        if controller is None:
+            return
+        target_channel_id = self._sta_target_channel_id
+        if target_channel_id is None:
+            return
+        channel_info = None
+        if hasattr(self, "_channel_index") and self._channel_index is not None:
+            channel_info = int(self._channel_index)
+        pending_items = list(self._sta_pending_events.values())
+        self._sta_pending_events.clear()
+        queue: list[tuple[Event, int]] = [(event, 0) for event in events]
+        queue.extend(pending_items)
+        updated = False
+        for event, attempts in queue:
+            status = self._sta_process_event(controller, target_channel_id, channel_info, event)
+            if status == "added":
+                updated = True
+            elif status == "pending":
+                event_id = getattr(event, "id", None)
+                if not isinstance(event_id, int):
+                    continue
+                if attempts >= self._sta_retry_limit:
+                    continue
+                self._sta_pending_events[event_id] = (event, attempts + 1)
+        if updated:
+            if len(self._sta_windows) > self._sta_max_events:
+                self._sta_windows = self._sta_windows[-self._sta_max_events :]
+            self._refresh_sta_plot()
+
+    def _sta_process_event(
+        self,
+        controller: "PipelineController",
+        target_channel_id: int,
+        channel_info: Optional[int],
+        event: Event,
+    ) -> str:
+        event_channel = getattr(event, "channelId", getattr(event, "channel_id", None))
+        if event_channel is not None and channel_info is not None:
+            try:
+                if int(event_channel) != int(channel_info):
+                    return "skip"
+            except (TypeError, ValueError):
+                return "skip"
+        event_id = getattr(event, "id", None)
+        if self._sta_source_cluster_id is not None:
+            if not isinstance(event_id, int):
+                return "skip"
+            cluster = self._get_cluster_for_event(event_id)
+            if cluster is None or cluster.id != self._sta_source_cluster_id:
+                return "skip"
+        window, miss_pre, miss_post = controller.collect_trigger_window(
+            event,
+            target_channel_id=target_channel_id,
+            window_ms=self._sta_window_ms,
+        )
+        if miss_pre > 0:
+            return "skip"
+        if miss_post > 0:
+            return "pending"
+        if window.size == 0:
+            return "pending"
+        pre_n = max(1, int(0.2 * window.size))
+        baseline = float(np.median(window[:pre_n]))
+        normalized = window.astype(np.float32, copy=False) - baseline
+        self._sta_windows.append(normalized)
+        return "added"
+
+    def _refresh_sta_plot(self) -> None:
+        """Redraw the spike-triggered average plot."""
+        plot_item = self.sta_plot.getPlotItem()
+        plot_item.clear()
+        if not self._sta_windows:
+            return
+        min_len = min(w.size for w in self._sta_windows if isinstance(w, np.ndarray))
+        if min_len is None or min_len <= 1:
+            return
+        windows = np.stack([np.asarray(w[:min_len], dtype=np.float32) for w in self._sta_windows], axis=0)
+        if windows.size == 0:
+            return
+        duration_ms = float(self._sta_window_ms)
+        if min_len <= 1:
+            return
+        t = np.linspace(-duration_ms / 2.0, duration_ms / 2.0, min_len, dtype=np.float32)
+        self._sta_time_axis = t
+        for row in windows:
+            curve = pg.PlotCurveItem(t, row, pen=pg.mkPen(70, 70, 70, 150))
+            plot_item.addItem(curve)
+        median = np.median(windows, axis=0)
+        median_curve = pg.PlotCurveItem(t, median, pen=pg.mkPen(255, 140, 0, 255, width=4))
+        median_curve.setZValue(10)
+        plot_item.addItem(median_curve)
+        plot_item.setLabel("bottom", "Lag", units="ms")
+        plot_item.setLabel("left", "Amplitude", units="V")
+        plot_item.showGrid(x=True, y=True, alpha=0.3)
+        plot_item.setXRange(-duration_ms / 2.0, duration_ms / 2.0, padding=0.0)
+
     def _on_add_class_clicked(self) -> None:
         if not self.clustering_enabled_check.isChecked():
             return
@@ -1062,6 +1351,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self.class_list.addItem(item)
         self.class_list.setCurrentItem(item)
         self._cluster_items[cluster_id] = item
+        self._refresh_sta_source_options()
         self._recompute_cluster_membership()
         self._update_metric_points()
         self._update_cluster_visuals()
@@ -1095,6 +1385,7 @@ class AnalysisTab(QtWidgets.QWidget):
         to_remove = [event_id for event_id, cid in self._event_cluster_labels.items() if cid == cluster_id]
         for event_id in to_remove:
             self._event_cluster_labels.pop(event_id, None)
+        self._refresh_sta_source_options()
         self._recompute_cluster_membership()
         self._update_metric_points()
         self._update_cluster_visuals()
@@ -1506,3 +1797,4 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
         t_ref = aligned[0][0]
         median_pen = pg.mkPen(color if color is not None else QtGui.QColor(0, 0, 200), width=3)
         self.plot_widget.plot(t_ref, median_wave, pen=median_pen)
+        self.metrics_plot.setAntialiasing(False)

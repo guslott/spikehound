@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence, TYPE_CHECKING
 
 from PySide6 import QtCore, QtWidgets
 
 from .analysis_tab import AnalysisTab
 from analysis.analysis_worker import AnalysisWorker
+
+if TYPE_CHECKING:
+    from daq.base_source import ChannelInfo
 
 
 class AnalysisDock(QtWidgets.QDockWidget):
@@ -36,6 +39,7 @@ class AnalysisDock(QtWidgets.QDockWidget):
         self._controller = controller
         self._last_sample_rate: float = 0.0
         self._settings_widget: Optional[QtWidgets.QWidget] = None
+        self._active_channels: list["ChannelInfo"] = []
 
     # ------------------------------------------------------------------
     # Scope management
@@ -77,6 +81,7 @@ class AnalysisDock(QtWidgets.QDockWidget):
         if worker is not None:
             widget.set_analysis_queue(worker.output_queue)
             widget.set_worker(worker)
+        widget.set_sta_channels(self._active_channels)
         insert_index = 1 if self._scope_widget is not None else self._tabs.count()
         self._tabs.insertTab(insert_index, widget, title)
         self._tabs.setCurrentWidget(widget)
@@ -84,6 +89,12 @@ class AnalysisDock(QtWidgets.QDockWidget):
         if sample_rate > 0:
             self._last_sample_rate = float(sample_rate)
         return widget
+
+    def update_active_channels(self, channels: Sequence["ChannelInfo"]) -> None:
+        self._active_channels = list(channels)
+        for widget in list(self._tab_info.keys()):
+            if isinstance(widget, AnalysisTab):
+                widget.set_sta_channels(self._active_channels)
 
     def update_sample_rate(self, sample_rate: float) -> None:
         if sample_rate <= 0:

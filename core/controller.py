@@ -4,6 +4,7 @@ import queue
 import threading
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Type
 
+import numpy as np
 from PySide6 import QtCore
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -21,6 +22,7 @@ from .models import Chunk, EndOfStream, TriggerConfig
 from analysis.settings import AnalysisSettingsStore
 from shared.app_settings import AppSettings, AppSettingsStore
 from shared.event_buffer import AnalysisEvents, EventRingBuffer
+from shared.types import Event as SharedEvent
 
 
 def _registry():
@@ -549,6 +551,41 @@ class PipelineController:
         depths["audio"] = _queue_status(self.audio_queue)
         depths["logging"] = _queue_status(self.logging_queue)
         return depths
+
+    def collect_trigger_window(
+        self,
+        event: SharedEvent,
+        target_channel_id: int,
+        window_ms: float,
+    ) -> tuple[np.ndarray, int, int]:
+        """Return samples centered on an event plus missing-prefix/suffix counts."""
+        dispatcher = self._dispatcher
+        if dispatcher is None:
+            return np.empty(0, dtype=np.float32), 0, 0
+        if event is None:
+            return np.empty(0, dtype=np.float32), 0, 0
+        sr = float(getattr(event, "sampleRateHz", 0.0) or 0.0)
+        if sr <= 0:
+            return np.empty(0, dtype=np.float32), 0, 0
+        try:
+            channel_id = int(target_channel_id)
+        except (TypeError, ValueError):
+            return np.empty(0, dtype=np.float32), 0, 0
+        window_samples = max(1, int(round(window_ms * sr / 1000.0)))
+        if window_samples % 2 == 0:
+            window_samples += 1
+        center_index = int(getattr(event, "crossingIndex", -1))
+        if center_index < 0:
+            return np.empty(0, dtype=np.float32), 0, window_samples
+        half = window_samples // 2
+        start_index = max(0, center_index - half)
+        data, missing_prefix, missing_suffix = dispatcher.collect_window(
+            start_index,
+            window_samples,
+            channel_id,
+            return_info=True,
+        )
+        return data, missing_prefix, missing_suffix
 
     def register_analysis_queue(self, data_queue: "queue.Queue[Chunk | EndOfStream]") -> Optional[int]:
         with self._lock:

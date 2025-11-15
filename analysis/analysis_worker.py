@@ -42,6 +42,7 @@ class AnalysisWorker(threading.Thread):
         self._last_window_end_sample = -10**12
         self._last_crossing_time_sec: Optional[float] = None
         self._event_id = 0
+        self._channel_id: Optional[int] = None
         if isinstance(self._settings_store, AnalysisSettingsStore):
             self._settings_unsub = self._settings_store.subscribe(self._on_settings_changed)
 
@@ -78,6 +79,7 @@ class AnalysisWorker(threading.Thread):
             source_name = chunk.channel_names[idx]
         except (IndexError, TypeError):
             source_name = self.channel_name
+        self._ensure_channel_id(source_name)
         channel_names = (source_name,)
         meta = dict(chunk.meta or {})
         meta.setdefault("source_channel_index", idx)
@@ -189,6 +191,31 @@ class AnalysisWorker(threading.Thread):
         if self._event_buffer is not None:
             self._event_buffer.push(event)
 
+    def _ensure_channel_id(self, channel_name: str) -> None:
+        if self._channel_id is not None or self._controller is None:
+            return
+        try:
+            infos = self._controller.active_channels()
+        except Exception:
+            return
+        for info in infos or []:
+            name = getattr(info, "name", None)
+            if name == channel_name:
+                self._channel_id = getattr(info, "id", None)
+                break
+
+    def _collect_waveform_samples(self, start_index: int, count: int) -> np.ndarray:
+        if self._controller is None or self._channel_id is None or count <= 0 or start_index < 0:
+            return np.empty(0, dtype=np.float32)
+        dispatcher = getattr(self._controller, "dispatcher", None)
+        if dispatcher is None:
+            return np.empty(0, dtype=np.float32)
+        try:
+            window = dispatcher.collect_window(int(start_index), int(count), int(self._channel_id))
+        except Exception:
+            return np.empty(0, dtype=np.float32)
+        return np.asarray(window, dtype=np.float32)
+
     def _on_settings_changed(self, settings: AnalysisSettings) -> None:
         with self._state_lock:
             self._event_window_ms = float(settings.event_window_ms)
@@ -288,6 +315,7 @@ class AnalysisWorker(threading.Thread):
         events: list[tuple[Event, int, float]] = []
         last_end = last_window_end
         prev_crossing_time = last_crossing_time
+        target_len = (half_samples * 2) + 1
         for idx in idxs:
             abs_idx = idx if start_sample < 0 else start_sample + int(idx)
             if abs_idx < last_end:
@@ -299,7 +327,6 @@ class AnalysisWorker(threading.Thread):
                 continue
             wf = sig[i0:i1].astype(np.float32, copy=True)
             dt_sec = 1.0 / sr
-            first_time = float(chunk.start_time) + i0 * dt_sec
             crossing_time = float(chunk.start_time) + int(idx) * dt_sec
             pre_count = int(idx) - i0
             post_count = i1 - int(idx) - 1
@@ -308,6 +335,24 @@ class AnalysisWorker(threading.Thread):
             crossing_index = abs_idx
             first_abs = crossing_index - pre_count
             candidate_last_end = first_abs + window_samples
+            first_time = float(chunk.start_time) + i0 * dt_sec
+            has_full_pre = pre_count >= half_samples
+            has_full_post = post_count >= half_samples
+            if (not has_full_pre or not has_full_post) and self._controller is not None:
+                desired_start = crossing_index - half_samples
+                if desired_start < 0:
+                    desired_start = 0
+                extended = self._collect_waveform_samples(desired_start, target_len)
+                if extended.size == target_len:
+                    wf = extended.astype(np.float32, copy=True)
+                    pre_count = min(half_samples, crossing_index - desired_start)
+                    post_count = target_len - pre_count - 1
+                    pre_ms = pre_count * dt_sec * 1000.0
+                    post_ms = post_count * dt_sec * 1000.0
+                    first_abs = crossing_index - pre_count
+                    candidate_last_end = first_abs + window_samples
+                    first_time = crossing_time - (pre_count * dt_sec)
+
             if use_secondary and self._waveform_crosses_threshold(wf, secondary_value):
                 continue
             interval_sec = float("nan")

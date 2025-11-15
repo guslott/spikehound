@@ -1223,6 +1223,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._controller.set_active_channels(ids)
             else:
                 self._controller.clear_active_channels()
+        dock = getattr(self, "_analysis_dock", None)
+        if dock is not None:
+            try:
+                dock.update_active_channels(infos)
+            except AttributeError:
+                pass
 
     def _next_channel_color(self) -> QtGui.QColor:
         color = self._channel_color_cycle[self._next_color_index % len(self._channel_color_cycle)]
