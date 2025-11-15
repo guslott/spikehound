@@ -16,6 +16,16 @@ from core.models import Chunk, EndOfStream
 from shared.types import Event
 
 
+CLUSTER_COLORS: list[QtGui.QColor] = [
+    QtGui.QColor(34, 139, 34),    # green
+    QtGui.QColor(255, 140, 0),    # orange
+    QtGui.QColor(148, 0, 211),    # purple
+    QtGui.QColor(255, 215, 0),    # gold
+    QtGui.QColor(199, 21, 133),   # magenta
+]
+UNCLASSIFIED_COLOR = QtGui.QColor(220, 0, 0)
+
+
 def _baseline(samples: np.ndarray, pre_samples: int) -> float:
     arr = np.asarray(samples, dtype=np.float32)
     if pre_samples <= 0 or arr.size == 0:
@@ -71,7 +81,7 @@ class ClusterRectROI(pg.ROI):
                 except AttributeError:
                     pass
         if pen is None:
-            pen = pg.mkPen(255, 0, 0)
+            pen = pg.mkPen(CLUSTER_COLORS[0])
         self.setPen(pen)
         self._dragging_with_shift = False
 
@@ -127,7 +137,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._worker: Optional["AnalysisWorker"] = None
         self._event_overlays: list[dict[str, object]] = []
         self._overlay_pool: list[pg.PlotCurveItem] = []
-        self._overlay_pen = pg.mkPen((220, 0, 0), width=2)
+        self._overlay_pen = pg.mkPen(UNCLASSIFIED_COLOR, width=2)
         self._latest_sample_time: Optional[float] = None
         self._window_start_time: Optional[float] = None
         self._channel_index: Optional[int] = None
@@ -191,7 +201,9 @@ class AnalysisTab(QtWidgets.QWidget):
         vb = metrics_item.getViewBox()
         if vb is not None:
             vb.setMouseEnabled(x=False, y=False)
-        self.energy_scatter = pg.ScatterPlotItem(size=6, brush=pg.mkBrush(220, 0, 0, 170), pen=None, name="Energy Density")
+        energy_scatter_color = QtGui.QColor(UNCLASSIFIED_COLOR)
+        energy_scatter_color.setAlpha(170)
+        self.energy_scatter = pg.ScatterPlotItem(size=6, brush=pg.mkBrush(energy_scatter_color), pen=None, name="Energy Density")
         self.metrics_plot.addItem(self.energy_scatter)
         self.energy_scatter.hide()
 
@@ -758,6 +770,38 @@ class AnalysisTab(QtWidgets.QWidget):
         item.setData([], [])
         self._overlay_pool.append(item)
 
+    def _apply_overlay_color(self, overlay: dict[str, object]) -> None:
+        item = overlay.get("item") or overlay.get("curve")
+        if not isinstance(item, pg.PlotCurveItem):
+            return
+        event_id = overlay.get("event_id")
+        event_id_int = event_id if isinstance(event_id, int) else None
+        color = self._get_event_color(event_id_int)
+        base_pen = getattr(item, "opts", {}).get("pen") if hasattr(item, "opts") else None
+        if base_pen is None:
+            base_pen = getattr(self, "_overlay_pen", None)
+        width = 2.0
+        if base_pen is not None:
+            width_attr = getattr(base_pen, "widthF", None)
+            if callable(width_attr):
+                try:
+                    width = float(width_attr())
+                except Exception:
+                    width = 2.0
+            else:
+                try:
+                    width = float(base_pen.width())
+                except Exception:
+                    width = 2.0
+        item.setPen(pg.mkPen(color, width=width))
+
+    def _refresh_overlay_colors(self) -> None:
+        """Update the pens for all raw event overlays based on cluster labels."""
+        if not self._event_overlays:
+            return
+        for overlay in self._event_overlays:
+            self._apply_overlay_color(overlay)
+
     def _handle_batch_events(
         self,
         events: Sequence[Event],
@@ -795,6 +839,7 @@ class AnalysisTab(QtWidgets.QWidget):
             if not self._apply_overlay_view(overlay, window_start, width, window_start_idx):
                 self._release_overlay_item(item)
                 continue
+            self._apply_overlay_color(overlay)
             kept.append(overlay)
         self._event_overlays = kept
         self._update_metric_points()
@@ -810,6 +855,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._metric_events.clear()
         self._event_details.clear()
         self._event_cluster_labels.clear()
+        self._refresh_overlay_colors()
         self._t0_event = None
         for cluster in self._clusters:
             item = self._cluster_items.get(cluster.id)
@@ -949,6 +995,27 @@ class AnalysisTab(QtWidgets.QWidget):
             self.metrics_container_layout.setStretchFactor(self.metrics_plot, 1)
             self.metrics_container_layout.setStretchFactor(self.cluster_panel, 0)
 
+    def _get_cluster_for_event(self, event_id: int | None) -> MetricCluster | None:
+        if event_id is None:
+            return None
+        cluster_id = self._event_cluster_labels.get(event_id)
+        if cluster_id is None:
+            return None
+        for cluster in self._clusters:
+            if cluster.id == cluster_id:
+                return cluster
+        return None
+
+    def _get_event_color(self, event_id: int | None) -> QtGui.QColor:
+        """Return the pen colour for a given event_id.
+
+        Unclassified events are red; classified events use their cluster colour.
+        """
+        cluster = self._get_cluster_for_event(event_id)
+        if cluster is None:
+            return QtGui.QColor(UNCLASSIFIED_COLOR)
+        return cluster.color
+
     def _on_clustering_toggled(self, checked: bool) -> None:
         self._set_cluster_panel_visible(checked)
         if checked:
@@ -962,6 +1029,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._update_metric_points()
         self._update_cluster_visuals()
         self._update_cluster_button_states()
+        self._refresh_overlay_colors()
 
     def _on_add_class_clicked(self) -> None:
         if not self.clustering_enabled_check.isChecked():
@@ -978,16 +1046,9 @@ class AnalysisTab(QtWidgets.QWidget):
         default_height = y_span * 0.3
         x0 = rect.left() + (x_span - default_width) * 0.5
         y0 = rect.top() + (y_span - default_height) * 0.5
-        palette = [
-            QtGui.QColor("#D62828"),
-            QtGui.QColor("#F77F00"),
-            QtGui.QColor("#5B8C5A"),
-            QtGui.QColor("#3F88C5"),
-            QtGui.QColor("#7209B7"),
-        ]
-        color = palette[len(self._clusters) % len(palette)]
         cluster_id = self._cluster_id_counter
         self._cluster_id_counter += 1
+        color = CLUSTER_COLORS[cluster_id % len(CLUSTER_COLORS)]
         cluster_name = f"Class {cluster_id + 1}"
         cluster = MetricCluster(id=cluster_id, name=cluster_name, color=color)
         roi = ClusterRectROI((x0, y0), (default_width, default_height), pen=pg.mkPen(color, width=1.5))
@@ -1144,7 +1205,10 @@ class AnalysisTab(QtWidgets.QWidget):
                     if item is None:
                         continue
                     item.setText(f"{cluster.name} ({counts.get(cluster.id, 0)} events)")
-        default_brush = pg.mkBrush(220, 0, 0, 170)
+                self._refresh_overlay_colors()
+        default_brush_color = QtGui.QColor(UNCLASSIFIED_COLOR)
+        default_brush_color.setAlpha(170)
+        default_brush = pg.mkBrush(default_brush_color)
         brushes: list[pg.mkBrush] = []
         cluster_color_map = {cluster.id: cluster.color for cluster in self._clusters}
         for idx, eid in enumerate(event_ids):
@@ -1198,7 +1262,9 @@ class AnalysisTab(QtWidgets.QWidget):
             removed_id = removed.get("event_id")
             if isinstance(removed_id, int):
                 self._event_details.pop(removed_id, None)
-                self._event_cluster_labels.pop(removed_id, None)
+                removed_cluster = self._event_cluster_labels.pop(removed_id, None) is not None
+                if removed_cluster:
+                    self._refresh_overlay_colors()
 
     def _build_overlay(self, event: Event) -> Optional[dict[str, object]]:
         samples = np.asarray(event.samples, dtype=np.float32)
@@ -1283,6 +1349,7 @@ class AnalysisTab(QtWidgets.QWidget):
             "metric_time": peak_time,
         }
         overlay_data["event_id"] = event_id
+        self._apply_overlay_color(overlay_data)
         details_entry: dict[str, object] = {
             "metric_time": float(peak_time),
             "times": times,
@@ -1332,6 +1399,7 @@ class AnalysisTab(QtWidgets.QWidget):
     def _recompute_cluster_membership(self) -> None:
         if not self._clusters:
             self._event_cluster_labels.clear()
+            self._refresh_overlay_colors()
             return
         x_key = self._selected_x_metric()
         y_key = self._selected_y_metric()
@@ -1354,6 +1422,7 @@ class AnalysisTab(QtWidgets.QWidget):
             cluster_bounds.append((cluster.id, min_x, max_x, min_y, max_y))
         self._event_cluster_labels.clear()
         if not cluster_bounds:
+            self._refresh_overlay_colors()
             return
         counts: dict[int, int] = {cluster.id: 0 for cluster in self._clusters}
         for record in self._metric_events:
@@ -1382,6 +1451,7 @@ class AnalysisTab(QtWidgets.QWidget):
                 continue
             count = counts.get(cluster.id, 0)
             item.setText(f"{cluster.name} ({count} events)")
+        self._refresh_overlay_colors()
 
 
 class ClusterWaveformDialog(QtWidgets.QDialog):
