@@ -27,16 +27,6 @@ CLUSTER_COLORS: list[QtGui.QColor] = [
 UNCLASSIFIED_COLOR = QtGui.QColor(220, 0, 0)
 MAX_VISIBLE_METRIC_EVENTS = 3000
 METRIC_TIME_WINDOW_SEC = 60.0
-STA_IMAGE_LUT = np.array(
-    [
-        [255, 255, 255, 0],
-        [170, 170, 170, 90],
-        [110, 110, 110, 170],
-        [60, 60, 60, 230],
-    ],
-    dtype=np.ubyte,
-)
-
 
 def _baseline(samples: np.ndarray, pre_samples: int) -> float:
     arr = np.asarray(samples, dtype=np.float32)
@@ -231,17 +221,16 @@ class AnalysisTab(QtWidgets.QWidget):
             pass
         self.sta_plot.setBackground(pg.mkColor(250, 250, 252))
         self.sta_plot.showGrid(x=True, y=True, alpha=0.25)
-        self.sta_plot.setLabel("bottom", "Lag", units="s")
-        self.sta_plot.setLabel("left", "Amplitude", units="V")
+        self.sta_plot.setLabel("bottom", "Lag", units="ms")
+        self.sta_plot.setLabel("left", "Amplitude", units="mV")
         self.sta_plot.setMouseEnabled(x=False, y=False)
         self.raw_row_layout.addWidget(self.sta_plot, stretch=3)
         self.sta_plot.setAntialiasing(False)
-        self._sta_image_item = pg.ImageItem()
-        self._sta_image_item.setZValue(-5)
-        self.sta_plot.addItem(self._sta_image_item)
         self._sta_median_curve = pg.PlotCurveItem()
         self._sta_median_curve.setZValue(10)
         self.sta_plot.addItem(self._sta_median_curve)
+        self._sta_trace_items: list[pg.PlotCurveItem] = []
+        self._sta_max_traces: int = 250
 
         layout.addWidget(self.raw_row_widget, stretch=4)
         self._hide_sta_plot()
@@ -1009,6 +998,21 @@ class AnalysisTab(QtWidgets.QWidget):
             self._release_overlay_item(overlay.get("item"))
         self._event_overlays.clear()
 
+    def _ensure_sta_trace_capacity(self, capacity: int) -> None:
+        current = len(self._sta_trace_items)
+        if current >= capacity:
+            return
+        for _ in range(capacity - current):
+            item = pg.PlotCurveItem(pen=STA_TRACE_PEN)
+            item.setZValue(-2)
+            self.sta_plot.addItem(item)
+            self._sta_trace_items.append(item)
+
+    def _clear_sta_traces(self) -> None:
+        for item in self._sta_trace_items:
+            item.hide()
+            item.setData([], [])
+
     def _clear_metrics(self) -> None:
         self._metric_events.clear()
         self._event_details.clear()
@@ -1254,9 +1258,9 @@ class AnalysisTab(QtWidgets.QWidget):
             self._sta_time_axis = None
             self._sta_pending_events.clear()
             self._sta_dirty = False
-            self._sta_image_item.hide()
             self._sta_median_curve.hide()
             self._sta_median_curve.clear()
+            self._clear_sta_traces()
 
     def _on_sta_source_changed(self, index: int) -> None:
         if index < 0:
@@ -1294,7 +1298,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._sta_time_axis = None
         self._sta_pending_events.clear()
         self._sta_dirty = False
-        self._sta_image_item.hide()
+        self._clear_sta_traces()
         self._sta_median_curve.hide()
         self._sta_median_curve.clear()
 
@@ -1376,24 +1380,27 @@ class AnalysisTab(QtWidgets.QWidget):
         """Redraw the spike-triggered average plot."""
         plot_item = self.sta_plot.getPlotItem()
         if not self._sta_windows:
-            self._sta_image_item.hide()
             self._sta_median_curve.hide()
             self._sta_median_curve.clear()
+            self._clear_sta_traces()
             return
         min_len = min((w.size for w in self._sta_windows if isinstance(w, np.ndarray)), default=0)
         if min_len <= 1:
-            self._sta_image_item.hide()
             self._sta_median_curve.hide()
             self._sta_median_curve.clear()
+            self._clear_sta_traces()
             return
         windows = np.stack([np.asarray(w[:min_len], dtype=np.float32) for w in self._sta_windows], axis=0)
+        assert windows.ndim == 2, "STA windows must be 2D (events x samples)"
+        num_events, num_samples = windows.shape
         if windows.size == 0:
-            self._sta_image_item.hide()
             self._sta_median_curve.hide()
             self._sta_median_curve.clear()
+            self._clear_sta_traces()
             return
         duration_ms = float(self._sta_window_ms)
-        t = np.linspace(-duration_ms / 2.0, duration_ms / 2.0, min_len, dtype=np.float32)
+        t = np.linspace(-duration_ms / 2.0, duration_ms / 2.0, num_samples, dtype=np.float32)
+        assert t.shape[0] == num_samples, "Time axis must align with samples"
         self._sta_time_axis = t
         amp_min = float(np.min(windows))
         amp_max = float(np.max(windows))
@@ -1403,32 +1410,25 @@ class AnalysisTab(QtWidgets.QWidget):
             bound = max(1e-3, abs(amp_max))
             amp_min = -bound
             amp_max = bound
-        amp_bins = max(64, min(256, int(np.sqrt(windows.size))))
-        time_bins = min_len
-        amp_values = windows.reshape(-1)
-        time_coords = np.tile(t, windows.shape[0])
-        time_edges = np.linspace(t[0], t[-1], time_bins + 1)
-        amp_edges = np.linspace(amp_min, amp_max, amp_bins + 1)
-        density, _, _ = np.histogram2d(amp_values, time_coords, bins=[amp_edges, time_edges])
-        img = density.astype(np.float32)
-        if img.size:
-            img = np.sqrt(img)
-            img_max = float(np.max(img))
-            if img_max > 0:
-                img /= img_max
-        self._sta_image_item.resetTransform()
-        self._sta_image_item.setImage(img, autoLevels=False, levels=(0.0, 1.0))
-        self._sta_image_item.setLookupTable(STA_IMAGE_LUT)
-        rect = QtCore.QRectF(time_edges[0], amp_edges[-1], time_edges[-1] - time_edges[0], amp_edges[0] - amp_edges[-1])
-        self._sta_image_item.setRect(rect)
-        self._sta_image_item.setOpacity(0.85)
-        self._sta_image_item.show()
+        max_traces = min(num_events, self._sta_max_traces)
+        visible_windows = windows[-max_traces:] if max_traces else []
+        self._ensure_sta_trace_capacity(max_traces)
+        for idx, item in enumerate(self._sta_trace_items):
+            if idx < max_traces:
+                waveform = visible_windows[idx]
+                item.setPen(STA_TRACE_PEN)
+                item.setData(t, waveform)
+                item.show()
+            else:
+                item.hide()
+                item.setData([], [])
         median = np.median(windows, axis=0)
+        # STA curves always use (time -> x, amplitude -> y)
         self._sta_median_curve.setData(t, median)
-        self._sta_median_curve.setPen(pg.mkPen(30, 60, 180, 255, width=2))
+        self._sta_median_curve.setPen(pg.mkPen(30, 150, 70, 255, width=2))
         self._sta_median_curve.show()
         plot_item.setLabel("bottom", "Lag", units="ms")
-        plot_item.setLabel("left", "Amplitude", units="V")
+        plot_item.setLabel("left", "Amplitude", units="mV")
         plot_item.showGrid(x=True, y=True, alpha=0.3)
         plot_item.setXRange(t[0], t[-1], padding=0.0)
         plot_item.setYRange(amp_min, amp_max, padding=0.05)
@@ -1953,3 +1953,4 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
         median_pen = pg.mkPen(color if color is not None else QtGui.QColor(0, 0, 200), width=3)
         self.plot_widget.plot(t_ref, median_wave, pen=median_pen)
         self.plot_widget.setAntialiasing(False)
+STA_TRACE_PEN = pg.mkPen(90, 90, 90, 110)
