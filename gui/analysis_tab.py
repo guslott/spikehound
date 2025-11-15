@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import queue
+from collections import Counter
+from dataclasses import dataclass
 from typing import Optional, TYPE_CHECKING, Sequence
 
 import numpy as np
 
 import pyqtgraph as pg
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtWidgets, QtGui
 
 from analysis.analysis_worker import _peak_frequency_sinc
 from analysis.models import AnalysisBatch
@@ -52,6 +54,56 @@ if TYPE_CHECKING:
     from shared.event_buffer import EventRingBuffer
 
 
+class ClusterRectROI(pg.ROI):
+    """Rectangular ROI used for metric clusters."""
+
+    def __init__(self, pos, size, pen=None, **kwargs):
+        super().__init__(pos, size, movable=False, rotatable=False, **kwargs)
+        self.addScaleHandle((0.0, 0.5), (1.0, 0.5))
+        self.addScaleHandle((1.0, 0.5), (0.0, 0.5))
+        self.addScaleHandle((0.5, 0.0), (0.5, 1.0))
+        self.addScaleHandle((0.5, 1.0), (0.5, 0.0))
+        for handle in self.handles:
+            item = handle.get("item")
+            if item is not None:
+                try:
+                    item.setSize(10)
+                except AttributeError:
+                    pass
+        if pen is None:
+            pen = pg.mkPen(255, 0, 0)
+        self.setPen(pen)
+        self._dragging_with_shift = False
+
+    def mouseDragEvent(self, ev):
+        if ev.isStart():
+            self._dragging_with_shift = bool(ev.modifiers() & QtCore.Qt.ShiftModifier)
+            if self._dragging_with_shift:
+                ev.accept()
+                return
+            return super().mouseDragEvent(ev)
+        if self._dragging_with_shift:
+            last = ev.lastPos()
+            if last is None:
+                ev.accept()
+                return
+            delta = pg.Point(ev.pos()) - pg.Point(last)
+            self.translate(delta, snap=False)
+            ev.accept()
+            if ev.isFinish():
+                self._dragging_with_shift = False
+            return
+        return super().mouseDragEvent(ev)
+
+
+@dataclass
+class MetricCluster:
+    id: int
+    name: str
+    color: QtGui.QColor
+    roi: pg.RectROI | None = None
+
+
 class AnalysisTab(QtWidgets.QWidget):
     """Simple analysis view with a top-half plot for a single channel."""
 
@@ -86,7 +138,7 @@ class AnalysisTab(QtWidgets.QWidget):
             self._event_buffer = getattr(controller, "event_buffer", None)
         self._event_window_ms = self._initial_event_window_ms()
         self._t0_event: Optional[float] = None
-        self._metric_events: list[dict[str, float]] = []
+        self._metric_events: list[dict[str, float | int]] = []
         self._max_metric_events = 10_000
         self._viz_paused = False
         self._cached_raw_times: Optional[np.ndarray] = None
@@ -94,6 +146,13 @@ class AnalysisTab(QtWidgets.QWidget):
         self._last_window_start: float = 0.0
         self._last_window_width: float = 0.5
         self._fallback_start_sample: int = 0
+        self._next_event_id: int = 0
+        self._event_details: dict[int, dict[str, object]] = {}
+        self._event_cluster_labels: dict[int, int] = {}
+        self._clusters: list[MetricCluster] = []
+        self._cluster_id_counter: int = 0
+        self._cluster_items: dict[int, QtWidgets.QListWidgetItem] = {}
+        self._selected_cluster_id: int | None = None
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -128,6 +187,10 @@ class AnalysisTab(QtWidgets.QWidget):
         self.metrics_plot.setLabel("bottom", "Time (s)")
         self.metrics_plot.setLabel("left", "Max Amplitude (V)")
         self.metrics_plot.showGrid(x=True, y=True, alpha=0.3)
+        metrics_item = self.metrics_plot.getPlotItem()
+        vb = metrics_item.getViewBox()
+        if vb is not None:
+            vb.setMouseEnabled(x=False, y=False)
         self.energy_scatter = pg.ScatterPlotItem(size=6, brush=pg.mkBrush(220, 0, 0, 170), pen=None, name="Energy Density")
         self.metrics_plot.addItem(self.energy_scatter)
         self.energy_scatter.hide()
@@ -220,11 +283,6 @@ class AnalysisTab(QtWidgets.QWidget):
         metrics_label.setStyleSheet("font-weight: bold;")
         metrics_layout.addWidget(metrics_label)
 
-        self.metrics_autorange = QtWidgets.QCheckBox("Auto-range")
-        self.metrics_autorange.setChecked(True)
-        self.metrics_autorange.toggled.connect(lambda _: self._update_metric_points())
-        metrics_layout.addWidget(self.metrics_autorange)
-
         metric_row = QtWidgets.QHBoxLayout()
         metric_row.setSpacing(6)
         metric_row.addWidget(QtWidgets.QLabel("Vertical (Y) Metric"))
@@ -258,6 +316,9 @@ class AnalysisTab(QtWidgets.QWidget):
         self.metrics_clear_btn = QtWidgets.QPushButton("Clear metrics")
         self.metrics_clear_btn.clicked.connect(self._clear_metrics)
         metrics_layout.addWidget(self.metrics_clear_btn)
+        self.clustering_enabled_check = QtWidgets.QCheckBox("Enable clustering")
+        self.clustering_enabled_check.toggled.connect(self._on_clustering_toggled)
+        metrics_layout.addWidget(self.clustering_enabled_check)
         metrics_layout.addStretch(1)
 
         controls_layout.addLayout(metrics_layout)
@@ -266,7 +327,38 @@ class AnalysisTab(QtWidgets.QWidget):
         controls.setLayout(controls_layout)
         layout.addWidget(controls, stretch=2)
 
-        layout.addWidget(self.metrics_plot, stretch=4)
+        self.metrics_container = QtWidgets.QWidget(self)
+        metrics_container_layout = QtWidgets.QHBoxLayout(self.metrics_container)
+        metrics_container_layout.setContentsMargins(0, 0, 0, 0)
+        metrics_container_layout.setSpacing(10)
+        metrics_container_layout.addWidget(self.metrics_plot, stretch=1)
+        self.metrics_container_layout = metrics_container_layout
+
+        self.cluster_panel = QtWidgets.QGroupBox("Event Clusters")
+        cluster_layout = QtWidgets.QVBoxLayout()
+        cluster_layout.setContentsMargins(12, 10, 12, 10)
+        cluster_layout.setSpacing(6)
+        self.add_class_btn = QtWidgets.QPushButton("Add class…")
+        self.add_class_btn.clicked.connect(self._on_add_class_clicked)
+        cluster_layout.addWidget(self.add_class_btn)
+        self.remove_class_btn = QtWidgets.QPushButton("Remove class")
+        self.remove_class_btn.clicked.connect(self._on_remove_class_clicked)
+        cluster_layout.addWidget(self.remove_class_btn)
+        self.export_class_btn = QtWidgets.QPushButton("Export class to CSV…")
+        self.export_class_btn.clicked.connect(self._on_export_class_clicked)
+        cluster_layout.addWidget(self.export_class_btn)
+        self.view_class_waveforms_btn = QtWidgets.QPushButton("View waveforms…")
+        self.view_class_waveforms_btn.clicked.connect(self._on_view_class_waveforms_clicked)
+        cluster_layout.addWidget(self.view_class_waveforms_btn)
+        self.class_list = QtWidgets.QListWidget()
+        self.class_list.currentItemChanged.connect(self._on_class_selection_changed)
+        cluster_layout.addWidget(self.class_list, stretch=1)
+        cluster_layout.addStretch(1)
+        self.cluster_panel.setLayout(cluster_layout)
+        metrics_container_layout.addWidget(self.cluster_panel, stretch=0)
+        self._set_cluster_panel_visible(False)
+
+        layout.addWidget(self.metrics_container, stretch=4)
 
         self.raw_curve = self.plot_widget.plot(pen=pg.mkPen((30, 144, 255), width=2))
         self.event_curve = self.plot_widget.plot(pen=pg.mkPen((200, 0, 0), width=2))
@@ -308,6 +400,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._in_threshold_update = False
         self._on_axis_metric_changed()
         self._apply_ranges()
+        self._update_cluster_button_states()
 
     # ------------------------------------------------------------------
     # Buffer helpers
@@ -715,12 +808,19 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def _clear_metrics(self) -> None:
         self._metric_events.clear()
+        self._event_details.clear()
+        self._event_cluster_labels.clear()
         self._t0_event = None
+        for cluster in self._clusters:
+            item = self._cluster_items.get(cluster.id)
+            if item is not None:
+                item.setText(f"{cluster.name} (0 events)")
         if hasattr(self, "energy_scatter"):
             self.energy_scatter.clear()
             self.energy_scatter.hide()
         if hasattr(self, "metrics_plot"):
             self.metrics_plot.getPlotItem().enableAutoRange(y=True)
+        self._update_metric_points()
 
     def get_energy_density_points(self) -> list[tuple[float, float]]:
         return [
@@ -800,10 +900,185 @@ class AnalysisTab(QtWidgets.QWidget):
             self.metrics_plot.setLabel("bottom", "Peak Wavelength (s)")
         if metric in {"ed", "max", "min", "freq", "period", "interval"}:
             self.energy_scatter.show()
-            self._update_metric_points()
         else:
             self.energy_scatter.hide()
             self.energy_scatter.setData([], [])
+        if self.clustering_enabled_check.isChecked():
+            self._recompute_cluster_membership()
+        self._update_metric_points()
+
+    def _on_class_selection_changed(
+        self,
+        current: Optional[QtWidgets.QListWidgetItem],
+        previous: Optional[QtWidgets.QListWidgetItem],
+    ) -> None:
+        del previous
+        if current is None:
+            self._selected_cluster_id = None
+        else:
+            data = current.data(QtCore.Qt.UserRole)
+            self._selected_cluster_id = int(data) if isinstance(data, int) else None
+        self._update_cluster_visuals()
+        self._update_cluster_button_states()
+
+    def _update_cluster_visuals(self) -> None:
+        base_width = 1.5
+        selected_id = self._selected_cluster_id
+        for cluster in self._clusters:
+            roi = cluster.roi
+            if roi is None:
+                continue
+            width = base_width * 3.0 if cluster.id == selected_id else base_width
+            roi.setPen(pg.mkPen(cluster.color, width=width))
+
+    def _update_cluster_button_states(self) -> None:
+        enabled = self.clustering_enabled_check.isChecked()
+        has_selection = self.class_list.currentItem() is not None
+        self.add_class_btn.setEnabled(enabled)
+        self.remove_class_btn.setEnabled(enabled and has_selection)
+        self.view_class_waveforms_btn.setEnabled(enabled and has_selection)
+        self.export_class_btn.setEnabled(enabled and has_selection)
+
+    def _set_cluster_panel_visible(self, visible: bool) -> None:
+        if visible:
+            self.cluster_panel.show()
+            self.metrics_container_layout.setStretchFactor(self.metrics_plot, 7)
+            self.metrics_container_layout.setStretchFactor(self.cluster_panel, 3)
+        else:
+            self.cluster_panel.hide()
+            self.metrics_container_layout.setStretchFactor(self.metrics_plot, 1)
+            self.metrics_container_layout.setStretchFactor(self.cluster_panel, 0)
+
+    def _on_clustering_toggled(self, checked: bool) -> None:
+        self._set_cluster_panel_visible(checked)
+        if checked:
+            self._recompute_cluster_membership()
+        else:
+            self._event_cluster_labels.clear()
+            for cluster in self._clusters:
+                item = self._cluster_items.get(cluster.id)
+                if item is not None:
+                    item.setText(f"{cluster.name} (0 events)")
+        self._update_metric_points()
+        self._update_cluster_visuals()
+        self._update_cluster_button_states()
+
+    def _on_add_class_clicked(self) -> None:
+        if not self.clustering_enabled_check.isChecked():
+            return
+        view_box = self.metrics_plot.getViewBox()
+        if view_box is None:
+            return
+        rect = view_box.viewRect()
+        if rect is None or rect.width() <= 0 or rect.height() <= 0:
+            return
+        x_span = rect.width()
+        y_span = rect.height()
+        default_width = x_span * 0.3
+        default_height = y_span * 0.3
+        x0 = rect.left() + (x_span - default_width) * 0.5
+        y0 = rect.top() + (y_span - default_height) * 0.5
+        palette = [
+            QtGui.QColor("#D62828"),
+            QtGui.QColor("#F77F00"),
+            QtGui.QColor("#5B8C5A"),
+            QtGui.QColor("#3F88C5"),
+            QtGui.QColor("#7209B7"),
+        ]
+        color = palette[len(self._clusters) % len(palette)]
+        cluster_id = self._cluster_id_counter
+        self._cluster_id_counter += 1
+        cluster_name = f"Class {cluster_id + 1}"
+        cluster = MetricCluster(id=cluster_id, name=cluster_name, color=color)
+        roi = ClusterRectROI((x0, y0), (default_width, default_height), pen=pg.mkPen(color, width=1.5))
+        roi.setZValue(50)
+        cluster.roi = roi
+        roi.sigRegionChanged.connect(lambda _: self._on_cluster_roi_changed())
+        self.metrics_plot.addItem(roi)
+        self._clusters.append(cluster)
+        item = QtWidgets.QListWidgetItem(f"{cluster.name} (0 events)")
+        item.setData(QtCore.Qt.UserRole, cluster_id)
+        self.class_list.addItem(item)
+        self.class_list.setCurrentItem(item)
+        self._cluster_items[cluster_id] = item
+        self._recompute_cluster_membership()
+        self._update_metric_points()
+        self._update_cluster_visuals()
+        self._update_cluster_button_states()
+
+    def _on_remove_class_clicked(self) -> None:
+        current_item = self.class_list.currentItem()
+        if current_item is None:
+            return
+        cluster_id = current_item.data(QtCore.Qt.UserRole)
+        if not isinstance(cluster_id, int):
+            return
+        cluster = next((c for c in self._clusters if c.id == cluster_id), None)
+        if cluster is not None and cluster.roi is not None:
+            try:
+                self.metrics_plot.removeItem(cluster.roi)
+            except Exception:
+                pass
+        self._clusters = [c for c in self._clusters if c.id != cluster_id]
+        row = self.class_list.row(current_item)
+        if row >= 0:
+            self.class_list.takeItem(row)
+        count = self.class_list.count()
+        if count > 0:
+            new_row = min(row, count - 1)
+            if new_row >= 0:
+                self.class_list.setCurrentRow(new_row)
+        else:
+            self.class_list.setCurrentRow(-1)
+        self._cluster_items.pop(cluster_id, None)
+        to_remove = [event_id for event_id, cid in self._event_cluster_labels.items() if cid == cluster_id]
+        for event_id in to_remove:
+            self._event_cluster_labels.pop(event_id, None)
+        self._recompute_cluster_membership()
+        self._update_metric_points()
+        self._update_cluster_visuals()
+        self._update_cluster_button_states()
+
+    def _on_export_class_clicked(self) -> None:
+        pass
+
+    def _on_view_class_waveforms_clicked(self) -> None:
+        if not self.clustering_enabled_check.isChecked():
+            QtWidgets.QMessageBox.information(self, "Waveforms", "Enable clustering to view class waveforms.")
+            return
+        current_item = self.class_list.currentItem()
+        if current_item is None:
+            QtWidgets.QMessageBox.information(self, "Waveforms", "Select a class to view its waveforms.")
+            return
+        cluster_id = current_item.data(QtCore.Qt.UserRole)
+        if not isinstance(cluster_id, int):
+            return
+        cluster = next((c for c in self._clusters if c.id == cluster_id), None)
+        if cluster is None:
+            return
+        event_ids = [event_id for event_id, cid in self._event_cluster_labels.items() if cid == cluster_id]
+        waveforms: list[tuple[np.ndarray, np.ndarray]] = []
+        for event_id in event_ids:
+            details = self._event_details.get(event_id)
+            if not details:
+                continue
+            times = details.get("times")
+            samples = details.get("samples")
+            if times is None or samples is None:
+                continue
+            arr_t = np.asarray(times, dtype=np.float64)
+            arr_s = np.asarray(samples, dtype=np.float32)
+            if arr_t.size == 0 or arr_s.size == 0 or arr_t.size != arr_s.size:
+                continue
+            t_rel = arr_t - arr_t[0]
+            baseline = float(np.median(arr_s)) if arr_s.size else 0.0
+            s_rel = arr_s - baseline
+            waveforms.append((t_rel, s_rel))
+        if not waveforms:
+            QtWidgets.QMessageBox.information(self, "Waveforms", "No waveform data available for this class.")
+            return
+        dialog = ClusterWaveformDialog(self, cluster.name, waveforms, cluster.color)
+        dialog.exec()
 
     def _release_metrics(self) -> None:
         self._metric_events = []
@@ -818,6 +1093,7 @@ class AnalysisTab(QtWidgets.QWidget):
             return
         xs: list[float] = []
         ys: list[float] = []
+        event_ids: list[Optional[int]] = []
         for event in self._metric_events:
             x_val = event.get(x_key)
             y_val = event.get(y_key)
@@ -827,14 +1103,67 @@ class AnalysisTab(QtWidgets.QWidget):
                 continue
             xs.append(float(x_val))
             ys.append(float(y_val))
+            event_id = event.get("event_id")
+            event_ids.append(event_id if isinstance(event_id, int) else None)
         if not xs:
             self.energy_scatter.hide()
             return
-        self.energy_scatter.setData(xs, ys)
+        if self.clustering_enabled_check.isChecked() and self._clusters:
+            cluster_bounds: list[tuple[int, float, float, float, float]] = []
+            for cluster in self._clusters:
+                roi = cluster.roi
+                if roi is None:
+                    continue
+                rect = roi.parentBounds()
+                if rect is None:
+                    continue
+                min_x = float(rect.left())
+                max_x = float(rect.right())
+                if max_x < min_x:
+                    min_x, max_x = max_x, min_x
+                min_y = float(rect.top())
+                max_y = float(rect.bottom())
+                if max_y < min_y:
+                    min_y, max_y = max_y, min_y
+                cluster_bounds.append((cluster.id, min_x, max_x, min_y, max_y))
+            if cluster_bounds:
+                for idx, event_id in enumerate(event_ids):
+                    if event_id is None:
+                        continue
+                    x_val = xs[idx]
+                    y_val = ys[idx]
+                    for cluster_id, min_x, max_x, min_y, max_y in cluster_bounds:
+                        if min_x <= x_val <= max_x and min_y <= y_val <= max_y:
+                            self._event_cluster_labels[event_id] = cluster_id
+                            break
+                counts: dict[int, int] = {cluster.id: 0 for cluster in self._clusters}
+                for cid in self._event_cluster_labels.values():
+                    counts[cid] = counts.get(cid, 0) + 1
+                for cluster in self._clusters:
+                    item = self._cluster_items.get(cluster.id)
+                    if item is None:
+                        continue
+                    item.setText(f"{cluster.name} ({counts.get(cluster.id, 0)} events)")
+        default_brush = pg.mkBrush(220, 0, 0, 170)
+        brushes: list[pg.mkBrush] = []
+        cluster_color_map = {cluster.id: cluster.color for cluster in self._clusters}
+        for idx, eid in enumerate(event_ids):
+            if eid is None:
+                brushes.append(default_brush)
+                continue
+            cluster_id = self._event_cluster_labels.get(eid)
+            if cluster_id is None:
+                brushes.append(default_brush)
+                continue
+            color = cluster_color_map.get(cluster_id)
+            if color is None:
+                brushes.append(default_brush)
+                continue
+            brushes.append(pg.mkBrush(color))
+        self.energy_scatter.setData(xs, ys, brush=brushes)
         self.energy_scatter.show()
-        if self.metrics_autorange.isChecked():
-            plot_item = self.metrics_plot.getPlotItem()
-            self._set_metrics_range(plot_item, min(xs), max(xs), min(ys), max(ys))
+        plot_item = self.metrics_plot.getPlotItem()
+        self._set_metrics_range(plot_item, min(xs), max(xs), min(ys), max(ys))
 
     def _record_overlay_metrics(self, overlay: dict[str, object]) -> None:
         metrics = overlay.get("metrics")
@@ -844,7 +1173,8 @@ class AnalysisTab(QtWidgets.QWidget):
         if self._t0_event is None:
             self._t0_event = float(metric_time)
         rel_time = max(0.0, float(metric_time) - (self._t0_event or 0.0))
-        record: dict[str, float] = {"time": rel_time}
+        record: dict[str, float | int] = {"time": rel_time}
+        has_metric = False
         for key in ("ed", "max", "min", "freq", "period", "interval"):
             value = metrics.get(key)
             if value is None:
@@ -856,11 +1186,19 @@ class AnalysisTab(QtWidgets.QWidget):
             if not np.isfinite(val):
                 continue
             record[key] = val
-        if len(record) <= 1:
+            has_metric = True
+        event_id = overlay.get("event_id")
+        if isinstance(event_id, int):
+            record["event_id"] = event_id
+        if not has_metric:
             return
         self._metric_events.append(record)
         if len(self._metric_events) > self._max_metric_events:
-            self._metric_events.pop(0)
+            removed = self._metric_events.pop(0)
+            removed_id = removed.get("event_id")
+            if isinstance(removed_id, int):
+                self._event_details.pop(removed_id, None)
+                self._event_cluster_labels.pop(removed_id, None)
 
     def _build_overlay(self, event: Event) -> Optional[dict[str, object]]:
         samples = np.asarray(event.samples, dtype=np.float32)
@@ -924,7 +1262,13 @@ class AnalysisTab(QtWidgets.QWidget):
             metric_values["interval"] = float(interval_val)
         if metric_values:
             metrics = metric_values
-        return {
+        raw_event_id = getattr(event, "id", None)
+        if isinstance(raw_event_id, int):
+            event_id = raw_event_id
+        else:
+            event_id = self._next_event_id
+            self._next_event_id += 1
+        overlay_data = {
             "item": curve,
             "times": times,
             "samples": samples,
@@ -938,6 +1282,15 @@ class AnalysisTab(QtWidgets.QWidget):
             "metrics": metrics,
             "metric_time": peak_time,
         }
+        overlay_data["event_id"] = event_id
+        details_entry: dict[str, object] = {
+            "metric_time": float(peak_time),
+            "times": times,
+            "samples": samples,
+            "metrics": dict(metrics) if isinstance(metrics, dict) else {},
+        }
+        self._event_details[event_id] = details_entry
+        return overlay_data
 
     def _apply_overlay_view(
         self,
@@ -952,15 +1305,18 @@ class AnalysisTab(QtWidgets.QWidget):
         if times is None or samples is None or item is None:
             return False
         arr_samples = np.asarray(samples, dtype=np.float32)
-        relative: np.ndarray
-        if window_start_idx is not None and overlay.get("first_index") is not None:
-            sr = float(overlay.get("sr") or 0.0)
-            if sr <= 0:
-                sr = self.sample_rate if self.sample_rate > 0 else 1.0
-            first_index = int(overlay["first_index"])
-            offsets = np.arange(arr_samples.size, dtype=np.float64) + (first_index - window_start_idx)
-            relative = offsets / sr
-        else:
+        relative: Optional[np.ndarray] = None
+        first_index = overlay.get("first_index")
+        sample_dt = float(self._dt) if self._dt > 0 else float(overlay.get("sr") or 0.0)
+        if (
+            window_start_idx is not None
+            and first_index is not None
+            and sample_dt > 0
+        ):
+            start_diff = int(first_index) - int(window_start_idx)
+            offsets = np.arange(arr_samples.size, dtype=np.float64) + start_diff
+            relative = offsets * sample_dt
+        if relative is None:
             arr_times = np.asarray(times, dtype=np.float64)
             relative = arr_times - window_start_time
         mask = (relative >= 0.0) & (relative <= width)
@@ -968,3 +1324,115 @@ class AnalysisTab(QtWidgets.QWidget):
             return False
         item.setData(relative[mask].astype(np.float32), arr_samples[mask])
         return True
+
+    def _on_cluster_roi_changed(self) -> None:
+        self._recompute_cluster_membership()
+        self._update_metric_points()
+
+    def _recompute_cluster_membership(self) -> None:
+        if not self._clusters:
+            self._event_cluster_labels.clear()
+            return
+        x_key = self._selected_x_metric()
+        y_key = self._selected_y_metric()
+        cluster_bounds: list[tuple[int, float, float, float, float]] = []
+        for cluster in self._clusters:
+            roi = cluster.roi
+            if roi is None:
+                continue
+            rect = roi.parentBounds()
+            if rect is None:
+                continue
+            min_x = float(rect.left())
+            max_x = float(rect.right())
+            if max_x < min_x:
+                min_x, max_x = max_x, min_x
+            min_y = float(rect.top())
+            max_y = float(rect.bottom())
+            if max_y < min_y:
+                min_y, max_y = max_y, min_y
+            cluster_bounds.append((cluster.id, min_x, max_x, min_y, max_y))
+        self._event_cluster_labels.clear()
+        if not cluster_bounds:
+            return
+        counts: dict[int, int] = {cluster.id: 0 for cluster in self._clusters}
+        for record in self._metric_events:
+            event_id = record.get("event_id")
+            if not isinstance(event_id, int):
+                continue
+            x_val = record.get(x_key)
+            y_val = record.get(y_key)
+            if x_val is None or y_val is None:
+                continue
+            try:
+                x_num = float(x_val)
+                y_num = float(y_val)
+            except (TypeError, ValueError):
+                continue
+            if not (np.isfinite(x_num) and np.isfinite(y_num)):
+                continue
+            for cluster_id, min_x, max_x, min_y, max_y in cluster_bounds:
+                if min_x <= x_num <= max_x and min_y <= y_num <= max_y:
+                    self._event_cluster_labels[event_id] = cluster_id
+                    counts[cluster_id] = counts.get(cluster_id, 0) + 1
+                    break
+        for cluster in self._clusters:
+            item = self._cluster_items.get(cluster.id)
+            if item is None:
+                continue
+            count = counts.get(cluster.id, 0)
+            item.setText(f"{cluster.name} ({count} events)")
+
+
+class ClusterWaveformDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        parent: Optional[QtWidgets.QWidget],
+        class_name: str,
+        waveforms: Sequence[tuple[np.ndarray, np.ndarray]],
+        color: Optional[QtGui.QColor] = None,
+    ) -> None:
+        super().__init__(parent)
+        count = len(waveforms)
+        self.setWindowTitle(f"Waveforms \u2013 {class_name} ({count} events)")
+        layout = QtWidgets.QVBoxLayout(self)
+        self.plot_widget = pg.PlotWidget(enableMenu=False)
+        self.plot_widget.setBackground("w")
+        self.plot_widget.setLabel("bottom", "Time (s)")
+        self.plot_widget.setLabel("left", "Amplitude (V)")
+        plot_item = self.plot_widget.getPlotItem()
+        plot_item.showGrid(x=True, y=True, alpha=0.15)
+        for axis_name in ("bottom", "left"):
+            axis = plot_item.getAxis(axis_name)
+            axis.setPen(pg.mkPen("black"))
+            axis.setTextPen(pg.mkPen("black"))
+        layout.addWidget(self.plot_widget, 1)
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_layout = QtWidgets.QHBoxLayout()
+        btn_layout.addStretch(1)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+        line_pen = pg.mkPen(QtGui.QColor(140, 140, 140, 90), width=1)
+        lengths: list[int] = []
+        trimmed_waveforms: list[tuple[np.ndarray, np.ndarray]] = []
+        for times, samples in waveforms:
+            length = int(min(times.size, samples.size))
+            if length <= 0:
+                continue
+            trimmed_waveforms.append((times[:length], samples[:length]))
+            lengths.append(length)
+            self.plot_widget.plot(times, samples, pen=line_pen, clear=False)
+        if not trimmed_waveforms:
+            return
+        length_counts = Counter(lengths)
+        target_len = max(length_counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+        aligned = [(times[:target_len], samples[:target_len]) for times, samples in trimmed_waveforms if times.size >= target_len and samples.size >= target_len]
+        if not aligned:
+            return
+        stack = np.stack([samples for _, samples in aligned], axis=0)
+        median_wave = np.median(stack, axis=0)
+        t_ref = aligned[0][0]
+        median_pen = pg.mkPen(color if color is not None else QtGui.QColor(0, 0, 200), width=3)
+        self.plot_widget.plot(t_ref, median_wave, pen=median_pen)
