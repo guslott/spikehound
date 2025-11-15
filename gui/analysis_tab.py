@@ -1425,7 +1425,7 @@ class AnalysisTab(QtWidgets.QWidget):
         median = np.median(windows, axis=0)
         # STA curves always use (time -> x, amplitude -> y)
         self._sta_median_curve.setData(t, median)
-        self._sta_median_curve.setPen(pg.mkPen(30, 150, 70, 255, width=2))
+        self._sta_median_curve.setPen(pg.mkPen(255, 140, 0, 255, width=2))
         self._sta_median_curve.show()
         plot_item.setLabel("bottom", "Lag", units="ms")
         plot_item.setLabel("left", "Amplitude", units="mV")

@@ -27,7 +27,7 @@ if __name__ == "__main__":
 # !!- Add option to save/load layouts of the GUI
 
 # - Feature for cross channel correlation
-#   - Spike triggered averaging of one channel based on spikes detected in another channel
+#   - option to pop out the traces into a separate figure
 
 # - Neural network based spike detection and sorting.
 #   - resolve overlaps of spikes
