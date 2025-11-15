@@ -13,6 +13,7 @@ from PySide6 import QtCore, QtWidgets, QtGui
 from analysis.analysis_worker import _peak_frequency_sinc
 from analysis.models import AnalysisBatch
 from core.models import Chunk, EndOfStream
+from shared.event_buffer import AnalysisEvents
 from shared.types import Event
 
 
@@ -24,6 +25,17 @@ CLUSTER_COLORS: list[QtGui.QColor] = [
     QtGui.QColor(199, 21, 133),   # magenta
 ]
 UNCLASSIFIED_COLOR = QtGui.QColor(220, 0, 0)
+MAX_VISIBLE_METRIC_EVENTS = 3000
+METRIC_TIME_WINDOW_SEC = 60.0
+STA_IMAGE_LUT = np.array(
+    [
+        [255, 255, 255, 0],
+        [170, 170, 170, 90],
+        [110, 110, 110, 170],
+        [60, 60, 60, 230],
+    ],
+    dtype=np.ubyte,
+)
 
 
 def _baseline(samples: np.ndarray, pre_samples: int) -> float:
@@ -135,10 +147,12 @@ class AnalysisTab(QtWidgets.QWidget):
         self._controller = controller
         self._analysis_settings: Optional["AnalysisSettingsStore"] = None
         self._event_buffer: Optional["EventRingBuffer"] = None
+        self._analysis_events: Optional[AnalysisEvents] = None
         self._worker: Optional["AnalysisWorker"] = None
         self._event_overlays: list[dict[str, object]] = []
         self._overlay_pool: list[pg.PlotCurveItem] = []
         self._overlay_pen = pg.mkPen(UNCLASSIFIED_COLOR, width=2)
+        self._overlay_capacity: int = 64
         self._latest_sample_time: Optional[float] = None
         self._window_start_time: Optional[float] = None
         self._channel_index: Optional[int] = None
@@ -147,10 +161,14 @@ class AnalysisTab(QtWidgets.QWidget):
         if controller is not None:
             self._analysis_settings = getattr(controller, "analysis_settings_store", None)
             self._event_buffer = getattr(controller, "event_buffer", None)
+            if self._event_buffer is not None:
+                self._analysis_events = AnalysisEvents(self._event_buffer)
         self._event_window_ms = self._initial_event_window_ms()
         self._t0_event: Optional[float] = None
         self._metric_events: list[dict[str, float | int]] = []
         self._max_metric_events = 10_000
+        self._metrics_dirty: bool = False
+        self._last_event_id: Optional[int] = None
         self._viz_paused = False
         self._cached_raw_times: Optional[np.ndarray] = None
         self._cached_raw_samples: Optional[np.ndarray] = None
@@ -166,11 +184,13 @@ class AnalysisTab(QtWidgets.QWidget):
         self._selected_cluster_id: int | None = None
         self._sta_enabled: bool = False
         self._sta_windows: list[np.ndarray] = []
+        self._sta_max_windows: int = 500
+        self._sta_update_interval_ms: int = 100
+        self._sta_dirty: bool = False
         self._sta_time_axis: np.ndarray | None = None
         self._sta_window_ms: float = 50.0
         self._sta_source_cluster_id: int | None = None
         self._sta_target_channel_id: int | None = None
-        self._sta_max_events: int = 1000
         self._sta_pending_events: dict[int, tuple[Event, int]] = {}
         self._sta_retry_limit: int = 10
 
@@ -216,6 +236,12 @@ class AnalysisTab(QtWidgets.QWidget):
         self.sta_plot.setMouseEnabled(x=False, y=False)
         self.raw_row_layout.addWidget(self.sta_plot, stretch=3)
         self.sta_plot.setAntialiasing(False)
+        self._sta_image_item = pg.ImageItem()
+        self._sta_image_item.setZValue(-5)
+        self.sta_plot.addItem(self._sta_image_item)
+        self._sta_median_curve = pg.PlotCurveItem()
+        self._sta_median_curve.setZValue(10)
+        self.sta_plot.addItem(self._sta_median_curve)
 
         layout.addWidget(self.raw_row_widget, stretch=4)
         self._hide_sta_plot()
@@ -485,6 +511,14 @@ class AnalysisTab(QtWidgets.QWidget):
         self._timer.setInterval(30)
         self._timer.timeout.connect(self._on_timer)
         self._timer.start()
+        self._metrics_timer = QtCore.QTimer(self)
+        self._metrics_timer.setInterval(100)
+        self._metrics_timer.timeout.connect(self._on_metrics_timer)
+        self._metrics_timer.start()
+        self._sta_timer = QtCore.QTimer(self)
+        self._sta_timer.setInterval(self._sta_update_interval_ms)
+        self._sta_timer.timeout.connect(self._on_sta_timer)
+        self._sta_timer.start()
         self._in_threshold_update = False
         self._on_axis_metric_changed()
         self._apply_ranges()
@@ -625,8 +659,9 @@ class AnalysisTab(QtWidgets.QWidget):
     def _on_timer(self) -> None:
         if self._analysis_queue is None:
             return
-        latest: Optional[AnalysisBatch] = None
-        while True:
+        max_batches = 3
+        processed = 0
+        while processed < max_batches:
             try:
                 item = self._analysis_queue.get_nowait()
             except queue.Empty:
@@ -634,15 +669,36 @@ class AnalysisTab(QtWidgets.QWidget):
             if item is EndOfStream:
                 continue
             if isinstance(item, AnalysisBatch):
-                latest = item
+                batch = item
             elif isinstance(item, Chunk):
                 meta = getattr(item, "meta", None)
                 events_from_meta = ()
                 if meta is not None and hasattr(meta, "get"):
                     events_from_meta = tuple(meta.get("analysis_events") or ())
-                latest = AnalysisBatch(chunk=item, events=events_from_meta)
-        if latest is not None:
-            self._render_batch(latest)
+                batch = AnalysisBatch(chunk=item, events=events_from_meta)
+            else:
+                continue
+            self._render_batch(batch)
+            processed += 1
+        if self._analysis_events is not None:
+            new_events, new_last_id = self._analysis_events.pull_events(self._last_event_id)
+            if new_events:
+                window_start = self._last_window_start
+                width = self._last_window_width or float(self.width_combo.currentData() or 0.5)
+                self._handle_batch_events(new_events, window_start, width, self._window_start_index)
+                self._last_event_id = new_last_id
+
+    def _on_metrics_timer(self) -> None:
+        if not self._metrics_dirty:
+            return
+        self._update_metric_points()
+        self._metrics_dirty = False
+
+    def _on_sta_timer(self) -> None:
+        if not self._sta_enabled or not self._sta_dirty:
+            return
+        self._refresh_sta_plot()
+        self._sta_dirty = False
 
     def _apply_ranges(self) -> None:
         width = float(self.width_combo.currentData() or 0.5)
@@ -881,6 +937,19 @@ class AnalysisTab(QtWidgets.QWidget):
         for overlay in self._event_overlays:
             self._apply_overlay_color(overlay)
 
+    def _update_last_event_id(self, events: Sequence[Event]) -> None:
+        if not events:
+            return
+        current_max = self._last_event_id if isinstance(self._last_event_id, int) else None
+        for event in events:
+            event_id = getattr(event, "id", None)
+            if not isinstance(event_id, int):
+                continue
+            if current_max is None or event_id > current_max:
+                current_max = event_id
+        if current_max is not None:
+            self._last_event_id = current_max
+
     def _handle_batch_events(
         self,
         events: Sequence[Event],
@@ -891,8 +960,13 @@ class AnalysisTab(QtWidgets.QWidget):
         pending_sta = bool(getattr(self, "_sta_pending_events", None))
         if events:
             for event in events:
-                overlay = self._build_overlay(event)
+                reuse_overlay: dict[str, object] | None = None
+                if len(self._event_overlays) >= self._overlay_capacity:
+                    reuse_overlay = self._event_overlays.pop(0)
+                overlay = self._build_overlay(event, reuse_overlay)
                 if overlay is None:
+                    if reuse_overlay is not None:
+                        self._release_overlay_item(reuse_overlay.get("item"))
                     continue
                 if not self._viz_paused:
                     if not self._apply_overlay_view(overlay, window_start, width, window_start_idx):
@@ -900,9 +974,10 @@ class AnalysisTab(QtWidgets.QWidget):
                         continue
                 self._event_overlays.append(overlay)
                 self._record_overlay_metrics(overlay)
-            self._update_metric_points()
+            self._metrics_dirty = True
             if self._sta_enabled:
                 self._sta_handle_events(events)
+            self._update_last_event_id(events)
         elif self._sta_enabled and pending_sta:
             self._sta_handle_events(())
         if not self._viz_paused:
@@ -926,7 +1001,6 @@ class AnalysisTab(QtWidgets.QWidget):
             self._apply_overlay_color(overlay)
             kept.append(overlay)
         self._event_overlays = kept
-        self._update_metric_points()
 
     def _clear_event_overlays(self) -> None:
         if not self._event_overlays:
@@ -1178,8 +1252,11 @@ class AnalysisTab(QtWidgets.QWidget):
             self._hide_sta_plot()
             self._sta_windows.clear()
             self._sta_time_axis = None
-            self.sta_plot.clear()
             self._sta_pending_events.clear()
+            self._sta_dirty = False
+            self._sta_image_item.hide()
+            self._sta_median_curve.hide()
+            self._sta_median_curve.clear()
 
     def _on_sta_source_changed(self, index: int) -> None:
         if index < 0:
@@ -1215,10 +1292,11 @@ class AnalysisTab(QtWidgets.QWidget):
     def _on_sta_clear_clicked(self) -> None:
         self._sta_windows.clear()
         self._sta_time_axis = None
-        self.sta_plot.clear()
         self._sta_pending_events.clear()
-        if self._sta_enabled:
-            self._refresh_sta_plot()
+        self._sta_dirty = False
+        self._sta_image_item.hide()
+        self._sta_median_curve.hide()
+        self._sta_median_curve.clear()
 
     def _sta_handle_events(self, events: Sequence[Event]) -> None:
         if not self._sta_enabled:
@@ -1249,9 +1327,7 @@ class AnalysisTab(QtWidgets.QWidget):
                     continue
                 self._sta_pending_events[event_id] = (event, attempts + 1)
         if updated:
-            if len(self._sta_windows) > self._sta_max_events:
-                self._sta_windows = self._sta_windows[-self._sta_max_events :]
-            self._refresh_sta_plot()
+            self._sta_dirty = True
 
     def _sta_process_event(
         self,
@@ -1272,7 +1348,9 @@ class AnalysisTab(QtWidgets.QWidget):
             if not isinstance(event_id, int):
                 return "skip"
             cluster = self._get_cluster_for_event(event_id)
-            if cluster is None or cluster.id != self._sta_source_cluster_id:
+            if cluster is None:
+                return "pending"
+            if cluster.id != self._sta_source_cluster_id:
                 return "skip"
         window, miss_pre, miss_post = controller.collect_trigger_window(
             event,
@@ -1289,36 +1367,70 @@ class AnalysisTab(QtWidgets.QWidget):
         baseline = float(np.median(window[:pre_n]))
         normalized = window.astype(np.float32, copy=False) - baseline
         self._sta_windows.append(normalized)
+        if len(self._sta_windows) > self._sta_max_windows:
+            self._sta_windows = self._sta_windows[-self._sta_max_windows :]
+        self._sta_dirty = True
         return "added"
 
     def _refresh_sta_plot(self) -> None:
         """Redraw the spike-triggered average plot."""
         plot_item = self.sta_plot.getPlotItem()
-        plot_item.clear()
         if not self._sta_windows:
+            self._sta_image_item.hide()
+            self._sta_median_curve.hide()
+            self._sta_median_curve.clear()
             return
-        min_len = min(w.size for w in self._sta_windows if isinstance(w, np.ndarray))
-        if min_len is None or min_len <= 1:
+        min_len = min((w.size for w in self._sta_windows if isinstance(w, np.ndarray)), default=0)
+        if min_len <= 1:
+            self._sta_image_item.hide()
+            self._sta_median_curve.hide()
+            self._sta_median_curve.clear()
             return
         windows = np.stack([np.asarray(w[:min_len], dtype=np.float32) for w in self._sta_windows], axis=0)
         if windows.size == 0:
+            self._sta_image_item.hide()
+            self._sta_median_curve.hide()
+            self._sta_median_curve.clear()
             return
         duration_ms = float(self._sta_window_ms)
-        if min_len <= 1:
-            return
         t = np.linspace(-duration_ms / 2.0, duration_ms / 2.0, min_len, dtype=np.float32)
         self._sta_time_axis = t
-        for row in windows:
-            curve = pg.PlotCurveItem(t, row, pen=pg.mkPen(70, 70, 70, 150))
-            plot_item.addItem(curve)
+        amp_min = float(np.min(windows))
+        amp_max = float(np.max(windows))
+        if not np.isfinite(amp_min) or not np.isfinite(amp_max):
+            amp_min, amp_max = -1.0, 1.0
+        if amp_max - amp_min < 1e-6:
+            bound = max(1e-3, abs(amp_max))
+            amp_min = -bound
+            amp_max = bound
+        amp_bins = max(64, min(256, int(np.sqrt(windows.size))))
+        time_bins = min_len
+        amp_values = windows.reshape(-1)
+        time_coords = np.tile(t, windows.shape[0])
+        time_edges = np.linspace(t[0], t[-1], time_bins + 1)
+        amp_edges = np.linspace(amp_min, amp_max, amp_bins + 1)
+        density, _, _ = np.histogram2d(time_coords, amp_values, bins=[time_edges, amp_edges])
+        img = density.T.astype(np.float32)
+        if img.size:
+            img = np.sqrt(img)
+            img_max = float(np.max(img))
+            if img_max > 0:
+                img /= img_max
+        self._sta_image_item.setImage(img, autoLevels=False, levels=(0.0, 1.0))
+        self._sta_image_item.setLookupTable(STA_IMAGE_LUT)
+        rect = QtCore.QRectF(time_edges[0], amp_edges[0], time_edges[-1] - time_edges[0], amp_edges[-1] - amp_edges[0])
+        self._sta_image_item.setRect(rect)
+        self._sta_image_item.setOpacity(0.85)
+        self._sta_image_item.show()
         median = np.median(windows, axis=0)
-        median_curve = pg.PlotCurveItem(t, median, pen=pg.mkPen(255, 140, 0, 255, width=4))
-        median_curve.setZValue(10)
-        plot_item.addItem(median_curve)
+        self._sta_median_curve.setData(t, median)
+        self._sta_median_curve.setPen(pg.mkPen(255, 140, 0, 220, width=2))
+        self._sta_median_curve.show()
         plot_item.setLabel("bottom", "Lag", units="ms")
         plot_item.setLabel("left", "Amplitude", units="V")
         plot_item.showGrid(x=True, y=True, alpha=0.3)
-        plot_item.setXRange(-duration_ms / 2.0, duration_ms / 2.0, padding=0.0)
+        plot_item.setXRange(t[0], t[-1], padding=0.0)
+        plot_item.setYRange(amp_min, amp_max, padding=0.05)
 
     def _on_add_class_clicked(self) -> None:
         if not self.clustering_enabled_check.isChecked():
@@ -1443,10 +1555,43 @@ class AnalysisTab(QtWidgets.QWidget):
         if y_key not in {"ed", "max", "min", "freq", "period", "interval"}:
             self.energy_scatter.hide()
             return
+        events = self._metric_events
+        if not events:
+            self.energy_scatter.hide()
+            return
+        visible_events = events
+        if x_key == "time":
+            last_time: float | None = None
+            for event in reversed(events):
+                t_val = event.get("time")
+                if t_val is None:
+                    continue
+                try:
+                    last_time = float(t_val)
+                except (TypeError, ValueError):
+                    continue
+                break
+            if last_time is not None:
+                min_time = last_time - METRIC_TIME_WINDOW_SEC
+                if min_time > 0:
+                    start_idx = 0
+                    for idx, event in enumerate(events):
+                        t_val = event.get("time")
+                        if t_val is None:
+                            continue
+                        try:
+                            if float(t_val) >= min_time:
+                                start_idx = idx
+                                break
+                        except (TypeError, ValueError):
+                            continue
+                    visible_events = events[start_idx:]
+        if len(visible_events) > MAX_VISIBLE_METRIC_EVENTS:
+            visible_events = visible_events[-MAX_VISIBLE_METRIC_EVENTS:]
         xs: list[float] = []
         ys: list[float] = []
         event_ids: list[Optional[int]] = []
-        for event in self._metric_events:
+        for event in visible_events:
             x_val = event.get(x_key)
             y_val = event.get(y_key)
             if x_val is None or y_val is None:
@@ -1557,7 +1702,7 @@ class AnalysisTab(QtWidgets.QWidget):
                 if removed_cluster:
                     self._refresh_overlay_colors()
 
-    def _build_overlay(self, event: Event) -> Optional[dict[str, object]]:
+    def _build_overlay(self, event: Event, reuse_overlay: Optional[dict[str, object]] = None) -> Optional[dict[str, object]]:
         samples = np.asarray(event.samples, dtype=np.float32)
         if samples.size < 8:
             return None
@@ -1588,7 +1733,13 @@ class AnalysisTab(QtWidgets.QWidget):
             peak_idx = cross_idx
         peak_idx = int(np.clip(peak_idx, 0, samples.size - 1))
         peak_time = float(times[peak_idx]) if times.size else float(event.crossingTimeSec)
-        curve = self._acquire_overlay_item()
+        curve: Optional[pg.PlotCurveItem] = None
+        if reuse_overlay is not None:
+            item = reuse_overlay.get("item")
+            if isinstance(item, pg.PlotCurveItem):
+                curve = item
+        if curve is None:
+            curve = self._acquire_overlay_item()
         metrics: Optional[dict[str, float]] = None
         metric_values: dict[str, float] = {}
         if samples.size >= 4:
@@ -1625,20 +1776,23 @@ class AnalysisTab(QtWidgets.QWidget):
         else:
             event_id = self._next_event_id
             self._next_event_id += 1
-        overlay_data = {
-            "item": curve,
-            "times": times,
-            "samples": samples,
-            "last_time": last_time,
-            "first_index": first_index,
-            "sr": sr,
-            "pre_samples": pre_samples,
-            "baseline": baseline,
-            "peak_idx": peak_idx,
-            "peak_time": peak_time,
-            "metrics": metrics,
-            "metric_time": peak_time,
-        }
+        overlay_data = reuse_overlay if reuse_overlay is not None else {}
+        overlay_data.update(
+            {
+                "item": curve,
+                "times": times,
+                "samples": samples,
+                "last_time": last_time,
+                "first_index": first_index,
+                "sr": sr,
+                "pre_samples": pre_samples,
+                "baseline": baseline,
+                "peak_idx": peak_idx,
+                "peak_time": peak_time,
+                "metrics": metrics,
+                "metric_time": peak_time,
+            }
+        )
         overlay_data["event_id"] = event_id
         self._apply_overlay_color(overlay_data)
         details_entry: dict[str, object] = {
@@ -1797,4 +1951,4 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
         t_ref = aligned[0][0]
         median_pen = pg.mkPen(color if color is not None else QtGui.QColor(0, 0, 200), width=3)
         self.plot_widget.plot(t_ref, median_wave, pen=median_pen)
-        self.metrics_plot.setAntialiasing(False)
+        self.plot_widget.setAntialiasing(False)
