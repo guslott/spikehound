@@ -1652,6 +1652,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if existing is not None:
             config.channel_name = existing.channel_name or config.channel_name
         display_changed = existing is not None and existing.display_enabled != config.display_enabled
+        filters_changed = self._filters_changed(existing, config)
         panel = self._channel_panels.get(channel_id)
         if panel is not None:
             panel.set_config(config)
@@ -1669,7 +1670,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._last_times = np.zeros(0, dtype=np.float32)
         self._update_channel_display(channel_id)
         self._refresh_channel_layout()
-        self._sync_filter_settings()
+        if filters_changed:
+            self._sync_filter_settings()
         if self._active_channel_id == channel_id:
             self._update_axis_label()
         self._handle_listen_change(channel_id, config.listen_enabled)
@@ -2053,6 +2055,24 @@ class MainWindow(QtWidgets.QMainWindow):
         axis.setPen(pen)
         axis.setTextPen(pen)
         axis.setLabel(text="Amplitude", units="V")
+
+    def _filters_changed(self, previous: Optional[ChannelConfig], current: ChannelConfig) -> bool:
+        if previous is None:
+            return True
+
+        def _diff(a: float, b: float) -> bool:
+            return abs(float(a) - float(b)) > 1e-9
+
+        return any(
+            [
+                previous.notch_enabled != current.notch_enabled,
+                _diff(previous.notch_freq, current.notch_freq),
+                previous.highpass_enabled != current.highpass_enabled,
+                _diff(previous.highpass_freq, current.highpass_freq),
+                previous.lowpass_enabled != current.lowpass_enabled,
+                _diff(previous.lowpass_freq, current.lowpass_freq),
+            ]
+        )
 
     def _sync_filter_settings(self) -> None:
         controller = self._controller

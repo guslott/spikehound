@@ -17,6 +17,7 @@ if __name__ == "__main__":
 
 #TODO Notes:
 # - Add spectrogram view in analysis mode, also, simply fft amplitudes view
+#    - Add spectrogram button next to analyze and have it pop up a spectrogram tab for a channel
 # - Button to export of events list to CSV
 # - Buttons to pop up windows for screen shotting for reports
 # - DAQ devices need to provide discrete sample rate settings rather than arbitrary ones
@@ -24,10 +25,16 @@ if __name__ == "__main__":
 # - Fix vertical range and offset per channel in scope view
 # - Complete trigger options in scope view or remove them
 # - Allow for custom channel names
-# !!- Add option to save/load layouts of the GUI
 
 # - Feature for cross channel correlation
 #   - option to pop out the traces into a separate figure
+
+# - Automated spike sorting (advanced analysis tab)
+#   - Could involve human support for identifying class types
+#   - clustering algorithms (k-means, hierarchical, etc)
+#   - Overlap detection and deconvolution
+#   - Build templates and align spikes to templates for defining event start times
+#   - Will want to build a model of noise for each channel as well
 
 # - Neural network based spike detection and sorting.
 #   - resolve overlaps of spikes

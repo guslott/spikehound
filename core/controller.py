@@ -405,6 +405,8 @@ class PipelineController:
 
     def update_filter_settings(self, settings: FilterSettings) -> None:
         with self._lock:
+            if settings == self._filter_settings:
+                return
             self._filter_settings = settings
             if self._dispatcher is not None:
                 self._dispatcher.update_filter_settings(settings)
