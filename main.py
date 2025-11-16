@@ -32,3 +32,7 @@ if __name__ == "__main__":
 # - Neural network based spike detection and sorting.
 #   - resolve overlaps of spikes
 
+# - Test on Windows
+#   - Get school laptop and install NIDAQmx drivers
+#   - simulate devices and write a windows only DAQ interface using pyDAQmx
+

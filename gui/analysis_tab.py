@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 import queue
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass
 from typing import Optional, TYPE_CHECKING, Sequence
 
@@ -27,6 +29,7 @@ CLUSTER_COLORS: list[QtGui.QColor] = [
 UNCLASSIFIED_COLOR = QtGui.QColor(220, 0, 0)
 MAX_VISIBLE_METRIC_EVENTS = 3000
 METRIC_TIME_WINDOW_SEC = 60.0
+STA_TRACE_PEN = pg.mkPen(90, 90, 90, 110)
 
 def _baseline(samples: np.ndarray, pre_samples: int) -> float:
     arr = np.asarray(samples, dtype=np.float32)
@@ -117,6 +120,44 @@ class MetricCluster:
     roi: pg.RectROI | None = None
 
 
+@dataclass
+class OverlayPayload:
+    """Qt-free representation of a raw spike overlay."""
+
+    event_id: int | None
+    times: np.ndarray
+    samples: np.ndarray
+    last_time: float
+    first_index: int | None
+    sr: float
+    pre_samples: int
+    baseline: float
+    peak_idx: int
+    peak_time: float
+    metrics: dict[str, float] | None
+    metric_time: float
+
+
+@dataclass
+class StaTask:
+    """Data packet describing which events to use for STA processing."""
+
+    events: tuple[Event, ...]
+    target_channel_id: int
+    channel_index: int | None
+    window_ms: float
+
+
+@dataclass
+class AnalysisUpdate:
+    """Result bundle produced by preprocessing an analysis batch."""
+
+    overlays: list[OverlayPayload]
+    sta_windows: list[np.ndarray] | None = None
+    sta_task: StaTask | None = None
+    last_event_id: int | None = None
+
+
 class AnalysisTab(QtWidgets.QWidget):
     """Simple analysis view with a top-half plot for a single channel."""
 
@@ -138,6 +179,8 @@ class AnalysisTab(QtWidgets.QWidget):
         self._analysis_settings: Optional["AnalysisSettingsStore"] = None
         self._event_buffer: Optional["EventRingBuffer"] = None
         self._analysis_events: Optional[AnalysisEvents] = None
+        self._analysis_executor: ThreadPoolExecutor | None = ThreadPoolExecutor(max_workers=1)
+        self._analysis_futures: set[Future] = set()
         self._worker: Optional["AnalysisWorker"] = None
         self._event_overlays: list[dict[str, object]] = []
         self._overlay_pool: list[pg.PlotCurveItem] = []
@@ -512,6 +555,18 @@ class AnalysisTab(QtWidgets.QWidget):
         self._on_axis_metric_changed()
         self._apply_ranges()
         self._update_cluster_button_states()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        executor = getattr(self, "_analysis_executor", None)
+        if executor is not None:
+            try:
+                for fut in list(self._analysis_futures):
+                    fut.cancel()
+                executor.shutdown(wait=False)
+            except Exception:
+                pass
+            self._analysis_executor = None
+        super().closeEvent(event)
 
     # ------------------------------------------------------------------
     # Buffer helpers
@@ -926,19 +981,6 @@ class AnalysisTab(QtWidgets.QWidget):
         for overlay in self._event_overlays:
             self._apply_overlay_color(overlay)
 
-    def _update_last_event_id(self, events: Sequence[Event]) -> None:
-        if not events:
-            return
-        current_max = self._last_event_id if isinstance(self._last_event_id, int) else None
-        for event in events:
-            event_id = getattr(event, "id", None)
-            if not isinstance(event_id, int):
-                continue
-            if current_max is None or event_id > current_max:
-                current_max = event_id
-        if current_max is not None:
-            self._last_event_id = current_max
-
     def _handle_batch_events(
         self,
         events: Sequence[Event],
@@ -948,28 +990,132 @@ class AnalysisTab(QtWidgets.QWidget):
     ) -> None:
         pending_sta = bool(getattr(self, "_sta_pending_events", None))
         if events:
-            for event in events:
-                reuse_overlay: dict[str, object] | None = None
-                if len(self._event_overlays) >= self._overlay_capacity:
-                    reuse_overlay = self._event_overlays.pop(0)
-                overlay = self._build_overlay(event, reuse_overlay)
-                if overlay is None:
-                    if reuse_overlay is not None:
-                        self._release_overlay_item(reuse_overlay.get("item"))
-                    continue
-                if not self._viz_paused:
-                    if not self._apply_overlay_view(overlay, window_start, width, window_start_idx):
-                        self._release_overlay_item(overlay.get("item"))
-                        continue
-                self._event_overlays.append(overlay)
-                self._record_overlay_metrics(overlay)
-            self._metrics_dirty = True
-            if self._sta_enabled:
-                self._sta_handle_events(events)
-            self._update_last_event_id(events)
+            self._submit_analysis_job(tuple(events), window_start, width, window_start_idx)
         elif self._sta_enabled and pending_sta:
-            self._sta_handle_events(())
+            task = self._build_sta_task(())
+            if task is not None:
+                self._sta_handle_task(task)
         if not self._viz_paused:
+            self._refresh_overlay_positions(window_start, width, window_start_idx)
+
+    def _build_sta_task(self, events: Sequence[Event]) -> StaTask | None:
+        if not self._sta_enabled:
+            return None
+        target_channel_id = self._sta_target_channel_id
+        if target_channel_id is None:
+            return None
+        channel_info = int(self._channel_index) if getattr(self, "_channel_index", None) is not None else None
+        return StaTask(
+            events=tuple(events),
+            target_channel_id=int(target_channel_id),
+            channel_index=channel_info,
+            window_ms=float(self._sta_window_ms),
+        )
+
+    def _submit_analysis_job(
+        self,
+        events: tuple[Event, ...],
+        window_start: float,
+        width: float,
+        window_start_idx: Optional[int],
+    ) -> None:
+        if not events:
+            return
+        executor = self._analysis_executor
+        if executor is None:
+            self._apply_analysis_update(
+                self._build_analysis_update(events),
+                window_start,
+                width,
+                window_start_idx,
+            )
+            return
+        if len(self._analysis_futures) >= 3:
+            # Avoid dropping overlays: process inline if the worker is saturated.
+            self._apply_analysis_update(
+                self._build_analysis_update(events),
+                window_start,
+                width,
+                window_start_idx,
+            )
+            return
+        future = executor.submit(self._build_analysis_update, events)
+        self._analysis_futures.add(future)
+
+        def _on_done(fut: Future, params=(window_start, width, window_start_idx)) -> None:
+            QtCore.QTimer.singleShot(
+                0,
+                lambda: self._on_analysis_update_ready(fut, *params),
+            )
+
+        future.add_done_callback(_on_done)
+
+    def _on_analysis_update_ready(
+        self,
+        future: Future,
+        window_start: float,
+        width: float,
+        window_start_idx: Optional[int],
+    ) -> None:
+        self._analysis_futures.discard(future)
+        try:
+            update = future.result()
+        except Exception as exc:
+            logging.getLogger(__name__).exception("Analysis worker failed: %s", exc)
+            return
+        self._apply_analysis_update(update, window_start, width, window_start_idx)
+
+    def _build_analysis_update(self, events: tuple[Event, ...]) -> AnalysisUpdate:
+        overlays: list[OverlayPayload] = []
+        last_event_id: int | None = None
+        for event in events:
+            payload = self._build_overlay_payload(event)
+            if payload is None:
+                continue
+            overlays.append(payload)
+            event_id = payload.event_id
+            if isinstance(event_id, int):
+                last_event_id = event_id if last_event_id is None else max(last_event_id, event_id)
+        sta_task = self._build_sta_task(events)
+        return AnalysisUpdate(overlays=overlays, sta_task=sta_task, last_event_id=last_event_id)
+
+    def _apply_analysis_update(
+        self,
+        update: AnalysisUpdate,
+        window_start: float,
+        width: float,
+        window_start_idx: Optional[int],
+    ) -> None:
+        payloads = update.overlays or []
+        for payload in payloads:
+            reuse_overlay: dict[str, object] | None = None
+            if len(self._event_overlays) >= self._overlay_capacity:
+                reuse_overlay = self._event_overlays.pop(0)
+            overlay = self._materialize_overlay(payload, reuse_overlay)
+            if overlay is None:
+                continue
+            if not self._viz_paused:
+                if not self._apply_overlay_view(overlay, window_start, width, window_start_idx):
+                    self._release_overlay_item(overlay.get("item"))
+                    continue
+            self._event_overlays.append(overlay)
+            self._record_overlay_metrics(overlay)
+        if payloads:
+            self._metrics_dirty = True
+        if update.sta_windows:
+            self._sta_windows.extend(update.sta_windows)
+            if len(self._sta_windows) > self._sta_max_windows:
+                self._sta_windows = self._sta_windows[-self._sta_max_windows :]
+            self._sta_dirty = True
+        elif update.sta_task is not None:
+            self._sta_handle_task(update.sta_task)
+        if isinstance(update.last_event_id, int):
+            self._last_event_id = (
+                update.last_event_id
+                if self._last_event_id is None
+                else max(self._last_event_id, update.last_event_id)
+            )
+        if not self._viz_paused and payloads:
             self._refresh_overlay_positions(window_start, width, window_start_idx)
 
     def _refresh_overlay_positions(self, window_start: float, width: float, window_start_idx: Optional[int]) -> None:
@@ -1302,25 +1448,25 @@ class AnalysisTab(QtWidgets.QWidget):
         self._sta_median_curve.hide()
         self._sta_median_curve.clear()
 
-    def _sta_handle_events(self, events: Sequence[Event]) -> None:
-        if not self._sta_enabled:
-            return
+    def _sta_handle_task(self, task: StaTask) -> None:
         controller = self._controller
         if controller is None:
             return
-        target_channel_id = self._sta_target_channel_id
-        if target_channel_id is None:
-            return
-        channel_info = None
-        if hasattr(self, "_channel_index") and self._channel_index is not None:
-            channel_info = int(self._channel_index)
+        target_channel_id = task.target_channel_id
+        channel_info = task.channel_index
         pending_items = list(self._sta_pending_events.values())
         self._sta_pending_events.clear()
-        queue: list[tuple[Event, int]] = [(event, 0) for event in events]
+        queue: list[tuple[Event, int]] = [(event, 0) for event in task.events]
         queue.extend(pending_items)
         updated = False
         for event, attempts in queue:
-            status = self._sta_process_event(controller, target_channel_id, channel_info, event)
+            status = self._sta_process_event(
+                controller,
+                target_channel_id,
+                channel_info,
+                event,
+                task.window_ms,
+            )
             if status == "added":
                 updated = True
             elif status == "pending":
@@ -1339,6 +1485,7 @@ class AnalysisTab(QtWidgets.QWidget):
         target_channel_id: int,
         channel_info: Optional[int],
         event: Event,
+        window_ms: float,
     ) -> str:
         event_channel = getattr(event, "channelId", getattr(event, "channel_id", None))
         if event_channel is not None and channel_info is not None:
@@ -1359,7 +1506,7 @@ class AnalysisTab(QtWidgets.QWidget):
         window, miss_pre, miss_post = controller.collect_trigger_window(
             event,
             target_channel_id=target_channel_id,
-            window_ms=self._sta_window_ms,
+            window_ms=window_ms,
         )
         if miss_pre > 0:
             return "skip"
@@ -1425,7 +1572,7 @@ class AnalysisTab(QtWidgets.QWidget):
         median = np.median(windows, axis=0)
         # STA curves always use (time -> x, amplitude -> y)
         self._sta_median_curve.setData(t, median)
-        self._sta_median_curve.setPen(pg.mkPen(255, 140, 0, 255, width=2))
+        self._sta_median_curve.setPen(pg.mkPen(0, 250, 30, 255, width=3))
         self._sta_median_curve.show()
         plot_item.setLabel("bottom", "Lag", units="ms")
         plot_item.setLabel("left", "Amplitude", units="mV")
@@ -1703,7 +1850,7 @@ class AnalysisTab(QtWidgets.QWidget):
                 if removed_cluster:
                     self._refresh_overlay_colors()
 
-    def _build_overlay(self, event: Event, reuse_overlay: Optional[dict[str, object]] = None) -> Optional[dict[str, object]]:
+    def _build_overlay_payload(self, event: Event) -> Optional[OverlayPayload]:
         samples = np.asarray(event.samples, dtype=np.float32)
         if samples.size < 8:
             return None
@@ -1734,13 +1881,6 @@ class AnalysisTab(QtWidgets.QWidget):
             peak_idx = cross_idx
         peak_idx = int(np.clip(peak_idx, 0, samples.size - 1))
         peak_time = float(times[peak_idx]) if times.size else float(event.crossingTimeSec)
-        curve: Optional[pg.PlotCurveItem] = None
-        if reuse_overlay is not None:
-            item = reuse_overlay.get("item")
-            if isinstance(item, pg.PlotCurveItem):
-                curve = item
-        if curve is None:
-            curve = self._acquire_overlay_item()
         metrics: Optional[dict[str, float]] = None
         metric_values: dict[str, float] = {}
         if samples.size >= 4:
@@ -1777,32 +1917,60 @@ class AnalysisTab(QtWidgets.QWidget):
         else:
             event_id = self._next_event_id
             self._next_event_id += 1
+        return OverlayPayload(
+            event_id=event_id,
+            times=times,
+            samples=samples,
+            last_time=last_time,
+            first_index=first_index,
+            sr=sr,
+            pre_samples=pre_samples,
+            baseline=baseline,
+            peak_idx=peak_idx,
+            peak_time=peak_time,
+            metrics=metrics,
+            metric_time=peak_time,
+        )
+
+    def _materialize_overlay(
+        self,
+        payload: OverlayPayload,
+        reuse_overlay: Optional[dict[str, object]] = None,
+    ) -> Optional[dict[str, object]]:
+        curve: Optional[pg.PlotCurveItem] = None
         overlay_data = reuse_overlay if reuse_overlay is not None else {}
+        if reuse_overlay is not None:
+            item = reuse_overlay.get("item")
+            if isinstance(item, pg.PlotCurveItem):
+                curve = item
+        if curve is None:
+            curve = self._acquire_overlay_item()
         overlay_data.update(
             {
                 "item": curve,
-                "times": times,
-                "samples": samples,
-                "last_time": last_time,
-                "first_index": first_index,
-                "sr": sr,
-                "pre_samples": pre_samples,
-                "baseline": baseline,
-                "peak_idx": peak_idx,
-                "peak_time": peak_time,
-                "metrics": metrics,
-                "metric_time": peak_time,
+                "times": payload.times,
+                "samples": payload.samples,
+                "last_time": payload.last_time,
+                "first_index": payload.first_index,
+                "sr": payload.sr,
+                "pre_samples": payload.pre_samples,
+                "baseline": payload.baseline,
+                "peak_idx": payload.peak_idx,
+                "peak_time": payload.peak_time,
+                "metrics": payload.metrics,
+                "metric_time": payload.metric_time,
+                "event_id": payload.event_id,
             }
         )
-        overlay_data["event_id"] = event_id
         self._apply_overlay_color(overlay_data)
         details_entry: dict[str, object] = {
-            "metric_time": float(peak_time),
-            "times": times,
-            "samples": samples,
-            "metrics": dict(metrics) if isinstance(metrics, dict) else {},
+            "metric_time": float(payload.metric_time),
+            "times": payload.times,
+            "samples": payload.samples,
+            "metrics": dict(payload.metrics) if isinstance(payload.metrics, dict) else {},
         }
-        self._event_details[event_id] = details_entry
+        if isinstance(payload.event_id, int):
+            self._event_details[payload.event_id] = details_entry
         return overlay_data
 
     def _apply_overlay_view(
@@ -1953,4 +2121,3 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
         median_pen = pg.mkPen(color if color is not None else QtGui.QColor(0, 0, 200), width=3)
         self.plot_widget.plot(t_ref, median_wave, pen=median_pen)
         self.plot_widget.setAntialiasing(False)
-STA_TRACE_PEN = pg.mkPen(90, 90, 90, 110)
