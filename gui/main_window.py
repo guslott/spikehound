@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import queue
 import threading
 import time
@@ -458,6 +459,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._bind_app_settings_store()
         self._emit_trigger_config()
         QtCore.QTimer.singleShot(0, self._update_splash_pixmap)
+        QtCore.QTimer.singleShot(0, self._try_load_default_config)
 
         # Global shortcuts for quitting/closing
         quit_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Quit), self)
@@ -689,6 +691,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.device_group = QtWidgets.QGroupBox("Device")
         device_layout = QtWidgets.QGridLayout(self.device_group)
+        device_layout.setContentsMargins(6, 6, 6, 6)
+        device_layout.setHorizontalSpacing(6)
+        device_layout.setVerticalSpacing(6)
         device_layout.setColumnStretch(1, 1)
         self.device_group.setMaximumWidth(320)
 
@@ -705,19 +710,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sample_rate_spin.setStyleSheet("color: rgb(255,255,255); background-color: rgb(0,0,0);")
         device_layout.addWidget(self.sample_rate_spin, 1, 1)
 
-        self.device_toggle_btn = QtWidgets.QPushButton("Connect")
-        self.device_toggle_btn.setCheckable(True)
-        self.device_toggle_btn.clicked.connect(self._on_device_button_clicked)
-        device_layout.addWidget(self.device_toggle_btn, 2, 0, 1, 2)
-
-        listen_row = QtWidgets.QHBoxLayout()
-        listen_row.setSpacing(6)
-        listen_row.addStretch(1)
+        controls_row = QtWidgets.QHBoxLayout()
+        controls_row.setSpacing(6)
         self.settings_toggle_btn = QtWidgets.QPushButton("Settings")
         self.settings_toggle_btn.setCheckable(True)
         self.settings_toggle_btn.toggled.connect(self._toggle_settings_tab)
-        listen_row.addWidget(self.settings_toggle_btn)
-        device_layout.addLayout(listen_row, 3, 0, 1, 2)
+        controls_row.addWidget(self.settings_toggle_btn)
+        self.save_config_btn = QtWidgets.QPushButton("Save Config")
+        self.save_config_btn.clicked.connect(self._on_save_scope_config)
+        controls_row.addWidget(self.save_config_btn)
+        self.load_config_btn = QtWidgets.QPushButton("Load Config")
+        self.load_config_btn.clicked.connect(self._on_load_scope_config)
+        controls_row.addWidget(self.load_config_btn)
+        controls_row.addStretch(1)
+        device_layout.addLayout(controls_row, 2, 0, 1, 2)
+
+        self.device_toggle_btn = QtWidgets.QPushButton("Connect")
+        self.device_toggle_btn.setCheckable(True)
+        self.device_toggle_btn.clicked.connect(self._on_device_button_clicked)
+        device_layout.addWidget(self.device_toggle_btn, 3, 0, 1, 2)
 
         self.channels_group = QtWidgets.QGroupBox("Channels")
         channels_layout = QtWidgets.QVBoxLayout(self.channels_group)
@@ -1002,6 +1013,185 @@ class MainWindow(QtWidgets.QMainWindow):
         label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         return label
 
+    def _color_to_tuple(self, color: QtGui.QColor) -> tuple[int, int, int, int]:
+        if not isinstance(color, QtGui.QColor):
+            return (0, 0, 0, 255)
+        return (color.red(), color.green(), color.blue(), color.alpha())
+
+    def _color_from_tuple(self, data: Sequence[int]) -> QtGui.QColor:
+        try:
+            r, g, b, a = (int(x) for x in data)
+            return QtGui.QColor(r, g, b, a)
+        except Exception:
+            return QtGui.QColor(0, 0, 139)
+
+    def _channel_config_to_dict(self, config: ChannelConfig) -> dict:
+        return {
+            "color": self._color_to_tuple(config.color),
+            "display_enabled": bool(config.display_enabled),
+            "range_v": float(config.range_v),
+            "offset_v": float(config.offset_v),
+            "notch_enabled": bool(config.notch_enabled),
+            "notch_freq": float(config.notch_freq),
+            "highpass_enabled": bool(config.highpass_enabled),
+            "highpass_freq": float(config.highpass_freq),
+            "lowpass_enabled": bool(config.lowpass_enabled),
+            "lowpass_freq": float(config.lowpass_freq),
+            "listen_enabled": bool(config.listen_enabled),
+            "analyze_enabled": bool(config.analyze_enabled),
+            "channel_name": config.channel_name,
+        }
+
+    def _channel_config_from_dict(self, payload: dict, *, fallback_name: str = "") -> ChannelConfig:
+        cfg = ChannelConfig()
+        try:
+            cfg.color = self._color_from_tuple(payload.get("color", (0, 0, 139, 255)))
+            cfg.display_enabled = bool(payload.get("display_enabled", True))
+            cfg.range_v = float(payload.get("range_v", 1.0))
+            cfg.offset_v = float(payload.get("offset_v", 0.0))
+            cfg.notch_enabled = bool(payload.get("notch_enabled", False))
+            cfg.notch_freq = float(payload.get("notch_freq", 60.0))
+            cfg.highpass_enabled = bool(payload.get("highpass_enabled", False))
+            cfg.highpass_freq = float(payload.get("highpass_freq", 10.0))
+            cfg.lowpass_enabled = bool(payload.get("lowpass_enabled", False))
+            cfg.lowpass_freq = float(payload.get("lowpass_freq", 1_000.0))
+            cfg.listen_enabled = bool(payload.get("listen_enabled", False))
+            cfg.analyze_enabled = bool(payload.get("analyze_enabled", False))
+            cfg.channel_name = str(payload.get("channel_name") or fallback_name or "")
+        except Exception:
+            cfg.channel_name = fallback_name
+        return cfg
+
+    def _collect_scope_config(self) -> Optional[dict]:
+        device_key = self.device_combo.currentData()
+        if device_key is None:
+            QtWidgets.QMessageBox.information(self, "Save Config", "Select a device before saving a scope config.")
+            return None
+        window_value = float(self.window_combo.currentData() or self._current_window_sec or 0.0)
+        payload = {
+            "version": 1,
+            "device_key": device_key,
+            "sample_rate": float(self.sample_rate_spin.value()),
+            "window_sec": float(window_value),
+            "channels": [],
+        }
+        channel_names = {cid: name for cid, name in zip(self._channel_ids_current, self._channel_names)}
+        for cid in self._channel_ids_current:
+            cfg = self._channel_configs.get(cid)
+            if cfg is None:
+                continue
+            payload["channels"].append(
+                {
+                    "id": cid,
+                    "name": channel_names.get(cid) or cfg.channel_name or f"Channel {cid}",
+                    "config": self._channel_config_to_dict(cfg),
+                }
+            )
+        return payload
+
+    def _find_available_index_by_id(self, channel_id: int) -> int:
+        for idx in range(self.available_combo.count()):
+            info = self.available_combo.itemData(idx)
+            if getattr(info, "id", None) == channel_id:
+                return idx
+        return -1
+
+    def _apply_scope_config_data(self, data: dict, source: str = "", *, show_dialogs: bool = True) -> None:
+        def _info(title: str, message: str) -> None:
+            if show_dialogs:
+                QtWidgets.QMessageBox.information(self, title, message)
+            else:
+                self.statusBar().showMessage(message, 5000)
+
+        def _warning(title: str, message: str) -> None:
+            if show_dialogs:
+                QtWidgets.QMessageBox.warning(self, title, message)
+            else:
+                self.statusBar().showMessage(message, 7000)
+
+        def _critical(title: str, message: str) -> None:
+            if show_dialogs:
+                QtWidgets.QMessageBox.critical(self, title, message)
+            else:
+                self.statusBar().showMessage(message, 8000)
+
+        version = int(data.get("version", 1) or 1)
+        if version != 1:
+            _warning("Load Config", f"Unsupported config version: {version}")
+            return
+        device_key = data.get("device_key")
+        sample_rate = float(data.get("sample_rate", self.sample_rate_spin.value()))
+        window_sec = float(data.get("window_sec", self._current_window_sec))
+        channels_payload = data.get("channels") or []
+
+        if device_key is not None:
+            idx = self.device_combo.findData(device_key)
+            if idx >= 0:
+                self.device_combo.setCurrentIndex(idx)
+            else:
+                _warning(
+                    "Load Config",
+                    f"Device '{device_key}' is not available; cannot load configuration{f' from {source}' if source else ''}.",
+                )
+                return
+
+        self.sample_rate_spin.setValue(sample_rate)
+        self._set_window_combo_value(window_sec)
+
+        if device_key is None or self._device_manager is None:
+            _info("Load Config", "No device specified in the configuration.")
+            return
+
+        try:
+            self._device_manager.connect_device(device_key, sample_rate=self.sample_rate_spin.value())
+        except Exception as exc:
+            _critical("Load Config", f"Failed to connect to device '{device_key}': {exc}")
+            return
+
+        # Refresh channel lists with the newly connected device
+        try:
+            available_channels = self._device_manager.get_available_channels()
+            self._on_available_channels(available_channels)
+        except Exception:
+            pass
+
+        missing_channels: list[int] = []
+        self.active_list.blockSignals(True)
+        self.available_combo.blockSignals(True)
+        self.active_list.clear()
+        self._channel_configs.clear()
+        try:
+            for entry in channels_payload:
+                cid = entry.get("id")
+                if cid is None:
+                    continue
+                idx = self._find_available_index_by_id(int(cid))
+                if idx < 0:
+                    missing_channels.append(int(cid))
+                    continue
+                info = self.available_combo.itemData(idx)
+                name = entry.get("name") or self.available_combo.itemText(idx)
+                item = QtWidgets.QListWidgetItem(name)
+                item.setData(QtCore.Qt.UserRole, info)
+                self.active_list.addItem(item)
+                self.available_combo.removeItem(idx)
+                cfg = self._channel_config_from_dict(entry.get("config") or {}, fallback_name=name)
+                cfg.channel_name = name
+                self._channel_configs[int(cid)] = cfg
+            if self.active_list.count():
+                self.active_list.setCurrentRow(0)
+        finally:
+            self.active_list.blockSignals(False)
+            self.available_combo.blockSignals(False)
+
+        self._publish_active_channels()
+        if missing_channels:
+            missing_str = ", ".join(str(cid) for cid in missing_channels)
+            _info("Load Config", f"Loaded with missing channels: {missing_str}")
+        else:
+            msg = f"Scope configuration loaded{f' from {source}' if source else ''}."
+            self.statusBar().showMessage(msg, 5000)
+
     def _emit_trigger_config(self, *_) -> None:
         data = self.trigger_channel_combo.currentData()
         channel_id = int(data) if data is not None else None
@@ -1032,6 +1222,72 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.trigger_mode_single.isChecked():
             return "single"
         return "stream"
+
+    def _on_save_scope_config(self) -> None:
+        payload = self._collect_scope_config()
+        if payload is None:
+            return
+        default_path = Path.home() / "spikehound_scope.json"
+        path_str, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save Scope Configuration",
+            str(default_path),
+            "JSON Files (*.json)",
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        if path.suffix.lower() != ".json":
+            path = path.with_suffix(".json")
+        try:
+            path.write_text(json.dumps(payload, indent=2))
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Save Config",
+                f"Failed to save configuration: {exc}",
+            )
+            return
+        self.statusBar().showMessage(f"Saved scope configuration to {path}", 5000)
+
+    def _on_load_scope_config(self) -> None:
+        start_dir = str(Path.home())
+        path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Load Scope Configuration",
+            start_dir,
+            "JSON Files (*.json)",
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        try:
+            data = json.loads(path.read_text())
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Load Config",
+                f"Failed to read configuration: {exc}",
+            )
+            return
+        if not isinstance(data, dict):
+            QtWidgets.QMessageBox.critical(self, "Load Config", "Configuration file is not valid JSON.")
+            return
+        self._apply_scope_config_data(data, source=str(path))
+
+    def _try_load_default_config(self) -> None:
+        default_path = Path.cwd() / "default_config.json"
+        if not default_path.is_file():
+            return
+        try:
+            data = json.loads(default_path.read_text())
+        except Exception as exc:
+            self.statusBar().showMessage(f"Failed to read default_config.json: {exc}", 7000)
+            return
+        if not isinstance(data, dict):
+            self.statusBar().showMessage("default_config.json is not valid JSON.", 7000)
+            return
+        self._apply_scope_config_data(data, source=str(default_path), show_dialogs=False)
 
     def _on_device_button_clicked(self) -> None:
         if not hasattr(self, "_device_manager") or self._device_manager is None:
@@ -1907,6 +2163,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_toggle_btn.setText("Disconnect" if connected else "Connect")
         self.device_toggle_btn.setEnabled(connected or has_connectable)
         self.device_toggle_btn.blockSignals(False)
+        self.save_config_btn.setEnabled(has_entries)
+        self.load_config_btn.setEnabled(True)
         self.available_combo.setEnabled(connected)
         self.active_list.setEnabled(connected)
         self._update_channel_buttons()
