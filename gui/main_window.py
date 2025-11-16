@@ -503,6 +503,8 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         self.plot_widget.setMenuEnabled(False)
+        # Keep the scope axes fixed; range changes should only come from the UI controls.
+        self.plot_widget.setMouseEnabled(x=False, y=False)
         self.plot_widget.setBackground(QtGui.QColor(211, 230, 204))
         self.plot_widget.setLabel("bottom", "Time", units="s")
         self.plot_widget.setLabel("left", "Amplitude", units="V")
