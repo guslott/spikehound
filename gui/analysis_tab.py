@@ -217,7 +217,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._selected_cluster_id: int | None = None
         self._sta_enabled: bool = False
         self._sta_windows: list[np.ndarray] = []
-        self._sta_max_windows: int = 500
+        self._sta_max_windows = float("inf")
         self._sta_update_interval_ms: int = 100
         self._sta_dirty: bool = False
         self._sta_time_axis: np.ndarray | None = None
@@ -255,7 +255,23 @@ class AnalysisTab(QtWidgets.QWidget):
         plot_item.setXRange(0.0, 1.0, padding=0.0)
         plot_item.setYRange(-1.0, 1.0, padding=0.0)
         self.plot_widget.setMouseEnabled(x=False, y=False)
-        self.raw_row_layout.addWidget(self.plot_widget, stretch=7)
+        self.pause_viz_btn = QtWidgets.QPushButton("Pause Display")
+        self.pause_viz_btn.setCheckable(True)
+        self.pause_viz_btn.setToolTip("Pause/resume updating the raw trace (analysis continues).")
+        self.pause_viz_btn.toggled.connect(self._on_pause_viz_toggled)
+        plot_container = QtWidgets.QWidget()
+        grid = QtWidgets.QGridLayout(plot_container)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(0)
+        grid.addWidget(self.plot_widget, 0, 0)
+        overlay = QtWidgets.QWidget()
+        overlay_layout = QtWidgets.QHBoxLayout(overlay)
+        overlay_layout.setContentsMargins(8, 0, 0, 8)
+        overlay_layout.setSpacing(0)
+        overlay_layout.addWidget(self.pause_viz_btn, 0, QtCore.Qt.AlignLeft | QtCore.Qt.AlignBottom)
+        overlay_layout.addStretch(1)
+        grid.addWidget(overlay, 0, 0, QtCore.Qt.AlignLeft | QtCore.Qt.AlignBottom)
+        self.raw_row_layout.addWidget(plot_container, stretch=7)
 
         self.sta_plot = pg.PlotWidget(enableMenu=False)
         try:
@@ -273,7 +289,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._sta_median_curve.setZValue(10)
         self.sta_plot.addItem(self._sta_median_curve)
         self._sta_trace_items: list[pg.PlotCurveItem] = []
-        self._sta_max_traces: int = 250
+        self._sta_max_traces: int = 100
 
         layout.addWidget(self.raw_row_widget, stretch=4)
         self._hide_sta_plot()
@@ -299,25 +315,19 @@ class AnalysisTab(QtWidgets.QWidget):
 
         controls = QtWidgets.QGroupBox("Display")
         controls_layout = QtWidgets.QHBoxLayout()
-        controls_layout.setContentsMargins(8, 10, 8, 10)
-        controls_layout.setSpacing(12)
+        controls_layout.setContentsMargins(8, 6, 8, 8)
+        controls_layout.setSpacing(10)
 
         size_layout = QtWidgets.QVBoxLayout()
-        size_layout.setSpacing(4)
-
-        self.pause_viz_btn = QtWidgets.QPushButton("Pause Viz")
-        self.pause_viz_btn.setCheckable(True)
-        self.pause_viz_btn.setToolTip("Pause/resume updating the raw trace (analysis continues).")
-        self.pause_viz_btn.toggled.connect(self._on_pause_viz_toggled)
-        self.pause_viz_btn.setFixedWidth(90)
-        size_layout.addWidget(self.pause_viz_btn)
+        size_layout.setContentsMargins(0, 0, 0, 0)
+        size_layout.setSpacing(3)
 
         width_row = QtWidgets.QHBoxLayout()
-        width_row.setSpacing(6)
+        width_row.setSpacing(4)
         width_row.addWidget(QtWidgets.QLabel("Width (s)"))
         self.width_combo = QtWidgets.QComboBox()
         self.width_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
-        self.width_combo.setFixedWidth(80)
+        self.width_combo.setFixedWidth(72)
         for value in (0.2, 0.5, 1.0, 2.0, 5.0):
             self.width_combo.addItem(f"{value:.1f}", value)
         self.width_combo.setCurrentIndex(1)
@@ -325,16 +335,28 @@ class AnalysisTab(QtWidgets.QWidget):
         size_layout.addLayout(width_row)
 
         height_row = QtWidgets.QHBoxLayout()
-        height_row.setSpacing(6)
+        height_row.setSpacing(4)
         height_row.addWidget(QtWidgets.QLabel("Height (±V)"))
         self.height_combo = QtWidgets.QComboBox()
         self.height_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
-        self.height_combo.setFixedWidth(80)
+        self.height_combo.setFixedWidth(72)
         for value in (0.1, 0.2, 0.5, 1.0, 2.0, 5.0):
             self.height_combo.addItem(f"{value:.1f}", value)
         self.height_combo.setCurrentIndex(3)
         height_row.addWidget(self.height_combo)
         size_layout.addLayout(height_row)
+
+        event_window_row = QtWidgets.QHBoxLayout()
+        event_window_row.setSpacing(4)
+        event_window_row.addWidget(QtWidgets.QLabel("Event Width (ms)"))
+        self.event_window_combo = QtWidgets.QComboBox()
+        self.event_window_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        self.event_window_combo.setFixedWidth(72)
+        for label, value in (("5", 5.0), ("10", 10.0), ("20", 20.0)):
+            self.event_window_combo.addItem(label, value)
+        self._set_event_window_selection(self._event_window_ms)
+        event_window_row.addWidget(self.event_window_combo)
+        size_layout.addLayout(event_window_row)
         controls_layout.addLayout(size_layout)
 
         threshold_layout = QtWidgets.QVBoxLayout()
@@ -364,18 +386,6 @@ class AnalysisTab(QtWidgets.QWidget):
         t2_row.addWidget(self.threshold2_check)
         t2_row.addWidget(self.threshold2_spin)
         threshold_layout.addLayout(t2_row)
-
-        event_window_row = QtWidgets.QHBoxLayout()
-        event_window_row.setSpacing(6)
-        event_window_row.addWidget(QtWidgets.QLabel("Event window width"))
-        self.event_window_combo = QtWidgets.QComboBox()
-        self.event_window_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
-        self.event_window_combo.setMinimumWidth(110)
-        for label, value in (("5 ms", 5.0), ("10 ms", 10.0), ("20 ms", 20.0)):
-            self.event_window_combo.addItem(label, value)
-        self._set_event_window_selection(self._event_window_ms)
-        event_window_row.addWidget(self.event_window_combo)
-        threshold_layout.addLayout(event_window_row)
 
         controls_layout.addLayout(threshold_layout)
 
@@ -1104,8 +1114,6 @@ class AnalysisTab(QtWidgets.QWidget):
             self._metrics_dirty = True
         if update.sta_windows:
             self._sta_windows.extend(update.sta_windows)
-            if len(self._sta_windows) > self._sta_max_windows:
-                self._sta_windows = self._sta_windows[-self._sta_max_windows :]
             self._sta_dirty = True
         elif update.sta_task is not None:
             self._sta_handle_task(update.sta_task)
@@ -1518,8 +1526,6 @@ class AnalysisTab(QtWidgets.QWidget):
         baseline = float(np.median(window[:pre_n]))
         normalized = window.astype(np.float32, copy=False) - baseline
         self._sta_windows.append(normalized)
-        if len(self._sta_windows) > self._sta_max_windows:
-            self._sta_windows = self._sta_windows[-self._sta_max_windows :]
         self._sta_dirty = True
         return "added"
 
