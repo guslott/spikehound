@@ -132,10 +132,13 @@ class SimulatedPhysiologySource(BaseSource):
             rate_hz = 2.0 + rng.random()
             amp_min, amp_max = cls["amp"]
             base_amp_prox = amp_min + rng.random() * (amp_max - amp_min)
+            # Keep spikes comfortably above the noise floor.
+            base_amp_prox = max(base_amp_prox, self._noise_level * 6.0 + 0.05)
             distal_ratio = 0.5 + rng.random() * 0.7  # 0.5–1.2 relative to prox
+            distal_ratio = max(0.6, distal_ratio)
             velocity_m_per_s = 10.0 + rng.random() * 50.0
             syn_delay_s = 0.002 + rng.random() * 0.004  # 2–6 ms
-            psp_gain = 0.005 + rng.random() * 0.02
+            psp_gain = 0.02 + rng.random() * 0.03
 
             self._units.append({
                 'template': template,
@@ -234,6 +237,7 @@ class SimulatedPhysiologySource(BaseSource):
                     syn_delay = u['syn_delay_samples']
                     for off in offs:
                         amp = u['amp_prox'] * (0.95 + 0.10 * np.random.rand())
+                        amp = max(amp, self._noise_level * 5.0 + 0.05)
                         scaled = templ * amp
                         end = off + templ_len
                         if end > buf_len:

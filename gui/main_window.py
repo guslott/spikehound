@@ -2299,7 +2299,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_window_value(value)
 
     def _on_threshold_line_changed(self) -> None:
-        value = float(self.threshold_line.value())
+        y_norm = float(self.threshold_line.value())
+        cfg = self._channel_configs.get(self._trigger_channel_id) or self._channel_configs.get(self._active_channel_id)
+        span = cfg.vertical_span_v if cfg is not None else 1.0
+        offset = cfg.screen_offset if cfg is not None else 0.0
+        value = (y_norm - offset) * span
         if abs(self.threshold_spin.value() - value) > 1e-6:
             self.threshold_spin.blockSignals(True)
             self.threshold_spin.setValue(value)
@@ -2352,7 +2356,13 @@ class MainWindow(QtWidgets.QMainWindow):
         except AttributeError:
             pass
         value = float(config.get("threshold", 0.0))
-        self.threshold_line.setValue(value)
+        chan_id = config.get("channel_index", -1)
+        cfg = self._channel_configs.get(chan_id) or self._channel_configs.get(self._active_channel_id)
+        span = cfg.vertical_span_v if cfg is not None else 1.0
+        offset = cfg.screen_offset if cfg is not None else 0.0
+        y_norm = (value / span) + offset
+        self.threshold_line.setMovable(True)
+        self.threshold_line.setValue(y_norm)
         pre_value = float(config.get("pretrigger_frac", 0.0) or 0.0)
         if pre_value > 0.0:
             self.pretrigger_line.setVisible(True)
