@@ -3,7 +3,7 @@ import pytest
 
 from analysis.analysis_worker import AnalysisWorker, _peak_frequency_sinc
 from analysis.settings import AnalysisSettingsStore
-from core.models import Chunk
+from shared.models import Chunk
 from shared.event_buffer import AnalysisEvents, EventRingBuffer
 from shared.types import Event
 

@@ -10,7 +10,7 @@ import numpy as np
 from PySide6 import QtCore
 
 from .conditioning import FilterSettings, SignalConditioner
-from .models import Chunk, EndOfStream, TriggerConfig
+from shared.models import Chunk, EndOfStream, TriggerConfig
 
 
 @dataclass

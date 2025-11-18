@@ -23,49 +23,12 @@ from typing import Any, Iterable, List, Literal, Optional, Sequence
 
 import numpy as np
 
-from core import Chunk
+from shared.models import Chunk, ActualConfig, Capabilities, ChannelInfo, DeviceInfo
 
 
 # ----------------------------
 # Data model (shared contract)
 # ----------------------------
-
-@dataclass(frozen=True)
-class DeviceInfo:
-    """A discoverable input device."""
-    id: str                      # Driver-specific identifier (e.g., "0", "Built-in Mic", "Dev1")
-    name: str                    # Human-friendly name
-    vendor: Optional[str] = None
-    details: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class ChannelInfo:
-    """A single input channel."""
-    id: int                      # Hardware channel index or logical ID
-    name: str                    # Display name: "Mic 1", "AI0", "Ch 0", etc.
-    units: str = "V"             # Engineering units (V, Pa, arb, ...)
-    range: Optional[tuple[float, float]] = None  # Physical range if known
-
-
-@dataclass(frozen=True)
-class Capabilities:
-    """What a device can do for input."""
-    max_channels_in: int
-    sample_rates: Optional[List[int]]  # None => continuous range; else allowed discrete rates
-    dtype: str = "float32"             # Stream dtype; default normalized to float32
-    notes: Optional[str] = None
-
-
-@dataclass(frozen=True)
-class ActualConfig:
-    """The configuration a driver actually achieved after configure/open."""
-    sample_rate: int
-    channels: List[ChannelInfo]
-    chunk_size: int
-    latency_s: Optional[float] = None  # If driver reports one
-    dtype: str = "float32"
-
 
 # ----------------------------
 # Base class

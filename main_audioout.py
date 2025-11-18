@@ -8,7 +8,7 @@ from audio.player import AudioPlayer, AudioConfig
 # Adjust this import path if your sim source lives elsewhere:
 from daq.simulated_source import SimulatedPhysiologySource
 from core.dispatcher import Dispatcher
-from core.models import EndOfStream
+from shared.models import EndOfStream
 
 IN_SAMPLE_RATE = 20_000
 CHUNK_SIZE = 400

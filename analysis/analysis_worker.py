@@ -7,7 +7,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from core.models import Chunk, EndOfStream
+from shared.models import Chunk, EndOfStream
 from shared.event_buffer import EventRingBuffer
 from shared.types import Event
 

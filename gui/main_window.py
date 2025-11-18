@@ -17,7 +17,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from core import DeviceManager, PipelineController
 from shared.app_settings import AppSettings
 from core.conditioning import ChannelFilterSettings, FilterSettings
-from core.models import Chunk, EndOfStream
+from shared.models import Chunk, EndOfStream
 from audio.player import AudioPlayer, AudioConfig
 from .analysis_dock import AnalysisDock
 from .settings_tab import SettingsTab
@@ -108,16 +108,17 @@ QPushButton:checked {
         range_row.addWidget(self.range_combo, 1)
         layout.addLayout(range_row)
 
-        # DC offset adjustment
+        # Vertical offset adjustment (normalized 0-1)
         offset_row = QtWidgets.QHBoxLayout()
         offset_row.setSpacing(4)
-        offset_row.addWidget(QtWidgets.QLabel("Vertical Offset (V)"))
-        self.offset_spin = QtWidgets.QDoubleSpinBox()
-        self.offset_spin.setRange(-10_000.0, 10_000.0)
-        self.offset_spin.setDecimals(3)
-        self.offset_spin.setSingleStep(0.1)
-        self.offset_spin.setMaximumWidth(110)
-        offset_row.addWidget(self.offset_spin, 1)
+        offset_row.addWidget(QtWidgets.QLabel("Vertical Offset"))
+        self.offset_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.offset_slider.setRange(0, 100)
+        self.offset_slider.setSingleStep(1)
+        self.offset_slider.setPageStep(5)
+        self.offset_slider.setValue(50)
+        self.offset_slider.setFixedWidth(140)
+        offset_row.addWidget(self.offset_slider, 1)
         layout.addLayout(offset_row)
 
         # Filtering controls
@@ -197,7 +198,7 @@ QPushButton:checked {
         self.highpass_spin.valueChanged.connect(self._on_widgets_changed)
         self.lowpass_check.toggled.connect(self._on_lowpass_toggled)
         self.lowpass_spin.valueChanged.connect(self._on_widgets_changed)
-        self.offset_spin.valueChanged.connect(self._on_widgets_changed)
+        self.offset_slider.valueChanged.connect(self._on_widgets_changed)
         self.listen_btn.toggled.connect(self._on_widgets_changed)
         self.display_check.toggled.connect(self._on_display_toggled)
         self.analyze_btn.clicked.connect(self._on_analyze_clicked)
@@ -207,14 +208,19 @@ QPushButton:checked {
         self._title_label.setText(f"Channel: {name}")
 
     def set_config(self, config: ChannelConfig) -> None:
+        # Backwards compatibility for older configs
+        span = getattr(config, "vertical_span_v", getattr(config, "range_v", 1.0))
+        offset = getattr(config, "screen_offset", getattr(config, "offset_v", 0.5))
+        config.vertical_span_v = span
+        config.screen_offset = offset
         self._config = replace(config)
         self._block_updates = True
         self._apply_color(config.color)
-        idx = self.range_combo.findData(config.range_v)
+        idx = self.range_combo.findData(config.vertical_span_v)
         if idx >= 0:
             self.range_combo.setCurrentIndex(idx)
         else:
-            self.range_combo.addItem(f"{config.range_v:.3f}", config.range_v)
+            self.range_combo.addItem(f"{config.vertical_span_v:.3f}", config.vertical_span_v)
             self.range_combo.setCurrentIndex(self.range_combo.count() - 1)
         self.notch_check.setChecked(config.notch_enabled)
         self.notch_spin.setValue(config.notch_freq)
@@ -225,7 +231,9 @@ QPushButton:checked {
         self.lowpass_check.setChecked(config.lowpass_enabled)
         self.lowpass_spin.setValue(config.lowpass_freq)
         self.lowpass_spin.setEnabled(config.lowpass_enabled)
-        self.offset_spin.setValue(config.offset_v)
+        self.offset_slider.blockSignals(True)
+        self.offset_slider.setValue(int(round(config.screen_offset * 100.0)))
+        self.offset_slider.blockSignals(False)
         self.listen_btn.setChecked(config.listen_enabled)
         self.display_check.setChecked(config.display_enabled)
         self._block_updates = False
@@ -261,8 +269,8 @@ QPushButton:checked {
     def _on_widgets_changed(self) -> None:
         if self._block_updates:
             return
-        self._config.range_v = float(self.range_combo.currentData())
-        self._config.offset_v = float(self.offset_spin.value())
+        self._config.vertical_span_v = float(self.range_combo.currentData())
+        self._config.screen_offset = float(self.offset_slider.value()) / 100.0
         self._config.notch_enabled = self.notch_check.isChecked()
         self._config.notch_freq = float(self.notch_spin.value())
         self._config.highpass_enabled = self.highpass_check.isChecked()
@@ -701,14 +709,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_combo = QtWidgets.QComboBox()
         device_layout.addWidget(self.device_combo, 0, 1)
 
-        device_layout.addWidget(self._label("Sample Rate (Hz)"), 1, 0)
+        self.device_toggle_btn = QtWidgets.QPushButton("Connect")
+        self.device_toggle_btn.setCheckable(True)
+        self.device_toggle_btn.clicked.connect(self._on_device_button_clicked)
+        device_layout.addWidget(self.device_toggle_btn, 1, 0, 1, 2)
+
+        device_layout.addWidget(self._label("Sample Rate (Hz)"), 2, 0)
         self.sample_rate_spin = QtWidgets.QDoubleSpinBox()
         self.sample_rate_spin.setRange(100.0, 1_000_000.0)
         self.sample_rate_spin.setDecimals(0)
         self.sample_rate_spin.setSingleStep(1000.0)
         self.sample_rate_spin.setValue(20_000.0)
         self.sample_rate_spin.setStyleSheet("color: rgb(255,255,255); background-color: rgb(0,0,0);")
-        device_layout.addWidget(self.sample_rate_spin, 1, 1)
+        device_layout.addWidget(self.sample_rate_spin, 2, 1)
 
         controls_row = QtWidgets.QHBoxLayout()
         controls_row.setSpacing(6)
@@ -723,12 +736,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.load_config_btn.clicked.connect(self._on_load_scope_config)
         controls_row.addWidget(self.load_config_btn)
         controls_row.addStretch(1)
-        device_layout.addLayout(controls_row, 2, 0, 1, 2)
-
-        self.device_toggle_btn = QtWidgets.QPushButton("Connect")
-        self.device_toggle_btn.setCheckable(True)
-        self.device_toggle_btn.clicked.connect(self._on_device_button_clicked)
-        device_layout.addWidget(self.device_toggle_btn, 3, 0, 1, 2)
+        device_layout.addLayout(controls_row, 3, 0, 1, 2)
 
         self.channels_group = QtWidgets.QGroupBox("Channels")
         channels_layout = QtWidgets.QVBoxLayout(self.channels_group)
@@ -1648,6 +1656,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._drag_channel_id = None
 
     def _on_channel_config_changed(self, channel_id: int, config: ChannelConfig) -> None:
+        # Normalize legacy fields
+        if not hasattr(config, "vertical_span_v"):
+            try:
+                config.vertical_span_v = float(getattr(config, "range_v", 1.0))
+            except Exception:
+                config.vertical_span_v = 1.0
+        if not hasattr(config, "screen_offset"):
+            try:
+                config.screen_offset = float(getattr(config, "offset_v", 0.5))
+            except Exception:
+                config.screen_offset = 0.5
         existing = self._channel_configs.get(channel_id)
         if existing is not None:
             config.channel_name = existing.channel_name or config.channel_name

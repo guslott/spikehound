@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Optional, Sequence
 import numpy as np
 
-from core.models import Chunk
+from shared.models import Chunk
 from shared.types import Event
 
 

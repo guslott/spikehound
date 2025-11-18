@@ -18,7 +18,7 @@ else:  # pragma: no cover - runtime fallback
 
 from .conditioning import FilterSettings
 from .dispatcher import Dispatcher
-from .models import Chunk, EndOfStream, TriggerConfig
+from shared.models import Chunk, EndOfStream, TriggerConfig
 from analysis.settings import AnalysisSettingsStore
 from shared.app_settings import AppSettings, AppSettingsStore
 from shared.event_buffer import AnalysisEvents, EventRingBuffer

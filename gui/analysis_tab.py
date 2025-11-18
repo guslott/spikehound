@@ -14,7 +14,7 @@ from PySide6 import QtCore, QtWidgets, QtGui
 
 from analysis.analysis_worker import _peak_frequency_sinc
 from analysis.models import AnalysisBatch
-from core.models import Chunk, EndOfStream
+from shared.models import Chunk, EndOfStream
 from shared.event_buffer import AnalysisEvents
 from shared.types import Event
 
