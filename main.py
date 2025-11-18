@@ -28,6 +28,7 @@ if __name__ == "__main__":
 # - Allow for custom channel names
 
 # - Add PCA features (top two components) to analysis tab
+#   - Will need a "compute PCA features" button to avoid recomputing every time
 
 # - Feature for cross channel correlation
 #   - option to pop out the traces into a separate figure

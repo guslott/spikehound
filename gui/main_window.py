@@ -27,8 +27,8 @@ from .settings_tab import SettingsTab
 class ChannelConfig:
     color: QtGui.QColor = field(default_factory=lambda: QtGui.QColor(0, 0, 139))
     display_enabled: bool = True
-    range_v: float = 1.0
-    offset_v: float = 0.0
+    vertical_span_v: float = 1.0
+    screen_offset: float = 0.5
     notch_enabled: bool = False
     notch_freq: float = 60.0
     highpass_enabled: bool = False
@@ -38,6 +38,25 @@ class ChannelConfig:
     listen_enabled: bool = False
     analyze_enabled: bool = False
     channel_name: str = ""
+
+
+class VoltageAxis(pg.AxisItem):
+    """Axis item that maps normalized 0-1 coordinates to volts for display."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._span = 1.0
+        self._offset = 0.5
+
+    def set_scaling(self, span: float, offset: float) -> None:
+        self._span = max(float(span), 1e-9)
+        self._offset = float(offset)
+
+    def tickStrings(self, values, scale, spacing):
+        try:
+            return [f"{(float(v) - self._offset) * self._span:.3g}" for v in values]
+        except Exception:
+            return super().tickStrings(values, scale, spacing)
 
 
 class ChannelOptionsPanel(QtWidgets.QWidget):
@@ -270,7 +289,13 @@ QPushButton:checked {
         if self._block_updates:
             return
         self._config.vertical_span_v = float(self.range_combo.currentData())
-        self._config.screen_offset = float(self.offset_slider.value()) / 100.0
+        slider_val = float(self.offset_slider.value())
+        if abs(slider_val - 50.0) <= 5.0:
+            slider_val = 50.0
+            self.offset_slider.blockSignals(True)
+            self.offset_slider.setValue(int(slider_val))
+            self.offset_slider.blockSignals(False)
+        self._config.screen_offset = slider_val / 100.0
         self._config.notch_enabled = self.notch_check.isChecked()
         self._config.notch_freq = float(self.notch_spin.value())
         self._config.highpass_enabled = self.highpass_check.isChecked()
@@ -310,31 +335,13 @@ class ChannelViewBox(pg.ViewBox):
         self._drag_button: Optional[QtCore.Qt.MouseButton] = None
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
-        if event.button() == QtCore.Qt.MouseButton.LeftButton:
-            pos = self.mapSceneToView(event.scenePos())
-            self.channelClicked.emit(pos.y(), event.button())
-            self._dragging = True
-            self._drag_button = event.button()
-            event.accept()
-        else:
-            super().mousePressEvent(event)
+        event.ignore()
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
-        if self._dragging and self._drag_button == QtCore.Qt.MouseButton.LeftButton:
-            pos = self.mapSceneToView(event.scenePos())
-            self.channelDragged.emit(pos.y())
-            event.accept()
-        else:
-            super().mouseMoveEvent(event)
+        event.ignore()
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
-        if self._dragging and event.button() == self._drag_button:
-            self.channelDragFinished.emit()
-            self._dragging = False
-            self._drag_button = None
-            event.accept()
-        else:
-            super().mouseReleaseEvent(event)
+        event.ignore()
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -506,7 +513,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Upper-left: plot area for multi-channel traces.
         self._view_box = ChannelViewBox()
-        self.plot_widget = pg.PlotWidget(viewBox=self._view_box, enableMenu=False)
+        left_axis = VoltageAxis("left")
+        self.plot_widget = pg.PlotWidget(viewBox=self._view_box, enableMenu=False, axisItems={"left": left_axis})
         try:
             # Hide pyqtgraph's default auto-range button to avoid distracting flashes
             self.plot_widget.hideButtons()
@@ -536,9 +544,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pretrigger_line = pg.InfiniteLine(angle=90, pen=pg.mkPen((0, 0, 139), style=QtCore.Qt.DashLine), movable=False)
         self.pretrigger_line.setVisible(False)
         self.plot_widget.addItem(self.pretrigger_line)
-        self._view_box.channelClicked.connect(self._on_plot_channel_clicked)
-        self._view_box.channelDragged.connect(self._on_plot_channel_dragged)
-        self._view_box.channelDragFinished.connect(self._on_plot_drag_finished)
 
         self._status_labels = {}
 
@@ -1037,8 +1042,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return {
             "color": self._color_to_tuple(config.color),
             "display_enabled": bool(config.display_enabled),
-            "range_v": float(config.range_v),
-            "offset_v": float(config.offset_v),
+            "vertical_span_v": float(config.vertical_span_v),
+            "screen_offset": float(config.screen_offset),
             "notch_enabled": bool(config.notch_enabled),
             "notch_freq": float(config.notch_freq),
             "highpass_enabled": bool(config.highpass_enabled),
@@ -1055,8 +1060,8 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             cfg.color = self._color_from_tuple(payload.get("color", (0, 0, 139, 255)))
             cfg.display_enabled = bool(payload.get("display_enabled", True))
-            cfg.range_v = float(payload.get("range_v", 1.0))
-            cfg.offset_v = float(payload.get("offset_v", 0.0))
+            cfg.vertical_span_v = float(payload.get("vertical_span_v", payload.get("range_v", 1.0)))
+            cfg.screen_offset = float(payload.get("screen_offset", payload.get("offset_v", 0.5)))
             cfg.notch_enabled = bool(payload.get("notch_enabled", False))
             cfg.notch_freq = float(payload.get("notch_freq", 60.0))
             cfg.highpass_enabled = bool(payload.get("highpass_enabled", False))
@@ -1429,9 +1434,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.available_combo.removeItem(idx)
         if self.available_combo.count():
             self.available_combo.setCurrentIndex(min(idx, self.available_combo.count() - 1))
+        # Activate and focus the newly added channel without extra signal chatter.
+        self.active_list.blockSignals(True)
         self.active_list.setCurrentItem(item)
+        self.active_list.blockSignals(False)
         self._update_channel_buttons()
         self._publish_active_channels()
+        self._set_active_channel_focus(getattr(info, "id", None))
         self._emit_trigger_config()
 
     def _on_remove_channel(self) -> None:
@@ -1501,10 +1510,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._next_color_index += 1
         return QtGui.QColor(color)
 
+    def _initial_screen_offset(self) -> float:
+        """Pick a starting offset; default all new channels to center."""
+        return 0.5
+
     def _ensure_channel_config(self, channel_id: int, channel_name: str) -> ChannelConfig:
         config = self._channel_configs.get(channel_id)
         if config is None:
-            config = ChannelConfig(color=self._next_channel_color(), channel_name=channel_name)
+            config = ChannelConfig(
+                color=self._next_channel_color(),
+                channel_name=channel_name,
+                screen_offset=self._initial_screen_offset(),
+            )
             self._channel_configs[channel_id] = config
         else:
             config.channel_name = channel_name
@@ -1543,6 +1560,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_channel_panel(cid)
         else:
             self._show_channel_panel(channel_ids[0] if channel_ids else None)
+            if channel_ids:
+                self._set_active_channel_focus(channel_ids[0])
 
     def _clear_channel_panels(self) -> None:
         for panel in list(self._channel_panels.values()):
@@ -1617,14 +1636,15 @@ class MainWindow(QtWidgets.QMainWindow):
             config = self._channel_configs.get(cid)
             if config is None:
                 continue
-            center = config.offset_v
-            span = max(config.range_v, 0.1)
-            if abs(y - center) <= span:
-                candidates.append((abs(y - center), cid))
+            center = config.screen_offset
+            candidates.append((abs(float(y) - center), cid))
         if not candidates:
             return None
         candidates.sort(key=lambda item: item[0])
-        return candidates[0][1]
+        distance, cid = candidates[0]
+        if distance > 0.05:
+            return None
+        return cid
 
     def _on_plot_channel_clicked(self, y: float, button: QtCore.Qt.MouseButton) -> None:
         if button != QtCore.Qt.MouseButton.LeftButton:
@@ -1636,6 +1656,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._drag_channel_id = cid
         self._select_active_channel_by_id(cid)
         self._set_active_channel_focus(cid)
+        self._show_channel_panel(cid)
+        self._set_active_channel_focus(cid)
 
     def _on_plot_channel_dragged(self, y: float) -> None:
         if self._drag_channel_id is None:
@@ -1643,14 +1665,19 @@ class MainWindow(QtWidgets.QMainWindow):
         config = self._channel_configs.get(self._drag_channel_id)
         if config is None:
             return
-        if abs(config.offset_v - y) < 1e-6:
+        y_clamped = max(0.0, min(1.0, float(y)))
+        # Snap to center if within 5% of mid
+        if abs(y_clamped - 0.5) <= 0.05:
+            y_clamped = 0.5
+        if abs(config.screen_offset - y_clamped) < 1e-6:
             return
-        config.offset_v = y
+        config.screen_offset = y_clamped
         panel = self._channel_panels.get(self._drag_channel_id)
         if panel is not None:
             panel.set_config(config)
         self._update_channel_display(self._drag_channel_id)
         self._update_plot_y_range()
+        self._update_axis_label()
 
     def _on_plot_drag_finished(self) -> None:
         self._drag_channel_id = None
@@ -1715,7 +1742,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if buf is None or buf.shape != raw.shape:
             buf = np.empty_like(raw)
             self._channel_display_buffers[channel_id] = buf
-        np.add(raw, config.offset_v, out=buf)
+        buf[:] = self._transform_to_screen(raw, config.vertical_span_v, config.screen_offset)
         curve.setData(self._last_times, buf, skipFiniteCheck=True)
         self._apply_active_channel_style()
 
@@ -2036,39 +2063,50 @@ class MainWindow(QtWidgets.QMainWindow):
             self._chunk_accum_samples = 0
             self._chunk_last_rate_update = now
 
+    def _transform_to_screen(self, raw_data: np.ndarray, span_v: float, offset_pct: float) -> np.ndarray:
+        span = max(float(span_v), 1e-9)
+        return np.asarray(raw_data, dtype=np.float32) / span + float(offset_pct)
+
     def _update_plot_y_range(self) -> None:
-        """Apply a symmetric ±range envelope using the selected channel's scale (or first channel)."""
+        """Fix the normalized viewport to [0.0, 1.0]."""
         plot_item = self.plot_widget.getPlotItem()
-        span = None
-        if self._active_channel_id is not None:
-            cfg = self._channel_configs.get(self._active_channel_id)
-            if cfg is not None:
-                span = max(cfg.range_v, 1e-6)
-        if span is None:
-            for cid in self._channel_ids_current:
-                cfg = self._channel_configs.get(cid)
-                if cfg is not None:
-                    span = max(cfg.range_v, 1e-6)
-                    break
-        if span is None:
-            plot_item.setYRange(-1.0, 1.0, padding=0)
-            return
-        min_y = -span
-        max_y = span
-        plot_item.setYRange(min_y, max_y, padding=0)
+        plot_item.setYRange(0.0, 1.0, padding=0.0)
 
     def _update_axis_label(self) -> None:
         axis = self.plot_widget.getPlotItem().getAxis("left")
         if self._active_channel_id is not None:
             config = self._channel_configs.get(self._active_channel_id)
             if config is not None:
+                try:
+                    axis.set_scaling(config.vertical_span_v, config.screen_offset)
+                except AttributeError:
+                    pass
+                # Fixed ticks based on the channel span; values move with the screen offset.
+                try:
+                    span = max(float(config.vertical_span_v), 1e-9)
+                    offset = float(config.screen_offset)
+                    step = span / 10.0
+                    vals: list[tuple[float, Optional[str]]] = []
+                    start = int(np.floor(((0.0 - offset) * span) / step) - 2)
+                    end = int(np.ceil(((1.0 - offset) * span) / step) + 2)
+                    for n in range(start, end + 1):
+                        v = n * step
+                        pos = (v / span) + offset
+                        if 0.0 <= pos <= 1.0:
+                            vals.append((pos, f"{v:.3g}"))
+                    axis.setTicks([vals])
+                except Exception:
+                    pass
                 name = config.channel_name or f"Ch {self._active_channel_id}"
                 axis_color = QtGui.QColor(config.color)
                 rgb = axis_color.getRgb()[:3]
                 pen = pg.mkPen(rgb, width=2)
                 axis.setPen(pen)
                 axis.setTextPen(pen)
-                axis.setLabel(text=f"{name} Amplitude (±{config.range_v:.3g} V @ {config.offset_v:.3g} V)", units="V")
+                axis.setLabel(
+                    text=f"{name} Amplitude (±{config.vertical_span_v:.3g} V)",
+                    units="V",
+                )
                 return
         pen = pg.mkPen((0, 0, 139), width=1)
         axis.setPen(pen)
@@ -2573,7 +2611,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if buf is None or buf.shape != raw.shape:
                     buf = np.empty_like(raw)
                     self._channel_display_buffers[cid] = buf
-                np.add(raw, config.offset_v, out=buf)
+                buf[:] = self._transform_to_screen(raw, config.vertical_span_v, config.screen_offset)
                 curve.setData(times_arr, buf, skipFiniteCheck=True)
             else:
                 if should_redraw:
@@ -2729,8 +2767,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 if config is not None and not config.display_enabled:
                     curve.clear()
                     continue
-                offset = config.offset_v if config else 0.0
-                curve.setData(time_axis, data[:, idx] + offset, skipFiniteCheck=True)
+                if config is None:
+                    curve.setData(time_axis, data[:, idx], skipFiniteCheck=True)
+                else:
+                    transformed = self._transform_to_screen(data[:, idx], config.vertical_span_v, config.screen_offset)
+                    curve.setData(time_axis, transformed, skipFiniteCheck=True)
             else:
                 curve.clear()
         self._channel_last_samples = {cid: data[:, i].astype(np.float32) for i, cid in enumerate(channel_ids) if i < data.shape[1]}
