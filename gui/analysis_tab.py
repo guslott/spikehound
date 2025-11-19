@@ -226,6 +226,11 @@ class AnalysisTab(QtWidgets.QWidget):
         self._sta_target_channel_id: int | None = None
         self._sta_pending_events: dict[int, tuple[Event, int]] = {}
         self._sta_retry_limit: int = 10
+        self._pca_active: bool = False
+        self._pca_mean: np.ndarray | None = None
+        self._pca_components: np.ndarray | None = None  # shape (2, n_features)
+        self._min_pca_events: int = 200
+        self._pca_busy: bool = False
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -399,6 +404,7 @@ class AnalysisTab(QtWidgets.QWidget):
         metric_row.setSpacing(6)
         metric_row.addWidget(QtWidgets.QLabel("Vertical (Y) Metric"))
         self.metric_combo = QtWidgets.QComboBox()
+        metric_model = QtGui.QStandardItemModel(self.metric_combo)
         for label in (
             "Max in window (V)",
             "Min in window (V)",
@@ -406,8 +412,18 @@ class AnalysisTab(QtWidgets.QWidget):
             "Peak Frequency (Hz)",
             "Peak Wavelength (s)",
             "Interval since last event (s)",
+            "PC 1 (arb)",
+            "PC 2 (arb)",
         ):
-            self.metric_combo.addItem(label)
+            item = QtGui.QStandardItem(label)
+            metric_model.appendRow(item)
+        self.metric_combo.setModel(metric_model)
+        # Disable PC items initially
+        pc_indexes = [6, 7]
+        for idx in pc_indexes:
+            item = metric_model.item(idx)
+            if item is not None:
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEnabled)
         self.metric_combo.setCurrentIndex(0)
         self.metric_combo.setMinimumWidth(180)
         self.metric_combo.currentIndexChanged.connect(self._on_axis_metric_changed)
@@ -418,16 +434,42 @@ class AnalysisTab(QtWidgets.QWidget):
         xaxis_row.setSpacing(6)
         xaxis_row.addWidget(QtWidgets.QLabel("Horizontal (X) Axis"))
         self.metric_xaxis_combo = QtWidgets.QComboBox()
-        for label in ("Time (s)", "Max in window (V)", "Min in window (V)", "Energy Density (V²/s)", "Peak Frequency (Hz)", "Peak Wavelength (s)"):
-            self.metric_xaxis_combo.addItem(label)
+        metric_x_model = QtGui.QStandardItemModel(self.metric_xaxis_combo)
+        for label in (
+            "Time (s)",
+            "Max in window (V)",
+            "Min in window (V)",
+            "Energy Density (V²/s)",
+            "Peak Frequency (Hz)",
+            "Peak Wavelength (s)",
+            "PC 1 (arb)",
+            "PC 2 (arb)",
+        ):
+            item = QtGui.QStandardItem(label)
+            metric_x_model.appendRow(item)
+        self.metric_xaxis_combo.setModel(metric_x_model)
+        for idx in [6, 7]:
+            item = metric_x_model.item(idx)
+            if item is not None:
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEnabled)
         self.metric_xaxis_combo.setMinimumWidth(180)
         self.metric_xaxis_combo.currentIndexChanged.connect(self._on_axis_metric_changed)
         xaxis_row.addWidget(self.metric_xaxis_combo)
         metrics_layout.addLayout(xaxis_row)
 
-        self.metrics_clear_btn = QtWidgets.QPushButton("Clear metrics")
+        buttons_row = QtWidgets.QHBoxLayout()
+        buttons_row.setSpacing(6)
+        self.metrics_clear_btn = QtWidgets.QPushButton("Clear metrics (0)")
+        self.metrics_clear_btn.setFixedWidth(150)
         self.metrics_clear_btn.clicked.connect(self._clear_metrics)
-        metrics_layout.addWidget(self.metrics_clear_btn)
+        buttons_row.addWidget(self.metrics_clear_btn)
+        self.calc_pca_btn = QtWidgets.QPushButton("Calculate PCA")
+        self.calc_pca_btn.setEnabled(False)
+        self.calc_pca_btn.setStyleSheet("color: rgb(150,150,150);")
+        self.calc_pca_btn.clicked.connect(self._on_calc_pca_clicked)
+        buttons_row.addWidget(self.calc_pca_btn)
+        buttons_row.addStretch(1)
+        metrics_layout.addLayout(buttons_row)
         self.clustering_enabled_check = QtWidgets.QCheckBox("Enable clustering")
         self.clustering_enabled_check.toggled.connect(self._on_clustering_toggled)
         metrics_layout.addWidget(self.clustering_enabled_check)
@@ -747,6 +789,80 @@ class AnalysisTab(QtWidgets.QWidget):
             return
         self._update_metric_points()
         self._metrics_dirty = False
+
+    def _on_calc_pca_clicked(self) -> None:
+        if self._pca_busy:
+            return
+        self.calc_pca_btn.setEnabled(False)
+        self._pca_busy = True
+        try:
+            # Gather waveforms ordered by metric events to preserve alignment.
+            waveforms: list[np.ndarray] = []
+            event_keys: list[int] = []
+            for rec in self._metric_events:
+                eid = rec.get("event_id")
+                if not isinstance(eid, int):
+                    continue
+                detail = self._event_details.get(eid)
+                if detail is None:
+                    continue
+                wf = detail.get("samples")
+                if wf is None:
+                    continue
+                arr = np.asarray(wf, dtype=np.float32)
+                if arr.ndim != 1 or arr.size == 0:
+                    continue
+                waveforms.append(arr)
+                event_keys.append(eid)
+            if not waveforms:
+                return
+            min_len = min(w.size for w in waveforms)
+            if min_len <= 0:
+                return
+            X = np.stack([w[:min_len] for w in waveforms], axis=0)
+            mean = np.mean(X, axis=0)
+            X_centered = X - mean
+            try:
+                U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
+            except np.linalg.LinAlgError:
+                return
+            if Vt.shape[0] < 2:
+                return
+            components = Vt[0:2]
+            scores = np.dot(X_centered, components.T)
+
+            self._pca_mean = mean
+            self._pca_components = components
+            self._pca_active = True
+
+            # Update metric events with PC scores
+            score_by_id = {eid: score for eid, score in zip(event_keys, scores)}
+            for rec in self._metric_events:
+                eid = rec.get("event_id")
+                if not isinstance(eid, int):
+                    continue
+                score = score_by_id.get(eid)
+                if score is None:
+                    continue
+                rec["pc1"] = float(score[0])
+                rec["pc2"] = float(score[1])
+
+            # Enable PC entries in combos
+            for combo in (self.metric_combo, self.metric_xaxis_combo):
+                model = combo.model()
+                for idx in (6, 7):
+                    item = model.item(idx)
+                    if item is not None:
+                        item.setFlags(item.flags() | QtCore.Qt.ItemIsEnabled)
+
+            self._metrics_dirty = True
+            self._update_metric_points()
+        finally:
+            self._pca_busy = False
+            count = len(self._metric_events)
+            enabled = count >= self._min_pca_events
+            self.calc_pca_btn.setEnabled(enabled)
+            self.calc_pca_btn.setStyleSheet("" if enabled else "color: rgb(150,150,150);")
 
     def _on_sta_timer(self) -> None:
         if not self._sta_enabled or not self._sta_dirty:
@@ -1183,6 +1299,20 @@ class AnalysisTab(QtWidgets.QWidget):
         if hasattr(self, "metrics_plot"):
             self.metrics_plot.getPlotItem().enableAutoRange(y=True)
         self._update_metric_points()
+        # Reset PCA/UI state
+        self.metrics_clear_btn.setText("Clear metrics (0)")
+        self.calc_pca_btn.setEnabled(False)
+        self.calc_pca_btn.setStyleSheet("color: rgb(150,150,150);")
+        self._pca_active = False
+        self._pca_mean = None
+        self._pca_components = None
+        # Disable PC entries in combos
+        for combo in (self.metric_combo, self.metric_xaxis_combo):
+            model = combo.model()
+            for idx in (6, 7):
+                item = model.item(idx)
+                if item is not None:
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEnabled)
 
     def get_energy_density_points(self) -> list[tuple[float, float]]:
         return [
@@ -1205,6 +1335,10 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def _selected_y_metric(self) -> str:
         label = self.metric_combo.currentText().lower()
+        if "pc 1" in label:
+            return "pc1"
+        if "pc 2" in label:
+            return "pc2"
         if "interval" in label:
             return "interval"
         if "max" in label:
@@ -1219,6 +1353,10 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def _selected_x_metric(self) -> str:
         label = self.metric_xaxis_combo.currentText().lower()
+        if "pc 1" in label:
+            return "pc1"
+        if "pc 2" in label:
+            return "pc2"
         if "time" in label:
             return "time"
         if "frequency" in label:
@@ -1245,6 +1383,10 @@ class AnalysisTab(QtWidgets.QWidget):
             self.metrics_plot.setLabel("left", "Peak Wavelength (s)")
         elif metric == "interval":
             self.metrics_plot.setLabel("left", "Interval (s)")
+        elif metric == "pc1":
+            self.metrics_plot.setLabel("left", "Principal Component 1 (arb)")
+        elif metric == "pc2":
+            self.metrics_plot.setLabel("left", "Principal Component 2 (arb)")
         else:
             self.metrics_plot.setLabel("left", "Value")
         x_metric = self._selected_x_metric()
@@ -1258,9 +1400,13 @@ class AnalysisTab(QtWidgets.QWidget):
             self.metrics_plot.setLabel("bottom", "Min Amplitude (V)")
         elif x_metric == "freq":
             self.metrics_plot.setLabel("bottom", "Peak Frequency (Hz)")
+        elif x_metric == "pc1":
+            self.metrics_plot.setLabel("bottom", "Principal Component 1 (arb)")
+        elif x_metric == "pc2":
+            self.metrics_plot.setLabel("bottom", "Principal Component 2 (arb)")
         else:
             self.metrics_plot.setLabel("bottom", "Peak Wavelength (s)")
-        if metric in {"ed", "max", "min", "freq", "period", "interval"}:
+        if metric in {"ed", "max", "min", "freq", "period", "interval", "pc1", "pc2"}:
             self.energy_scatter.show()
         else:
             self.energy_scatter.hide()
@@ -1706,7 +1852,7 @@ class AnalysisTab(QtWidgets.QWidget):
     def _update_metric_points(self) -> None:
         y_key = self._selected_y_metric()
         x_key = self._selected_x_metric()
-        if y_key not in {"ed", "max", "min", "freq", "period", "interval"}:
+        if y_key not in {"ed", "max", "min", "freq", "period", "interval", "pc1", "pc2"}:
             self.energy_scatter.hide()
             return
         events = self._metric_events
@@ -1759,6 +1905,11 @@ class AnalysisTab(QtWidgets.QWidget):
         if not xs:
             self.energy_scatter.hide()
             return
+        # Update UI counts here to reduce per-event UI churn
+        self.metrics_clear_btn.setText(f"Clear metrics ({len(self._metric_events)})")
+        if (not self._pca_active) and (len(self._metric_events) >= self._min_pca_events) and (not self._pca_busy):
+            self.calc_pca_btn.setEnabled(True)
+            self.calc_pca_btn.setStyleSheet("")
         if self.clustering_enabled_check.isChecked() and self._clusters:
             cluster_bounds: list[tuple[int, float, float, float, float]] = []
             for cluster in self._clusters:
@@ -1841,20 +1992,33 @@ class AnalysisTab(QtWidgets.QWidget):
                 continue
             record[key] = val
             has_metric = True
+        # If PCA values are present, treat them as metrics too.
+        for key in ("pc1", "pc2"):
+            if key in metrics:
+                try:
+                    record[key] = float(metrics[key])
+                    has_metric = True
+                except (TypeError, ValueError):
+                    continue
         event_id = overlay.get("event_id")
         if isinstance(event_id, int):
             record["event_id"] = event_id
         if not has_metric:
             return
         self._metric_events.append(record)
+        removed_cluster = False
         if len(self._metric_events) > self._max_metric_events:
             removed = self._metric_events.pop(0)
             removed_id = removed.get("event_id")
             if isinstance(removed_id, int):
                 self._event_details.pop(removed_id, None)
                 removed_cluster = self._event_cluster_labels.pop(removed_id, None) is not None
-                if removed_cluster:
-                    self._refresh_overlay_colors()
+        if removed_cluster:
+            self._refresh_overlay_colors()
+        # Flag metrics for refresh; UI updates happen in the timer to avoid per-event churn.
+        if (not self._pca_active) and (len(self._metric_events) >= self._min_pca_events):
+            self.calc_pca_btn.setEnabled(True)
+            self.calc_pca_btn.setStyleSheet("")
 
     def _build_overlay_payload(self, event: Event) -> Optional[OverlayPayload]:
         samples = np.asarray(event.samples, dtype=np.float32)
@@ -1923,6 +2087,22 @@ class AnalysisTab(QtWidgets.QWidget):
         else:
             event_id = self._next_event_id
             self._next_event_id += 1
+
+        # If PCA is active, project this event onto PCs (if length matches)
+        if self._pca_active and self._pca_components is not None and self._pca_mean is not None:
+            if samples.size >= self._pca_mean.size:
+                wf = samples[: self._pca_mean.size].astype(np.float32)
+                wf_centered = wf - self._pca_mean
+                try:
+                    score = np.dot(wf_centered, self._pca_components.T)
+                    if metric_values is None:
+                        metric_values = {}
+                    metric_values["pc1"] = float(score[0])
+                    metric_values["pc2"] = float(score[1])
+                    metrics = metric_values
+                except Exception:
+                    pass
+
         return OverlayPayload(
             event_id=event_id,
             times=times,
