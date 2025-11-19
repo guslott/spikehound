@@ -22,13 +22,10 @@ if __name__ == "__main__":
 # - Button to export raw trace data for waveforms to CSV
 # - Buttons to pop up windows for screen shotting for reports
 # - DAQ devices need to provide discrete sample rate settings rather than arbitrary ones
-# - fix the scope from auto-rescaling when I add a channel
-# - Fix vertical range and offset per channel in scope view
-# - Complete trigger options in scope view or remove them
 # - Allow for custom channel names
 
 # - Add PCA features (top two components) to analysis tab
-#   - Will need a "compute PCA features" button to avoid recomputing every time
+#   - PCA needs to be debugged in the case that the user clears all the events.
 
 # - Feature for cross channel correlation
 #   - option to pop out the traces into a separate figure
