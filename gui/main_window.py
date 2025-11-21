@@ -476,6 +476,10 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(0, self._update_splash_pixmap)
         QtCore.QTimer.singleShot(0, self._try_load_default_config)
 
+    def _reset_color_cycle(self) -> None:
+        """Reset channel color selection to the initial palette order."""
+        self._next_color_index = 0
+
         # Global shortcuts for quitting/closing
         quit_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Quit), self)
         quit_shortcut.activated.connect(self._quit_application)
@@ -1368,6 +1372,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_device_connected(self, key: str) -> None:
         self._device_connected = True
+        self._reset_color_cycle()
         self._apply_device_state(True)
         idx = self.device_combo.findData(key)
         if idx >= 0:
@@ -1383,6 +1388,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_device_disconnected(self) -> None:
         self._device_connected = False
+        self._reset_color_cycle()
         self._apply_device_state(False)
         if self._controller is not None:
             self._controller.detach_device()
@@ -1409,6 +1415,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._analysis_dock.shutdown()
             except Exception:
                 pass
+            self._analysis_dock.select_scope()
 
     def _on_available_channels(self, channels: Sequence[object]) -> None:
         self.available_combo.clear()
@@ -2512,6 +2519,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _clear_scope_display(self) -> None:
         plot_item = self.plot_widget.getPlotItem()
+        try:
+            plot_item.clear()
+        except Exception:
+            pass
         for curve in list(self._curve_map.values()):
             try:
                 plot_item.removeItem(curve)

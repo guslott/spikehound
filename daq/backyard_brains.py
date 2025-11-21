@@ -15,15 +15,31 @@ try:
 except ImportError:
     serial = None
 
-from .base_source import ActualConfig, BaseSource, Capabilities, ChannelInfo, Chunk, DeviceInfo
+from daq.base_source import ActualConfig, BaseSource, Capabilities, ChannelInfo, Chunk, DeviceInfo
 
 _LOGGER = logging.getLogger(__name__)
 
 # Known Backyard Brains VIDs from documentation
 _BYB_VIDS = {
     0x2E73,  # Backyard Brains
-    0x0403,  # FTDI (older devices)
+    0x0403,  # FTDI (older devices and vendor specific)
     0x2341,  # Arduino (SpikerShields)
+}
+
+# Heuristics for common BYB devices keyed by (vid, pid)
+_DEVICE_HINTS = {
+    (0x2E73, 0x0001): {"label": "Muscle SpikerBox Pro (HID)", "channels": 4, "bits": 10, "start": True, "set_channels": False},
+    (0x2E73, 0x0002): {"label": "Neuron SpikerBox Pro (HID)", "channels": 4, "bits": 10, "start": True, "set_channels": False},
+    (0x2E73, 0x0004): {"label": "Human SpikerBox", "channels": 4, "bits": 14, "start": False, "set_channels": False},
+    (0x2E73, 0x0006): {"label": "Muscle SpikerBox Pro (Serial)", "channels": 4, "bits": 10, "start": True, "set_channels": False},
+    (0x2E73, 0x0007): {"label": "Neuron SpikerBox Pro (Serial)", "channels": 4, "bits": 10, "start": True, "set_channels": False},
+    # Field reports show the Serial + MFi Neuron SB streams 2 channels over CDC.
+    # Enable explicit channel count command to request both channels.
+    (0x2E73, 0x0009): {"label": "Neuron SpikerBox Pro (Serial + MFi)", "channels": 2, "bits": 14, "start": True, "set_channels": True},
+    (0x2E73, 0x000D): {"label": "Spike Station", "channels": 2, "bits": 14, "start": True, "set_channels": False, "sample_rate": 42661},
+    (0x2341, 0x8036): {"label": "Plant SpikerBox", "channels": 1, "bits": 10, "start": False, "set_channels": False},
+    (0x2341, 0x0043): {"label": "SpikerShield (Arduino)", "channels": 6, "bits": 10, "start": False, "set_channels": True},
+    (0x0403, 0x6015): {"label": "FTDI-based SpikerBox", "channels": 1, "bits": 10, "start": False, "set_channels": False},
 }
 
 # Escape sequences for custom messages
@@ -54,13 +70,17 @@ class BackyardBrainsSource(BaseSource):
         self._ser: Optional[serial.Serial] = None
         self._producer_thread: Optional[threading.Thread] = None
         self._buffer = bytearray()
-        # Default capabilities
-        self._max_channels = 6  # Max supported by protocol (e.g. Muscle SpikerShield Pro)
+        self._bits = 10
+        self._requires_start = True
+        self._supports_channel_cfg = False
+        self._hint_sample_rate: Optional[int] = None
+        # Default capabilities fallback (updated on open)
+        self._max_channels = 2
 
     @classmethod
     def list_available_devices(cls) -> List[DeviceInfo]:
         if serial is None:
-            return []
+            raise RuntimeError("pyserial is not installed; Backyard Brains devices require pyserial to enumerate over USB CDC.")
         
         candidates = []
         try:
@@ -68,28 +88,38 @@ class BackyardBrainsSource(BaseSource):
             for p in ports:
                 # Loose matching: check VID or "SpikerBox" in description
                 is_byb = (p.vid in _BYB_VIDS) or ("SpikerBox" in str(p.description))
-                if is_byb:
-                    candidates.append(
-                        DeviceInfo(
-                            id=p.device,
-                            name=f"{p.description} ({p.device})",
-                            vendor="Backyard Brains" if p.vid == 0x2E73 else "Generic/FTDI",
-                            details={"vid": p.vid, "pid": p.pid, "hwid": p.hwid},
-                        )
+                if not is_byb:
+                    continue
+
+                hint = _DEVICE_HINTS.get((p.vid, p.pid))
+                name = hint.get("label") if hint else None
+                if not name:
+                    name = p.description or "Backyard Brains device"
+                name = f"{name} ({p.device})"
+                candidates.append(
+                    DeviceInfo(
+                        id=p.device,
+                        name=name,
+                        vendor="Backyard Brains" if p.vid == 0x2E73 else "Generic/FTDI/Arduino",
+                        details={"vid": p.vid, "pid": p.pid, "hwid": p.hwid},
                     )
+                )
         except Exception as e:
             _LOGGER.error("Failed to scan serial ports: %s", e)
         
         return candidates
 
     def get_capabilities(self, device_id: str) -> Capabilities:
-        # Most BYB devices support up to 10kHz.
-        # We don't know the exact model yet without opening it, so we report generic specs.
+        # Most BYB devices support up to 10kHz. Use hints if we have them.
+        sample_rates = [1000, 2500, 3333, 5000, 10000]
+        if self._hint_sample_rate:
+            sample_rates = sorted(set(sample_rates + [self._hint_sample_rate]))
+        notes = f"Serial/CDC SpikerBox. {self._bits}-bit resolution expected."
         return Capabilities(
             max_channels_in=self._max_channels,
-            sample_rates=[1000, 2500, 3333, 5000, 10000],
+            sample_rates=sample_rates,
             dtype="float32",
-            notes="Serial/CDC SpikerBox. 10-14bit resolution.",
+            notes=notes,
         )
 
     def list_available_channels(self, device_id: str) -> List[ChannelInfo]:
@@ -100,6 +130,39 @@ class BackyardBrainsSource(BaseSource):
             for i in range(self._max_channels)
         ]
 
+    def _lookup_port(self, device_id: str):
+        if serial is None:
+            return None
+        try:
+            for p in serial.tools.list_ports.comports():
+                if p.device == device_id:
+                    return p
+        except Exception:
+            return None
+        return None
+
+    def _apply_port_hints(self, port_info) -> None:
+        """
+        Configure driver expectations (channels, bit depth, start command)
+        based on VID/PID hints from enumeration.
+        """
+        if port_info is None:
+            return
+        hint = _DEVICE_HINTS.get((port_info.vid, port_info.pid))
+        if hint:
+            self._max_channels = max(1, int(hint.get("channels", self._max_channels)))
+            self._bits = int(hint.get("bits", self._bits))
+            self._requires_start = bool(hint.get("start", self._requires_start))
+            self._supports_channel_cfg = bool(hint.get("set_channels", False))
+            self._hint_sample_rate = int(hint["sample_rate"]) if "sample_rate" in hint else None
+        else:
+            # Unknown device: keep conservative defaults
+            self._max_channels = max(1, 2)
+            self._bits = 10
+            self._requires_start = True
+            self._supports_channel_cfg = False
+            self._hint_sample_rate = None
+
     def _open_impl(self, device_id: str) -> None:
         if serial is None:
             raise RuntimeError("pyserial module is not installed.")
@@ -107,6 +170,18 @@ class BackyardBrainsSource(BaseSource):
         # 222222 is a common baud rate for BYB, though CDC usually ignores it.
         # 500000 is used by newer Human Human Interface.
         try:
+            port_info = self._lookup_port(device_id)
+            self._apply_port_hints(port_info)
+            if port_info:
+                _LOGGER.info(
+                    "Opening BYB device %s (vid=0x%04X pid=0x%04X, channels=%d, bits=%d, start_cmd=%s)",
+                    device_id,
+                    port_info.vid or 0,
+                    port_info.pid or 0,
+                    self._max_channels,
+                    self._bits,
+                    self._requires_start,
+                )
             self._ser = serial.Serial(
                 port=device_id,
                 baudrate=222222,
@@ -132,37 +207,25 @@ class BackyardBrainsSource(BaseSource):
         if not self._ser:
             raise RuntimeError("Device is not open.")
 
-        # The BYB protocol often defines sample rate implicitly by channel count 
-        # (e.g. 10kHz total bandwidth split by channels), OR by specific commands.
-        # We'll try to set the number of channels which is the primary config.
-        
-        num_channels = len(channels)
-        # Ensure channels are contiguous 0..N for this simple driver, or we map them.
-        # The protocol just streams N channels. We assume the user wants the first N.
-        # If they selected [0, 2], we effectively have to ask for 3 channels to get index 2.
-        max_ch_idx = max(channels) if channels else 0
-        req_channels = max_ch_idx + 1
-        
-        # Send configuration commands
-        # Stop first to be safe
-        self._send_command("h:;") 
-        time.sleep(0.05)
-        
-        # Set number of channels
-        self._send_command(f"c:{req_channels};")
-        time.sleep(0.05)
-        
-        # Some devices support sample rate config, others derive it.
-        # We'll assume the device gives us roughly 10k / num_channels or fixed 10k.
-        # We just echo back what the user asked for, but in reality, 
-        # we will timestamp chunks based on arrival if we can't trust rate.
-        # For now, let's trust the user or default to 10000.
-        
-        actual_rate = sample_rate
-        
-        # Prepare channel infos
+        # Bound channels to what the hardware can actually emit
         all_chans = self.list_available_channels(self._device_id)
         selected_chans = [all_chans[i] for i in channels if i < len(all_chans)]
+        if not selected_chans:
+            selected_chans = [all_chans[0]]
+        num_channels = len(selected_chans)
+
+        # Some devices allow channel-count configuration (SpikerShield family).
+        # Others stream a fixed set; in those cases we simply decode that many.
+        if self._supports_channel_cfg:
+            # Stop first to be safe on devices that honor start/stop
+            if self._requires_start:
+                self._send_command("h:;")
+                time.sleep(0.05)
+            req_channels = num_channels
+            self._send_command(f"c:{req_channels};")
+            time.sleep(0.05)
+
+        actual_rate = self._hint_sample_rate or sample_rate
 
         return ActualConfig(
             sample_rate=actual_rate,
@@ -174,10 +237,11 @@ class BackyardBrainsSource(BaseSource):
     def _start_impl(self) -> None:
         if not self._ser:
             raise RuntimeError("Serial port not open")
-        
-        # Send start command
-        self._send_command("start:;")
-        
+
+        if self._requires_start:
+            self._send_command("start:;")
+            time.sleep(0.02)
+
         self._producer_thread = threading.Thread(target=self._run_loop, daemon=True)
         self._producer_thread.start()
 
@@ -186,7 +250,7 @@ class BackyardBrainsSource(BaseSource):
             self._producer_thread.join(timeout=1.0)
         
         # Send halt command
-        if self._ser and self._ser.is_open:
+        if self._requires_start and self._ser and self._ser.is_open:
             try:
                 self._send_command("h:;")
             except Exception:
@@ -200,17 +264,17 @@ class BackyardBrainsSource(BaseSource):
         if not self._ser or not self.config:
             return
 
-        num_channels = len(self._active_channel_ids)
-        # We might be capturing more channels than active if the user skipped some,
-        # but for simplicity, we assume 1:1 mapping to the first N channels here.
-        # Protocol frame size: 2 bytes per channel.
-        frame_size = num_channels * 2
-        
+        # Always decode the full stream channel count (hardware order).
+        cfg_channels = getattr(self.config, "channels", None) or []
+        stream_channels = len(cfg_channels) if cfg_channels else len(self._available_channels) or len(self._active_channel_ids) or 1
+        stream_channels = max(1, stream_channels)
+        bits = max(8, min(self._bits, 16))
+        center_val = float(1 << (bits - 1))
         chunk_size = self.config.chunk_size
         
         # Buffers
         raw_buffer = bytearray()
-        sample_buffer = np.zeros((chunk_size, num_channels), dtype=np.float32)
+        sample_buffer = np.zeros((chunk_size, stream_channels), dtype=np.float32)
         sample_idx = 0
         
         # For un-escaping logic
@@ -260,66 +324,57 @@ class BackyardBrainsSource(BaseSource):
                     pass
                 break
 
-            # 2. Process Frames
-            # We need at least frame_size bytes
-            while len(raw_buffer) >= frame_size:
-                # Search for frame alignment
-                # Bit 7 (MSB) of the *first byte of the frame* must be 1.
-                # Bit 7 of all other bytes in the frame must be 0.
-                
-                # Peek at the first byte
-                if not (raw_buffer[0] & 0x80):
-                    # Misaligned or garbage, pop one byte and retry
-                    del raw_buffer[0]
-                    continue
-                
-                # Check if we have enough data for a full frame
+            # 2. Process frames sample-wise.
+            # We align to the next byte with MSB=1 (frame start), then read
+            # expected_channels samples of two bytes each (high, low). If only the
+            # first sample is flagged, we still read the following pairs; if each
+            # channel is flagged, we tolerate MSB=1 on subsequent highs.
+            frame_size = stream_channels * 2
+            while len(raw_buffer) >= 2:
+                # Align to a start marker
+                start_idx = next((i for i, b in enumerate(raw_buffer) if b & 0x80), -1)
+                if start_idx < 0:
+                    raw_buffer.clear()
+                    break
+                if start_idx > 0:
+                    del raw_buffer[:start_idx]
+                    if len(raw_buffer) < 2:
+                        break
+
                 if len(raw_buffer) < frame_size:
                     break
-                
-                # Validate the rest of the bytes have MSB=0
-                valid_frame = True
-                for i in range(1, frame_size):
-                    if raw_buffer[i] & 0x80:
-                        # Found a '1' in a position that should be '0'. 
-                        # This implies the frame boundary is actually at 'i'.
-                        # Discard up to 'i' and restart scan.
-                        del raw_buffer[:i]
-                        valid_frame = False
-                        break
-                
-                if not valid_frame:
-                    continue
-                
-                # Decode Frame
-                # Each channel is 2 bytes. 
-                # Byte A: 1xxxxxxx (or 0 for ch>0) -> 7 bits
-                # Byte B: 0xxxxxxx -> 7 bits
-                # Value = (A & 0x7F) << 7 | (B & 0x7F)
-                
-                for ch_idx in range(num_channels):
-                    high_byte = raw_buffer[ch_idx * 2]
-                    low_byte = raw_buffer[ch_idx * 2 + 1]
-                    
-                    raw_val = ((high_byte & 0x7F) << 7) | (low_byte & 0x7F)
-                    
-                    # Map 0..16383 (14-bit) to -1.0 .. 1.0 V (approx)
-                    # Center is roughly 8192
-                    # BYB typically uses 5V range or 3.3V range. 
-                    # We'll normalize to a generic +/- 0.5 scale for now (1V pp)
-                    # Users can adjust gain in UI.
-                    
-                    norm_val = (raw_val - 8192) / 8192.0
-                    sample_buffer[sample_idx, ch_idx] = norm_val
-                
-                # Remove used frame
+
+                # Decode expected_channels pairs
+                for ch_idx in range(stream_channels):
+                    hi = raw_buffer[2 * ch_idx]
+                    lo = raw_buffer[2 * ch_idx + 1]
+                    raw_val = ((hi & 0x7F) << 7) | (lo & 0x7F)
+                    sample_buffer[sample_idx, ch_idx] = (raw_val - center_val) / center_val
+
                 del raw_buffer[:frame_size]
-                
                 sample_idx += 1
-                
-                # Emit chunk if full
+
                 if sample_idx >= chunk_size:
-                    self.emit_array(sample_buffer, mono_time=time.monotonic())
+                    self._emit_active(sample_buffer, sample_idx)
                     sample_buffer.fill(0.0)
                     sample_idx = 0
 
+    def _emit_active(self, sample_buffer: np.ndarray, frames: int) -> None:
+        """
+        Emit a chunk mapped to the current active channel order.
+        """
+        with self._channel_lock:
+            active_ids = list(self._active_channel_ids)
+            avail_map = {ch.id: idx for idx, ch in enumerate(self._available_channels)}
+
+        if not active_ids or frames <= 0:
+            return
+
+        out = np.zeros((frames, len(active_ids)), dtype=np.float32)
+        for out_idx, cid in enumerate(active_ids):
+            src_idx = avail_map.get(cid)
+            if src_idx is not None and src_idx < sample_buffer.shape[1]:
+                out[:, out_idx] = sample_buffer[:frames, src_idx]
+
+        meta = {"active_channel_ids": active_ids}
+        self.emit_array(out, mono_time=time.monotonic(), meta=meta)
