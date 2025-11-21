@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import logging
 import queue
 from collections import Counter
@@ -27,9 +28,108 @@ CLUSTER_COLORS: list[QtGui.QColor] = [
     QtGui.QColor(199, 21, 133),   # magenta
 ]
 UNCLASSIFIED_COLOR = QtGui.QColor(220, 0, 0)
+WAVEFORM_MEDIAN_COLOR = QtGui.QColor(200, 0, 0)
 MAX_VISIBLE_METRIC_EVENTS = 3000
 METRIC_TIME_WINDOW_SEC = 60.0
 STA_TRACE_PEN = pg.mkPen(90, 90, 90, 110)
+
+
+class _MeasureLine:
+    """Helper for draggable measurement lines with labels."""
+
+    def __init__(self, plot_item: pg.PlotItem, p1: QtCore.QPointF, p2: QtCore.QPointF, mode: str = "line") -> None:
+        self.mode = mode  # "line", "vertical", "horizontal"
+        self.roi = pg.LineSegmentROI((p1.x(), p1.y()), (p2.x(), p2.y()), pen=pg.mkPen(QtGui.QColor(0, 100, 200), width=2))
+        self.label = pg.TextItem(color=(20, 20, 20))
+        self._plot = plot_item
+        self._guard = False
+        self._endpoints = [
+            pg.ScatterPlotItem([p1.x()], [p1.y()], symbol="+", size=12, pen=pg.mkPen("black"), brush=None),
+            pg.ScatterPlotItem([p2.x()], [p2.y()], symbol="+", size=12, pen=pg.mkPen("black"), brush=None),
+        ]
+        plot_item.addItem(self.roi)
+        plot_item.addItem(self.label)
+        for ep in self._endpoints:
+            ep.setAcceptedMouseButtons(QtCore.Qt.NoButton)
+            plot_item.addItem(ep)
+        self.roi.sigRegionChanged.connect(self._on_changed)
+        self._set_handle_positions(pg.Point(p1), pg.Point(p2))
+        self._on_changed()
+
+    def remove(self) -> None:
+        try:
+            self._plot.removeItem(self.roi)
+        except Exception:
+            pass
+        try:
+            self._plot.removeItem(self.label)
+        except Exception:
+            pass
+        for ep in self._endpoints:
+            try:
+                self._plot.removeItem(ep)
+            except Exception:
+                pass
+
+    def set_points(self, p1: QtCore.QPointF, p2: QtCore.QPointF) -> None:
+        self._set_handle_positions(pg.Point(p1), pg.Point(p2))
+        self._on_changed()
+
+    def _set_handle_positions(self, p1: pg.Point, p2: pg.Point) -> None:
+        handles = getattr(self.roi, "handles", None)
+        if not handles or len(handles) < 2:
+            return
+        h0 = handles[0].get("item")
+        h1 = handles[1].get("item")
+        if h0 is not None:
+            try:
+                self.roi.movePoint(h0, p1)
+            except Exception:
+                pass
+        if h1 is not None:
+            try:
+                self.roi.movePoint(h1, p2)
+            except Exception:
+                pass
+        if self._endpoints and len(self._endpoints) >= 2:
+            self._endpoints[0].setData([p1.x()], [p1.y()])
+            self._endpoints[1].setData([p2.x()], [p2.y()])
+
+    def _on_changed(self) -> None:
+        if self._guard:
+            return
+        self._guard = True
+        try:
+            pts = self.roi.getState().get("points") or []
+            if len(pts) != 2:
+                return
+            p1 = pg.Point(pts[0])
+            p2 = pg.Point(pts[1])
+            if self.mode == "vertical":
+                x = (p1.x() + p2.x()) * 0.5
+                p1 = pg.Point(x, p1.y())
+                p2 = pg.Point(x, p2.y())
+                self._set_handle_positions(p1, p2)
+            elif self.mode == "horizontal":
+                y = (p1.y() + p2.y()) * 0.5
+                p1 = pg.Point(p1.x(), y)
+                p2 = pg.Point(p2.x(), y)
+                self._set_handle_positions(p1, p2)
+            dt = float(p2.x() - p1.x())
+            dv = float(p2.y() - p1.y())
+            text: str
+            if self.mode == "vertical":
+                text = f"\u0394V = {dv:.4g} V"
+            elif self.mode == "horizontal":
+                text = f"\u0394t = {dt:.4g} s"
+            else:
+                text = f"\u0394t = {dt:.4g} s, \u0394V = {dv:.4g} V"
+            mid = pg.Point((p1.x() + p2.x()) * 0.5, (p1.y() + p2.y()) * 0.5)
+            self.label.setText(text)
+            self.label.setPos(mid.x(), mid.y())
+        finally:
+            self._guard = False
+
 
 def _baseline(samples: np.ndarray, pre_samples: int) -> float:
     arr = np.asarray(samples, dtype=np.float32)
@@ -221,6 +321,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._sta_update_interval_ms: int = 100
         self._sta_dirty: bool = False
         self._sta_time_axis: np.ndarray | None = None
+        self._sta_aligned_windows: np.ndarray | None = None
         self._sta_window_ms: float = 50.0
         self._sta_source_cluster_id: int | None = None
         self._sta_target_channel_id: int | None = None
@@ -513,9 +614,18 @@ class AnalysisTab(QtWidgets.QWidget):
         sta_window_row.addWidget(self.sta_window_combo)
         sta_layout.addLayout(sta_window_row)
 
+        sta_buttons_row = QtWidgets.QHBoxLayout()
+        sta_buttons_row.setSpacing(6)
         self.sta_clear_btn = QtWidgets.QPushButton("Clear STA")
+        self.sta_clear_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         self.sta_clear_btn.clicked.connect(self._on_sta_clear_clicked)
-        sta_layout.addWidget(self.sta_clear_btn)
+        sta_buttons_row.addWidget(self.sta_clear_btn, 1)
+        self.sta_view_waveforms_btn = QtWidgets.QPushButton("View waveforms…")
+        self.sta_view_waveforms_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.sta_view_waveforms_btn.clicked.connect(self._on_sta_view_waveforms_clicked)
+        self.sta_view_waveforms_btn.setEnabled(False)
+        sta_buttons_row.addWidget(self.sta_view_waveforms_btn, 1)
+        sta_layout.addLayout(sta_buttons_row)
         sta_layout.addStretch(1)
 
         controls_layout.addLayout(sta_layout)
@@ -1447,6 +1557,17 @@ class AnalysisTab(QtWidgets.QWidget):
         self.view_class_waveforms_btn.setEnabled(enabled and has_selection)
         self.export_class_btn.setEnabled(enabled and has_selection)
 
+    def _update_sta_view_button(self) -> None:
+        has_data = (
+            self._sta_enabled
+            and self._sta_aligned_windows is not None
+            and getattr(self._sta_aligned_windows, "size", 0) > 0
+            and self._sta_time_axis is not None
+            and self._sta_time_axis.size > 0
+        )
+        if hasattr(self, "sta_view_waveforms_btn"):
+            self.sta_view_waveforms_btn.setEnabled(bool(has_data))
+
     def _set_cluster_panel_visible(self, visible: bool) -> None:
         if visible:
             self.cluster_panel.show()
@@ -1556,11 +1677,13 @@ class AnalysisTab(QtWidgets.QWidget):
             self._hide_sta_plot()
             self._sta_windows.clear()
             self._sta_time_axis = None
+            self._sta_aligned_windows = None
             self._sta_pending_events.clear()
             self._sta_dirty = False
             self._sta_median_curve.hide()
             self._sta_median_curve.clear()
             self._clear_sta_traces()
+        self._update_sta_view_button()
 
     def _on_sta_source_changed(self, index: int) -> None:
         if index < 0:
@@ -1596,11 +1719,13 @@ class AnalysisTab(QtWidgets.QWidget):
     def _on_sta_clear_clicked(self) -> None:
         self._sta_windows.clear()
         self._sta_time_axis = None
+        self._sta_aligned_windows = None
         self._sta_pending_events.clear()
         self._sta_dirty = False
         self._clear_sta_traces()
         self._sta_median_curve.hide()
         self._sta_median_curve.clear()
+        self._update_sta_view_button()
 
     def _sta_handle_task(self, task: StaTask) -> None:
         controller = self._controller
@@ -1678,16 +1803,20 @@ class AnalysisTab(QtWidgets.QWidget):
     def _refresh_sta_plot(self) -> None:
         """Redraw the spike-triggered average plot."""
         plot_item = self.sta_plot.getPlotItem()
+        self._sta_aligned_windows = None
+        self._sta_time_axis = None
         if not self._sta_windows:
             self._sta_median_curve.hide()
             self._sta_median_curve.clear()
             self._clear_sta_traces()
+            self._update_sta_view_button()
             return
         min_len = min((w.size for w in self._sta_windows if isinstance(w, np.ndarray)), default=0)
         if min_len <= 1:
             self._sta_median_curve.hide()
             self._sta_median_curve.clear()
             self._clear_sta_traces()
+            self._update_sta_view_button()
             return
         windows = np.stack([np.asarray(w[:min_len], dtype=np.float32) for w in self._sta_windows], axis=0)
         assert windows.ndim == 2, "STA windows must be 2D (events x samples)"
@@ -1696,11 +1825,13 @@ class AnalysisTab(QtWidgets.QWidget):
             self._sta_median_curve.hide()
             self._sta_median_curve.clear()
             self._clear_sta_traces()
+            self._update_sta_view_button()
             return
         duration_ms = float(self._sta_window_ms)
         t = np.linspace(-duration_ms / 2.0, duration_ms / 2.0, num_samples, dtype=np.float32)
         assert t.shape[0] == num_samples, "Time axis must align with samples"
         self._sta_time_axis = t
+        self._sta_aligned_windows = windows
         amp_min = float(np.min(windows))
         amp_max = float(np.max(windows))
         if not np.isfinite(amp_min) or not np.isfinite(amp_max):
@@ -1731,6 +1862,33 @@ class AnalysisTab(QtWidgets.QWidget):
         plot_item.showGrid(x=True, y=True, alpha=0.3)
         plot_item.setXRange(t[0], t[-1], padding=0.0)
         plot_item.setYRange(amp_min, amp_max, padding=0.05)
+        self._update_sta_view_button()
+
+    def _build_sta_waveform_payload(self) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Prepare STA waveforms for export/viewing."""
+        if self._sta_aligned_windows is None or self._sta_time_axis is None:
+            return []
+        if self._sta_time_axis.size == 0 or self._sta_aligned_windows.size == 0:
+            return []
+        t_sec = np.asarray(self._sta_time_axis, dtype=np.float64) / 1000.0
+        waveforms: list[tuple[np.ndarray, np.ndarray]] = []
+        for row in self._sta_aligned_windows:
+            samples = np.asarray(row, dtype=np.float32)
+            length = min(samples.size, t_sec.size)
+            if length <= 0:
+                continue
+            waveforms.append((t_sec[:length].copy(), samples[:length].copy()))
+        return waveforms
+
+    def _on_sta_view_waveforms_clicked(self) -> None:
+        waveforms = self._build_sta_waveform_payload()
+        if not waveforms:
+            QtWidgets.QMessageBox.information(self, "Waveforms", "No cross-correlation data available.")
+            return
+        channel_label = self.sta_channel_combo.currentText().strip() if self.sta_channel_combo.count() else ""
+        title = f"Cross correlation \u2013 {channel_label}" if channel_label else "Cross correlation"
+        dialog = ClusterWaveformDialog(self, title, waveforms, None)
+        dialog.exec()
 
     def _on_add_class_clicked(self) -> None:
         if not self.clustering_enabled_check.isChecked():
@@ -2263,47 +2421,399 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
         color: Optional[QtGui.QColor] = None,
     ) -> None:
         super().__init__(parent)
-        count = len(waveforms)
-        self.setWindowTitle(f"Waveforms \u2013 {class_name} ({count} events)")
+        self._class_name = class_name
+        self._cluster_color = color
+        self._waveforms = self._sanitize_waveforms(waveforms)
+        self._aligned_samples: list[np.ndarray] = []
+        self._plot_time_axis: np.ndarray | None = None
+        self._export_time_axis: np.ndarray | None = None
+        self._median_waveform: np.ndarray | None = None
+        self._measure_mode: str = "none"  # none | point | line
+        self._measure_points: list[dict[str, object]] = []
+        self._dragging_point_idx: int | None = None
+        self._active_line: _MeasureLine | None = None
+        self._measure_lines: list[_MeasureLine] = []
+        self._line_anchor: QtCore.QPointF | None = None
+
+        self._prepare_waveform_data()
+        self._build_ui()
+        self._plot_waveforms()
+        self._update_title()
+
+    def _sanitize_waveforms(self, waveforms: Sequence[tuple[np.ndarray, np.ndarray]]) -> list[tuple[np.ndarray, np.ndarray]]:
+        sanitized: list[tuple[np.ndarray, np.ndarray]] = []
+        for times, samples in waveforms:
+            t_arr = np.asarray(times, dtype=np.float64)
+            s_arr = np.asarray(samples, dtype=np.float32)
+            length = int(min(t_arr.size, s_arr.size))
+            if length <= 0:
+                continue
+            t_trim = t_arr[:length]
+            sanitized.append((t_trim, s_arr[:length]))
+        return sanitized
+
+    def _prepare_waveform_data(self) -> None:
+        if not self._waveforms:
+            return
+        lengths: list[int] = []
+        for times, samples in self._waveforms:
+            lengths.append(int(min(times.size, samples.size)))
+        if not lengths:
+            return
+        length_counts = Counter(lengths)
+        target_len = max(length_counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+        aligned: list[tuple[np.ndarray, np.ndarray]] = []
+        for times, samples in self._waveforms:
+            if times.size < target_len or samples.size < target_len or target_len <= 0:
+                continue
+            t_copy = np.array(times[:target_len], dtype=np.float64, copy=True)
+            s_copy = np.array(samples[:target_len], dtype=np.float32, copy=True)
+            aligned.append((t_copy, s_copy))
+        if not aligned:
+            return
+        self._plot_time_axis = aligned[0][0]
+        self._aligned_samples = [samples for _, samples in aligned]
+        stack = np.stack(self._aligned_samples, axis=0)
+        self._median_waveform = np.median(stack, axis=0)
+        self._export_time_axis = self._build_export_time_axis(self._plot_time_axis)
+
+    def _build_export_time_axis(self, reference: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if reference is None or reference.size == 0:
+            return None
+        if reference.size < 2:
+            dt = 0.0
+        else:
+            diffs = np.diff(reference)
+            finite = diffs[np.isfinite(diffs) & (diffs > 0)]
+            dt = float(np.median(finite)) if finite.size else 0.0
+        if not np.isfinite(dt) or dt <= 0:
+            dt = 1.0
+        start = float(reference[0])
+        return start + (np.arange(reference.size, dtype=np.float64) * dt)
+
+    def _safe_base_name(self) -> str:
+        base = self._class_name.strip() or "waveforms"
+        safe = "".join(ch if (ch.isalnum() or ch in {"_", "-"}) else "_" for ch in base)
+        return safe.lower()
+
+    def _build_ui(self) -> None:
+        palette = self.palette()
+        palette.setColor(self.backgroundRole(), QtGui.QColor("white"))
+        self.setPalette(palette)
+        self.setAutoFillBackground(True)
+
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        menu_bar = QtWidgets.QMenuBar(self)
+        file_menu = menu_bar.addMenu("File")
+        layout.setMenuBar(menu_bar)
+
+        save_image_action = QtGui.QAction("Save as image\u2026", self)
+        save_image_action.triggered.connect(self._on_save_image)
+        file_menu.addAction(save_image_action)
+
+        save_traces_action = QtGui.QAction("Save traces\u2026", self)
+        save_traces_action.triggered.connect(self._on_save_traces)
+        file_menu.addAction(save_traces_action)
+
+        file_menu.addSeparator()
+        close_action = QtGui.QAction("Close", self)
+        close_action.setShortcuts([QtGui.QKeySequence.Close, QtGui.QKeySequence("Ctrl+W")])
+        close_action.triggered.connect(self.close)
+        file_menu.addAction(close_action)
+        self.addAction(close_action)
+
+        measure_menu = menu_bar.addMenu("Measure")
+        point_action = QtGui.QAction("Point", self)
+        point_action.triggered.connect(lambda: self._set_measure_mode("point"))
+        measure_menu.addAction(point_action)
+
+        measure_action = QtGui.QAction("Measure", self)
+        measure_action.triggered.connect(lambda: self._set_measure_mode("line"))
+        measure_menu.addAction(measure_action)
+
+        measure_menu.addSeparator()
+        clear_measure_action = QtGui.QAction("Clear", self)
+        clear_measure_action.triggered.connect(self._clear_measurements)
+        measure_menu.addAction(clear_measure_action)
+
         self.plot_widget = pg.PlotWidget(enableMenu=False)
         self.plot_widget.setBackground("w")
         self.plot_widget.setLabel("bottom", "Time (s)")
         self.plot_widget.setLabel("left", "Amplitude (V)")
         plot_item = self.plot_widget.getPlotItem()
-        plot_item.showGrid(x=True, y=True, alpha=0.15)
+        plot_item.showGrid(x=True, y=True, alpha=0.35)
+        vb = plot_item.getViewBox()
+        if vb is not None:
+            vb.setMouseEnabled(x=True, y=True)
         for axis_name in ("bottom", "left"):
             axis = plot_item.getAxis(axis_name)
             axis.setPen(pg.mkPen("black"))
             axis.setTextPen(pg.mkPen("black"))
         layout.addWidget(self.plot_widget, 1)
-        close_btn = QtWidgets.QPushButton("Close")
-        close_btn.clicked.connect(self.accept)
-        btn_layout = QtWidgets.QHBoxLayout()
-        btn_layout.addStretch(1)
-        btn_layout.addWidget(close_btn)
-        layout.addLayout(btn_layout)
+        # Accept gesture-based zoom (trackpad pinch) on the viewport.
+        viewport = self.plot_widget.viewport()
+        viewport.setAttribute(QtCore.Qt.WA_AcceptTouchEvents, True)
+        viewport.grabGesture(QtCore.Qt.PinchGesture)
+        viewport.installEventFilter(self)
+        self.plot_widget.scene().installEventFilter(self)
 
-        line_pen = pg.mkPen(QtGui.QColor(140, 140, 140, 90), width=1)
-        lengths: list[int] = []
-        trimmed_waveforms: list[tuple[np.ndarray, np.ndarray]] = []
-        for times, samples in waveforms:
-            length = int(min(times.size, samples.size))
-            if length <= 0:
-                continue
-            trimmed_waveforms.append((times[:length], samples[:length]))
-            lengths.append(length)
-            self.plot_widget.plot(times, samples, pen=line_pen, clear=False)
-        if not trimmed_waveforms:
+    def _plot_waveforms(self) -> None:
+        if not self._aligned_samples or self._plot_time_axis is None:
             return
-        length_counts = Counter(lengths)
-        target_len = max(length_counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
-        aligned = [(times[:target_len], samples[:target_len]) for times, samples in trimmed_waveforms if times.size >= target_len and samples.size >= target_len]
-        if not aligned:
-            return
-        stack = np.stack([samples for _, samples in aligned], axis=0)
-        median_wave = np.median(stack, axis=0)
-        t_ref = aligned[0][0]
-        median_pen = pg.mkPen(color if color is not None else QtGui.QColor(0, 0, 200), width=3)
-        self.plot_widget.plot(t_ref, median_wave, pen=median_pen)
+        line_color = QtGui.QColor(STA_TRACE_PEN.color())
+        line_pen = pg.mkPen(line_color, width=1)
+        for samples in self._aligned_samples:
+            self.plot_widget.plot(self._plot_time_axis, samples, pen=line_pen, clear=False)
+        if self._median_waveform is not None:
+            median_pen = pg.mkPen(WAVEFORM_MEDIAN_COLOR, width=3)
+            self.plot_widget.plot(self._plot_time_axis, self._median_waveform, pen=median_pen)
         self.plot_widget.setAntialiasing(False)
+        self._set_measure_mode("none")
+
+    def _update_title(self) -> None:
+        count = len(self._aligned_samples) if self._aligned_samples else len(self._waveforms)
+        self.setWindowTitle(f"Waveforms \u2013 {self._class_name} ({count} events)")
+
+    def _on_save_image(self) -> None:
+        if self._plot_time_axis is None or not self._aligned_samples:
+            QtWidgets.QMessageBox.information(self, "Save image", "No waveform data available to save.")
+            return
+        suggested = f"{self._safe_base_name()}_waveforms.png"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save as image", suggested, "PNG image (*.png)")
+        if not path:
+            return
+        if not path.lower().endswith(".png"):
+            path = f"{path}.png"
+        pixmap = self.grab()
+        if pixmap.isNull():
+            QtWidgets.QMessageBox.warning(self, "Save image", "Unable to capture the waveform window.")
+            return
+        if not pixmap.save(path, "PNG"):
+            QtWidgets.QMessageBox.critical(self, "Save image", "Failed to save the image.")
+
+    def _on_save_traces(self) -> None:
+        if not self._aligned_samples or self._export_time_axis is None or self._median_waveform is None:
+            QtWidgets.QMessageBox.information(self, "Save traces", "No waveform data available to export.")
+            return
+        suggested = f"{self._safe_base_name()}_waveforms.csv"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save traces", suggested, "CSV file (*.csv)")
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path = f"{path}.csv"
+        try:
+            with open(path, "w", newline="") as fp:
+                writer = csv.writer(fp)
+                writer.writerow(self._export_time_axis)
+                writer.writerow(self._median_waveform)
+                for samples in self._aligned_samples:
+                    writer.writerow(samples)
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Save traces", f"Failed to save traces:\n{exc}")
+
+    def _set_measure_mode(self, mode: str) -> None:
+        self._measure_mode = mode
+        vb = self.plot_widget.getViewBox()
+        if vb is not None:
+            vb.setMouseEnabled(mode == "none", mode == "none")
+        if mode == "none":
+            self.plot_widget.unsetCursor()
+        else:
+            self.plot_widget.setCursor(QtCore.Qt.CrossCursor)
+        self._dragging_point_idx = None
+        self._active_line = None
+        self._line_anchor = None
+
+    def _handle_mouse_press(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> bool:
+        if event.button() != QtCore.Qt.LeftButton:
+            return False
+        scene_pos = event.scenePos()
+        vb = self.plot_widget.getViewBox()
+        if vb is None:
+            return False
+        hit_point = self._hit_test_point(scene_pos)
+        data_pos = vb.mapSceneToView(scene_pos)
+        if not np.isfinite(data_pos.x()) or not np.isfinite(data_pos.y()):
+            return False
+        if self._measure_mode == "none":
+            if hit_point is not None:
+                self._dragging_point_idx = hit_point
+                event.accept()
+                return True
+            return False
+        if self._measure_mode == "point":
+            if hit_point is not None:
+                self._dragging_point_idx = hit_point
+                event.accept()
+                return True
+            self._add_measure_point(data_pos)
+            self._dragging_point_idx = len(self._measure_points) - 1
+            event.accept()
+            return True
+        # If clicking on an existing line handle, let ROI handle manage it.
+        if self._line_handle_hit(scene_pos):
+            return False
+        # Begin a new measurement line
+        line = _MeasureLine(self.plot_widget.getPlotItem(), data_pos, data_pos, mode=self._measure_mode)
+        self._measure_lines.append(line)
+        self._active_line = line
+        self._line_anchor = QtCore.QPointF(data_pos)
+        event.accept()
+        return True
+
+    def _handle_mouse_move(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> bool:
+        if self._measure_mode == "none" and self._dragging_point_idx is None and self._active_line is None:
+            return False
+        scene_pos = event.scenePos()
+        vb = self.plot_widget.getViewBox()
+        if vb is None:
+            return False
+        data_pos = vb.mapSceneToView(scene_pos)
+        if not np.isfinite(data_pos.x()) or not np.isfinite(data_pos.y()):
+            return False
+        if self._dragging_point_idx is not None:
+            self._update_measure_point(self._dragging_point_idx, data_pos)
+            event.accept()
+            return True
+        if self._active_line is not None:
+            anchor = self._line_anchor if self._line_anchor is not None else data_pos
+            self._active_line.set_points(anchor, data_pos)
+            event.accept()
+            return True
+        return False
+
+    def _handle_mouse_release(self, event: QtWidgets.QGraphicsSceneMouseEvent) -> bool:
+        if self._measure_mode == "none" and self._dragging_point_idx is None and self._active_line is None:
+            return False
+        if event.button() != QtCore.Qt.LeftButton:
+            return False
+        if self._dragging_point_idx is not None:
+            self._dragging_point_idx = None
+            if self._measure_mode != "none":
+                self._set_measure_mode("none")
+            event.accept()
+            return True
+        if self._active_line is not None:
+            self._active_line = None
+            self._line_anchor = None
+            if self._measure_mode != "none":
+                self._set_measure_mode("none")
+            event.accept()
+            return True
+        return False
+
+    def _add_measure_point(self, pos: QtCore.QPointF) -> None:
+        scatter = pg.ScatterPlotItem([pos.x()], [pos.y()], symbol="+", size=14, pen=pg.mkPen("black"), brush=None)
+        label = pg.TextItem(color=(20, 20, 20))
+        self.plot_widget.addItem(scatter)
+        self.plot_widget.addItem(label)
+        entry = {"item": scatter, "label": label}
+        self._measure_points.append(entry)
+        self._update_measure_point(len(self._measure_points) - 1, pos)
+
+    def _update_measure_point(self, idx: int, pos: QtCore.QPointF) -> None:
+        if idx < 0 or idx >= len(self._measure_points):
+            return
+        entry = self._measure_points[idx]
+        item = entry.get("item")
+        label = entry.get("label")
+        if isinstance(item, pg.ScatterPlotItem):
+            item.setData([pos.x()], [pos.y()])
+            item.setToolTip(f"({pos.x():.4g} s, {pos.y():.4g} V)")
+        if isinstance(label, pg.TextItem):
+            label.setText(f"({pos.x():.4g} s, {pos.y():.4g} V)")
+            label.setPos(pos.x(), pos.y())
+
+    def _hit_test_point(self, scene_pos: QtCore.QPointF, pixel_radius: float = 8.0) -> int | None:
+        vb = self.plot_widget.getViewBox()
+        if vb is None:
+            return None
+        for idx, entry in enumerate(self._measure_points):
+            item = entry.get("item")
+            if not isinstance(item, pg.ScatterPlotItem):
+                continue
+            spots = item.points()
+            if not spots:
+                continue
+            spot = spots[0]
+            pt = vb.mapViewToScene(spot.pos())
+            dist = (QtCore.QPointF(pt) - scene_pos)
+            if (dist.x() ** 2 + dist.y() ** 2) ** 0.5 <= pixel_radius:
+                return idx
+        return None
+
+    def _line_handle_hit(self, scene_pos: QtCore.QPointF, pixel_radius: float = 8.0) -> bool:
+        for line in self._measure_lines:
+            handles = line.roi.getSceneHandlePositions()
+            for _, h_pos in handles:
+                dist = QtCore.QPointF(h_pos) - scene_pos
+                if (dist.x() ** 2 + dist.y() ** 2) ** 0.5 <= pixel_radius:
+                    return True
+        return False
+
+    def _clear_measurements(self) -> None:
+        for entry in self._measure_points:
+            item = entry.get("item")
+            label = entry.get("label")
+            try:
+                if isinstance(item, pg.ScatterPlotItem):
+                    self.plot_widget.removeItem(item)
+            except Exception:
+                pass
+            try:
+                if isinstance(label, pg.TextItem):
+                    self.plot_widget.removeItem(label)
+            except Exception:
+                pass
+        self._measure_points.clear()
+        for line in self._measure_lines:
+            line.remove()
+        self._measure_lines.clear()
+        self._dragging_point_idx = None
+        self._active_line = None
+        self._line_anchor = None
+
+    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:  # noqa: N802 - Qt API
+        if obj is self.plot_widget.viewport():
+            if event.type() == QtCore.QEvent.Gesture:
+                pinch = event.gesture(QtCore.Qt.PinchGesture)
+                if pinch is not None:
+                    self._handle_pinch_gesture(pinch)
+                    return True
+            if event.type() == QtCore.QEvent.NativeGesture:
+                if event.gestureType() == QtCore.Qt.NativeGestureType.Zoom:
+                    delta = float(event.value())
+                    factor = 1.0 + delta
+                    self._apply_zoom_factor(factor)
+                    return True
+        if obj is self.plot_widget.scene():
+            if event.type() == QtCore.QEvent.GraphicsSceneMousePress:
+                return self._handle_mouse_press(event)
+            if event.type() == QtCore.QEvent.GraphicsSceneMouseMove:
+                return self._handle_mouse_move(event)
+            if event.type() == QtCore.QEvent.GraphicsSceneMouseRelease:
+                return self._handle_mouse_release(event)
+        return super().eventFilter(obj, event)
+
+    def _handle_pinch_gesture(self, pinch: QtGui.QPinchGesture) -> None:
+        try:
+            factor = float(pinch.scaleFactor())
+        except Exception:
+            return
+        if not np.isfinite(factor) or factor <= 0.0:
+            return
+        self._apply_zoom_factor(factor)
+
+    def _apply_zoom_factor(self, factor: float) -> None:
+        if not np.isfinite(factor) or factor <= 0.0:
+            return
+        plot_item = self.plot_widget.getPlotItem()
+        vb = plot_item.getViewBox() if plot_item is not None else None
+        if vb is None:
+            return
+        # Scale equally on both axes; invert because scaleBy zooms the view rect.
+        inv = 1.0 / factor
+        vb.scaleBy((inv, inv))

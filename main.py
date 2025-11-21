@@ -19,7 +19,6 @@ if __name__ == "__main__":
 # - Add spectrogram view in analysis mode, also, simply fft amplitudes view
 #    - Add spectrogram button next to analyze and have it pop up a spectrogram tab for a channel
 # - Button to export of class events properties list to CSV (class ID - zero for non-classified events))
-# - Button to export raw trace data for waveforms to CSV
 # - Buttons to pop up windows for screen shotting for reports
 # - DAQ devices need to provide discrete sample rate settings rather than arbitrary ones
 # - Allow for custom channel names

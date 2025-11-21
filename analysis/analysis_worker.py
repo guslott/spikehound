@@ -211,8 +211,16 @@ class AnalysisWorker(threading.Thread):
         if dispatcher is None:
             return np.empty(0, dtype=np.float32)
         try:
-            window = dispatcher.collect_window(int(start_index), int(count), int(self._channel_id))
+            window, miss_pre, miss_post = dispatcher.collect_window(
+                int(start_index),
+                int(count),
+                int(self._channel_id),
+                return_info=True,
+            )
         except Exception:
+            return np.empty(0, dtype=np.float32)
+        if miss_pre > 0 or miss_post > 0:
+            # Avoid splicing truncated windows; fall back to the local chunk data.
             return np.empty(0, dtype=np.float32)
         return np.asarray(window, dtype=np.float32)
 

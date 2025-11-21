@@ -526,6 +526,18 @@ class Dispatcher:
                 start_sample = chunk.seq * chunk.n_samples
             end_sample = int(start_sample) + frames - 1
 
+            # If samples arrive with a gap (dropped/late chunk), reset the ring buffer to avoid
+            # stitching stale data onto new samples. We keep the buffer capacity but clear contents.
+            if self._filled > 0:
+                expected_next = self._latest_sample_index + 1
+                if start_sample != expected_next:
+                    self._ring_buffer.fill(0.0)
+                    self._write_idx = 0
+                    self._filled = 0
+                    self._latest_sample_index = start_sample - 1
+            else:
+                self._latest_sample_index = start_sample - 1
+
             if frames >= buffer_len:
                 self._ring_buffer[:, :] = data[:, -buffer_len:]
                 self._write_idx = 0
