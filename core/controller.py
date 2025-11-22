@@ -47,12 +47,23 @@ class DeviceManager(QtCore.QObject):
         self._active_key: Optional[str] = None
         self._driver: Optional[BaseSource] = None
         self._channels: List[ChannelInfo] = []
+        self._list_all_audio_devices = False
         self.refresh_devices()
+
+    def set_list_all_audio_devices(self, enabled: bool, *, refresh: bool = False) -> None:
+        self._list_all_audio_devices = bool(enabled)
+        if refresh:
+            self.refresh_devices()
 
     def refresh_devices(self) -> None:
         reg = _registry()
         reg.scan_devices(force=True)
         descriptors = reg.list_devices()
+        try:
+            from daq.soundcard_source import SoundCardSource
+            SoundCardSource.set_list_all_devices(self._list_all_audio_devices)
+        except Exception:
+            pass
         self._descriptors = {d.key: d for d in descriptors}
         self._device_entries = {}
         payload: List[Dict[str, object]] = []
@@ -127,7 +138,19 @@ class DeviceManager(QtCore.QObject):
                     entry["device_details"] = details
                 payload.append(entry)
 
-        payload.sort(key=lambda item: (item.get("driver_name", ""), item.get("device_name", "") or item["name"]))
+        def _priority(item: Dict[str, object]) -> tuple:
+            driver = str(item.get("driver_name", "")).lower()
+            module = str(item.get("module", "")).lower()
+            name = str(item.get("device_name", item.get("name", ""))).lower()
+            if "simulated" in driver or "simulated" in module:
+                rank = 0
+            elif "sound card" in driver or "soundcard" in module:
+                rank = 1
+            else:
+                rank = 2
+            return (rank, driver, name)
+
+        payload.sort(key=_priority)
         self.devicesChanged.emit(payload)
 
     def get_device_list(self) -> List[DeviceDescriptor]:
@@ -246,6 +269,7 @@ class PipelineController:
         self._streaming: bool = False
         self._active_channel_ids: List[int] = []
         self._channel_infos: List[ChannelInfo] = []
+        self._list_all_audio_devices: bool = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -289,6 +313,9 @@ class PipelineController:
 
     def update_app_settings(self, **kwargs) -> AppSettings:
         return self._app_settings_store.update(**kwargs)
+
+    def set_list_all_audio_devices(self, enabled: bool) -> None:
+        self._list_all_audio_devices = bool(enabled)
 
     @property
     def sample_rate(self) -> Optional[float]:

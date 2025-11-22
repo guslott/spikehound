@@ -48,6 +48,17 @@ class SoundCardSource(BaseSource):
     def device_class_name(cls) -> str:
         return "Sound Card"
 
+    # Toggle to control whether we list all input-capable devices or just the system default.
+    _LIST_ALL_DEVICES: bool = False
+
+    @classmethod
+    def set_list_all_devices(cls, enabled: bool) -> None:
+        cls._LIST_ALL_DEVICES = bool(enabled)
+
+    @classmethod
+    def _list_all_devices(cls) -> bool:
+        return cls._LIST_ALL_DEVICES
+
     # ---------- Discovery helpers ---------------------------------------------
 
     @classmethod
@@ -59,6 +70,37 @@ class SoundCardSource(BaseSource):
             )
         devices = sd.query_devices()
         out: List[DeviceInfo] = []
+        if not cls._list_all_devices():
+            # Prefer the system default input; fall back to first input-capable device.
+            default_in = sd.default.device[0] if sd.default.device else None
+            target_idx = None
+            if default_in is not None and default_in >= 0:
+                dev = devices[default_in]
+                if int(dev.get("max_input_channels", 0)) > 0:
+                    target_idx = default_in
+            if target_idx is None:
+                for idx, dev in enumerate(devices):
+                    if int(dev.get("max_input_channels", 0)) > 0:
+                        target_idx = idx
+                        break
+            if target_idx is None:
+                return []
+            dev = devices[target_idx]
+            host = sd.query_hostapis(dev["hostapi"])["name"]
+            name = dev["name"]
+            out.append(
+                DeviceInfo(
+                    id=str(target_idx),
+                    name=f"System Sound Input - {name}",
+                    details={
+                        "max_input_channels": int(dev.get("max_input_channels", 0)),
+                        "default_samplerate": float(dev.get("default_samplerate", 0)),
+                        "host_api": host,
+                    },
+                )
+            )
+            return out
+
         for idx, dev in enumerate(devices):
             max_in = int(dev.get("max_input_channels", 0))
             if max_in > 0:

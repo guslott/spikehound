@@ -23,6 +23,9 @@ if __name__ == "__main__":
 # - DAQ devices need to provide discrete sample rate settings rather than arbitrary ones
 # - Allow for custom channel names
 
+# - Trigger continuous not currently working
+# - Fix how sample rates are handled
+
 # - Add PCA features (top two components) to analysis tab
 #   - PCA needs to be debugged in the case that the user clears all the events.
 

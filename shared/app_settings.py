@@ -12,6 +12,7 @@ class AppSettings:
     plot_refresh_hz: float = 40.0
     default_window_sec: float = 1.0
     listen_output_key: Optional[str] = None
+    list_all_audio_devices: bool = False
 
 
 class AppSettingsStore:
@@ -37,10 +38,13 @@ class AppSettingsStore:
         listen = qsettings.value("listen_output_key", AppSettings.listen_output_key)
         if listen is not None:
             listen = str(listen)
+        list_all_audio = qsettings.value("list_all_audio_devices", AppSettings.list_all_audio_devices)
+        list_all_audio = bool(int(list_all_audio)) if isinstance(list_all_audio, str) else bool(list_all_audio)
         return AppSettings(
             plot_refresh_hz=refresh,
             default_window_sec=window_sec,
             listen_output_key=listen,
+            list_all_audio_devices=list_all_audio,
         )
 
     def get(self) -> AppSettings:
@@ -82,6 +86,7 @@ class AppSettingsStore:
             self._qsettings.remove("listen_output_key")
         else:
             self._qsettings.setValue("listen_output_key", settings.listen_output_key)
+        self._qsettings.setValue("list_all_audio_devices", int(bool(settings.list_all_audio_devices)))
 
 
 __all__ = ["AppSettings", "AppSettingsStore"]

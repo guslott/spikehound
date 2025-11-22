@@ -41,20 +41,11 @@ class SettingsTab(QtWidgets.QWidget):
         form.setContentsMargins(12, 10, 12, 10)
         form.setSpacing(6)
 
-        self.refresh_spin = QtWidgets.QDoubleSpinBox()
-        self.refresh_spin.setRange(5.0, 240.0)
-        self.refresh_spin.setSingleStep(5.0)
-        self.refresh_spin.setSuffix(" Hz")
-        self.refresh_spin.valueChanged.connect(lambda val: self._update_settings(plot_refresh_hz=float(val)))
-        form.addRow("Plot refresh rate", self.refresh_spin)
-
-        self.window_spin = QtWidgets.QDoubleSpinBox()
-        self.window_spin.setDecimals(3)
-        self.window_spin.setRange(0.05, 20.0)
-        self.window_spin.setSingleStep(0.05)
-        self.window_spin.setSuffix(" s")
-        self.window_spin.valueChanged.connect(lambda val: self._update_settings(default_window_sec=float(val)))
-        form.addRow("Default window width", self.window_spin)
+        self.list_audio_check = QtWidgets.QCheckBox("List all audio devices")
+        self.list_audio_check.stateChanged.connect(
+            lambda state: self._update_settings(list_all_audio_devices=bool(state))
+        )
+        form.addRow(self.list_audio_check)
 
         return box
 
@@ -127,30 +118,15 @@ class SettingsTab(QtWidgets.QWidget):
         self._populate_listen_devices()
 
     def _apply_settings(self, settings: AppSettings) -> None:
-        try:
-            self.refresh_spin.blockSignals(True)
-            self.window_spin.blockSignals(True)
-            self.refresh_spin.setValue(settings.plot_refresh_hz)
-            self.window_spin.setValue(settings.default_window_sec)
-        finally:
-            self.refresh_spin.blockSignals(False)
-            self.window_spin.blockSignals(False)
+        self.list_audio_check.blockSignals(True)
+        self.list_audio_check.setChecked(bool(settings.list_all_audio_devices))
+        self.list_audio_check.blockSignals(False)
 
     def _update_settings(self, **kwargs) -> None:
         store = getattr(self._controller, "app_settings_store", None)
         if store is None:
             return
         new_settings = store.update(**kwargs)
-        if "plot_refresh_hz" in kwargs and hasattr(self._main_window, "set_plot_refresh_hz"):
-            try:
-                self._main_window.set_plot_refresh_hz(float(new_settings.plot_refresh_hz))
-            except Exception:
-                pass
-        if "default_window_sec" in kwargs and hasattr(self._main_window, "set_default_window_sec"):
-            try:
-                self._main_window.set_default_window_sec(float(new_settings.default_window_sec))
-            except Exception:
-                pass
 
     # ------------------------------------------------------------------
     # Audio helpers

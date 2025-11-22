@@ -432,6 +432,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chunk_accum_samples: int = 0
         self._chunk_rate_window: float = 1.0
         self._chunk_last_rate_update = time.perf_counter()
+        self._downsample_supported = None
         self._window_combo_user_set = False
         self._window_combo_suppress = False
         self._splash_pixmap: Optional[QtGui.QPixmap] = None
@@ -473,6 +474,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if not self._window_combo_user_set:
                 self._set_window_combo_value(float(app_settings.default_window_sec))
             self._apply_listen_output_preference(app_settings.listen_output_key)
+        # Standard close shortcut (Cmd+W on macOS, Ctrl+W on Windows/Linux)
+        self._close_shortcut = QtGui.QShortcut(QtGui.QKeySequence.StandardKey.Close, self)
+        self._close_shortcut.setContext(QtCore.Qt.ApplicationShortcut)
+        self._close_shortcut.activated.connect(self.close)
         self._bind_app_settings_store()
         self._emit_trigger_config()
         QtCore.QTimer.singleShot(0, self._update_splash_pixmap)
@@ -485,8 +490,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # Global shortcuts for quitting/closing
         quit_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Quit), self)
         quit_shortcut.activated.connect(self._quit_application)
-        close_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Close), self)
-        close_shortcut.activated.connect(self.close)
 
     @property
     def chunk_rate(self) -> float:
@@ -720,10 +723,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_combo = QtWidgets.QComboBox()
         device_layout.addWidget(self.device_combo, 0, 1)
 
+        controls_row = QtWidgets.QHBoxLayout()
+        controls_row.setSpacing(6)
+        self.scan_hardware_btn = QtWidgets.QPushButton("Scan Hardware")
+        self.scan_hardware_btn.clicked.connect(self._on_scan_hardware)
+        self.scan_hardware_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        self.scan_hardware_btn.setFixedHeight(32)
+        controls_row.addWidget(self.scan_hardware_btn)
         self.device_toggle_btn = QtWidgets.QPushButton("Connect")
         self.device_toggle_btn.setCheckable(True)
         self.device_toggle_btn.clicked.connect(self._on_device_button_clicked)
-        device_layout.addWidget(self.device_toggle_btn, 1, 0, 1, 2)
+        self.device_toggle_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        self.device_toggle_btn.setFixedHeight(32)
+        controls_row.addWidget(self.device_toggle_btn)
+        device_layout.addLayout(controls_row, 1, 0, 1, 2)
 
         device_layout.addWidget(self._label("Sample Rate (Hz)"), 2, 0)
         self.sample_rate_spin = QtWidgets.QDoubleSpinBox()
@@ -1410,6 +1423,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._clear_channel_panels()
         self.set_trigger_channels([])
         self._update_channel_buttons()
+
+    def _on_scan_hardware(self) -> None:
+        if self._device_manager is None:
+            return
+        try:
+            self._device_manager.refresh_devices()
+        except Exception:
+            pass
         self._publish_active_channels()
         self._clear_scope_display()
         if hasattr(self, "_analysis_dock") and self._analysis_dock is not None:
@@ -2056,6 +2077,10 @@ class MainWindow(QtWidgets.QMainWindow):
             curve = self._curve_map.get(cid)
             if curve is None:
                 curve = pg.PlotCurveItem()
+                try:
+                    curve.setDownsampling(ds=True, auto=True, method="peak")
+                except Exception:
+                    pass
                 plot_item.addItem(curve)
                 self._curve_map[cid] = curve
             curves.append(curve)
@@ -2589,6 +2614,10 @@ class MainWindow(QtWidgets.QMainWindow):
             curve = self._curve_map.get(cid)
             if curve is None:
                 curve = pg.PlotCurveItem(pen=pg.mkPen(config.color, width=2.0))
+                try:
+                    curve.setDownsampling(ds=True, auto=True, method="peak")
+                except Exception:
+                    pass
                 plot_item.addItem(curve)
                 self._curve_map[cid] = curve
             else:
@@ -2991,6 +3020,16 @@ class MainWindow(QtWidgets.QMainWindow):
             if not self._device_connected and not self._window_combo_user_set:
                 self._set_window_combo_value(float(settings.default_window_sec))
             self._apply_listen_output_preference(settings.listen_output_key)
+            if self._device_manager is not None:
+                try:
+                    self._device_manager.set_list_all_audio_devices(settings.list_all_audio_devices, refresh=True)
+                except Exception:
+                    pass
+            if self._controller is not None:
+                try:
+                    self._controller.set_list_all_audio_devices(settings.list_all_audio_devices)
+                except Exception:
+                    pass
         self._app_settings_unsub = store.subscribe(_apply)
 
     def _apply_listen_output_preference(self, key: Optional[str]) -> None:
