@@ -174,6 +174,16 @@ class BaseSource(ABC):
                 channels = [ch.id for ch in self._available_channels]
             self.set_active_channels(channels)
 
+            # Validate requested sample rate against capabilities when provided
+            if self._device_id is not None:
+                try:
+                    caps = self.get_capabilities(self._device_id)
+                except Exception:
+                    caps = None
+                if caps is not None and caps.sample_rates:
+                    if int(sample_rate) not in [int(sr) for sr in caps.sample_rates]:
+                        raise ValueError(f"sample_rate {sample_rate} not in supported set {caps.sample_rates}")
+
             # Clamp or normalize chunk_size minimally (positive int)
             if not isinstance(chunk_size, int) or chunk_size <= 0:
                 raise ValueError("chunk_size must be a positive integer")

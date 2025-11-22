@@ -187,8 +187,12 @@ class SoundCardSource(BaseSource):
             raise RuntimeError(f"`sounddevice` unavailable: {_IMPORT_ERROR!r}")
         dev = sd.query_devices(int(device_id))
         max_in = int(dev.get("max_input_channels", 0))
-        rates = self.supported_sample_rates(int(device_id), min_channels=1)
-        return Capabilities(max_channels_in=max_in, sample_rates=rates, dtype=self.dtype)
+        # Offer a curated set of common rates, filtered by device support.
+        standard_rates = (22050, 44100, 48000, 96000)
+        supported = self.supported_sample_rates(int(device_id), probe=standard_rates, min_channels=1)
+        if not supported:
+            supported = self.supported_sample_rates(int(device_id), min_channels=1)
+        return Capabilities(max_channels_in=max_in, sample_rates=supported, dtype=self.dtype)
 
     def list_available_channels(self, device_id: str) -> List[ChannelInfo]:
         if sd is None:

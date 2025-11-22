@@ -47,7 +47,7 @@ class SimulatedPhysiologySource(BaseSource):
         return [DeviceInfo(id="sim0", name="Simulated Physiology (virtual)")]
 
     def get_capabilities(self, device_id: str) -> Capabilities:
-        return Capabilities(max_channels_in=3, sample_rates=None, dtype="float32")
+        return Capabilities(max_channels_in=3, sample_rates=[20_000], dtype="float32")
 
     def list_available_channels(self, device_id: str):
         return [
@@ -182,6 +182,8 @@ class SimulatedPhysiologySource(BaseSource):
         pass
 
     def _configure_impl(self, sample_rate: int, channels, chunk_size: int, **options) -> ActualConfig:
+        # Force fixed sample rate
+        sample_rate = 20_000
         num_units = int(options.get('num_units', 5))
         self._line_hum_amp = float(options.get('line_hum_amp', self._default_line_hum_amp))
         self._line_hum_freq = float(options.get('line_hum_freq', 60.0))

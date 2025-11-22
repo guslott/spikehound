@@ -722,6 +722,7 @@ class MainWindow(QtWidgets.QMainWindow):
         device_layout.addWidget(self._label("Source"), 0, 0)
         self.device_combo = QtWidgets.QComboBox()
         device_layout.addWidget(self.device_combo, 0, 1)
+        self.device_combo.currentIndexChanged.connect(self._on_device_selected)
 
         controls_row = QtWidgets.QHBoxLayout()
         controls_row.setSpacing(6)
@@ -739,13 +740,11 @@ class MainWindow(QtWidgets.QMainWindow):
         device_layout.addLayout(controls_row, 1, 0, 1, 2)
 
         device_layout.addWidget(self._label("Sample Rate (Hz)"), 2, 0)
-        self.sample_rate_spin = QtWidgets.QDoubleSpinBox()
-        self.sample_rate_spin.setRange(100.0, 1_000_000.0)
-        self.sample_rate_spin.setDecimals(0)
-        self.sample_rate_spin.setSingleStep(1000.0)
-        self.sample_rate_spin.setValue(20_000.0)
-        self.sample_rate_spin.setStyleSheet("color: rgb(255,255,255); background-color: rgb(0,0,0);")
-        device_layout.addWidget(self.sample_rate_spin, 2, 1)
+        self.sample_rate_combo = QtWidgets.QComboBox()
+        self.sample_rate_combo.setEditable(False)
+        self.sample_rate_combo.setFixedHeight(24)
+        self.sample_rate_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        device_layout.addWidget(self.sample_rate_combo, 2, 1)
 
         controls_row = QtWidgets.QHBoxLayout()
         controls_row.setSpacing(6)
@@ -1103,7 +1102,7 @@ class MainWindow(QtWidgets.QMainWindow):
         payload = {
             "version": 1,
             "device_key": device_key,
-            "sample_rate": float(self.sample_rate_spin.value()),
+            "sample_rate": float(self._current_sample_rate_value()),
             "window_sec": float(window_value),
             "channels": [],
         }
@@ -1152,7 +1151,7 @@ class MainWindow(QtWidgets.QMainWindow):
             _warning("Load Config", f"Unsupported config version: {version}")
             return
         device_key = data.get("device_key")
-        sample_rate = float(data.get("sample_rate", self.sample_rate_spin.value()))
+        sample_rate = float(data.get("sample_rate", self._current_sample_rate_value()))
         window_sec = float(data.get("window_sec", self._current_window_sec))
         channels_payload = data.get("channels") or []
 
@@ -1167,7 +1166,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 return
 
-        self.sample_rate_spin.setValue(sample_rate)
+        self._set_sample_rate_value(sample_rate)
         self._set_window_combo_value(window_sec)
 
         if device_key is None or self._device_manager is None:
@@ -1175,7 +1174,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         try:
-            self._device_manager.connect_device(device_key, sample_rate=self.sample_rate_spin.value())
+            self._device_manager.connect_device(device_key, sample_rate=self._current_sample_rate_value())
         except Exception as exc:
             _critical("Load Config", f"Failed to connect to device '{device_key}': {exc}")
             return
@@ -1339,7 +1338,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.device_toggle_btn.setChecked(False)
             return
         try:
-            self._device_manager.connect_device(key, sample_rate=self.sample_rate_spin.value())
+            self._device_manager.connect_device(key, sample_rate=self._current_sample_rate_value())
         except Exception as exc:  # pragma: no cover - GUI feedback only
             QtWidgets.QMessageBox.critical(self, "Device", f"Failed to connect: {exc}")
             self.device_toggle_btn.blockSignals(True)
@@ -1382,8 +1381,58 @@ class MainWindow(QtWidgets.QMainWindow):
                 idx = self.device_combo.findData(active_key)
                 if idx >= 0:
                     self.device_combo.setCurrentIndex(idx)
+        self._on_device_selected()
         self._apply_device_state(self._device_connected and bool(entries))
         self._update_channel_buttons()
+
+    def _on_device_selected(self) -> None:
+        key = self.device_combo.currentData()
+        entry = self._device_map.get(key) if key else None
+        self._populate_sample_rate_options(entry)
+        self._update_sample_rate_enabled()
+
+    def _populate_sample_rate_options(self, entry: Optional[dict]) -> None:
+        self.sample_rate_combo.blockSignals(True)
+        self.sample_rate_combo.clear()
+        rates = []
+        if entry is not None:
+            caps = entry.get("capabilities")
+            if hasattr(caps, "sample_rates"):
+                rates = getattr(caps, "sample_rates") or []
+            elif isinstance(caps, dict):
+                rates = caps.get("sample_rates") or []
+        for rate in rates:
+            self.sample_rate_combo.addItem(f"{int(rate):,}", float(rate))
+        if self.sample_rate_combo.count():
+            self.sample_rate_combo.setCurrentIndex(0)
+        self.sample_rate_combo.setEnabled(bool(rates) and (not self._device_connected or self.active_list.count() == 0))
+        self.sample_rate_combo.blockSignals(False)
+
+    def _set_sample_rate_value(self, sample_rate: float) -> None:
+        if self.sample_rate_combo.count() == 0:
+            return
+        idx = self.sample_rate_combo.findData(float(sample_rate))
+        if idx < 0:
+            idx = 0
+        self.sample_rate_combo.setCurrentIndex(idx)
+
+    def _current_sample_rate_value(self) -> float:
+        data = self.sample_rate_combo.currentData()
+        try:
+            return float(data)
+        except Exception:
+            if self.sample_rate_combo.count() > 0:
+                d = self.sample_rate_combo.itemData(0)
+                try:
+                    return float(d)
+                except Exception:
+                    return 0.0
+            return 0.0
+
+    def _update_sample_rate_enabled(self) -> None:
+        connected = self._device_connected
+        has_active = self.active_list.count() > 0
+        self.sample_rate_combo.setEnabled(self.sample_rate_combo.count() > 0 and ((not connected) or (connected and not has_active)))
 
     def _on_device_connected(self, key: str) -> None:
         self._device_connected = True
@@ -1396,7 +1445,7 @@ class MainWindow(QtWidgets.QMainWindow):
             driver = self._device_manager.current_driver()
             if driver is not None:
                 channels = self._device_manager.get_available_channels()
-                self._controller.attach_source(driver, self.sample_rate_spin.value(), channels)
+                self._controller.attach_source(driver, self._current_sample_rate_value(), channels)
                 self._bind_dispatcher_signals()
                 self._bind_app_settings_store()
         self._update_channel_buttons()
@@ -1409,6 +1458,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._controller.detach_device()
             self._controller.clear_active_channels()
             self._drain_visualization_queue()
+        self.sample_rate_combo.clear()
         if self._dispatcher_signals is not None:
             try:
                 self._dispatcher_signals.tick.disconnect(self._on_dispatcher_tick)
@@ -1423,6 +1473,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._clear_channel_panels()
         self.set_trigger_channels([])
         self._update_channel_buttons()
+        self._update_sample_rate_enabled()
 
     def _on_scan_hardware(self) -> None:
         if self._device_manager is None:
@@ -1452,6 +1503,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.set_trigger_channels(channels)
         self._update_channel_buttons()
         self._publish_active_channels()
+        self._update_sample_rate_enabled()
 
     def _on_add_channel(self) -> None:
         idx = self.available_combo.currentIndex()
@@ -1528,6 +1580,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._controller.set_active_channels(ids)
             else:
                 self._controller.clear_active_channels()
+        self._update_sample_rate_enabled()
         dock = getattr(self, "_analysis_dock", None)
         if dock is not None:
             try:
@@ -1811,11 +1864,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         channel_name = config.channel_name or f"Channel {channel_id}"
         sample_rate = self._current_sample_rate
-        if sample_rate <= 0 and hasattr(self, "sample_rate_spin"):
-            try:
-                sample_rate = float(self.sample_rate_spin.value())
-            except Exception:
-                sample_rate = 0.0
+        if sample_rate <= 0:
+            sample_rate = float(self._current_sample_rate_value())
         if sample_rate <= 0:
             sample_rate = 1.0
         dock.open_analysis(channel_name, sample_rate)
@@ -2282,7 +2332,7 @@ class MainWindow(QtWidgets.QMainWindow):
         has_entries = bool(self._device_map)
         has_connectable = any(entry.get("device_id") for entry in self._device_map.values())
         self.device_combo.setEnabled(not connected and has_entries)
-        self.sample_rate_spin.setEnabled(not connected)
+        self._update_sample_rate_enabled()
         self.device_toggle_btn.blockSignals(True)
         self.device_toggle_btn.setChecked(connected)
         self.device_toggle_btn.setText("Disconnect" if connected else "Connect")

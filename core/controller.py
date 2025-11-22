@@ -70,48 +70,10 @@ class DeviceManager(QtCore.QObject):
         for descriptor in descriptors:
             try:
                 available = descriptor.cls.list_available_devices()
-            except Exception as exc:  # pragma: no cover - discovery errors shown in UI
-                entry_key = f"{descriptor.key}::unavailable"
-                self._device_entries[entry_key] = {
-                    "descriptor_key": descriptor.key,
-                    "device_id": None,
-                    "error": str(exc),
-                }
-                payload.append(
-                    {
-                        "key": entry_key,
-                        "name": f"{descriptor.name} (unavailable)",
-                        "module": descriptor.module,
-                        "capabilities": descriptor.capabilities,
-                        "driver_key": descriptor.key,
-                        "driver_name": descriptor.name,
-                        "device_id": None,
-                        "device_name": None,
-                        "error": str(exc),
-                    }
-                )
+            except Exception:
                 continue
 
             if not available:
-                entry_key = f"{descriptor.key}::none"
-                self._device_entries[entry_key] = {
-                    "descriptor_key": descriptor.key,
-                    "device_id": None,
-                    "error": "No hardware devices detected.",
-                }
-                payload.append(
-                    {
-                        "key": entry_key,
-                        "name": f"{descriptor.name} (no devices detected)",
-                        "module": descriptor.module,
-                        "capabilities": descriptor.capabilities,
-                        "driver_key": descriptor.key,
-                        "driver_name": descriptor.name,
-                        "device_id": None,
-                        "device_name": None,
-                        "error": "No hardware devices detected.",
-                    }
-                )
                 continue
 
             for device in sorted(available, key=lambda info: info.name.lower()):
@@ -120,11 +82,17 @@ class DeviceManager(QtCore.QObject):
                     "descriptor_key": descriptor.key,
                     "device_id": device.id,
                 }
+                capabilities = descriptor.capabilities
+                try:
+                    drv = reg.create_device(descriptor.key)
+                    capabilities = drv.get_capabilities(device.id)
+                except Exception:
+                    pass
                 entry: Dict[str, object] = {
                     "key": entry_key,
                     "name": f"{descriptor.name} - {device.name}",
                     "module": descriptor.module,
-                    "capabilities": descriptor.capabilities,
+                    "capabilities": capabilities,
                     "driver_key": descriptor.key,
                     "driver_name": descriptor.name,
                     "device_id": device.id,
