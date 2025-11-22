@@ -22,14 +22,6 @@ if __name__ == "__main__":
 # - Button to export of class events properties list to CSV (class ID - zero for non-classified events))
 # - Allow for custom channel names
 
-# - Fix how sample rates are handled
-# - DAQ devices need to provide discrete sample rate settings rather than arbitrary ones
-
-# - Add PCA features (top two components) to analysis tab
-#   - PCA needs to be debugged in the case that the user clears all the events.
-#   - PCA is a pain, remove it for now
-
-
 # - Test on Windows
 #   - Get school laptop and install NIDAQmx drivers
 #   - simulate devices and write a windows only DAQ interface using pyDAQmx

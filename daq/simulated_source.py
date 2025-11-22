@@ -157,7 +157,9 @@ class SimulatedPhysiologySource(BaseSource):
                 'psp_gain': psp_gain,
             })
 
-        # Precompute max margins for buffers
+        # Precompute max margins for buffers. Include a full chunk of lookahead so
+        # PSP tails and delayed spikes that start near the end of a chunk are
+        # preserved intact into the next chunk without being truncated.
         max_template = max(u['templ_len'] for u in self._units) if self._units else 0
         distance_m = self._distance_m
         max_ec_delay = 0
@@ -165,7 +167,12 @@ class SimulatedPhysiologySource(BaseSource):
             delay_s = distance_m / max(1e-6, u['velocity'])
             max_ec_delay = max(max_ec_delay, int(round(delay_s * sample_rate)))
         max_syn = max((u['syn_delay_samples'] for u in self._units), default=0)
-        self._buffer_margin = max(max_template, max_ec_delay, max_syn + self._psp_len)
+        chunk_size = self.config.chunk_size if self.config is not None else 0
+        self._buffer_margin = max(
+            max_template,
+            max_ec_delay,
+            max_syn + self._psp_len + chunk_size,
+        )
 
         buf_len = self.config.chunk_size + self._buffer_margin if self.config else 0
         self._unit_wave_buffers = [np.zeros(buf_len, dtype=np.float32) for _ in self._units]
