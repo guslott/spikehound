@@ -3,6 +3,7 @@
 from .conditioning import ChannelFilterSettings, FilterSettings, SignalConditioner
 from .controller import DeviceManager, PipelineController
 from .dispatcher import Dispatcher, DispatcherStats
+from .runtime import SpikeHoundRuntime
 from shared.models import Chunk, EndOfStream, Event, TriggerConfig, ChannelInfo, DeviceInfo, Capabilities, ActualConfig
 
 __all__ = [
@@ -16,6 +17,7 @@ __all__ = [
     "ActualConfig",
     "DeviceManager",
     "PipelineController",
+    "SpikeHoundRuntime",
     "ChannelFilterSettings",
     "FilterSettings",
     "SignalConditioner",

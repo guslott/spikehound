@@ -110,7 +110,9 @@ class SettingsTab(QtWidgets.QWidget):
     # ------------------------------------------------------------------
 
     def _load_settings(self) -> None:
-        store = getattr(self._controller, "app_settings_store", None)
+        if self._controller is None:
+            return
+        store = self._controller.app_settings_store
         if store is None:
             return
         settings = store.get()
@@ -123,10 +125,12 @@ class SettingsTab(QtWidgets.QWidget):
         self.list_audio_check.blockSignals(False)
 
     def _update_settings(self, **kwargs) -> None:
-        store = getattr(self._controller, "app_settings_store", None)
+        if self._controller is None:
+            return
+        store = self._controller.app_settings_store
         if store is None:
             return
-        new_settings = store.update(**kwargs)
+        store.update(**kwargs)
 
     # ------------------------------------------------------------------
     # Audio helpers
@@ -145,7 +149,9 @@ class SettingsTab(QtWidgets.QWidget):
             self.listen_combo.addItem(str(name), device_id)
         self.listen_combo.blockSignals(False)
 
-        settings = getattr(self._controller, "app_settings_store", None)
+        if self._controller is None:
+            return
+        settings = self._controller.app_settings_store
         if settings is None:
             return
         self.set_listen_device(settings.get().listen_output_key)
@@ -155,10 +161,18 @@ class SettingsTab(QtWidgets.QWidget):
             return
         key = self.listen_combo.itemData(index)
         value = str(key) if key is not None else None
+        if self._controller is not None and hasattr(self._controller, "set_listen_output_device"):
+            try:
+                self._controller.set_listen_output_device(value)
+                return
+            except Exception:
+                pass
         if hasattr(self._main_window, "set_listen_output_device"):
             self._main_window.set_listen_output_device(value)
             return
-        store = getattr(self._controller, "app_settings_store", None)
+        if self._controller is None:
+            return
+        store = self._controller.app_settings_store
         if store is not None:
             store.update(listen_output_key=value)
 

@@ -1,0 +1,231 @@
+from __future__ import annotations
+
+import logging
+import queue
+import threading
+from typing import Any, Optional, Sequence, TYPE_CHECKING, Tuple
+
+from daq.base_source import BaseSource
+
+from .conditioning import FilterSettings, SignalConditioner
+from shared.app_settings import AppSettingsStore
+from shared.models import TriggerConfig
+from shared.types import Event
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .controller import PipelineController
+    from analysis.analysis_worker import AnalysisWorker
+else:  # pragma: no cover - runtime fallback
+    PipelineController = Any
+    AnalysisWorker = Any
+
+
+class SpikeHoundRuntime:
+    """
+    Skeleton runtime orchestrator for DAQ, conditioning, analysis, audio, and metrics.
+
+    This will evolve into the headless controller that replaces direct MainWindow
+    ownership of pipeline pieces.
+    """
+
+    def __init__(
+        self,
+        *,
+        app_settings_store: Optional[AppSettingsStore] = None,
+        logger: Optional[logging.Logger] = None,
+        pipeline: Optional["PipelineController"] = None,
+    ) -> None:
+        self.app_settings_store = app_settings_store
+        self.logger = logger or logging.getLogger(__name__)
+        self.daq_source: Optional[BaseSource] = None
+        self.conditioner = SignalConditioner()
+        self._queues: dict[str, queue.Queue] = {}
+        self._threads: dict[str, threading.Thread] = {}
+        self._pipeline: Optional["PipelineController"] = pipeline
+        self._analysis_workers: dict[Tuple[str, float], "AnalysisWorker"] = {}
+        self.dispatcher = getattr(pipeline, "dispatcher", None) if pipeline is not None else None
+        self.visualization_queue: Optional[queue.Queue] = getattr(pipeline, "visualization_queue", None)
+        self.audio_queue: Optional[queue.Queue] = getattr(pipeline, "audio_queue", None)
+        self.logging_queue: Optional[queue.Queue] = getattr(pipeline, "logging_queue", None)
+        self.chunk_rate: float = 0.0
+        self.plot_refresh_hz: float = 0.0
+        self.sample_rate: float = 0.0
+
+    def set_pipeline(self, controller: Optional["PipelineController"]) -> None:
+        """Update the underlying pipeline controller used for delegation."""
+        self._pipeline = controller
+        self.dispatcher = getattr(controller, "dispatcher", None) if controller is not None else None
+        self.visualization_queue = getattr(controller, "visualization_queue", None) if controller is not None else None
+        self.audio_queue = getattr(controller, "audio_queue", None) if controller is not None else None
+        self.logging_queue = getattr(controller, "logging_queue", None) if controller is not None else None
+
+    def __getattr__(self, name: str):
+        """
+        Temporary delegation to the underlying pipeline controller so existing
+        GUI components keep working while the runtime grows real behavior.
+        """
+        pipeline = self.__dict__.get("_pipeline")
+        if pipeline is not None:
+            try:
+                return getattr(pipeline, name)
+            except AttributeError:
+                pass
+        raise AttributeError(f"{self.__class__.__name__!s} has no attribute {name!r}")
+
+    def open_device(self, driver: BaseSource, sample_rate: float, channels: Sequence[object]) -> None:
+        """Open and prepare the requested DAQ backend/device."""
+        self.attach_source(driver, sample_rate, channels)
+
+    def configure_acquisition(
+        self,
+        *,
+        sample_rate: Optional[int] = None,
+        channels: Optional[list[int]] = None,
+        chunk_size: Optional[int] = None,
+        filter_settings: Optional[FilterSettings] = None,
+        trigger_cfg: Optional[TriggerConfig] = None,
+    ) -> None:
+        """
+        Placeholder: configure the acquisition pipeline (filters, triggers, buffering).
+        """
+        controller = self._pipeline
+        if controller is None:
+            return
+        if filter_settings is not None:
+            try:
+                controller.update_filter_settings(filter_settings)
+            except Exception:
+                pass
+        if trigger_cfg is not None:
+            try:
+                controller.update_trigger_config(trigger_cfg.__dict__ if hasattr(trigger_cfg, "__dict__") else trigger_cfg)
+            except Exception:
+                pass
+        if channels is not None:
+            if channels:
+                try:
+                    controller.set_active_channels(channels)
+                except Exception:
+                    pass
+            else:
+                try:
+                    controller.clear_active_channels()
+                except Exception:
+                    pass
+
+    def start_acquisition(self) -> None:
+        """Placeholder: start streaming from the current DAQ source into the pipeline."""
+        controller = self._pipeline
+        if controller is None:
+            return
+        try:
+            controller.start()
+        except Exception:
+            return
+
+    def stop_acquisition(self) -> None:
+        """Placeholder: stop streaming and tear down active threads/queues."""
+        controller = self._pipeline
+        if controller is None:
+            return
+        try:
+            controller.stop(join=True)
+        except Exception:
+            pass
+        try:
+            controller.detach_device()
+        except Exception:
+            pass
+        self.daq_source = None
+
+    def attach_source(self, driver: BaseSource, sample_rate: float, channels) -> None:
+        """Attach a connected driver to the pipeline controller."""
+        controller = self._pipeline
+        if controller is None or driver is None:
+            return
+        self.daq_source = driver
+        try:
+            controller.attach_source(driver, float(sample_rate), channels)
+        except Exception:
+            return
+        self.dispatcher = getattr(controller, "dispatcher", None)
+        self.visualization_queue = getattr(controller, "visualization_queue", None)
+        self.audio_queue = getattr(controller, "audio_queue", None)
+        self.logging_queue = getattr(controller, "logging_queue", None)
+
+    def health_snapshot(self) -> dict[str, object]:
+        """Placeholder: return current queue depths, rates, and dispatcher health."""
+        controller = self._pipeline
+        stats = controller.dispatcher_stats() if controller is not None else {}
+        queues: dict[str, dict] = {}
+
+        def _queue_status(q: Optional[queue.Queue]) -> dict:
+            if q is None:
+                return {"size": 0, "max": 0, "utilization": 0.0}
+            size = q.qsize()
+            maxsize = q.maxsize
+            util = (size / maxsize) if maxsize > 0 else 0.0
+            return {"size": size, "max": maxsize, "utilization": util}
+
+        queues["visualization"] = _queue_status(self.visualization_queue)
+        queues["audio"] = _queue_status(self.audio_queue)
+        queues["logging"] = _queue_status(self.logging_queue)
+
+        dispatcher = self.dispatcher
+        if dispatcher is not None:
+            try:
+                queues["viz_buffer"] = dispatcher.buffer_status()
+            except Exception:
+                queues["viz_buffer"] = {}
+
+        return {
+            "chunk_rate": float(self.chunk_rate),
+            "plot_refresh_hz": float(self.plot_refresh_hz),
+            "sample_rate": float(self.sample_rate),
+            "dispatcher": stats,
+            "queues": queues,
+        }
+
+    def update_metrics(
+        self,
+        *,
+        chunk_rate: Optional[float] = None,
+        plot_refresh_hz: Optional[float] = None,
+        sample_rate: Optional[float] = None,
+    ) -> None:
+        """Update runtime-facing metrics so health_snapshot can report them."""
+        if chunk_rate is not None:
+            self.chunk_rate = float(chunk_rate)
+        if plot_refresh_hz is not None:
+            self.plot_refresh_hz = float(plot_refresh_hz)
+        if sample_rate is not None:
+            self.sample_rate = float(sample_rate)
+
+    def set_listen_output_device(self, device_key: Optional[str]) -> None:
+        """Select audio output target for listen/mirror mode (persist only for now)."""
+        if self.app_settings_store is not None:
+            try:
+                self.app_settings_store.update(listen_output_key=device_key)
+            except Exception:
+                return
+
+    def open_analysis_stream(self, channel_name: str, sample_rate: float) -> tuple[Optional[queue.Queue], Optional["AnalysisWorker"]]:
+        """
+        Create and start an AnalysisWorker for the given channel and return its output queue.
+        """
+        if self._pipeline is None:
+            return None, None
+        try:
+            from analysis.analysis_worker import AnalysisWorker  # local import to avoid cycles
+        except Exception:
+            return None, None
+        key = (str(channel_name), float(sample_rate))
+        worker = self._analysis_workers.get(key)
+        if worker is None:
+            try:
+                worker = AnalysisWorker(self._pipeline, channel_name, sample_rate)
+                worker.start()
+                self._analysis_workers[key] = worker
+            except Exception:
+                return None, None
+        return getattr(worker, "output_queue", None), worker

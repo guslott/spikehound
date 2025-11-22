@@ -70,16 +70,21 @@ class AnalysisDock(QtWidgets.QDockWidget):
 
     def open_analysis(self, channel_name: str, sample_rate: float) -> AnalysisTab:
         worker: Optional[AnalysisWorker] = None
+        output_queue = None
         if self._controller is not None:
-            worker = AnalysisWorker(self._controller, channel_name, sample_rate)
-            worker.start()
+            try:
+                output_queue, worker = self._controller.open_analysis_stream(channel_name, sample_rate)
+            except Exception:
+                output_queue = None
+                worker = None
         count = self._analysis_count.get(channel_name, 0) + 1
         self._analysis_count[channel_name] = count
         title = f"Analysis - {channel_name}" if count == 1 else f"Analysis - {channel_name} #{count}"
 
         widget = AnalysisTab(channel_name, sample_rate, self._tabs, controller=self._controller)
+        if output_queue is not None:
+            widget.set_analysis_queue(output_queue)
         if worker is not None:
-            widget.set_analysis_queue(worker.output_queue)
             widget.set_worker(worker)
         widget.set_sta_channels(self._active_channels)
         insert_index = 1 if self._scope_widget is not None else self._tabs.count()

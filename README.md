@@ -19,3 +19,6 @@ SpikeHound 2.0 is an open-source desktop application for live, multi-channel bio
 
 ## Why it fits neuroscience education
 SpikeHound keeps the signal chain visible: students see raw voltage traces, the impact of each filter, and the timing of detected events. The same interface works with low-cost teaching hardware and higher-channel lab rigs, lowering the barrier to authentic electrophysiology practice from middle school through advanced research training.
+
+## Headless/runtime usage
+The `core/` package exposes `SpikeHoundRuntime`, a GUI-agnostic orchestrator that owns DAQ attachment, dispatcher/queues, analysis workers, and health metrics. See `core/runtime_readme.md` for how to embed the runtime in a CLI recorder or alternate frontend.

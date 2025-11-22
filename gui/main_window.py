@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import threading
 import time
@@ -15,6 +16,7 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from core import DeviceManager, PipelineController
+from core.runtime import SpikeHoundRuntime
 from shared.app_settings import AppSettings
 from core.conditioning import ChannelFilterSettings, FilterSettings
 from shared.models import ChunkPointer, EndOfStream
@@ -359,6 +361,12 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         if controller is None:
             controller = PipelineController()
+        self._logger = logging.getLogger(__name__)
+        self.runtime = SpikeHoundRuntime(
+            app_settings_store=getattr(controller, "app_settings_store", None),
+            logger=self._logger,
+            pipeline=controller,
+        )
         self._controller: Optional[PipelineController] = None
         self._app_settings_unsub: Optional[Callable[[], None]] = None
         self.setWindowTitle("SpikeHound - Manlius Pebble Hill School & Cornell University")
@@ -453,7 +461,7 @@ class MainWindow(QtWidgets.QMainWindow):
         central_placeholder.setVisible(False)
         self._central_placeholder = central_placeholder
         self.setCentralWidget(central_placeholder)
-        self._analysis_dock = AnalysisDock(parent=self, controller=controller)
+        self._analysis_dock = AnalysisDock(parent=self, controller=self.runtime)
         self._analysis_dock.set_scope_widget(scope_widget, "Scope")
         self.addDockWidget(QtCore.Qt.TopDockWidgetArea, self._analysis_dock)
         self._analysis_dock.settingsClosed.connect(self._on_settings_tab_closed)
@@ -503,6 +511,58 @@ class MainWindow(QtWidgets.QMainWindow):
         hz = max(1.0, float(hz))
         self._plot_refresh_hz = hz
         self._plot_interval = 1.0 / hz
+        try:
+            self.runtime.update_metrics(plot_refresh_hz=hz)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Runtime delegation
+    # ------------------------------------------------------------------
+
+    def open_device(self, driver: object, sample_rate: float, channels: Sequence[object]) -> None:
+        """Delegate device attachment to the runtime/pipeline controller."""
+        try:
+            self.runtime.open_device(driver, sample_rate, channels)
+        except Exception:
+            return
+        self._bind_dispatcher_signals()
+        self._bind_app_settings_store()
+
+    def configure_acquisition(
+        self,
+        *,
+        sample_rate: Optional[int] = None,
+        channels: Optional[list[int]] = None,
+        chunk_size: Optional[int] = None,
+        filter_settings: Optional[FilterSettings] = None,
+        trigger_cfg: Optional[dict] = None,
+    ) -> None:
+        cfg_trigger = trigger_cfg
+        try:
+            self.runtime.configure_acquisition(
+                sample_rate=sample_rate,
+                channels=channels,
+                chunk_size=chunk_size,
+                filter_settings=filter_settings,
+                trigger_cfg=cfg_trigger,
+            )
+        except Exception:
+            return
+
+    def start_acquisition(self) -> None:
+        """Start streaming via the runtime."""
+        try:
+            self.runtime.start_acquisition()
+        except Exception:
+            return
+
+    def stop_acquisition(self) -> None:
+        """Stop streaming via the runtime."""
+        try:
+            self.runtime.stop_acquisition()
+        except Exception:
+            return
 
     def set_default_window_sec(self, value: float) -> None:
         value = max(0.05, float(value))
@@ -849,9 +909,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 except (TypeError, RuntimeError):
                     pass
 
+        if hasattr(self, "runtime") and self.runtime is not None:
+            try:
+                self.runtime.set_pipeline(controller)
+            except Exception:
+                pass
+
         self._controller = controller
         if hasattr(self, "_analysis_dock") and self._analysis_dock is not None:
-            self._analysis_dock._controller = controller
+            self._analysis_dock._controller = self.runtime
 
         if controller is None:
             return
@@ -1441,23 +1507,18 @@ class MainWindow(QtWidgets.QMainWindow):
         idx = self.device_combo.findData(key)
         if idx >= 0:
             self.device_combo.setCurrentIndex(idx)
-        if self._controller is not None:
-            driver = self._device_manager.current_driver()
-            if driver is not None:
-                channels = self._device_manager.get_available_channels()
-                self._controller.attach_source(driver, self._current_sample_rate_value(), channels)
-                self._bind_dispatcher_signals()
-                self._bind_app_settings_store()
+        driver = self._device_manager.current_driver()
+        if driver is not None:
+            channels = self._device_manager.get_available_channels()
+            self.open_device(driver, self._current_sample_rate_value(), channels)
         self._update_channel_buttons()
 
     def _on_device_disconnected(self) -> None:
         self._device_connected = False
         self._reset_color_cycle()
         self._apply_device_state(False)
-        if self._controller is not None:
-            self._controller.detach_device()
-            self._controller.clear_active_channels()
-            self._drain_visualization_queue()
+        self.stop_acquisition()
+        self._drain_visualization_queue()
         self.sample_rate_combo.clear()
         if self._dispatcher_signals is not None:
             try:
@@ -1575,11 +1636,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.trigger_channel_combo.clear()
             self.trigger_channel_combo.blockSignals(False)
             self._emit_trigger_config()
-        if self._controller is not None:
-            if ids:
-                self._controller.set_active_channels(ids)
-            else:
-                self._controller.clear_active_channels()
+        if ids:
+            self.configure_acquisition(channels=ids)
+        else:
+            self.configure_acquisition(channels=[])
         self._update_sample_rate_enabled()
         dock = getattr(self, "_analysis_dock", None)
         if dock is not None:
@@ -1961,7 +2021,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._audio_router_stop.wait(0.1)
                     continue
                 try:
-                    item = controller.audio_queue.get(timeout=0.1)
+                    aq = getattr(self.runtime, "audio_queue", None)
+                    if aq is None:
+                        self._audio_router_stop.wait(0.1)
+                        continue
+                    item = aq.get(timeout=0.1)
                 except queue.Empty:
                     continue
                 if item is EndOfStream:
@@ -2154,8 +2218,12 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self._chunk_mean_samples = 0.0
             self._chunk_accum_count = 0
-            self._chunk_accum_samples = 0
-            self._chunk_last_rate_update = now
+        self._chunk_accum_samples = 0
+        self._chunk_last_rate_update = now
+        try:
+            self.runtime.update_metrics(chunk_rate=self._chunk_rate, sample_rate=self._current_sample_rate)
+        except Exception:
+            pass
 
     def _transform_to_screen(self, raw_data: np.ndarray, span_v: float, offset_pct: float) -> np.ndarray:
         span = max(float(span_v), 1e-9)
@@ -2247,10 +2315,9 @@ class MainWindow(QtWidgets.QMainWindow):
         controller.update_filter_settings(settings)
 
     def _drain_visualization_queue(self) -> List[ChunkPointer]:
-        controller = self._controller
-        if controller is None:
+        queue_obj = getattr(self.runtime, "visualization_queue", None)
+        if queue_obj is None:
             return []
-        queue_obj = controller.visualization_queue
         pointers: List[ChunkPointer] = []
         while True:
             try:
@@ -2511,16 +2578,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 label.setText(text)
 
     def health_snapshot(self) -> dict:
-        controller = self._controller
-        stats = controller.dispatcher_stats() if controller is not None else {}
-        queues = controller.queue_depths() if controller is not None else {}
-        return {
-            "chunk_rate": float(getattr(self, "_chunk_rate", 0.0)),
-            "plot_refresh_hz": float(getattr(self, "_plot_refresh_hz", 0.0)),
-            "sample_rate": float(getattr(self, "_current_sample_rate", 0.0)),
-            "dispatcher": stats,
-            "queues": queues,
-        }
+        return self.runtime.health_snapshot()
 
         _set_status_text(
             "sr",
@@ -2743,6 +2801,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._current_sample_rate = sample_rate
         self._current_window_sec = window_sec
+        try:
+            self.runtime.update_metrics(sample_rate=sample_rate)
+        except Exception:
+            pass
         self._update_status(viz_depth=0)
         if self._listen_channel_id is not None:
             self._ensure_audio_player()
@@ -2943,6 +3005,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._trigger_display is not None:
             self._current_sample_rate = sample_rate
             self._current_window_sec = window_sec
+            try:
+                self.runtime.update_metrics(sample_rate=sample_rate)
+            except Exception:
+                pass
             self._render_trigger_display(channel_ids, window_sec)
             self._update_status(viz_depth=0)
             if self._listen_channel_id is not None:
@@ -2952,6 +3018,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._trigger_mode == "single":
             self._current_sample_rate = sample_rate
             self._current_window_sec = window_sec
+            try:
+                self.runtime.update_metrics(sample_rate=sample_rate)
+            except Exception:
+                pass
             self._update_status(viz_depth=0)
             if self._listen_channel_id is not None:
                 self._ensure_audio_player()
@@ -2961,6 +3031,10 @@ class MainWindow(QtWidgets.QMainWindow):
             # Only update the plot when we have a trigger display; otherwise hold.
             self._current_sample_rate = sample_rate
             self._current_window_sec = window_sec
+            try:
+                self.runtime.update_metrics(sample_rate=sample_rate)
+            except Exception:
+                pass
             self._update_status(viz_depth=0)
             return
 
@@ -3109,13 +3183,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def set_listen_output_device(self, device_key: Optional[str]) -> None:
         normalized = None if device_key in (None, "") else str(device_key)
-        self._apply_listen_output_preference(normalized)
-        controller = self._controller
-        if controller is not None:
-            try:
-                controller.update_app_settings(listen_output_key=normalized)
-            except Exception:
-                pass
+        try:
+            self.runtime.set_listen_output_device(normalized)
+        except Exception:
+            pass
     def _toggle_settings_tab(self, checked: bool) -> None:
         dock = getattr(self, "_analysis_dock", None)
         controller = self._controller
@@ -3126,7 +3197,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if checked:
             if self._settings_tab is None:
-                self._settings_tab = SettingsTab(controller, self)
+                self._settings_tab = SettingsTab(self.runtime, self)
                 self._settings_tab.set_listen_device(self._listen_device_key)
             dock.open_settings(self._settings_tab)
         else:
