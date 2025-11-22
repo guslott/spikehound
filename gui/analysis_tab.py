@@ -581,7 +581,7 @@ class AnalysisTab(QtWidgets.QWidget):
         sta_layout = QtWidgets.QVBoxLayout()
         sta_layout.setSpacing(4)
 
-        self.sta_enable_check = QtWidgets.QCheckBox("Enable Cross Channel Correlation")
+        self.sta_enable_check = QtWidgets.QCheckBox("Enable Spike Triggered Average (STA)")
         self.sta_enable_check.setChecked(False)
         self.sta_enable_check.toggled.connect(self._on_sta_toggled)
         sta_layout.addWidget(self.sta_enable_check)
@@ -1796,6 +1796,10 @@ class AnalysisTab(QtWidgets.QWidget):
         pre_n = max(1, int(0.2 * window.size))
         baseline = float(np.median(window[:pre_n]))
         normalized = window.astype(np.float32, copy=False) - baseline
+        # Align all traces so the trigger sample crosses zero
+        center_idx = normalized.size // 2
+        if 0 <= center_idx < normalized.size:
+            normalized = normalized - float(normalized[center_idx])
         self._sta_windows.append(normalized)
         self._sta_dirty = True
         return "added"

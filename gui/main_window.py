@@ -2907,6 +2907,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._ensure_audio_player()
             return
 
+        if self._trigger_mode == "continuous":
+            # Only update the plot when we have a trigger display; otherwise hold.
+            self._current_sample_rate = sample_rate
+            self._current_window_sec = window_sec
+            self._update_status(viz_depth=0)
+            return
+
         self._process_streaming(data, times_arr, sample_rate, window_sec, channel_ids, now)
 
 

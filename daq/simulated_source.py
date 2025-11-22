@@ -68,7 +68,13 @@ class SimulatedPhysiologySource(BaseSource):
         t_psp = np.linspace(0, 5, psp_len)
         self._psp_template = t_psp * np.exp(-t_psp)
         self._psp_template /= np.max(self._psp_template)
-        self._psp_template = self._psp_template.astype(np.float32, copy=False)
+        # Extend tail to ensure the waveform decays smoothly to zero so it does not
+        # step down at chunk boundaries.
+        tail = float(self._psp_template[-1])
+        while tail > 1e-4:
+            tail *= 0.5
+            self._psp_template = np.append(self._psp_template, tail)
+        self._psp_template = np.append(self._psp_template, 0.0).astype(np.float32, copy=False)
         self._psp_len = len(self._psp_template)
 
         self._units.clear()
