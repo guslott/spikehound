@@ -19,6 +19,7 @@ else:  # pragma: no cover - runtime fallback
 from .conditioning import FilterSettings
 from .dispatcher import Dispatcher
 from shared.models import Chunk, EndOfStream, TriggerConfig
+from shared.ring_buffer import SharedRingBuffer
 from analysis.settings import AnalysisSettingsStore
 from shared.app_settings import AppSettings, AppSettingsStore
 from shared.event_buffer import AnalysisEvents, EventRingBuffer
@@ -356,6 +357,10 @@ class PipelineController:
                 filter_settings=self._filter_settings,
                 poll_timeout=self._dispatcher_timeout,
             )
+            try:
+                self._dispatcher.set_source_buffer(source.get_buffer(), sample_rate=actual.sample_rate)
+            except Exception:
+                pass
             self._running = False
             self._reset_output_queues()
             return actual
@@ -468,6 +473,10 @@ class PipelineController:
                 filter_settings=self._filter_settings,
                 poll_timeout=self._dispatcher_timeout,
             )
+            try:
+                self._dispatcher.set_source_buffer(driver.get_buffer(), sample_rate=sample_rate)
+            except Exception:
+                pass
             channel_ids = [info.id for info in channels]
             channel_names = [info.name for info in channels]
             self._dispatcher.set_channel_layout(channel_ids, channel_names)
@@ -496,6 +505,13 @@ class PipelineController:
                     self._source.set_active_channels(self._active_channel_ids)
                 except Exception:
                     pass
+                # Rewire dispatcher to the source buffer in case channel changes resized it.
+                if self._dispatcher is not None:
+                    try:
+                        sr = self._actual_config.sample_rate if self._actual_config is not None else None
+                        self._dispatcher.set_source_buffer(self._source.get_buffer(), sample_rate=sr)
+                    except Exception:
+                        pass
 
             if self._active_channel_ids and self._dispatcher is not None and self._source is not None:
                 if not self._streaming:
@@ -530,6 +546,13 @@ class PipelineController:
     def dispatcher_signals(self):
         with self._lock:
             return None if self._dispatcher is None else self._dispatcher.signals
+
+    def viz_buffer(self) -> Optional[SharedRingBuffer]:
+        with self._lock:
+            dispatcher = self._dispatcher
+        if dispatcher is None:
+            return None
+        return dispatcher.viz_buffer
 
     def queue_depths(self) -> Dict[str, dict]:
         """Return per-queue health metrics for visualization, analysis, audio, and logging."""

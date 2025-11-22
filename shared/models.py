@@ -133,6 +133,23 @@ class Chunk:
 
 
 @dataclass(frozen=True)
+class ChunkPointer:
+    """Lightweight pointer to data stored in a SharedRingBuffer."""
+
+    start_index: int
+    length: int
+    render_time: float
+
+    def __post_init__(self) -> None:
+        if self.start_index < 0:
+            raise ValueError("start_index must be non-negative")
+        if self.length <= 0:
+            raise ValueError("length must be positive")
+        if self.render_time < 0:
+            raise ValueError("render_time must be non-negative")
+
+
+@dataclass(frozen=True)
 class Event:
     """Detected feature emitted by the analyzer."""
 
@@ -202,8 +219,8 @@ __all__ = [
     "Capabilities",
     "ActualConfig",
     "Chunk",
+    "ChunkPointer",
     "Event",
     "EndOfStream",
     "TriggerConfig",
 ]
-

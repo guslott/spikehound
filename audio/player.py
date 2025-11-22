@@ -13,6 +13,9 @@ except Exception as e:  # pragma: no cover
     sd = None
     _SD_IMPORT_ERR = e
 
+from shared.models import ChunkPointer
+from shared.ring_buffer import SharedRingBuffer
+
 
 @dataclass
 class AudioConfig:
@@ -56,9 +59,10 @@ def list_output_devices() -> List[Dict[str, object]]:
 
 class AudioPlayer(threading.Thread):
     """
-    Consumes Chunk-like objects from an audio_queue. Each chunk must have a
-    .data shaped (frames, channels) at input_sr. We select one channel, resample
-    to out_sr (linear interpolation), and play via sounddevice.OutputStream.
+    Consumes Chunk/ChunkPointer-like objects from an audio_queue. Each item must
+    resolve to samples shaped (frames, channels) at input_sr. We select one
+    channel, resample to out_sr (linear interpolation), and play via
+    sounddevice.OutputStream.
     """
 
     def __init__(
@@ -68,6 +72,7 @@ class AudioPlayer(threading.Thread):
         input_samplerate: int,
         config: AudioConfig = AudioConfig(),
         selected_channel: Optional[int] = 0,  # 0 by default; None = mute
+        ring_buffer: Optional[SharedRingBuffer] = None,
     ) -> None:
         super().__init__(name="AudioPlayer", daemon=True)
         if sd is None:
@@ -77,6 +82,7 @@ class AudioPlayer(threading.Thread):
         self.in_sr = int(input_samplerate)
         self.cfg = config
         self._selected: Optional[int] = selected_channel
+        self._ring_buffer = ring_buffer
 
         # --- Output ring buffer (mono at out_sr) ---
         ring_len = max(self.cfg.blocksize * 4, int(self.cfg.out_samplerate * self.cfg.ring_seconds))
@@ -95,6 +101,9 @@ class AudioPlayer(threading.Thread):
 
     def set_selected_channel(self, idx: Optional[int]) -> None:
         self._selected = None if idx is None else int(idx)
+
+    def set_ring_buffer(self, ring_buffer: Optional[SharedRingBuffer]) -> None:
+        self._ring_buffer = ring_buffer
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -153,7 +162,15 @@ class AudioPlayer(threading.Thread):
         arr = None
 
         # Common possibilities:
-        if hasattr(ch, "data"):
+        if isinstance(ch, ChunkPointer):
+            if self._ring_buffer is None:
+                return None
+            try:
+                block = self._ring_buffer.read(ch.start_index, ch.length)
+            except Exception:
+                return None
+            arr = np.asarray(block, dtype=np.float32, order="C").T
+        elif hasattr(ch, "data"):
             arr = getattr(ch, "data")
         elif hasattr(ch, "frames"):
             arr = getattr(ch, "frames")

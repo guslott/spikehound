@@ -10,7 +10,8 @@ import numpy as np
 from PySide6 import QtCore
 
 from .conditioning import FilterSettings, SignalConditioner
-from shared.models import Chunk, EndOfStream, TriggerConfig
+from shared.models import Chunk, ChunkPointer, EndOfStream, TriggerConfig
+from shared.ring_buffer import SharedRingBuffer
 
 
 @dataclass
@@ -36,13 +37,13 @@ class DispatcherSignals(QtCore.QObject):
 
 
 class Dispatcher:
-    """Router thread that conditions incoming chunks and fans them out to consumers."""
+    """Router thread that conditions incoming samples from ChunkPointers and fans them out to consumers."""
 
     def __init__(
         self,
-        raw_queue: "queue.Queue[Chunk | EndOfStream]",
-        visualization_queue: "queue.Queue[Chunk | EndOfStream]",
-        audio_queue: "queue.Queue[Chunk | EndOfStream]",
+        raw_queue: "queue.Queue[ChunkPointer | EndOfStream]",
+        visualization_queue: "queue.Queue[ChunkPointer | EndOfStream]",
+        audio_queue: "queue.Queue[ChunkPointer | EndOfStream]",
         logging_queue: "queue.Queue[Chunk | EndOfStream]",
         *,
         filter_settings: Optional[FilterSettings] = None,
@@ -67,8 +68,8 @@ class Dispatcher:
 
         # Ring buffer / selection state
         self._ring_lock = threading.Lock()
-        self._ring_buffer: Optional[np.ndarray] = None
-        self._buffer_len: int = 0
+        self._source_buffer: Optional[SharedRingBuffer] = None
+        self.viz_buffer: SharedRingBuffer = SharedRingBuffer((1, 1), dtype=np.float32)
         self._write_idx: int = 0
         self._filled: int = 0
         self._latest_sample_index: int = -1
@@ -79,6 +80,8 @@ class Dispatcher:
         self._channel_index_map: Dict[int, int] = {}
         self._current_trigger: Optional[TriggerConfig] = None
         self._active_channel_ids: list[int] = []
+        self._next_start_sample: int = 0
+        self._next_seq: int = 0
         self._analysis_lock = threading.Lock()
         self._analysis_queues: Dict[int, queue.Queue] = {}
         self._next_analysis_id = 1
@@ -112,30 +115,47 @@ class Dispatcher:
         with self._ring_lock:
             self._active_channel_ids = list(channel_ids)
 
+    def set_source_buffer(self, buffer: SharedRingBuffer, *, sample_rate: Optional[float] = None) -> None:
+        """
+        Point the dispatcher at the source's shared buffer and prime viz buffer sizing.
+        """
+        if buffer is None:
+            raise ValueError("buffer must not be None")
+        if sample_rate is not None and sample_rate <= 0:
+            raise ValueError("sample_rate must be positive")
+        with self._ring_lock:
+            self._source_buffer = buffer
+            if sample_rate is not None:
+                self._sample_rate = float(sample_rate)
+            channels = buffer.shape[0]
+            if not self._channel_ids:
+                self._channel_ids = tuple(range(channels))
+                if not self._channel_names:
+                    self._channel_names = tuple(str(idx) for idx in range(channels))
+                self._channel_index_map = {cid: idx for idx, cid in enumerate(self._channel_ids)}
+            self._ensure_viz_buffer_locked(channels, min_capacity=buffer.capacity)
+            self._reset_viz_counters_locked()
+
     def clear_active_channels(self) -> None:
         with self._ring_lock:
             self._active_channel_ids = []
-            self._filled = 0
-            self._latest_sample_index = -1
+            self._reset_viz_counters_locked()
 
     def set_channel_layout(self, channel_ids: Sequence[int], channel_names: Sequence[str]) -> None:
         with self._ring_lock:
             self._channel_ids = tuple(channel_ids)
             self._channel_names = tuple(channel_names)
             self._channel_index_map = {cid: idx for idx, cid in enumerate(self._channel_ids)}
-            self._ring_buffer = None
-            self._buffer_len = 0
-            self._write_idx = 0
-            self._filled = 0
-            self._latest_sample_index = -1
+            channels = len(self._channel_ids) if self._channel_ids else len(self._channel_names)
+            min_capacity = self._source_buffer.capacity if self._source_buffer is not None else 1
+            self._ensure_viz_buffer_locked(channels or 1, min_capacity=min_capacity)
+            self._reset_viz_counters_locked()
 
     def reset_buffers(self) -> None:
         with self._ring_lock:
-            if self._ring_buffer is not None:
-                self._ring_buffer.fill(0.0)
-            self._write_idx = 0
-            self._filled = 0
-            self._latest_sample_index = -1
+            shape = self.viz_buffer.shape
+            self.viz_buffer = SharedRingBuffer(shape, dtype=np.float32)
+            self._reset_viz_counters_locked()
 
     def emit_empty_tick(self) -> None:
         self.signals.tick.emit(self._empty_payload())
@@ -164,17 +184,18 @@ class Dispatcher:
         with self._ring_lock:
             self._current_trigger = config
             if sample_rate > 0:
-                self._sample_rate = sample_rate
-                self._ensure_buffer_capacity_locked()
+                self._sample_rate = float(sample_rate)
             self._window_sec = max(config.window_sec, 1e-3)
-            self._ensure_buffer_capacity_locked()
+            channels = self.viz_buffer.shape[0]
+            self._ensure_viz_buffer_locked(channels, min_capacity=self.viz_buffer.capacity)
 
     def set_window_duration(self, window_sec: float) -> None:
         if window_sec <= 0:
             return
         with self._ring_lock:
             self._window_sec = window_sec
-            self._ensure_buffer_capacity_locked()
+            channels = self.viz_buffer.shape[0]
+            self._ensure_viz_buffer_locked(channels, min_capacity=self.viz_buffer.capacity)
 
     def snapshot(self) -> Dict[str, object]:
         with self._stats_lock:
@@ -183,7 +204,7 @@ class Dispatcher:
     def buffer_status(self) -> Dict[str, float]:
         with self._ring_lock:
             filled = float(self._filled)
-            capacity = float(self._buffer_len)
+            capacity = float(self.viz_buffer.capacity)
             sample_rate = float(self._sample_rate or 0.0)
             seconds = filled / sample_rate if sample_rate > 0 else 0.0
             capacity_seconds = capacity / sample_rate if sample_rate > 0 else 0.0
@@ -211,43 +232,93 @@ class Dispatcher:
                     self._broadcast_end_of_stream()
                     break
 
-                if not isinstance(item, Chunk):
+                if not isinstance(item, ChunkPointer):
                     continue
 
-                filtered_chunk = self._process_chunk(item)
-                self._fan_out(item, filtered_chunk)
+                processed = self._process_pointer(item)
+                if processed is None:
+                    continue
+                raw_chunk, filtered_chunk, viz_pointer = processed
+                self._fan_out(raw_chunk, filtered_chunk, viz_pointer)
             finally:
                 self._raw_queue.task_done()
 
-    def _process_chunk(self, chunk: Chunk) -> Chunk:
+    def _process_pointer(self, ptr: ChunkPointer) -> Optional[tuple[Chunk, Chunk, ChunkPointer]]:
         with self._stats_lock:
             self._stats.received += 1
 
-        filtered_samples = self._conditioner.process(chunk)
-        filters_active = self._conditioner.settings.any_enabled()
-        meta: Dict[str, object] = dict(chunk.meta or {})
-        meta.setdefault("start_sample", chunk.seq * chunk.n_samples)
-        meta["filtered"] = filters_active
-        meta["filters"] = self._conditioner.describe()
+        source_buffer = self._source_buffer
+        sample_rate = self._sample_rate
+        if source_buffer is None or sample_rate is None or sample_rate <= 0:
+            return None
 
-        filtered_chunk = Chunk(
-            samples=filtered_samples,
-            start_time=chunk.start_time,
-            dt=chunk.dt,
-            seq=chunk.seq,
-            channel_names=chunk.channel_names,
-            units=chunk.units,
+        raw = source_buffer.read(ptr.start_index, ptr.length)
+        if raw.ndim != 2 or raw.shape[1] == 0:
+            return None
+
+        with self._ring_lock:
+            if not self._channel_ids or len(self._channel_ids) != raw.shape[0]:
+                self._channel_ids = tuple(range(raw.shape[0]))
+                self._channel_index_map = {cid: idx for idx, cid in enumerate(self._channel_ids)}
+                self._channel_names = tuple(str(idx) for idx in range(raw.shape[0]))
+            elif not self._channel_names:
+                self._channel_names = tuple(str(idx) for idx in range(raw.shape[0]))
+            channel_names: tuple[str, ...] = self._channel_names
+        dt = 1.0 / float(sample_rate)
+
+        start_sample = self._next_start_sample
+        seq = self._next_seq
+        self._next_start_sample += raw.shape[1]
+        self._next_seq += 1
+
+        meta: Dict[str, object] = {"start_sample": start_sample}
+        raw_chunk = Chunk(
+            samples=np.ascontiguousarray(raw),
+            start_time=ptr.render_time,
+            dt=dt,
+            seq=seq,
+            channel_names=channel_names,
+            units="unknown",
             meta=meta,
         )
-        self._update_ring_buffer(filtered_chunk)
+
+        filtered_samples = np.ascontiguousarray(self._conditioner.process(raw_chunk))
+        filters_active = self._conditioner.settings.any_enabled()
+        filtered_meta = dict(meta)
+        filtered_meta["filtered"] = filters_active
+        filtered_meta["filters"] = self._conditioner.describe()
+        filtered_chunk = Chunk(
+            samples=filtered_samples,
+            start_time=ptr.render_time,
+            dt=dt,
+            seq=seq,
+            channel_names=channel_names,
+            units="unknown",
+            meta=filtered_meta,
+        )
+
+        with self._ring_lock:
+            self._ensure_viz_buffer_locked(filtered_samples.shape[0], min_capacity=ptr.length)
+            viz_start = self.viz_buffer.write(filtered_samples)
+            self._update_viz_bookkeeping_locked(ptr.length, start_sample, viz_start)
+
         with self._stats_lock:
             self._stats.processed += 1
-        return filtered_chunk
 
-    def _fan_out(self, raw_chunk: Chunk, filtered_chunk: Chunk) -> None:
+        viz_pointer = ChunkPointer(
+            start_index=viz_start,
+            length=ptr.length,
+            render_time=ptr.render_time,
+        )
+        return raw_chunk, filtered_chunk, viz_pointer
+
+    def _fan_out(self, raw_chunk: Chunk, filtered_chunk: Chunk, viz_pointer: ChunkPointer) -> None:
         self._enqueue(self._logging_queue, raw_chunk, "logging")
         for name, out_queue in self._output_queues.items():
-            self._enqueue(out_queue, filtered_chunk, name)
+            if name in ("visualization", "audio"):
+                self._enqueue(out_queue, viz_pointer, name)
+            else:
+                self._enqueue(out_queue, filtered_chunk, name)
         self._dispatch_to_analysis(filtered_chunk)
 
     def _dispatch_to_analysis(self, filtered_chunk: Chunk) -> None:
@@ -344,9 +415,8 @@ class Dispatcher:
                 "sample_rate": float(self._sample_rate or 0.0),
                 "window_sec": float(self._window_sec),
             }
-            if self._ring_buffer is None or self._sample_rate is None:
-                return self._empty_payload(status)
-            if self._filled == 0:
+            sample_rate = float(self._sample_rate or 0.0)
+            if sample_rate <= 0 or self._filled == 0:
                 return self._empty_payload(status)
             mode = "continuous"
             if self._current_trigger is not None:
@@ -354,19 +424,14 @@ class Dispatcher:
             if mode not in ("continuous", "stream", "single"):
                 return self._empty_payload(status)
 
-            window_samples = int(max(1, min(self._buffer_len, self._window_sec * self._sample_rate)))
+            capacity = self.viz_buffer.capacity
+            window_samples = int(max(1, min(capacity, self._window_sec * sample_rate)))
             window_samples = min(window_samples, self._filled)
             if window_samples <= 0:
                 return self._empty_payload(status)
 
-            start = (self._write_idx - window_samples) % self._buffer_len
-            if start + window_samples <= self._buffer_len:
-                data = self._ring_buffer[:, start : start + window_samples].copy()
-            else:
-                first = self._buffer_len - start
-                part1 = self._ring_buffer[:, start:].copy()
-                part2 = self._ring_buffer[:, : window_samples - first].copy()
-                data = np.concatenate((part1, part2), axis=1)
+            start = (self._write_idx - window_samples) % capacity
+            data = np.array(self.viz_buffer.read(start, window_samples), copy=True, dtype=np.float32)
 
             if self._active_channel_ids:
                 indices = [self._channel_index_map[cid] for cid in self._active_channel_ids if cid in self._channel_index_map]
@@ -381,7 +446,7 @@ class Dispatcher:
             data = data[safe_indices, :]
             channel_ids = [self._channel_ids[idx] if idx < len(self._channel_ids) else idx for idx in safe_indices]
             channel_names = [self._channel_names[idx] if idx < len(self._channel_names) else str(channel_ids[i]) for i, idx in enumerate(safe_indices)]
-            actual_window_sec = window_samples / self._sample_rate if self._sample_rate else 0.0
+            actual_window_sec = window_samples / sample_rate if sample_rate else 0.0
             times = np.linspace(0.0, actual_window_sec, window_samples, endpoint=False, dtype=np.float32)
             return {
                 "channel_ids": channel_ids,
@@ -412,18 +477,13 @@ class Dispatcher:
                 return result, 0, 0
             return result
         with self._ring_lock:
-            if (
-                self._ring_buffer is None
-                or self._filled == 0
-                or self._latest_sample_index < 0
-                or self._buffer_len <= 0
-            ):
+            if self._filled == 0 or self._latest_sample_index < 0 or self.viz_buffer.capacity <= 0:
                 zeros = np.zeros(window_samples, dtype=np.float32)
                 if return_info:
                     return zeros, window_samples, window_samples
                 return zeros
             channel_idx = self._channel_index_map.get(int(channel_id))
-            if channel_idx is None or not (0 <= channel_idx < self._ring_buffer.shape[0]):
+            if channel_idx is None or not (0 <= channel_idx < self.viz_buffer.shape[0]):
                 zeros = np.zeros(window_samples, dtype=np.float32)
                 if return_info:
                     return zeros, window_samples, window_samples
@@ -458,7 +518,7 @@ class Dispatcher:
                 if return_info:
                     return zeros, window_samples, window_samples
                 return zeros
-            buffer_len = self._buffer_len
+            buffer_len = self.viz_buffer.capacity
             if buffer_len <= 0:
                 zeros = np.zeros(window_samples, dtype=np.float32)
                 if return_info:
@@ -467,20 +527,9 @@ class Dispatcher:
             start_ptr = (self._write_idx - self._filled) % buffer_len
             start_offset = actual_start - earliest
             start_pos = (start_ptr + start_offset) % buffer_len
-            channel_data = self._ring_buffer[channel_idx]
-            extracted: np.ndarray
-            if start_pos + available_count <= buffer_len:
-                extracted = channel_data[start_pos : start_pos + available_count].copy()
-            else:
-                first = buffer_len - start_pos
-                take_first = min(first, available_count)
-                part1 = channel_data[start_pos : start_pos + take_first].copy()
-                remaining = available_count - take_first
-                if remaining > 0:
-                    part2 = channel_data[:remaining].copy()
-                    extracted = np.concatenate((part1, part2), axis=0)
-                else:
-                    extracted = part1
+            block = self.viz_buffer.read(start_pos, available_count)
+            channel_data = np.array(block[channel_idx], copy=True)
+            extracted: np.ndarray = channel_data
             if extracted.size > available_count:
                 extracted = extracted[:available_count]
             result = np.empty(window_samples, dtype=np.float32)
@@ -497,128 +546,47 @@ class Dispatcher:
                 return result, missing_prefix, missing_suffix
             return result
 
-    def _update_ring_buffer(self, chunk: Chunk) -> None:
-        with self._ring_lock:
-            self._ensure_buffer_for_chunk_locked(chunk)
-            if self._ring_buffer is None:
-                return
+    def _ensure_viz_buffer_locked(self, channels: int, *, min_capacity: int = 1) -> None:
+        channels = max(1, int(channels))
+        target_capacity = self._compute_viz_capacity()
+        target_capacity = max(target_capacity, int(min_capacity))
+        current = self.viz_buffer
+        if (
+            current is None
+            or current.shape[0] != channels
+            or current.capacity < target_capacity
+        ):
+            self.viz_buffer = SharedRingBuffer((channels, target_capacity), dtype=np.float32)
+            self._reset_viz_counters_locked()
 
-            data = chunk.samples
-            frames = data.shape[1]
-            if frames <= 0:
-                return
-            buffer_len = self._buffer_len
-
-            if not self._channel_ids or len(self._channel_ids) != data.shape[0]:
-                self._channel_ids = tuple(self._active_channel_ids) if self._active_channel_ids else tuple(range(data.shape[0]))
-                self._channel_index_map = {cid: idx for idx, cid in enumerate(self._channel_ids)}
-
-            start_sample = None
-            meta = chunk.meta
-            if meta is not None:
-                raw_start = meta.get("start_sample")
-                if raw_start is not None:
-                    try:
-                        start_sample = int(raw_start)
-                    except (TypeError, ValueError):
-                        start_sample = None
-            if start_sample is None:
-                start_sample = chunk.seq * chunk.n_samples
-            end_sample = int(start_sample) + frames - 1
-
-            # If samples arrive with a gap (dropped/late chunk), reset the ring buffer to avoid
-            # stitching stale data onto new samples. We keep the buffer capacity but clear contents.
-            if self._filled > 0:
-                expected_next = self._latest_sample_index + 1
-                if start_sample != expected_next:
-                    self._ring_buffer.fill(0.0)
-                    self._write_idx = 0
-                    self._filled = 0
-                    self._latest_sample_index = start_sample - 1
-            else:
-                self._latest_sample_index = start_sample - 1
-
-            if frames >= buffer_len:
-                self._ring_buffer[:, :] = data[:, -buffer_len:]
-                self._write_idx = 0
-                self._filled = buffer_len
-                self._latest_sample_index = end_sample
-                return
-
-            end = self._write_idx + frames
-            if end <= buffer_len:
-                self._ring_buffer[:, self._write_idx:end] = data
-            else:
-                first = buffer_len - self._write_idx
-                self._ring_buffer[:, self._write_idx:] = data[:, :first]
-                self._ring_buffer[:, : frames - first] = data[:, first:]
-            self._write_idx = (self._write_idx + frames) % buffer_len
-            self._filled = min(buffer_len, self._filled + frames)
-            self._latest_sample_index = end_sample
-
-    def _ensure_buffer_for_chunk_locked(self, chunk: Chunk) -> None:
-        prev_sample_rate = self._sample_rate
-        self._sample_rate = 1.0 / chunk.dt if chunk.dt > 0 else self._sample_rate
-        channel_names = tuple(chunk.channel_names)
-        channels = len(channel_names)
-        if channels == 0 or self._sample_rate is None:
+    def _update_viz_bookkeeping_locked(self, frames: int, start_sample: int, start_idx: int) -> None:
+        if frames <= 0:
             return
-
-        resize_needed = False
-        if self._ring_buffer is None:
-            resize_needed = True
-        else:
-            if self._ring_buffer.shape[0] != channels:
-                resize_needed = True
-            elif prev_sample_rate is not None and abs(prev_sample_rate - self._sample_rate) > 1e-6:
-                resize_needed = True
-
-        if not self._channel_names:
-            self._channel_names = channel_names
-        if resize_needed:
-            desired_len = self._compute_buffer_len(self._sample_rate)
-            self._ring_buffer = np.zeros((channels, desired_len), dtype=np.float32)
-            self._buffer_len = desired_len
-            self._write_idx = 0
-            self._filled = 0
-            self._latest_sample_index = -1
-        else:
-            self._ensure_buffer_capacity_locked()
-
-    def _ensure_buffer_capacity_locked(self) -> None:
-        if self._ring_buffer is None or self._sample_rate is None:
+        capacity = self.viz_buffer.capacity
+        if capacity <= 0:
             return
-        desired_len = self._compute_buffer_len(self._sample_rate)
-        if desired_len <= self._buffer_len:
-            return
-        channels = self._ring_buffer.shape[0]
-        recent = self._collect_recent_locked(min(self._filled, desired_len))
-        new_buffer = np.zeros((channels, desired_len), dtype=np.float32)
-        if recent.size:
-            new_buffer[:, -recent.shape[1] :] = recent
-            self._filled = recent.shape[1]
-            self._write_idx = self._filled % desired_len
-        else:
-            self._filled = 0
-            self._write_idx = 0
-        self._ring_buffer = new_buffer
-        self._buffer_len = desired_len
+        # Reset if there is a gap in samples.
+        if self._filled > 0 and start_sample != self._latest_sample_index + 1:
+            self._reset_viz_counters_locked()
+        end_sample = start_sample + frames - 1
+        self._write_idx = (start_idx + frames) % capacity
+        self._filled = min(capacity, self._filled + frames)
+        self._latest_sample_index = end_sample
 
-    def _collect_recent_locked(self, count: int) -> np.ndarray:
-        if self._ring_buffer is None or count <= 0 or self._filled == 0:
-            return np.empty((0, 0), dtype=np.float32)
-        count = min(count, self._filled)
-        start = (self._write_idx - count) % self._buffer_len
-        if start + count <= self._buffer_len:
-            return self._ring_buffer[:, start : start + count].copy()
-        first = self._buffer_len - start
-        part1 = self._ring_buffer[:, start:].copy()
-        part2 = self._ring_buffer[:, : count - first].copy()
-        return np.concatenate((part1, part2), axis=1)
+    def _reset_viz_counters_locked(self) -> None:
+        self._write_idx = 0
+        self._filled = 0
+        self._latest_sample_index = -1
+        self._next_start_sample = 0
+        self._next_seq = 0
 
-    def _compute_buffer_len(self, sample_rate: float) -> int:
-        max_window = max(self._window_sec, 1e-3)
-        return max(int(sample_rate * max_window * 2), 1)
+    def _compute_viz_capacity(self) -> int:
+        if self._sample_rate is not None and self._sample_rate > 0:
+            sr = float(self._sample_rate)
+            window_len = int(max(sr * max(self._window_sec, 1e-3) * 2, 1))
+            ten_sec = int(max(sr * 10.0, 1))
+            return max(window_len, ten_sec)
+        return max(1, self.viz_buffer.capacity if self.viz_buffer is not None else 1)
 
     def _empty_payload(self, status: Optional[dict] = None) -> dict:
         if status is None:

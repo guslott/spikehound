@@ -17,7 +17,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from core import DeviceManager, PipelineController
 from shared.app_settings import AppSettings
 from core.conditioning import ChannelFilterSettings, FilterSettings
-from shared.models import Chunk, EndOfStream
+from shared.models import ChunkPointer, EndOfStream
+from shared.ring_buffer import SharedRingBuffer
 from audio.player import AudioPlayer, AudioConfig
 from .analysis_dock import AnalysisDock
 from .settings_tab import SettingsTab
@@ -400,6 +401,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._audio_player: Optional[AudioPlayer] = None
         self._audio_player_queue: Optional["queue.Queue"] = None
         self._audio_input_samplerate: float = 0.0
+        self._audio_player_buffer: Optional[SharedRingBuffer] = None
         self._audio_lock = threading.Lock()
         self._audio_current_device: Optional[object] = None
         self._listen_device_key: Optional[str] = None
@@ -1880,7 +1882,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._audio_router_stop = threading.Event()
 
     def _audio_router_loop(self) -> None:
-        """Pass chunks from the dispatcher audio queue into the AudioPlayer following listen selection."""
+        """Pass audio pointers/chunks from the dispatcher audio queue into the AudioPlayer following listen selection."""
         while not self._audio_router_stop.is_set():
             try:
                 controller = self._controller
@@ -1891,14 +1893,14 @@ class MainWindow(QtWidgets.QMainWindow):
                     item = controller.audio_queue.get(timeout=0.1)
                 except queue.Empty:
                     continue
-                if item is EndOfStream or not isinstance(item, Chunk):
-                    continue
-                samples = np.asarray(item.samples, dtype=np.float32)
-                if samples.ndim != 2 or samples.size == 0:
+                if item is EndOfStream:
                     continue
                 with self._audio_lock:
                     listen_id = self._listen_channel_id
                 if listen_id is None or listen_id not in self._channel_ids_current:
+                    continue
+                viz_buffer = self._controller.viz_buffer() if self._controller else None
+                if isinstance(item, ChunkPointer) and viz_buffer is None:
                     continue
                 if not self._ensure_audio_player():
                     continue
@@ -1906,19 +1908,21 @@ class MainWindow(QtWidgets.QMainWindow):
                     idx = self._channel_ids_current.index(listen_id)
                 except ValueError:
                     continue
-                if idx >= samples.shape[0]:
-                    continue
-                mono = samples[idx].astype(np.float32, copy=False)
-                if mono.ndim == 1:
-                    payload = mono[:, None]
-                else:
-                    payload = mono.T
+                # Sync selected channel in the player
+                with self._audio_lock:
+                    player = self._audio_player
+                if player is not None:
+                    try:
+                        player.set_selected_channel(idx)
+                    except Exception:
+                        pass
+                # Forward the item (ChunkPointer or Chunk) to the player queue
                 with self._audio_lock:
                     player_queue = self._audio_player_queue
                 if player_queue is None:
                     continue
                 try:
-                    player_queue.put_nowait(payload)
+                    player_queue.put_nowait(item)
                 except queue.Full:
                     pass
             except Exception:
@@ -1931,10 +1935,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         device_id = self._selected_output_device()
         with self._audio_lock:
+            viz_buffer = self._controller.viz_buffer() if self._controller else None
             if (
                 self._audio_player is not None
                 and abs(self._audio_input_samplerate - sample_rate) < 1e-6
                 and self._audio_current_device == device_id
+                and self._audio_player_buffer is viz_buffer
             ):
                 return True
             player_to_stop = self._audio_player
@@ -1942,6 +1948,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._audio_player_queue = None
             self._audio_input_samplerate = 0.0
             self._audio_current_device = None
+            self._audio_player_buffer = None
         if player_to_stop is not None:
             try:
                 player_to_stop.stop()
@@ -1957,12 +1964,15 @@ class MainWindow(QtWidgets.QMainWindow):
             blocksize=512,
             ring_seconds=0.5,
         )
+        # Re-fetch current viz buffer each time to avoid stale references.
+        viz_buffer = self._controller.viz_buffer() if self._controller else None
         try:
             player = AudioPlayer(
                 audio_queue=queue_obj,
                 input_samplerate=sample_rate,
                 config=config,
                 selected_channel=0,
+                ring_buffer=viz_buffer,
             )
         except Exception as exc:
             if show_error:
@@ -1973,6 +1983,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._audio_player_queue = queue_obj
             self._audio_input_samplerate = float(sample_rate)
             self._audio_current_device = device_id
+            self._audio_player_buffer = viz_buffer
         self._audio_player.start()
         return True
 
@@ -1983,6 +1994,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._audio_player_queue = None
             self._audio_input_samplerate = 0.0
             self._audio_current_device = None
+            self._audio_player_buffer = None
         if player is None:
             return
         try:
@@ -2159,11 +2171,12 @@ class MainWindow(QtWidgets.QMainWindow):
         settings = FilterSettings(default=base.default, overrides=overrides)
         controller.update_filter_settings(settings)
 
-    def _drain_visualization_queue(self) -> None:
+    def _drain_visualization_queue(self) -> List[ChunkPointer]:
         controller = self._controller
         if controller is None:
-            return
+            return []
         queue_obj = controller.visualization_queue
+        pointers: List[ChunkPointer] = []
         while True:
             try:
                 item = queue_obj.get_nowait()
@@ -2171,10 +2184,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 break
             if item is EndOfStream:
                 continue
+            if isinstance(item, ChunkPointer):
+                pointers.append(item)
             try:
                 queue_obj.task_done()
             except Exception:
                 pass
+        return pointers
 
     def _update_channel_buttons(self) -> None:
         connected = self._device_connected
@@ -2865,25 +2881,72 @@ class MainWindow(QtWidgets.QMainWindow):
         self._process_streaming(data, times_arr, sample_rate, window_sec, channel_ids, now)
 
 
-    @QtCore.Slot(dict)
-    def _on_dispatcher_tick(self, payload: dict) -> None:
-        samples = payload.get("samples")
-        times = payload.get("times")
-        status = payload.get("status", {})
-        sample_rate = float(status.get("sample_rate", 0.0))
-        window_sec = float(status.get("window_sec", 0.0))
-        channel_ids = list(payload.get("channel_ids", []))
-        channel_names = list(payload.get("channel_names", []))
+    @QtCore.Slot(object)
+    def _on_dispatcher_tick(self, payload: object) -> None:
+        # Extract pointers and metadata (payload may be dict or ChunkPointer/list).
+        status: Dict[str, object] = {}
+        channel_ids: List[int] = []
+        channel_names: List[str] = []
+        samples = None
+        times = None
+        pointers: List[ChunkPointer] = []
+
+        if isinstance(payload, ChunkPointer):
+            pointers = [payload]
+        elif isinstance(payload, (list, tuple)) and payload and all(isinstance(p, ChunkPointer) for p in payload):
+            pointers = list(payload)
+        elif isinstance(payload, dict):
+            status = payload.get("status", {}) or {}
+            channel_ids = list(payload.get("channel_ids", []))
+            channel_names = list(payload.get("channel_names", []))
+            samples = payload.get("samples")
+            times = payload.get("times")
+
+        # Always drain the queue to keep it from growing, but prefer the tick payload
+        # for plotting since it already represents a windowed view.
+        queue_pointers = self._drain_visualization_queue()
+        has_samples = samples is not None and not (isinstance(samples, np.ndarray) and samples.size == 0)
+        if not has_samples and queue_pointers:
+            pointers = queue_pointers
+
+        viz_buffer = self._controller.viz_buffer() if self._controller else None
+        sample_rate = float(status.get("sample_rate", self._current_sample_rate))
+        window_sec = float(status.get("window_sec", self._current_window_sec))
         if sample_rate > 0:
             self._maybe_update_analysis_sample_rate(sample_rate)
 
-        data = np.asarray(samples) if samples is not None else np.zeros((0, 0), dtype=np.float32)
-        times_arr = np.asarray(times) if times is not None else np.zeros(0, dtype=np.float32)
+        data: np.ndarray
+        times_arr: np.ndarray
+        if pointers and viz_buffer is not None:
+            blocks: List[np.ndarray] = []
+            for ptr in pointers:
+                try:
+                    block = np.asarray(viz_buffer.read(ptr.start_index, ptr.length), dtype=np.float32)
+                except Exception:
+                    continue
+                if block.size == 0:
+                    continue
+                blocks.append(block)
+            if not blocks:
+                return
+            data = blocks[0] if len(blocks) == 1 else np.concatenate(blocks, axis=1)
+            if sample_rate > 0:
+                times_arr = np.arange(data.shape[1], dtype=np.float32) / float(sample_rate)
+                window_sec = max(window_sec, float(data.shape[1]) / float(sample_rate))
+            else:
+                times_arr = np.zeros(data.shape[1], dtype=np.float32)
+            if not channel_ids:
+                channel_ids = self._channel_ids_current or list(range(data.shape[0]))
+            if not channel_names:
+                channel_names = [str(cid) for cid in channel_ids]
+        else:
+            data = np.asarray(samples) if samples is not None else np.zeros((0, 0), dtype=np.float32)
+            times_arr = np.asarray(times) if times is not None else np.zeros(0, dtype=np.float32)
+
         self._last_times = times_arr
         now = time.perf_counter()
 
         self._register_chunk(data)
-        self._drain_visualization_queue()
 
         if channel_ids != self._channel_ids_current:
             self._ensure_curves_for_ids(channel_ids, channel_names)
