@@ -8,6 +8,7 @@ from typing import Any, Optional, Sequence, TYPE_CHECKING, Tuple
 from daq.base_source import BaseSource
 
 from .conditioning import FilterSettings, SignalConditioner
+from .controller import DeviceManager
 from shared.app_settings import AppSettingsStore
 from shared.models import TriggerConfig
 from shared.types import Event
@@ -43,6 +44,7 @@ class SpikeHoundRuntime:
         self._threads: dict[str, threading.Thread] = {}
         self._pipeline: Optional["PipelineController"] = pipeline
         self._analysis_workers: dict[Tuple[str, float], "AnalysisWorker"] = {}
+        self.device_manager = DeviceManager()
         self.dispatcher = getattr(pipeline, "dispatcher", None) if pipeline is not None else None
         self.visualization_queue: Optional[queue.Queue] = getattr(pipeline, "visualization_queue", None)
         self.audio_queue: Optional[queue.Queue] = getattr(pipeline, "audio_queue", None)
@@ -75,6 +77,14 @@ class SpikeHoundRuntime:
     def open_device(self, driver: BaseSource, sample_rate: float, channels: Sequence[object]) -> None:
         """Open and prepare the requested DAQ backend/device."""
         self.attach_source(driver, sample_rate, channels)
+
+    def connect_device(self, device_key: str, sample_rate: float, chunk_size: int = 1024) -> None:
+        """Connect a device via the DeviceManager and wire it into the pipeline."""
+        driver = self.device_manager.connect_device(device_key, sample_rate, chunk_size=chunk_size)
+        channels = self.device_manager.get_available_channels()
+        self.attach_source(driver, sample_rate, channels)
+        # Emit deviceConnected AFTER dispatcher is created so GUI can bind to it
+        self.device_manager.deviceConnected.emit(device_key)
 
     def configure_acquisition(
         self,
@@ -208,6 +218,13 @@ class SpikeHoundRuntime:
                 self.app_settings_store.update(listen_output_key=device_key)
             except Exception:
                 return
+
+    def set_list_all_audio_devices(self, enabled: bool) -> None:
+        """Propagate audio device listing preference to the device manager."""
+        try:
+            self.device_manager.set_list_all_audio_devices(enabled, refresh=True)
+        except Exception:
+            pass
 
     def open_analysis_stream(self, channel_name: str, sample_rate: float) -> tuple[Optional[queue.Queue], Optional["AnalysisWorker"]]:
         """

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 from collections import Counter
@@ -12,6 +13,8 @@ from PySide6 import QtCore
 from .conditioning import FilterSettings, SignalConditioner
 from shared.models import Chunk, ChunkPointer, EndOfStream, TriggerConfig
 from shared.ring_buffer import SharedRingBuffer
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -135,6 +138,7 @@ class Dispatcher:
                 self._channel_index_map = {cid: idx for idx, cid in enumerate(self._channel_ids)}
             self._ensure_viz_buffer_locked(channels, min_capacity=buffer.capacity)
             self._reset_viz_counters_locked()
+            logger.info("Dispatcher linked to source buffer: shape=%s, sr=%s", buffer.shape, self._sample_rate)
 
     def clear_active_channels(self) -> None:
         with self._ring_lock:
@@ -235,11 +239,14 @@ class Dispatcher:
                 if not isinstance(item, ChunkPointer):
                     continue
 
-                processed = self._process_pointer(item)
-                if processed is None:
-                    continue
-                raw_chunk, filtered_chunk, viz_pointer = processed
-                self._fan_out(raw_chunk, filtered_chunk, viz_pointer)
+                try:
+                    processed = self._process_pointer(item)
+                    if processed is None:
+                        continue
+                    raw_chunk, filtered_chunk, viz_pointer = processed
+                    self._fan_out(raw_chunk, filtered_chunk, viz_pointer)
+                except Exception as exc:
+                    logger.warning("Dispatcher skipped bad chunk: %s", exc)
             finally:
                 self._raw_queue.task_done()
 
@@ -250,10 +257,12 @@ class Dispatcher:
         source_buffer = self._source_buffer
         sample_rate = self._sample_rate
         if source_buffer is None or sample_rate is None or sample_rate <= 0:
+            logger.warning("No source buffer linked; skipping pointer")
             return None
 
         raw = source_buffer.read(ptr.start_index, ptr.length)
         if raw.ndim != 2 or raw.shape[1] == 0:
+            logger.warning("Read empty data from source (shape=%s)", getattr(raw, "shape", None))
             return None
 
         with self._ring_lock:
@@ -404,9 +413,12 @@ class Dispatcher:
 
     def _tick_loop(self) -> None:
         while not self._stop_event.is_set():
-            payload = self._collect_window_payload()
-            if payload is not None:
-                self.signals.tick.emit(payload)
+            try:
+                payload = self._collect_window_payload()
+                if payload is not None:
+                    self.signals.tick.emit(payload)
+            except Exception as exc:
+                logger.error("Dispatcher tick error: %s", exc)
             self._stop_event.wait(self._tick_interval)
 
     def _collect_window_payload(self) -> Optional[dict]:

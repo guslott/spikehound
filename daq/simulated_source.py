@@ -217,6 +217,7 @@ class SimulatedPhysiologySource(BaseSource):
             psp_buffers = self._unit_psp_buffers
             buf_len = self._buf_len
             next_deadline = time.perf_counter()
+            counter = 0
 
             while not self.stop_event.is_set():
                 loop_start = time.perf_counter()
@@ -325,6 +326,7 @@ class SimulatedPhysiologySource(BaseSource):
 
                 next_deadline += chunk_duration
                 time.sleep(max(0.0, next_deadline - time.perf_counter()))
+                counter += 1
 
         self._worker = threading.Thread(target=_loop, name="SimPhys-Worker", daemon=True)
         self._worker.start()

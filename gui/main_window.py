@@ -15,7 +15,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from core import DeviceManager, PipelineController
+from core import PipelineController
 from core.runtime import SpikeHoundRuntime
 from shared.app_settings import AppSettings
 from core.conditioning import ChannelFilterSettings, FilterSettings
@@ -468,13 +468,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._analysis_dock.select_scope()
         self._wire_placeholders()
         self._update_trigger_controls()
-        self._device_manager = DeviceManager(self)
-        self._device_manager.devicesChanged.connect(self._on_devices_changed)
-        self._device_manager.deviceConnected.connect(self._on_device_connected)
-        self._device_manager.deviceDisconnected.connect(self._on_device_disconnected)
-        self._device_manager.availableChannelsChanged.connect(self._on_available_channels)
+        self.runtime.device_manager.devicesChanged.connect(self._on_devices_changed)
+        self.runtime.device_manager.deviceConnected.connect(self._on_device_connected)
+        self.runtime.device_manager.deviceDisconnected.connect(self._on_device_disconnected)
+        self.runtime.device_manager.availableChannelsChanged.connect(self._on_available_channels)
         self._apply_device_state(False)
-        self._device_manager.refresh_devices()
+        self.runtime.device_manager.refresh_devices()
         self.attach_controller(controller)
         app_settings = controller.app_settings if controller is not None else None
         if app_settings is not None:
@@ -1235,19 +1234,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_sample_rate_value(sample_rate)
         self._set_window_combo_value(window_sec)
 
-        if device_key is None or self._device_manager is None:
+        if device_key is None:
             _info("Load Config", "No device specified in the configuration.")
             return
 
         try:
-            self._device_manager.connect_device(device_key, sample_rate=self._current_sample_rate_value())
+            self.runtime.connect_device(device_key, sample_rate=self._current_sample_rate_value())
         except Exception as exc:
             _critical("Load Config", f"Failed to connect to device '{device_key}': {exc}")
             return
 
         # Refresh channel lists with the newly connected device
         try:
-            available_channels = self._device_manager.get_available_channels()
+            available_channels = self.runtime.device_manager.get_available_channels()
             self._on_available_channels(available_channels)
         except Exception:
             pass
@@ -1387,10 +1386,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_scope_config_data(data, source=str(default_path), show_dialogs=False)
 
     def _on_device_button_clicked(self) -> None:
-        if not hasattr(self, "_device_manager") or self._device_manager is None:
+        dm = getattr(self.runtime, "device_manager", None)
+        if dm is None:
             return
         if self._device_connected:
-            self._device_manager.disconnect_device()
+            dm.disconnect_device()
             return
         key = self.device_combo.currentData()
         if not key:
@@ -1404,7 +1404,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.device_toggle_btn.setChecked(False)
             return
         try:
-            self._device_manager.connect_device(key, sample_rate=self._current_sample_rate_value())
+            self.runtime.connect_device(key, sample_rate=self._current_sample_rate_value())
         except Exception as exc:  # pragma: no cover - GUI feedback only
             QtWidgets.QMessageBox.critical(self, "Device", f"Failed to connect: {exc}")
             self.device_toggle_btn.blockSignals(True)
@@ -1442,7 +1442,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.device_combo.setItemData(idx, tooltip, QtCore.Qt.ToolTipRole)
         self.device_combo.blockSignals(False)
         if self._device_connected:
-            active_key = self._device_manager.active_key()
+            dm = getattr(self.runtime, "device_manager", None)
+            active_key = dm.active_key() if dm is not None else None
             if active_key is not None:
                 idx = self.device_combo.findData(active_key)
                 if idx >= 0:
@@ -1485,15 +1486,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def _current_sample_rate_value(self) -> float:
         data = self.sample_rate_combo.currentData()
         try:
-            return float(data)
+            value = float(data)
         except Exception:
+            value = 0.0
             if self.sample_rate_combo.count() > 0:
                 d = self.sample_rate_combo.itemData(0)
                 try:
-                    return float(d)
+                    value = float(d)
                 except Exception:
-                    return 0.0
-            return 0.0
+                    value = 0.0
+        # If still zero, use a reasonable default rather than failing
+        if value == 0.0:
+            value = 20000.0
+        return value
 
     def _update_sample_rate_enabled(self) -> None:
         connected = self._device_connected
@@ -1507,10 +1512,8 @@ class MainWindow(QtWidgets.QMainWindow):
         idx = self.device_combo.findData(key)
         if idx >= 0:
             self.device_combo.setCurrentIndex(idx)
-        driver = self._device_manager.current_driver()
-        if driver is not None:
-            channels = self._device_manager.get_available_channels()
-            self.open_device(driver, self._current_sample_rate_value(), channels)
+        self._bind_dispatcher_signals()
+        self._bind_app_settings_store()
         self._update_channel_buttons()
 
     def _on_device_disconnected(self) -> None:
@@ -1519,6 +1522,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_device_state(False)
         self.stop_acquisition()
         self._drain_visualization_queue()
+        self._clear_scope_display()
         self.sample_rate_combo.clear()
         if self._dispatcher_signals is not None:
             try:
@@ -1537,10 +1541,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_sample_rate_enabled()
 
     def _on_scan_hardware(self) -> None:
-        if self._device_manager is None:
+        dm = getattr(self.runtime, "device_manager", None)
+        if dm is None:
             return
         try:
-            self._device_manager.refresh_devices()
+            dm.refresh_devices()
         except Exception:
             pass
         self._publish_active_channels()
@@ -2052,6 +2057,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     except Exception:
                         pass
                 # Forward the item (ChunkPointer or Chunk) to the player queue
+                # Evict oldest data if queue is full to keep audio fresh (reduce lag)
                 with self._audio_lock:
                     player_queue = self._audio_player_queue
                 if player_queue is None:
@@ -2059,7 +2065,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 try:
                     player_queue.put_nowait(item)
                 except queue.Full:
-                    pass
+                    # Drop oldest item to make room for fresh data
+                    try:
+                        _ = player_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    # Try again with the evicted slot
+                    try:
+                        player_queue.put_nowait(item)
+                    except queue.Full:
+                        pass  # Still full, drop this item
             except Exception:
                 continue
 
@@ -2227,7 +2242,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _transform_to_screen(self, raw_data: np.ndarray, span_v: float, offset_pct: float) -> np.ndarray:
         span = max(float(span_v), 1e-9)
-        return np.asarray(raw_data, dtype=np.float32) / span + float(offset_pct)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = np.asarray(raw_data, dtype=np.float32) / span + float(offset_pct)
+        return np.nan_to_num(result, nan=offset_pct, posinf=offset_pct, neginf=offset_pct)
 
     def _update_plot_y_range(self) -> None:
         """Fix the normalized viewport to [0.0, 1.0]."""
@@ -2412,9 +2429,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_channel_buttons()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[override]
-        if hasattr(self, "_device_manager") and self._device_manager is not None:
+        dm = getattr(self.runtime, "device_manager", None)
+        if dm is not None:
             try:
-                self._device_manager.disconnect_device()
+                dm.disconnect_device()
             except Exception:
                 pass
         self._clear_listen_channel()
@@ -3151,9 +3169,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if not self._device_connected and not self._window_combo_user_set:
                 self._set_window_combo_value(float(settings.default_window_sec))
             self._apply_listen_output_preference(settings.listen_output_key)
-            if self._device_manager is not None:
+            dm = getattr(self.runtime, "device_manager", None)
+            if dm is not None:
                 try:
-                    self._device_manager.set_list_all_audio_devices(settings.list_all_audio_devices, refresh=True)
+                    dm.set_list_all_audio_devices(settings.list_all_audio_devices, refresh=True)
                 except Exception:
                     pass
             if self._controller is not None:

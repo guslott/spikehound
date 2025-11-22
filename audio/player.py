@@ -211,6 +211,14 @@ class AudioPlayer(threading.Thread):
         if mono_in.size == 0:
             return mono_in.astype(np.float32)
 
+        # OPTIMIZATION: Zero-cost bypass if rates match
+        # This saves massive CPU cycles by skipping np.interp
+        if abs(self.in_sr - self.cfg.out_samplerate) < 1.0:
+            # Advance cursor to keep state consistent
+            dt_in = 1.0 / self.in_sr
+            self._t_in_cursor += mono_in.size * dt_in
+            return mono_in.astype(np.float32)
+
         # Input times for this block (seconds)
         N = mono_in.size
         t0 = self._t_in_cursor

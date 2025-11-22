@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Type
 
 import numpy as np
@@ -30,6 +31,9 @@ def _registry():
     from daq import registry as reg  # local import to avoid circular dependencies
 
     return reg
+
+
+logger = logging.getLogger(__name__)
 
 
 class DeviceManager(QtCore.QObject):
@@ -110,9 +114,10 @@ class DeviceManager(QtCore.QObject):
             driver = str(item.get("driver_name", "")).lower()
             module = str(item.get("module", "")).lower()
             name = str(item.get("device_name", item.get("name", ""))).lower()
-            if "simulated" in driver or "simulated" in module:
+            # Prioritize: 1) Sound card (default), 2) Simulated, 3) Other DAQ
+            if "sound card" in driver or "soundcard" in module:
                 rank = 0
-            elif "sound card" in driver or "soundcard" in module:
+            elif "simulated" in driver or "simulated" in module:
                 rank = 1
             else:
                 rank = 2
@@ -171,7 +176,8 @@ class DeviceManager(QtCore.QObject):
         self._active_key = device_key
         self._channels = list(channels)
         self.availableChannelsChanged.emit(list(self._channels))
-        self.deviceConnected.emit(device_key)
+        # NOTE: deviceConnected signal is now emitted from runtime.connect_device()
+        # after attach_source() completes to ensure dispatcher is ready
         return driver
 
     def disconnect_device(self) -> None:
@@ -468,15 +474,35 @@ class PipelineController:
                 filter_settings=self._filter_settings,
                 poll_timeout=self._dispatcher_timeout,
             )
+            effective_sr = float(sample_rate) if sample_rate is not None else 0.0
+            if effective_sr <= 0:
+                try:
+                    cfg = getattr(driver, "config", None)
+                    effective_sr = float(getattr(cfg, "sample_rate", 0.0))
+                except Exception:
+                    effective_sr = 0.0
+            if effective_sr <= 0:
+                logger.error("Invalid sample rate for dispatcher wiring (driver=%s)", driver)
+                raise ValueError("Sample rate must be positive to attach source")
+            if getattr(driver, "ring_buffer", None) is None:
+                try:
+                    channel_ids_cfg = [info.id for info in channels] if channels else None
+                    driver.configure(sample_rate=int(round(effective_sr)), channels=channel_ids_cfg)
+                except Exception as exc:
+                    logger.error("Failed to configure driver before wiring dispatcher: %s", exc)
+                    raise
             try:
-                self._dispatcher.set_source_buffer(driver.get_buffer(), sample_rate=sample_rate)
-            except Exception:
-                pass
+                self._dispatcher.set_source_buffer(driver.get_buffer(), sample_rate=effective_sr)
+                logger.info("Attached source buffer to dispatcher. SR=%s", effective_sr)
+            except Exception as exc:
+                logger.error("Failed to link source buffer: %s", exc)
+                raise
             channel_ids = [info.id for info in channels]
             channel_names = [info.name for info in channels]
             self._dispatcher.set_channel_layout(channel_ids, channel_names)
             self._dispatcher.set_window_duration(self._window_sec)
             self._dispatcher.clear_active_channels()
+            logger.info("Source attached successfully (sr=%s, channels=%s)", effective_sr, channel_ids)
 
     def detach_device(self) -> None:
         with self._lock:
@@ -501,12 +527,12 @@ class PipelineController:
                 except Exception:
                     pass
                 # Rewire dispatcher to the source buffer in case channel changes resized it.
-                if self._dispatcher is not None:
+                if self._dispatcher is not None and hasattr(self._source, 'ring_buffer') and self._source.ring_buffer is not None:
                     try:
                         sr = self._actual_config.sample_rate if self._actual_config is not None else None
                         self._dispatcher.set_source_buffer(self._source.get_buffer(), sample_rate=sr)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("Could not re-link source buffer on channel change: %s", exc)
 
             if self._active_channel_ids and self._dispatcher is not None and self._source is not None:
                 if not self._streaming:
