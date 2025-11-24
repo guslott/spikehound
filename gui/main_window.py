@@ -24,6 +24,8 @@ from shared.ring_buffer import SharedRingBuffer
 from audio.player import AudioPlayer, AudioConfig
 from .analysis_dock import AnalysisDock
 from .settings_tab import SettingsTab
+from .scope_widget import ScopeWidget, ChannelConfig as ScopeChannelConfig
+from .device_control_widget import DeviceControlWidget
 
 
 @dataclass
@@ -43,23 +45,7 @@ class ChannelConfig:
     channel_name: str = ""
 
 
-class VoltageAxis(pg.AxisItem):
-    """Axis item that maps normalized 0-1 coordinates to volts for display."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._span = 1.0
-        self._offset = 0.5
-
-    def set_scaling(self, span: float, offset: float) -> None:
-        self._span = max(float(span), 1e-9)
-        self._offset = float(offset)
-
-    def tickStrings(self, values, scale, spacing):
-        try:
-            return [f"{(float(v) - self._offset) * self._span:.3g}" for v in values]
-        except Exception:
-            return super().tickStrings(values, scale, spacing)
 
 
 class ChannelOptionsPanel(QtWidgets.QWidget):
@@ -324,27 +310,7 @@ QPushButton:checked {
         self.analysisRequested.emit()
 
 
-class ChannelViewBox(pg.ViewBox):
-    """Custom ViewBox to expose click & drag events for channel selection."""
 
-    channelClicked = QtCore.Signal(float, QtCore.Qt.MouseButton)
-    channelDragged = QtCore.Signal(float)
-    channelDragFinished = QtCore.Signal()
-
-    def __init__(self, *args, **kwargs) -> None:
-        kwargs.setdefault("enableMenu", False)
-        super().__init__(*args, **kwargs)
-        self._dragging = False
-        self._drag_button: Optional[QtCore.Qt.MouseButton] = None
-
-    def mousePressEvent(self, event) -> None:  # type: ignore[override]
-        event.ignore()
-
-    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
-        event.ignore()
-
-    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
-        event.ignore()
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -579,39 +545,20 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.setContentsMargins(8, 8, 8, 8)
         grid.setSpacing(8)
 
-        # Upper-left: plot area for multi-channel traces.
-        self._view_box = ChannelViewBox()
-        left_axis = VoltageAxis("left")
-        self.plot_widget = pg.PlotWidget(viewBox=self._view_box, enableMenu=False, axisItems={"left": left_axis})
-        try:
-            # Hide pyqtgraph's default auto-range button to avoid distracting flashes
-            self.plot_widget.hideButtons()
-        except Exception:
-            pass
-        self.plot_widget.setMenuEnabled(False)
-        # Keep the scope axes fixed; range changes should only come from the UI controls.
-        self.plot_widget.setMouseEnabled(x=False, y=False)
-        self.plot_widget.setBackground(QtGui.QColor(211, 230, 204))
-        self.plot_widget.setLabel("bottom", "Time", units="s")
-        self.plot_widget.setLabel("left", "Amplitude", units="V")
-        plot_item = self.plot_widget.getPlotItem()
-        plot_item.getAxis("left").setPen(pg.mkPen((0, 0, 139)))
-        plot_item.getAxis("bottom").setPen(pg.mkPen((0, 0, 139)))
-        plot_item.showGrid(x=True, y=True, alpha=0.4)
-        plot_item.vb.setBorder(pg.mkPen((0, 0, 139)))
-        grid.addWidget(self.plot_widget, 0, 0)
-
-        self.threshold_line = pg.InfiniteLine(angle=0, pen=pg.mkPen((178, 34, 34), width=3), movable=True)
-        self.threshold_line.setVisible(False)
-        self.plot_widget.addItem(self.threshold_line)
-        try:
-            self.threshold_line.setZValue(100)
-        except AttributeError:
-            pass
-
-        self.pretrigger_line = pg.InfiniteLine(angle=90, pen=pg.mkPen((0, 0, 139), style=QtCore.Qt.DashLine), movable=False)
-        self.pretrigger_line.setVisible(False)
-        self.plot_widget.addItem(self.pretrigger_line)
+        # Upper-left: ScopeWidget for multi-channel visualization
+        self.scope = ScopeWidget(self)
+        grid.addWidget(self.scope, 0, 0)
+        
+        # Keep references to threshold and pretrigger lines for compatibility
+        self.threshold_line = self.scope.threshold_line
+        self.pretrigger_line = self.scope.pretrigger_line
+        self.plot_widget = self.scope.plot_widget  # For backwards compatibility
+        
+        # Connect ScopeWidget signals
+        self.scope.channelClicked.connect(self._on_scope_channel_clicked)
+        self.scope.channelDragged.connect(self._on_scope_channel_dragged)
+        self.scope.channelDragFinished.connect(self._on_scope_drag_finished)
+        self.scope.thresholdChanged.connect(self._on_scope_threshold_changed)
 
         self._status_labels = {}
 
@@ -632,7 +579,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._splash_pixmap = self._load_splash_pixmap()
         if self._splash_pixmap is None:
-            self._splash_label.setText("Manlius Pebble Hill School\nCornell University")
+            self._splash_label.setText("Manlius Pebble Hill School\\nCornell University")
             self._splash_label.setWordWrap(True)
             self._splash_label.setStyleSheet(
                 "#splashLabel { border: 2px solid rgb(0,0,0); background-color: rgb(0,0,0); color: rgb(240,240,240); padding: 6px; font-weight: bold; }"
@@ -765,95 +712,36 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(side_panel, 0, 1, 2, 1)
 
         # Bottom row (spanning full width): device / channel controls.
-        bottom_panel = QtWidgets.QWidget()
-        bottom_layout = QtWidgets.QHBoxLayout(bottom_panel)
-        bottom_layout.setContentsMargins(0, 0, 0, 0)
-        bottom_layout.setSpacing(8)
+        self.device_control = DeviceControlWidget(self)
+        
+        # Keep references to individual widgets for backward compatibility
+        self.device_group = self.device_control.device_group
+        self.device_combo = self.device_control.device_combo
+        self.scan_hardware_btn = self.device_control.scan_hardware_btn
+        self.device_toggle_btn = self.device_control.device_toggle_btn
+        self.sample_rate_combo = self.device_control.sample_rate_combo
+        self.settings_toggle_btn = self.device_control.settings_toggle_btn
+        self.save_config_btn = self.device_control.save_config_btn
+        self.load_config_btn = self.device_control.load_config_btn
+        self.channels_group = self.device_control.channels_group
+        self.active_list = self.device_control.active_list
+        self.add_channel_btn = self.device_control.add_channel_btn
+        self.remove_channel_btn = self.device_control.remove_channel_btn
+        self.available_combo = self.device_control.available_combo
+        
+        # Connect DeviceControlWidget signals
+        self.device_control.deviceSelected.connect(self._on_device_selected)
+        self.device_control.deviceConnectRequested.connect(self._on_device_connect_requested)
+        self.device_control.deviceDisconnectRequested.connect(self._on_device_disconnect_requested)
+        self.device_control.deviceScanRequested.connect(self._on_scan_hardware)
+        self.device_control.channelAddRequested.connect(self._on_channel_add_requested)
+        self.device_control.channelRemoveRequested.connect(self._on_channel_remove_requested)
+        self.device_control.activeChannelSelected.connect(self._on_active_list_index_changed)
+        self.device_control.saveConfigRequested.connect(self._on_save_scope_config)
+        self.device_control.loadConfigRequested.connect(self._on_load_scope_config)
+        self.device_control.settingsToggled.connect(self._toggle_settings_tab)
 
-        self.device_group = QtWidgets.QGroupBox("Device")
-        device_layout = QtWidgets.QGridLayout(self.device_group)
-        device_layout.setContentsMargins(6, 6, 6, 6)
-        device_layout.setHorizontalSpacing(6)
-        device_layout.setVerticalSpacing(6)
-        device_layout.setColumnStretch(1, 1)
-        self.device_group.setMaximumWidth(320)
-
-        device_layout.addWidget(self._label("Source"), 0, 0)
-        self.device_combo = QtWidgets.QComboBox()
-        device_layout.addWidget(self.device_combo, 0, 1)
-        self.device_combo.currentIndexChanged.connect(self._on_device_selected)
-
-        controls_row = QtWidgets.QHBoxLayout()
-        controls_row.setSpacing(6)
-        self.scan_hardware_btn = QtWidgets.QPushButton("Scan Hardware")
-        self.scan_hardware_btn.clicked.connect(self._on_scan_hardware)
-        self.scan_hardware_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
-        self.scan_hardware_btn.setFixedHeight(32)
-        controls_row.addWidget(self.scan_hardware_btn)
-        self.device_toggle_btn = QtWidgets.QPushButton("Connect")
-        self.device_toggle_btn.setCheckable(True)
-        self.device_toggle_btn.clicked.connect(self._on_device_button_clicked)
-        self.device_toggle_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
-        self.device_toggle_btn.setFixedHeight(32)
-        controls_row.addWidget(self.device_toggle_btn)
-        device_layout.addLayout(controls_row, 1, 0, 1, 2)
-
-        device_layout.addWidget(self._label("Sample Rate (Hz)"), 2, 0)
-        self.sample_rate_combo = QtWidgets.QComboBox()
-        self.sample_rate_combo.setEditable(False)
-        self.sample_rate_combo.setFixedHeight(24)
-        self.sample_rate_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
-        device_layout.addWidget(self.sample_rate_combo, 2, 1)
-
-        controls_row = QtWidgets.QHBoxLayout()
-        controls_row.setSpacing(6)
-        self.settings_toggle_btn = QtWidgets.QPushButton("Settings")
-        self.settings_toggle_btn.setCheckable(True)
-        self.settings_toggle_btn.toggled.connect(self._toggle_settings_tab)
-        controls_row.addWidget(self.settings_toggle_btn)
-        self.save_config_btn = QtWidgets.QPushButton("Save Config")
-        self.save_config_btn.clicked.connect(self._on_save_scope_config)
-        controls_row.addWidget(self.save_config_btn)
-        self.load_config_btn = QtWidgets.QPushButton("Load Config")
-        self.load_config_btn.clicked.connect(self._on_load_scope_config)
-        controls_row.addWidget(self.load_config_btn)
-        controls_row.addStretch(1)
-        device_layout.addLayout(controls_row, 3, 0, 1, 2)
-
-        self.channels_group = QtWidgets.QGroupBox("Channels")
-        channels_layout = QtWidgets.QVBoxLayout(self.channels_group)
-        channels_layout.setContentsMargins(8, 12, 8, 12)
-        channels_layout.setSpacing(6)
-
-        active_label = self._label("Active")
-        channels_layout.addWidget(active_label)
-        self.active_list = QtWidgets.QListWidget()
-        self.active_list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.active_list.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        self.active_list.setMinimumHeight(50)
-        self.active_list.setMaximumHeight(60)
-        channels_layout.addWidget(self.active_list)
-
-        available_row = QtWidgets.QHBoxLayout()
-        available_row.setContentsMargins(0, 0, 0, 0)
-        available_row.setSpacing(6)
-        available_label = self._label("Available")
-        available_row.addWidget(available_label)
-        available_row.addStretch(1)
-        self.add_channel_btn = QtWidgets.QPushButton("↑ Add")
-        self.add_channel_btn.clicked.connect(self._on_add_channel)
-        available_row.addWidget(self.add_channel_btn)
-        self.remove_channel_btn = QtWidgets.QPushButton("↓ Remove")
-        self.remove_channel_btn.clicked.connect(self._on_remove_channel)
-        available_row.addWidget(self.remove_channel_btn)
-        channels_layout.addLayout(available_row)
-        self.available_combo = QtWidgets.QComboBox()
-        channels_layout.addWidget(self.available_combo)
-
-        bottom_layout.addWidget(self.device_group, 1)
-        bottom_layout.addWidget(self.channels_group, 2)
-
-        grid.addWidget(bottom_panel, 1, 0)
+        grid.addWidget(self.device_control, 1, 0)
 
         grid.setRowStretch(0, 1)
         grid.setRowStretch(1, 0)
@@ -874,7 +762,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.threshold_spin.valueChanged.connect(self._emit_trigger_config)
         self.pretrigger_combo.currentIndexChanged.connect(self._emit_trigger_config)
         self.window_combo.currentIndexChanged.connect(self._on_window_changed)
-        self.threshold_line.sigPositionChanged.connect(self._on_threshold_line_changed)
+        # NOTE: threshold_line signal now handled by ScopeWidget.thresholdChanged
         self.active_list.currentItemChanged.connect(self._on_active_channel_selected)
         self.trigger_single_button.clicked.connect(self._on_trigger_single_clicked)
 
@@ -1411,6 +1299,42 @@ class MainWindow(QtWidgets.QMainWindow):
             self.device_toggle_btn.setChecked(False)
             self.device_toggle_btn.blockSignals(False)
 
+    # DeviceControlWidget signal handlers
+    def _on_device_connect_requested(self, device_key: str, sample_rate: float) -> None:
+        """Handle connection request from DeviceControlWidget."""
+        if self._device_connected:
+            return
+        
+        # Actually connect the device using the runtime
+        try:
+            self.runtime.connect_device(device_key, sample_rate=sample_rate)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Device", f"Failed to connect: {exc}")
+            self.device_control.set_connected(False)
+
+    def _on_device_disconnect_requested(self) -> None:
+        """Handle disconnection request from DeviceControlWidget."""
+        if self._device_connected:
+            dm = getattr(self.runtime, "device_manager", None)
+            if dm is not None:
+                dm.disconnect_device()
+
+    def _on_channel_add_requested(self, channel_id: int) -> None:
+        """Handle add channel request from DeviceControlWidget."""
+        self._on_add_channel()
+
+    def _on_channel_remove_requested(self, channel_id: int) -> None:
+        """Handle remove channel request from DeviceControlWidget."""
+        self._on_remove_channel()
+
+    def _on_active_list_index_changed(self, index: int) -> None:
+        """Handle active channel selection change by index."""
+        if 0 <= index < self.active_list.count():
+            item = self.active_list.item(index)
+            if item is not None:
+                self._on_active_channel_selected(item, None)
+
+
     def _on_devices_changed(self, entries: List[dict]) -> None:
         self._device_map = {entry["key"]: entry for entry in entries}
         self.device_combo.blockSignals(True)
@@ -1558,12 +1482,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._analysis_dock.select_scope()
 
     def _on_available_channels(self, channels: Sequence[object]) -> None:
-        self.available_combo.clear()
+        # Update DeviceControlWidget with available channels
+        self.device_control.set_available_channels(list(channels))
+        
+        # Clear active channels
         self.active_list.clear()
         self._clear_channel_panels()
-        for info in channels:
-            name = getattr(info, "name", str(info))
-            self.available_combo.addItem(name, info)
+        
+        # Set trigger channels and update UI
         if self.available_combo.count():
             self.available_combo.setCurrentIndex(0)
         self.set_trigger_channels(channels)
@@ -2493,6 +2419,53 @@ class MainWindow(QtWidgets.QMainWindow):
             self.threshold_spin.blockSignals(False)
         self._emit_trigger_config()
 
+    # ScopeWidget signal handlers
+    def _on_scope_channel_clicked(self, channel_id: int) -> None:
+        """Handle click on a channel trace in the scope."""
+        self._select_channel_by_id(channel_id)
+
+    def _on_scope_channel_dragged(self, channel_id: int, new_offset: float) -> None:
+        """Handle dragging a channel trace to reposition it."""
+        if channel_id not in self._channel_configs:
+            return
+        config = self._channel_configs[channel_id]
+        config.screen_offset = new_offset
+        # Update the scope widget's config
+        scope_config = ScopeChannelConfig(
+            color=config.color,
+            display_enabled=config.display_enabled,
+            vertical_span_v=config.vertical_span_v,
+            screen_offset=config.screen_offset,
+            channel_name=config.channel_name
+        )
+        self.scope.set_channel_config(channel_id, scope_config)
+        # Update the channel panel if exists
+        panel = self._channel_panels.get(channel_id)
+        if panel is not None:
+            panel.set_config(config)
+
+    def _on_scope_drag_finished(self) -> None:
+        """Handle end of channel drag operation."""
+        pass  # Currently no additional action needed
+
+    def _on_scope_threshold_changed(self, value: float) -> None:
+        """Handle threshold line moved by user."""
+        # value is in normalized 0-1 screen coordinates, convert to volts
+        cfg = self._channel_configs.get(self._trigger_channel_id) or self._channel_configs.get(self._active_channel_id)
+        if cfg is not None:
+            span = cfg.vertical_span_v
+            offset = cfg.screen_offset
+            # Convert from normalized screen coords to volts
+            voltage = (value - offset) * span
+        else:
+            # No channel config, can't convert properly
+            voltage = 0.0
+        
+        self.threshold_spin.blockSignals(True)
+        self.threshold_spin.setValue(voltage)
+        self.threshold_spin.blockSignals(False)
+        self._emit_trigger_config()
+
     def _on_trigger_mode_changed(self) -> None:
         self._update_trigger_controls()
 
@@ -2528,24 +2501,31 @@ class MainWindow(QtWidgets.QMainWindow):
         mode = config.get("mode", "stream")
         channel_valid = config.get("channel_index", -1) != -1
         if mode == "stream" or not channel_valid:
-            self.threshold_line.setVisible(False)
+            # Use ScopeWidget API to hide threshold
+            self.scope.set_threshold(0.0, visible=False)
             self.pretrigger_line.setVisible(False)
             return
-        self.threshold_line.setVisible(True)
+        
+        # Calculate threshold position in screen coordinates
+        threshold_value = config.get("threshold", 0.0)
+        cfg = self._channel_configs.get(self._trigger_channel_id) or self._channel_configs.get(self._active_channel_id)
+        if cfg is not None:
+            span = cfg.vertical_span_v
+            offset = cfg.screen_offset
+            # Transform threshold from volts to normalized 0-1 screen coords
+            normalized_value = (threshold_value / span) + offset
+        else:
+            normalized_value = 0.5
+        
+        # Use ScopeWidget API to show and position threshold
+        self.scope.set_threshold(normalized_value, visible=True)
+        
         pen = pg.mkPen((0, 0, 0), width=3)
         self.threshold_line.setPen(pen)
         try:
             self.threshold_line.setZValue(100)
         except AttributeError:
             pass
-        value = float(config.get("threshold", 0.0))
-        chan_id = config.get("channel_index", -1)
-        cfg = self._channel_configs.get(chan_id) or self._channel_configs.get(self._active_channel_id)
-        span = cfg.vertical_span_v if cfg is not None else 1.0
-        offset = cfg.screen_offset if cfg is not None else 0.0
-        y_norm = (value / span) + offset
-        self.threshold_line.setMovable(True)
-        self.threshold_line.setValue(y_norm)
         pre_value = float(config.get("pretrigger_frac", 0.0) or 0.0)
         if pre_value > 0.0:
             self.pretrigger_line.setVisible(True)
