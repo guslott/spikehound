@@ -19,6 +19,7 @@ else:  # pragma: no cover - runtime fallback
 
 from .conditioning import FilterSettings
 from .dispatcher import Dispatcher
+from .audio_manager import AudioManager
 from shared.models import Chunk, EndOfStream, TriggerConfig
 from shared.ring_buffer import SharedRingBuffer
 from analysis.settings import AnalysisSettingsStore
@@ -244,6 +245,9 @@ class PipelineController:
         self._active_channel_ids: List[int] = []
         self._channel_infos: List[ChannelInfo] = []
         self._list_all_audio_devices: bool = False
+        
+        # Audio management (will be initialized by Runtime)
+        self._audio_manager: Optional[AudioManager] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -285,8 +289,37 @@ class PipelineController:
     def app_settings(self) -> AppSettings:
         return self._app_settings_store.get()
 
-    def update_app_settings(self, **kwargs) -> AppSettings:
-        return self._app_settings_store.update(**kwargs)
+    def update_app_settings(self, **kwargs) -> None:
+        self._app_settings_store.update_app_settings(**kwargs)
+
+    # Audio control API (delegates to AudioManager)
+    
+    def set_audio_monitoring(self, channel_id: Optional[int]) -> None:
+        """Enable or disable audio monitoring for a channel.
+        
+        Args:
+            channel_id: Channel ID to monitor, or None to stop
+        """
+        if self._audio_manager is not None:
+            self._audio_manager.set_listen_channel(channel_id)
+    
+    def set_audio_device(self, device_id: Optional[int]) -> None:
+        """Set audio output device.
+        
+        Args:
+            device_id: Device ID for output, or None for default
+        """
+        if self._audio_manager is not None:
+            self._audio_manager.set_output_device(device_id)
+    
+    def set_audio_gain(self, gain: float) -> None:
+        """Set audio output gain.
+        
+        Args:
+            gain: Gain value (0.0 to 1.0)
+        """
+        if self._audio_manager is not None:
+            self._audio_manager.set_gain(gain)
 
     def set_list_all_audio_devices(self, enabled: bool) -> None:
         self._list_all_audio_devices = bool(enabled)
@@ -402,6 +435,10 @@ class PipelineController:
     def shutdown(self) -> None:
         """Stop everything and close the active source."""
         with self._lock:
+            # Stop audio manager first
+            if self._audio_manager is not None:
+                self._audio_manager.stop()
+            
             self.stop(join=True)
             self._destroy_dispatcher()
             self._close_source()

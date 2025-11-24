@@ -157,9 +157,16 @@ class SimulatedPhysiologySource(BaseSource):
                 'psp_gain': psp_gain,
             })
 
-        # Precompute max margins for buffers. Include a full chunk of lookahead so
-        # PSP tails and delayed spikes that start near the end of a chunk are
-        # preserved intact into the next chunk without being truncated.
+        # Calculate buffer margin needed to prevent signal truncation.
+        # The margin must accommodate:
+        # 1. Spike templates that extend beyond their trigger point
+        # 2. Conduction delays for distal electrode reads
+        # 3. PSP decay tails that extend beyond the chunk boundary
+        #
+        # For PSPs: an event at the very end of a chunk (position chunk_size-1)
+        # will have its PSP starting at (chunk_size-1 + max_syn_delay) and
+        # extending for psp_len samples. To avoid clipping, we need enough margin
+        # to hold: max_syn_delay + psp_len samples beyond chunk_size.
         max_template = max(u['templ_len'] for u in self._units) if self._units else 0
         distance_m = self._distance_m
         max_ec_delay = 0
@@ -168,6 +175,12 @@ class SimulatedPhysiologySource(BaseSource):
             max_ec_delay = max(max_ec_delay, int(round(delay_s * sample_rate)))
         max_syn = max((u['syn_delay_samples'] for u in self._units), default=0)
         chunk_size = self.config.chunk_size if self.config is not None else 0
+        # Margin must handle:
+        # - Spike template overhang
+        # - Conduction delay for distal reads
+        # - PSP that starts at (chunk_size-1 + max_syn) and extends psp_len samples
+        #   This requires max_syn + psp_len samples of margin.
+        # - Add chunk_size as safety buffer to ensure we never clip any signal
         self._buffer_margin = max(
             max_template,
             max_ec_delay,
@@ -240,11 +253,15 @@ class SimulatedPhysiologySource(BaseSource):
                     self._chunk_buffer.fill(0.0)
                 data_chunk = self._chunk_buffer
 
-                # Generate new events per unit
+                # Generate new spike events for this chunk.
+                # Events are generated at positions [0, chunk_size) within the current
+                # chunk window. The rolling buffer preserves signal tails from previous
+                # chunks in positions [0, margin), so new events are ADDED (via +=) to
+                # any carryover signal.
                 for ui, u in enumerate(self._units):
                     p_spike = u['rate_hz'] / sr
                     events = np.random.rand(chunk_size) < p_spike
-                    offs = np.where(events)[0]
+                    offs = np.where(events)[0]  # Spike positions in [0, chunk_size)
                     templ = u['template']
                     templ_len = u['templ_len']
                     wave_buf = wave_buffers[ui]
@@ -252,6 +269,7 @@ class SimulatedPhysiologySource(BaseSource):
                     psp_gain = u['psp_gain']
                     syn_delay = u['syn_delay_samples']
                     for off in offs:
+                        # Add extracellular spike waveform
                         amp = u['amp_prox'] * (0.95 + 0.10 * np.random.rand())
                         amp = max(amp, self._noise_level * 5.0 + 0.05)
                         scaled = templ * amp
@@ -259,9 +277,14 @@ class SimulatedPhysiologySource(BaseSource):
                         if end > buf_len:
                             end = buf_len
                         wave_buf[off:end] += scaled[: end - off]
+                        # Add intracellular PSP with synaptic delay.
+                        # PSP starts at (spike_time + synaptic_delay) and extends for psp_len.
+                        # With sufficient margin, this should never be clipped.
                         psp_start = off + syn_delay
                         psp_end = psp_start + self._psp_len
                         if psp_end > buf_len:
+                            # This should not happen if margin is calculated correctly.
+                            # If it does, clip the PSP (better than crashing).
                             psp_end = buf_len
                         span = psp_end - psp_start
                         if span > 0:
@@ -309,17 +332,24 @@ class SimulatedPhysiologySource(BaseSource):
                 chunk_meta = {"active_channel_ids": list(active_ids)}
                 self.emit_array(data_chunk, mono_time=loop_start, meta=chunk_meta)
 
-                # Advance buffers for the next chunk
+                # Shift buffers to prepare for next chunk.
+                # The rolling buffer works as follows:
+                # - After emitting chunk N (positions 0:chunk_size), we shift the buffer left.
+                # - Positions [chunk_size:buf_len] (the margin area) contain signal tails that
+                #   extend beyond the emitted chunk. These are moved to positions [0:margin].
+                # - Positions [margin:buf_len] are cleared for new events in the next chunk.
+                # - This ensures PSP decay tails and delayed spikes are preserved across chunks.
                 if chunk_size < buf_len:
-                    shift = buf_len - chunk_size
+                    shift = buf_len - chunk_size  # This equals the margin size
                     for ui in range(len(wave_buffers)):
                         wave = wave_buffers[ui]
-                        wave[:shift] = wave[chunk_size:]
-                        wave[shift:] = 0.0
+                        wave[:shift] = wave[chunk_size:]  # Preserve signal tails
+                        wave[shift:] = 0.0                # Clear remainder for new events
                         psp = psp_buffers[ui]
-                        psp[:shift] = psp[chunk_size:]
-                        psp[shift:] = 0.0
+                        psp[:shift] = psp[chunk_size:]    # Preserve PSP decay tails
+                        psp[shift:] = 0.0                 # Clear remainder for new PSPs
                 else:
+                    # Should not happen with proper margin, but handle gracefully
                     for ui in range(len(wave_buffers)):
                         wave_buffers[ui][:] = 0.0
                         psp_buffers[ui][:] = 0.0

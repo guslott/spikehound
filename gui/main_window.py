@@ -21,7 +21,6 @@ from shared.app_settings import AppSettings
 from core.conditioning import ChannelFilterSettings, FilterSettings
 from shared.models import ChunkPointer, EndOfStream
 from shared.ring_buffer import SharedRingBuffer
-from audio.player import AudioPlayer, AudioConfig
 from .analysis_dock import AnalysisDock
 from .settings_tab import SettingsTab
 from .scope_widget import ScopeWidget, ChannelConfig as ScopeChannelConfig
@@ -368,16 +367,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._dispatcher_signals: Optional[QtCore.QObject] = None
         self._drag_channel_id: Optional[int] = None
         self._active_channel_id: Optional[int] = None
-        # Audio monitoring pipeline (listen button -> AudioPlayer)
+        # Track which channel is being monitored (for UI state only, AudioManager handles actual routing)
         self._listen_channel_id: Optional[int] = None
-        self._audio_router_thread: Optional[threading.Thread] = None
-        self._audio_router_stop = threading.Event()
-        self._audio_player: Optional[AudioPlayer] = None
-        self._audio_player_queue: Optional["queue.Queue"] = None
-        self._audio_input_samplerate: float = 0.0
-        self._audio_player_buffer: Optional[SharedRingBuffer] = None
-        self._audio_lock = threading.Lock()
-        self._audio_current_device: Optional[object] = None
         self._listen_device_key: Optional[str] = None
         self._trigger_mode: str = "stream"
         self._trigger_channel_id: Optional[int] = None
@@ -814,7 +805,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.triggerConfigChanged.connect(controller.update_trigger_config)
 
         self._bind_dispatcher_signals()
-        self._ensure_audio_router()
         self._update_status(0)
         self._bind_app_settings_store()
 
@@ -1455,7 +1445,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
             self._dispatcher_signals = None
         self._clear_listen_channel()
-        self._stop_audio_router()
         self._reset_trigger_state()
         self.available_combo.clear()
         self.active_list.clear()
@@ -1843,9 +1832,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._listen_channel_id == channel_id:
                 self._clear_listen_channel(channel_id)
 
-    def _selected_output_device(self) -> Optional[str]:
-        return getattr(self, "_listen_device_key", None)
-
     def _open_analysis_for_channel(self, channel_id: int) -> None:
         dock = getattr(self, "_analysis_dock", None)
         if dock is None:
@@ -1892,204 +1878,37 @@ class MainWindow(QtWidgets.QMainWindow):
         if panel is not None:
             panel.set_config(cfg)
 
-        with self._audio_lock:
-            self._listen_channel_id = channel_id
+        # Track for UI state
+        self._listen_channel_id = channel_id
 
-        self._ensure_audio_router()
-        if not self._ensure_audio_player(show_error=True):
-            cfg.listen_enabled = False
-            if panel is not None:
-                panel.set_config(cfg)
-            with self._audio_lock:
-                self._listen_channel_id = None
-            return
-        self._flush_audio_player_queue()
+        #Use controller API to start audio monitoring
+        if self._controller:
+            self._controller.set_audio_monitoring(channel_id)
+            # Update active channels so AudioManager knows about them
+            if hasattr(self._controller, '_audio_manager') and self._controller._audio_manager:
+                self._controller._audio_manager.update_active_channels(self._channel_ids_current)
 
     def _clear_listen_channel(self, channel_id: Optional[int] = None) -> None:
         """Disable audio monitoring, optionally for a specific channel."""
         target = channel_id if channel_id is not None else self._listen_channel_id
         if target is None:
             return
+        
+        # Update UI state
         cfg = self._channel_configs.get(target)
         if cfg is not None and cfg.listen_enabled:
             cfg.listen_enabled = False
             panel = self._channel_panels.get(target)
             if panel is not None:
                 panel.set_config(cfg)
-        with self._audio_lock:
-            if self._listen_channel_id == target:
-                self._listen_channel_id = None
-                stop_audio = True
-            else:
-                stop_audio = False
-        if stop_audio:
-            self._stop_audio_player()
-
-    def _ensure_audio_router(self) -> None:
-        """Start the background thread that forwards dispatcher audio chunks when needed."""
-        if self._audio_router_thread is not None and self._audio_router_thread.is_alive():
-            return
-        self._audio_router_stop.clear()
-        thread = threading.Thread(target=self._audio_router_loop, name="AudioRouter", daemon=True)
-        thread.start()
-        self._audio_router_thread = thread
-
-    def _stop_audio_router(self) -> None:
-        """Stop the audio routing thread if it is currently running."""
-        if self._audio_router_thread is None:
-            return
-        self._audio_router_stop.set()
-        self._audio_router_thread.join(timeout=1.0)
-        self._audio_router_thread = None
-        self._audio_router_stop = threading.Event()
-
-    def _audio_router_loop(self) -> None:
-        """Pass audio pointers/chunks from the dispatcher audio queue into the AudioPlayer following listen selection."""
-        while not self._audio_router_stop.is_set():
-            try:
-                controller = self._controller
-                if controller is None:
-                    self._audio_router_stop.wait(0.1)
-                    continue
-                try:
-                    aq = getattr(self.runtime, "audio_queue", None)
-                    if aq is None:
-                        self._audio_router_stop.wait(0.1)
-                        continue
-                    item = aq.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                if item is EndOfStream:
-                    continue
-                with self._audio_lock:
-                    listen_id = self._listen_channel_id
-                if listen_id is None or listen_id not in self._channel_ids_current:
-                    continue
-                viz_buffer = self._controller.viz_buffer() if self._controller else None
-                if isinstance(item, ChunkPointer) and viz_buffer is None:
-                    continue
-                if not self._ensure_audio_player():
-                    continue
-                try:
-                    idx = self._channel_ids_current.index(listen_id)
-                except ValueError:
-                    continue
-                # Sync selected channel in the player
-                with self._audio_lock:
-                    player = self._audio_player
-                if player is not None:
-                    try:
-                        player.set_selected_channel(idx)
-                    except Exception:
-                        pass
-                # Forward the item (ChunkPointer or Chunk) to the player queue
-                # Evict oldest data if queue is full to keep audio fresh (reduce lag)
-                with self._audio_lock:
-                    player_queue = self._audio_player_queue
-                if player_queue is None:
-                    continue
-                try:
-                    player_queue.put_nowait(item)
-                except queue.Full:
-                    # Drop oldest item to make room for fresh data
-                    try:
-                        _ = player_queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                    # Try again with the evicted slot
-                    try:
-                        player_queue.put_nowait(item)
-                    except queue.Full:
-                        pass  # Still full, drop this item
-            except Exception:
-                continue
-
-    def _ensure_audio_player(self, *, show_error: bool = False) -> bool:
-        """Create or reconfigure the AudioPlayer to match the current listen stream."""
-        sample_rate = int(round(self._current_sample_rate))
-        if sample_rate <= 0:
-            return False
-        device_id = self._selected_output_device()
-        with self._audio_lock:
-            viz_buffer = self._controller.viz_buffer() if self._controller else None
-            if (
-                self._audio_player is not None
-                and abs(self._audio_input_samplerate - sample_rate) < 1e-6
-                and self._audio_current_device == device_id
-                and self._audio_player_buffer is viz_buffer
-            ):
-                return True
-            player_to_stop = self._audio_player
-            self._audio_player = None
-            self._audio_player_queue = None
-            self._audio_input_samplerate = 0.0
-            self._audio_current_device = None
-            self._audio_player_buffer = None
-        if player_to_stop is not None:
-            try:
-                player_to_stop.stop()
-                player_to_stop.join(timeout=1.0)
-            except Exception:
-                pass
-        queue_obj: "queue.Queue" = queue.Queue(maxsize=128)
-        config = AudioConfig(
-            out_samplerate=44_100,
-            out_channels=1,
-            device=device_id,
-            gain=0.7,
-            blocksize=512,
-            ring_seconds=0.5,
-        )
-        # Re-fetch current viz buffer each time to avoid stale references.
-        viz_buffer = self._controller.viz_buffer() if self._controller else None
-        try:
-            player = AudioPlayer(
-                audio_queue=queue_obj,
-                input_samplerate=sample_rate,
-                config=config,
-                selected_channel=0,
-                ring_buffer=viz_buffer,
-            )
-        except Exception as exc:
-            if show_error:
-                QtWidgets.QMessageBox.warning(self, "Audio Output", f"Unable to start audio output: {exc}")
-            return False
-        with self._audio_lock:
-            self._audio_player = player
-            self._audio_player_queue = queue_obj
-            self._audio_input_samplerate = float(sample_rate)
-            self._audio_current_device = device_id
-            self._audio_player_buffer = viz_buffer
-        self._audio_player.start()
-        return True
-
-    def _stop_audio_player(self) -> None:
-        with self._audio_lock:
-            player = self._audio_player
-            self._audio_player = None
-            self._audio_player_queue = None
-            self._audio_input_samplerate = 0.0
-            self._audio_current_device = None
-            self._audio_player_buffer = None
-        if player is None:
-            return
-        try:
-            player.stop()
-            player.join(timeout=1.0)
-        except Exception:
-            pass
-
-    def _flush_audio_player_queue(self) -> None:
-        """Drop any buffered audio frames so a new listen target starts immediately."""
-        with self._audio_lock:
-            q = self._audio_player_queue
-        if q is None:
-            return
-        try:
-            while True:
-                q.get_nowait()
-        except queue.Empty:
-            pass
+        
+        # Clear UI state tracking
+        if self._listen_channel_id == target:
+            self._listen_channel_id = None
+        
+        # Use controller API to stop audio monitoring
+        if self._controller:
+            self._controller.set_audio_monitoring(None)
 
     def _ensure_active_channel_focus(self) -> None:
         if self._channel_ids_current:
@@ -2362,8 +2181,6 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
         self._clear_listen_channel()
-        self._stop_audio_router()
-        self._stop_audio_player()
         if hasattr(self, "_analysis_dock") and self._analysis_dock is not None:
             self._analysis_dock.shutdown()
         super().closeEvent(event)
@@ -2804,8 +2621,6 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         self._update_status(viz_depth=0)
-        if self._listen_channel_id is not None:
-            self._ensure_audio_player()
         self._maybe_update_analysis_sample_rate(sample_rate)
 
     def _maybe_update_analysis_sample_rate(self, sample_rate: float) -> None:
@@ -3009,8 +2824,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
             self._render_trigger_display(channel_ids, window_sec)
             self._update_status(viz_depth=0)
-            if self._listen_channel_id is not None:
-                self._ensure_audio_player()
+
             return
 
         if self._trigger_mode == "single":
@@ -3021,8 +2835,7 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
             self._update_status(viz_depth=0)
-            if self._listen_channel_id is not None:
-                self._ensure_audio_player()
+
             return
 
         if self._trigger_mode == "continuous":

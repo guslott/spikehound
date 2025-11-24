@@ -52,14 +52,27 @@ class SpikeHoundRuntime:
         self.chunk_rate: float = 0.0
         self.plot_refresh_hz: float = 0.0
         self.sample_rate: float = 0.0
+        
+        # Initialize AudioManager and wire it to pipeline
+        from .audio_manager import AudioManager
+        audio_manager = AudioManager(runtime=self)
+        if pipeline is not None:
+            pipeline._audio_manager = audio_manager
+            audio_manager.start()  # Start audio routing thread
 
     def set_pipeline(self, controller: Optional["PipelineController"]) -> None:
         """Update the underlying pipeline controller used for delegation."""
         self._pipeline = controller
-        self.dispatcher = getattr(controller, "dispatcher", None) if controller is not None else None
-        self.visualization_queue = getattr(controller, "visualization_queue", None) if controller is not None else None
-        self.audio_queue = getattr(controller, "audio_queue", None) if controller is not None else None
-        self.logging_queue = getattr(controller, "logging_queue", None) if controller is not None else None
+        if controller is not None:
+            self.dispatcher = controller.dispatcher
+            self.visualization_queue = controller.visualization_queue
+            self.audio_queue = controller.audio_queue
+            self.logging_queue = controller.logging_queue
+    
+    @property
+    def controller(self) -> Optional["PipelineController"]:
+        """Get the underlying pipeline controller."""
+        return self._pipeline
 
     def __getattr__(self, name: str):
         """
