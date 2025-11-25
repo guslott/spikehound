@@ -218,7 +218,7 @@ class PipelineController:
         self,
         *,
         filter_settings: Optional[FilterSettings] = None,
-        visualization_queue_size: int = 256,
+        visualization_queue_size: int = 1024,
         audio_queue_size: int = 256,
         logging_queue_size: int = 512,
         dispatcher_poll_timeout: float = 0.05,
@@ -552,31 +552,45 @@ class PipelineController:
     def set_active_channels(self, channel_ids: Sequence[int]) -> None:
         with self._lock:
             self._active_channel_ids = list(channel_ids)
-            if self._dispatcher is not None:
-                info_map = {info.id: info for info in self._channel_infos}
-                ordered_infos = [info_map[cid] for cid in self._active_channel_ids if cid in info_map]
-                names = [info.name for info in ordered_infos]
-                self._dispatcher.set_channel_layout(self._active_channel_ids, names)
-                self._dispatcher.set_active_channels(self._active_channel_ids)
+
             if self._source is not None:
+                # Stop source to ensure clean reconfiguration
+                was_running = self._source.running
+                if was_running:
+                    self._source.stop()
+                    
                 try:
+                    # STRICT: Only enable the requested channels at the source level
+                    # This ensures the source only emits data for what we want
                     self._source.set_active_channels(self._active_channel_ids)
                 except Exception:
                     pass
-                # Rewire dispatcher to the source buffer in case channel changes resized it.
+                    
+                # Rewire dispatcher to the source buffer (it may have been replaced/resized)
                 if self._dispatcher is not None and hasattr(self._source, 'ring_buffer') and self._source.ring_buffer is not None:
                     try:
                         sr = self._actual_config.sample_rate if self._actual_config is not None else None
                         self._dispatcher.set_source_buffer(self._source.get_buffer(), sample_rate=sr)
                     except Exception as exc:
                         logger.debug("Could not re-link source buffer on channel change: %s", exc)
+                
+                # Restart if it was running
+                if was_running:
+                    self._source.start()
+                    self._start_streaming_locked() # Ensure dispatcher is also running/ready
 
-            if self._active_channel_ids and self._dispatcher is not None and self._source is not None:
-                if not self._streaming:
-                    self._start_streaming_locked()
-            else:
-                if self._streaming:
-                    self._stop_streaming_locked()
+            # CRITICAL: Call set_channel_layout AFTER the source and buffer are configured
+            # This ensures the Dispatcher's channel IDs match the actual buffer shape
+            if self._dispatcher is not None:
+                active_names = [info.name for info in self._channel_infos if info.id in self._active_channel_ids]
+                self._dispatcher.set_channel_layout(self._active_channel_ids, active_names)
+                self._dispatcher.set_active_channels(self._active_channel_ids)
+
+            # If we weren't running but have channels, ensure streaming state is correct
+            if self._active_channel_ids and not self._streaming and self._source and self._source.running:
+                 self._start_streaming_locked()
+            elif not self._active_channel_ids and self._streaming:
+                 self._stop_streaming_locked()
 
     def clear_active_channels(self) -> None:
         self.set_active_channels([])
@@ -744,10 +758,10 @@ class PipelineController:
         if self._dispatcher is None or self._source is None:
             return
         try:
-            info_map = {info.id: info for info in self._channel_infos}
-            ordered_infos = [info_map[cid] for cid in self._active_channel_ids if cid in info_map]
-            names = [info.name for info in ordered_infos]
-            self._dispatcher.set_channel_layout(self._active_channel_ids, names)
+            # Always set the FULL layout to match the source
+            full_ids = [info.id for info in self._channel_infos]
+            full_names = [info.name for info in self._channel_infos]
+            self._dispatcher.set_channel_layout(full_ids, full_names)
             self._dispatcher.set_active_channels(self._active_channel_ids)
             self._dispatcher.start()
         except Exception:

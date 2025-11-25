@@ -198,8 +198,8 @@ class BaseSource(ABC):
             self._dtype = actual.dtype
             # Store the echo so GUI can query it directly
             self.config = actual
-            # Allocate a shared ring buffer sized for ~10 seconds of data
-            capacity = max(int(actual.sample_rate * 10), actual.chunk_size)
+            # Allocate a shared ring buffer sized for ~30 seconds of data
+            capacity = max(int(actual.sample_rate * 30), actual.chunk_size)
             if capacity <= 0:
                 raise ValueError("computed ring buffer capacity must be positive")
             n_channels = len(self._active_channel_ids)
@@ -288,6 +288,11 @@ class BaseSource(ABC):
                 capacity = rb.capacity
                 dtype = rb._data.dtype  # type: ignore[attr-defined]  # internal dtype reuse
                 self.ring_buffer = SharedRingBuffer(shape=(desired_channels, capacity), dtype=dtype)
+                
+                # CRITICAL: Clear the queue of any pointers to the old buffer
+                # This prevents the consumer from trying to read from a replaced/closed buffer
+                with self.data_queue.mutex:
+                    self.data_queue.queue.clear()
 
     def get_active_channels(self) -> List[ChannelInfo]:
         with self._channel_lock:
@@ -482,26 +487,16 @@ class BaseSource(ABC):
             except queue.Empty:
                 pass
 
-    def _safe_put(self, item: ChunkPointer) -> None:
-        """
-        Central backpressure policy: drop-oldest, then try once more.
-        Keeps memory bounded and UI responsive under bursts.
-        """
+    def _safe_put(self, ptr: ChunkPointer) -> None:
+        """Enqueue chunk pointer with BLOCKING to ensure lossless data flow."""
         try:
-            self.data_queue.put_nowait(item)
+            # BLOCKING MODE: Wait up to 10 seconds. If still full, something is seriously wrong.
+            self.data_queue.put(ptr, block=True, timeout=10.0)
         except queue.Full:
-            # Drop the oldest and try once more
-            try:
-                _ = self.data_queue.get_nowait()
-                self._drops += 1
-            except queue.Empty:
-                # Race: became empty; ignore
-                pass
-            try:
-                self.data_queue.put_nowait(item)
-            except queue.Full:
-                # If still full, give up silently (we already counted a drop for the eviction).
-                pass
+            # This should NEVER happen with blocking mode - indicates deadlock or stuck consumer
+            print(f"\n!!! CRITICAL ERROR: Source data_queue BLOCKED for 10+ seconds !!!")
+            print(f"!!! Consumer (Dispatcher) is not keeping up - system deadlocked !!!")
+            raise RuntimeError("Source data_queue blocked - lossless constraint violated")
 
     def _assert_state(self, expected: Iterable[State]) -> None:
         if self._state not in expected:

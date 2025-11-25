@@ -127,6 +127,11 @@ class Dispatcher:
         if sample_rate is not None and sample_rate <= 0:
             raise ValueError("sample_rate must be positive")
         with self._ring_lock:
+            # Check if buffer or sample rate actually changed
+            if self._source_buffer is buffer and (sample_rate is None or self._sample_rate == float(sample_rate)):
+                # Buffer is identical, no need to reset
+                return
+
             self._source_buffer = buffer
             if sample_rate is not None:
                 self._sample_rate = float(sample_rate)
@@ -147,13 +152,22 @@ class Dispatcher:
 
     def set_channel_layout(self, channel_ids: Sequence[int], channel_names: Sequence[str]) -> None:
         with self._ring_lock:
-            self._channel_ids = tuple(channel_ids)
-            self._channel_names = tuple(channel_names)
+            new_ids = tuple(channel_ids)
+            new_names = tuple(channel_names)
+            
+            # Only reset if layout actually changed - prevents unnecessary buffer resets
+            # that would truncate PSP tails spanning multiple chunks
+            if new_ids == self._channel_ids and new_names == self._channel_names:
+                # logger.info("Layout unchanged, skipping reset")
+                return
+                
+            self._channel_ids = new_ids
+            self._channel_names = new_names
             self._channel_index_map = {cid: idx for idx, cid in enumerate(self._channel_ids)}
             channels = len(self._channel_ids) if self._channel_ids else len(self._channel_names)
             min_capacity = self._source_buffer.capacity if self._source_buffer is not None else 1
             self._ensure_viz_buffer_locked(channels or 1, min_capacity=min_capacity)
-            self._reset_viz_counters_locked()
+            self._reset_viz_counters_locked() # Log this call?
 
     def reset_buffers(self) -> None:
         with self._ring_lock:
@@ -266,7 +280,11 @@ class Dispatcher:
             return None
 
         with self._ring_lock:
+            # Only reset channel IDs if the COUNT mismatches.
+            # If the count matches, we trust the IDs set by set_channel_layout().
+            # This allows non-contiguous IDs (e.g. [0, 2]) to persist.
             if not self._channel_ids or len(self._channel_ids) != raw.shape[0]:
+                # Fallback: if count is wrong, we have to reset to default indices
                 self._channel_ids = tuple(range(raw.shape[0]))
                 self._channel_index_map = {cid: idx for idx, cid in enumerate(self._channel_ids)}
                 self._channel_names = tuple(str(idx) for idx in range(raw.shape[0]))
@@ -322,7 +340,8 @@ class Dispatcher:
         return raw_chunk, filtered_chunk, viz_pointer
 
     def _fan_out(self, raw_chunk: Chunk, filtered_chunk: Chunk, viz_pointer: ChunkPointer) -> None:
-        self._enqueue(self._logging_queue, raw_chunk, "logging")
+        # DISABLED: Logging queue disabled until explicit data logging feature is added
+        # self._enqueue(self._logging_queue, raw_chunk, "logging")
         for name, out_queue in self._output_queues.items():
             if name in ("visualization", "audio"):
                 self._enqueue(out_queue, viz_pointer, name)
@@ -358,26 +377,39 @@ class Dispatcher:
                     self._stats.forwarded["analysis"] += 1
 
     def _enqueue(self, target_queue: queue.Queue, item: object, queue_name: str) -> None:
-        try:
-            target_queue.put_nowait(item)
-        except queue.Full:
-            with self._stats_lock:
-                self._stats.evicted[queue_name] += 1
-            try:
-                _ = target_queue.get_nowait()
-            except queue.Empty:
-                pass
+        """Enqueue with blocking for critical queues (visualization), non-blocking for logging."""
+        # Logging is not critical - use drop-oldest policy
+        if queue_name == "logging":
             try:
                 target_queue.put_nowait(item)
             except queue.Full:
-                with self._stats_lock:
-                    self._stats.dropped[queue_name] += 1
+                # Drop oldest and try again (non-blocking for logging)
+                try:
+                    target_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    target_queue.put_nowait(item)
+                except queue.Full:
+                    pass  # Give up silently
             else:
                 with self._stats_lock:
                     self._stats.forwarded[queue_name] += 1
         else:
-            with self._stats_lock:
-                self._stats.forwarded[queue_name] += 1
+            # Visualization and audio are CRITICAL - use blocking mode
+            try:
+                # BLOCKING MODE: Wait up to 10 seconds. If still full, fatal error.
+                target_queue.put(item, block=True, timeout=10.0)
+            except queue.Full:
+                # This should NEVER happen - indicates consumer deadlock
+                print(f"\n!!! CRITICAL ERROR: Dispatcher queue '{queue_name}' BLOCKED for 10+ seconds !!!")
+                print(f"!!! Consumer is not keeping up - system deadlocked !!!")
+                with self._stats_lock:
+                    self._stats.evicted[queue_name] += 1
+                raise RuntimeError(f"Dispatcher queue '{queue_name}' blocked - lossless constraint violated")
+            else:
+                with self._stats_lock:
+                    self._stats.forwarded[queue_name] += 1
 
     def _broadcast_end_of_stream(self) -> None:
         # Deliver sentinel to all downstream queues, draining oldest entries if needed
@@ -439,6 +471,7 @@ class Dispatcher:
             capacity = self.viz_buffer.capacity
             window_samples = int(max(1, min(capacity, self._window_sec * sample_rate)))
             window_samples = min(window_samples, self._filled)
+            
             if window_samples <= 0:
                 return self._empty_payload(status)
 
@@ -577,9 +610,18 @@ class Dispatcher:
         capacity = self.viz_buffer.capacity
         if capacity <= 0:
             return
-        # Reset if there is a gap in samples.
+        # If we have a gap in samples, we must reset the visualization buffer
+        # to avoid plotting a straight line across the gap.
+        # Detect gaps - STRICT MODE: This should NEVER happen in lossless mode
         if self._filled > 0 and start_sample != self._latest_sample_index + 1:
+            gap_size = start_sample - (self._latest_sample_index + 1)
+            print(f"\n!!! SAMPLE GAP DETECTED !!!")
+            print(f"!!! Expected sample: {self._latest_sample_index + 1}, Got: {start_sample}, Gap: {gap_size} samples !!!")
+            print(f"!!! This indicates data loss or reordering - LOSSLESS CONSTRAINT VIOLATED !!!")
+            self._stats.sample_gaps += 1
             self._reset_viz_counters_locked()
+            raise RuntimeError(f"Sample gap detected: expected {self._latest_sample_index + 1}, got {start_sample} (gap={gap_size})")
+            
         end_sample = start_sample + frames - 1
         self._write_idx = (start_idx + frames) % capacity
         self._filled = min(capacity, self._filled + frames)
@@ -589,15 +631,15 @@ class Dispatcher:
         self._write_idx = 0
         self._filled = 0
         self._latest_sample_index = -1
-        self._next_start_sample = 0
-        self._next_seq = 0
+        # if self.viz_buffer is not None:
+        #     self.viz_buffer.clear() # SharedRingBuffer has no clear method, but resetting _filled is enough
 
     def _compute_viz_capacity(self) -> int:
         if self._sample_rate is not None and self._sample_rate > 0:
             sr = float(self._sample_rate)
             window_len = int(max(sr * max(self._window_sec, 1e-3) * 2, 1))
-            ten_sec = int(max(sr * 10.0, 1))
-            return max(window_len, ten_sec)
+            thirty_sec = int(max(sr * 30.0, 1))
+            return max(window_len, thirty_sec)
         return max(1, self.viz_buffer.capacity if self.viz_buffer is not None else 1)
 
     def _empty_payload(self, status: Optional[dict] = None) -> dict:

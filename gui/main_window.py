@@ -1558,8 +1558,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._emit_trigger_config()
         if ids:
             self.configure_acquisition(channels=ids)
+            # Ensure acquisition is started if we have active channels and a device
+            if self._device_connected:
+                self.start_acquisition()
         else:
             self.configure_acquisition(channels=[])
+            # Stop acquisition if no channels are active
+            self.stop_acquisition()
         self._update_sample_rate_enabled()
         dock = getattr(self, "_analysis_dock", None)
         if dock is not None:
@@ -2646,11 +2651,25 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if not self._trigger_history:
             self._trigger_history = deque()
+        
+        # Check for channel count mismatch
+        if self._trigger_history:
+            last_chunk = self._trigger_history[-1]
+            if last_chunk.shape[1] != chunk_samples.shape[1]:
+                print(f"Trigger history channel mismatch: had {last_chunk.shape[1]}, got {chunk_samples.shape[1]}. Resetting history.")
+                self._trigger_history.clear()
+                self._trigger_history_length = 0
+                self._trigger_history_total = 0
+                self._trigger_max_chunk = 0
+                
         self._trigger_history.append(chunk_samples)
         self._trigger_history_length += chunk_samples.shape[0]
         self._trigger_history_total += chunk_samples.shape[0]
         self._trigger_max_chunk = max(self._trigger_max_chunk, chunk_samples.shape[0])
-        max_keep = max(self._trigger_window_samples + self._trigger_max_chunk, self._trigger_window_samples + chunk_samples.shape[0])
+        # Keep 3x the trigger window to prevent evicting PSP tails before capture finalizes
+        # OLD: max_keep = max(self._trigger_window_samples + self._trigger_max_chunk, ...)
+        # This was too aggressive and evicted PSP tail chunks before finalization!
+        max_keep = self._trigger_window_samples * 3
         while self._trigger_history_length > max_keep and self._trigger_history:
             left = self._trigger_history.popleft()
             self._trigger_history_length -= left.shape[0]
@@ -2692,19 +2711,90 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._trigger_capture_start_abs is None or self._trigger_capture_end_abs is None:
             return
         if self._trigger_history_total < self._trigger_capture_end_abs:
+            # Waiting for more data...
             return
         if not self._trigger_history:
             return
+            
+        # Calculate absolute range we need
         earliest_abs = self._trigger_history_total - self._trigger_history_length
         start_abs = max(self._trigger_capture_start_abs, earliest_abs)
-        start_idx = start_abs - earliest_abs
+        end_abs = start_abs + self._trigger_window_samples
+        
+        # Efficiently collect only the relevant chunks
+        relevant_chunks = []
+        current_abs = earliest_abs
+        
+        for chunk in self._trigger_history:
+            chunk_len = chunk.shape[0]
+            chunk_end = current_abs + chunk_len
+            
+            # Check if this chunk overlaps with [start_abs, end_abs]
+            if chunk_end > start_abs and current_abs < end_abs:
+                relevant_chunks.append(chunk)
+                
+            current_abs += chunk_len
+            
+            # Optimization: Stop if we've passed the end of the requested window
+            if current_abs >= end_abs:
+                break
+                
+        if not relevant_chunks:
+            return
+
+        # Concatenate only the relevant chunks
+        data = np.concatenate(relevant_chunks, axis=0)
+        
+        # Adjust indices relative to the concatenated 'data' buffer
+        # The 'data' buffer starts at the 'current_abs' of the first chunk in relevant_chunks
+        first_chunk_start_abs = start_abs  # Fallback
+        
+        # Re-calculate the absolute start of the first chunk we grabbed
+        # We need to find the start_abs of relevant_chunks[0]
+        # We can do this by backtracking or just being smarter above.
+        # Let's just use the offset logic:
+        
+        # Find the absolute start of the first chunk in the list
+        # We know 'earliest_abs' is the start of the *entire* history.
+        # We need to find the offset of relevant_chunks[0] from earliest_abs.
+        # Actually, let's just re-calculate it properly.
+        
+        # Simpler approach: Concatenate everything (it's safe now that we only grabbed relevant ones)
+        # But we need to know where 'data' starts in absolute terms to slice it correctly.
+        
+        # Let's find the absolute start of relevant_chunks[0]
+        scan_abs = earliest_abs
+        data_start_abs = earliest_abs # Default
+        found_start = False
+        for chunk in self._trigger_history:
+            if chunk is relevant_chunks[0]:
+                data_start_abs = scan_abs
+                found_start = True
+                break
+            scan_abs += chunk.shape[0]
+            
+        if not found_start:
+            # Should never happen
+            return
+            
+        # Now slice 'data' to get exactly [start_abs, end_abs]
+        # relative_start = start_abs - data_start_abs
+        start_idx = start_abs - data_start_abs
         end_idx = start_idx + self._trigger_window_samples
-        data = np.concatenate(list(self._trigger_history), axis=0)
+        
+        # DIAGNOSTIC: Check for truncation
         if end_idx > data.shape[0]:
+            missing_samples = end_idx - data.shape[0]
+            print(f"!!! TRIGGER TRUNCATION: requested {end_idx} samples, only have {data.shape[0]}, missing {missing_samples} samples")
+            print(f"!!! This explains PSP tail truncation in trigger mode!")
             end_idx = data.shape[0]
         snippet = data[start_idx:end_idx]
         if snippet.shape[0] < self._trigger_window_samples:
             pad = self._trigger_window_samples - snippet.shape[0]
+            missing_ms = (pad / self._trigger_last_sample_rate) * 1000 if self._trigger_last_sample_rate > 0 else 0
+            print(f"!!! TRIGGER PADDING: snippet has {snippet.shape[0]} samples, need {self._trigger_window_samples}, padding {pad} samples ({missing_ms:.1f}ms)")
+            print(f"!!! This explains PSP truncation - trigger finalized before PSP tail arrived!")
+            print(f"!!! History stats: total={self._trigger_history_total}, length={self._trigger_history_length}, data.shape={data.shape}")
             if snippet.shape[0] > 0:
                 last_row = snippet[-1:]
             else:
@@ -2873,11 +2963,27 @@ class MainWindow(QtWidgets.QMainWindow):
             samples = payload.get("samples")
             times = payload.get("times")
 
-        # Always drain the queue to keep it from growing, but prefer the tick payload
-        # for plotting since it already represents a windowed view.
+        # Always drain the queue to keep it from growing.
         queue_pointers = self._drain_visualization_queue()
         has_samples = samples is not None and not (isinstance(samples, np.ndarray) and samples.size == 0)
-        if not has_samples and queue_pointers:
+        
+        # Logic to decide source:
+        # 1. If in Trigger Mode (single/continuous), we MUST use queue_pointers (chunks) to build history correctly.
+        #    We must NEVER use the window payload (samples) because it's a snapshot, not a stream, and will cause
+        #    overlaps, duplicates, and channel count mismatches (oscillation).
+        # 2. If in Stream Mode, we prefer the payload (window) for smooth display, unless it's missing.
+        use_pointers = False
+        if self._trigger_mode != "stream":
+            # STRICT: Only use pointers. If no pointers, we have no new stream data.
+            # Do NOT fall back to samples.
+            use_pointers = True
+            # CRITICAL: Discard samples to prevent fallback in the 'else' block below
+            samples = None
+            times = None
+        elif not has_samples and queue_pointers:
+            use_pointers = True
+            
+        if use_pointers:
             pointers = queue_pointers
 
         viz_buffer = self._controller.viz_buffer() if self._controller else None
@@ -2893,7 +2999,9 @@ class MainWindow(QtWidgets.QMainWindow):
             for ptr in pointers:
                 try:
                     block = np.asarray(viz_buffer.read(ptr.start_index, ptr.length), dtype=np.float32)
-                except Exception:
+                except Exception as e:
+                    print(f"!!! VIZ_BUFFER READ FAILED: start_index={ptr.start_index}, length={ptr.length}, error={e}")
+                    print(f"!!! This explains PSP truncation - chunk was overwritten before GUI could read it!")
                     continue
                 if block.size == 0:
                     continue
@@ -2907,7 +3015,9 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 times_arr = np.zeros(data.shape[1], dtype=np.float32)
             if not channel_ids:
-                channel_ids = self._channel_ids_current or list(range(data.shape[0]))
+                # When using pointers, channel_ids might not be in the payload.
+                # Prioritize the cached user selection to preserve non-contiguous IDs.
+                channel_ids = self._channel_ids_current if self._channel_ids_current else list(range(data.shape[0]))
             if not channel_names:
                 channel_names = [str(cid) for cid in channel_ids]
         else:
