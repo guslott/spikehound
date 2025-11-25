@@ -75,18 +75,28 @@ class SimulatedPhysiologySource(BaseSource):
           distal amplitude ratio, conduction velocity, synaptic delay, and PSP gain.
         - Buffers store generated waveforms and unit impulses (soma events).
         """
-        # PSP kernel (alpha function)
+        # PSP kernel (alpha function) - 20ms duration
         psp_len = int(0.020 * sample_rate)
         t_psp = np.linspace(0, 5, psp_len)
         self._psp_template = t_psp * np.exp(-t_psp)
         self._psp_template /= np.max(self._psp_template)
-        # Extend tail to ensure the waveform decays smoothly to zero so it does not
-        # step down at chunk boundaries.
-        tail = float(self._psp_template[-1])
-        while tail > 1e-4:
-            tail *= 0.5
-            self._psp_template = np.append(self._psp_template, tail)
-        self._psp_template = np.append(self._psp_template, 0.0).astype(np.float32, copy=False)
+        
+        # Subtract the endpoint value to shift the baseline so it ends at zero
+        endpoint_value = self._psp_template[-1]
+        self._psp_template -= endpoint_value
+        
+        # Trim the beginning where values are <= 0 (below the shifted baseline)
+        # Find the first index where the signal goes positive
+        positive_indices = np.where(self._psp_template > 0)[0]
+        if positive_indices.size > 0:
+            start_idx = positive_indices[0]
+            self._psp_template = self._psp_template[start_idx:]
+        
+        # Ensure exact zero at start and end
+        self._psp_template[0] = 0.0
+        self._psp_template[-1] = 0.0
+        
+        self._psp_template = self._psp_template.astype(np.float32, copy=False)
         self._psp_len = len(self._psp_template)
 
         self._units.clear()
