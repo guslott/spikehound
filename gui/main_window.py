@@ -1525,6 +1525,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_channel_buttons()
         self._publish_active_channels()
         self._emit_trigger_config()
+        
+        # FIX: Decrement color index so re-added channels reuse the released color slot.
+        if self._next_color_index > 0:
+            self._next_color_index -= 1
 
     def _publish_active_channels(self) -> None:
         infos = []
@@ -1585,13 +1589,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def _ensure_channel_config(self, channel_id: int, channel_name: str) -> ChannelConfig:
         config = self._channel_configs.get(channel_id)
         if config is None:
+            color = self._next_channel_color()
+            # print(f"Creating NEW config for ch{channel_id}, color={color}")
             config = ChannelConfig(
-                color=self._next_channel_color(),
+                color=color,
                 channel_name=channel_name,
                 screen_offset=self._initial_screen_offset(),
             )
             self._channel_configs[channel_id] = config
         else:
+            # print(f"Reusing config for ch{channel_id}, existing color={config.color}")
             config.channel_name = channel_name
         return config
 
@@ -1636,7 +1643,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.channel_opts_stack.removeWidget(panel)
             panel.deleteLater()
         self._channel_panels.clear()
-        self._channel_configs.clear()
+        # Don't clear _channel_configs - configs should persist so channels maintain
+        # their color/settings when re-added. Configs are cleared on device disconnect.
         self._channel_last_samples.clear()
         self._channel_display_buffers.clear()
         self._show_channel_panel(None)
@@ -2526,6 +2534,26 @@ class MainWindow(QtWidgets.QMainWindow):
     def _ensure_curves_for_ids(self, channel_ids: Sequence[int], channel_names: Sequence[str]) -> None:
         """Synchronize the pyqtgraph PlotCurveItems with the current active channel list."""
         plot_item = self.plot_widget.getPlotItem()
+        
+        # If no channels, clear everything and return
+        if not channel_ids:
+            # Remove all tracked curves
+            for cid, curve in list(self._curve_map.items()):
+                plot_item.removeItem(curve)
+            self._curve_map.clear()
+            self._channel_display_buffers.clear()
+            self._curves = []
+            self._channel_names = []
+            self._channel_ids_current = []
+            # Clear all curve items from the plot (in case of orphans)
+            for item in plot_item.listDataItems():
+                if isinstance(item, pg.PlotCurveItem):
+                    plot_item.removeItem(item)
+            self._update_plot_y_range()
+            # Force plot update
+            plot_item.update()
+            return
+        
         # Remove curves that are no longer needed
         for cid, curve in list(self._curve_map.items()):
             if cid not in channel_ids:
@@ -2541,6 +2569,7 @@ class MainWindow(QtWidgets.QMainWindow):
             config = self._ensure_channel_config(cid, name)
             curve = self._curve_map.get(cid)
             if curve is None:
+                # print(f"Creating NEW curve for ch{cid}, color={config.color}")
                 curve = pg.PlotCurveItem(pen=pg.mkPen(config.color, width=2.0))
                 try:
                     curve.setDownsampling(ds=True, auto=True, method="peak")
@@ -2549,13 +2578,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 plot_item.addItem(curve)
                 self._curve_map[cid] = curve
             else:
+                # print(f"Reusing curve for ch{cid}, updating color to {config.color}")
                 curve.setPen(pg.mkPen(config.color, width=2.0))
             self._curves.append(curve)
 
-        if not self._channel_ids_current:
-            self._update_plot_y_range()
-            return
-
+        # Force plot update after curve changes
+        plot_item.update()
         self._refresh_channel_layout()
 
     def _process_streaming(
@@ -2607,6 +2635,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._channel_display_buffers[cid] = buf
                 buf[:] = self._transform_to_screen(raw, config.vertical_span_v, config.screen_offset)
                 curve.setData(times_arr, buf, skipFiniteCheck=True)
+                # if idx == 0 and should_redraw:  # Only log first curve to reduce spam
+                #     print(f"Set data for ch{cid}: {len(buf)} samples, enabled={config.display_enabled}")
             else:
                 if should_redraw:
                     curve.clear()
@@ -3029,8 +3059,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._register_chunk(data)
 
-        if channel_ids != self._channel_ids_current:
-            self._ensure_curves_for_ids(channel_ids, channel_names)
+        # FIX: Do not blindly trust the payload's channel_ids, as they may be stale (race condition).
+        # Instead, filter the incoming data to only include channels that are currently active in the GUI.
+        # This prevents "ghost traces" where a removed channel reappears because a lingering packet arrived.
+        
+        # 1. Identify which indices in the payload correspond to currently active channels
+        active_set = set(self._channel_ids_current)
+        valid_indices = [i for i, cid in enumerate(channel_ids) if cid in active_set]
+        
+        # 2. Filter channel_ids and data/names to match
+        if len(valid_indices) < len(channel_ids):
+            channel_ids = [channel_ids[i] for i in valid_indices]
+            if channel_names:
+                channel_names = [channel_names[i] for i in valid_indices]
+            if data.shape[0] > 0:
+                data = data[valid_indices]
+
+        # 3. Do NOT call _ensure_curves_for_ids here. The GUI (DeviceControlWidget) is the source of truth
+        #    for what channels should exist. The dispatcher just feeds data.
+        # if channel_ids != self._channel_ids_current:
+        #    self._ensure_curves_for_ids(channel_ids, channel_names)
 
         if not self._curves:
             self.plot_widget.getPlotItem().setXRange(0, max(window_sec, 0.001), padding=0)

@@ -155,11 +155,13 @@ class SpikeHoundRuntime:
             controller.stop(join=True)
         except Exception:
             pass
-        try:
-            controller.detach_device()
-        except Exception:
-            pass
-        self.daq_source = None
+        # FIX: Do not detach device here. MainWindow calls this when channels are empty,
+        # but we want to keep the device open so we can resume later when channels are added.
+        # try:
+        #     controller.detach_device()
+        # except Exception:
+        #     pass
+        # self.daq_source = None
 
     def attach_source(self, driver: BaseSource, sample_rate: float, channels) -> None:
         """Attach a connected driver to the pipeline controller."""
