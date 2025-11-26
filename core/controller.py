@@ -9,11 +9,11 @@ import numpy as np
 from PySide6 import QtCore
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from daq.base_source import ActualConfig, BaseSource, ChannelInfo
+    from daq.base_device import ActualConfig, BaseDevice, ChannelInfo
     from daq.registry import DeviceDescriptor
 else:  # pragma: no cover - runtime fallback
     ActualConfig = Any
-    BaseSource = Any
+    BaseDevice = Any
     ChannelInfo = Any
     DeviceDescriptor = Any
 
@@ -50,7 +50,7 @@ class DeviceManager(QtCore.QObject):
         self._descriptors: Dict[str, DeviceDescriptor] = {}
         self._device_entries: Dict[str, Dict[str, object]] = {}
         self._active_key: Optional[str] = None
-        self._driver: Optional[BaseSource] = None
+        self._driver: Optional[BaseDevice] = None
         self._channels: List[ChannelInfo] = []
         self._list_all_audio_devices = False
         self.refresh_devices()
@@ -130,7 +130,7 @@ class DeviceManager(QtCore.QObject):
     def get_device_list(self) -> List[DeviceDescriptor]:
         return list(self._descriptors.values())
 
-    def connect_device(self, device_key: str, sample_rate: float, *, chunk_size: int = 1024, **driver_kwargs) -> BaseSource:
+    def connect_device(self, device_key: str, sample_rate: float, *, chunk_size: int = 1024, **driver_kwargs) -> BaseDevice:
         self.disconnect_device()
 
         entry = self._device_entries.get(device_key)
@@ -207,7 +207,7 @@ class DeviceManager(QtCore.QObject):
     def active_key(self) -> Optional[str]:
         return self._active_key
 
-    def current_driver(self) -> Optional[BaseSource]:
+    def current_driver(self) -> Optional[BaseDevice]:
         return self._driver
 
 
@@ -234,7 +234,7 @@ class PipelineController:
 
         self._dispatcher_timeout = dispatcher_poll_timeout
         self._dispatcher: Optional[Dispatcher] = None
-        self._source: Optional[BaseSource] = None
+        self._source: Optional[BaseDevice] = None
         self._actual_config: Optional[ActualConfig] = None
         self._device_id: Optional[str] = None
         self._configure_kwargs: Dict[str, Any] = {}
@@ -258,7 +258,7 @@ class PipelineController:
         return self._running
 
     @property
-    def source(self) -> Optional[BaseSource]:
+    def source(self) -> Optional[BaseDevice]:
         return self._source
 
     @property
@@ -333,7 +333,7 @@ class PipelineController:
 
     def switch_source(
         self,
-        source_cls: Type[BaseSource],
+        source_cls: Type[BaseDevice],
         *,
         device_id: Optional[str] = None,
         configure_kwargs: Optional[Dict[str, Any]] = None,
@@ -489,7 +489,7 @@ class PipelineController:
             self._dispatcher.set_trigger_config(trigger_conf, sample_rate)
             self._dispatcher.set_window_duration(trigger_conf.window_sec)
 
-    def attach_source(self, driver: BaseSource, sample_rate: float, channels: Sequence[ChannelInfo]) -> None:
+    def attach_source(self, driver: BaseDevice, sample_rate: float, channels: Sequence[ChannelInfo]) -> None:
         with self._lock:
             self._stop_streaming_locked()
             self._destroy_dispatcher()

@@ -13,8 +13,8 @@ except Exception as e:  # pragma: no cover
     sd = None
     _IMPORT_ERROR = e
 
-from .base_source import (
-    BaseSource,
+from .base_device import (
+    BaseDevice,
     Chunk,
     DeviceInfo,
     ChannelInfo,
@@ -32,7 +32,7 @@ class AudioDevice:
     default_samplerate: float
 
 
-class SoundCardSource(BaseSource):
+class SoundCardSource(BaseDevice):
     """
     Audio input DAQ using PortAudio via `sounddevice`.
 

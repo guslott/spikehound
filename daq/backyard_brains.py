@@ -15,7 +15,7 @@ try:
 except ImportError:
     serial = None
 
-from daq.base_source import ActualConfig, BaseSource, Capabilities, ChannelInfo, Chunk, DeviceInfo
+from daq.base_device import ActualConfig, BaseDevice, Capabilities, ChannelInfo, Chunk, DeviceInfo
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -47,7 +47,7 @@ _MSG_START = bytes([0xFF, 0xFF, 0x01, 0x01, 0x80, 0xFF])
 _MSG_END = bytes([0xFF, 0xFF, 0x01, 0x01, 0x81, 0xFF])
 
 
-class BackyardBrainsSource(BaseSource):
+class BackyardBrainsSource(BaseDevice):
     """
     Driver for Backyard Brains SpikerBox devices (Neuron, Muscle, Plant, etc.)
     communicating via USB Serial (CDC).

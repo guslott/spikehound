@@ -167,7 +167,7 @@ if TYPE_CHECKING:
     from analysis.settings import AnalysisSettingsStore
     from core.controller import PipelineController
     from shared.event_buffer import EventRingBuffer
-    from daq.base_source import ChannelInfo
+    from daq.base_device import ChannelInfo
 
 
 class ClusterRectROI(pg.ROI):

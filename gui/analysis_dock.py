@@ -8,7 +8,7 @@ from .analysis_tab import AnalysisTab
 from analysis.analysis_worker import AnalysisWorker
 
 if TYPE_CHECKING:
-    from daq.base_source import ChannelInfo
+    from daq.base_device import ChannelInfo
 
 
 class AnalysisDock(QtWidgets.QDockWidget):

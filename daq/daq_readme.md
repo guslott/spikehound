@@ -66,7 +66,7 @@ src.close()
 
 ## Architecture & lifecycle
 
-Every input source is a subclass of `BaseSource` and obeys the same lifecycle:
+Every input source is a subclass of `BaseDevice` and obeys the same lifecycle:
 
 ```
 list_available_devices()
@@ -75,7 +75,7 @@ open(device_id)
   └─ list_available_channels(device_id)
 configure(sample_rate, channels, chunk_size, **options) -> ActualConfig
 start()
-  [ driver thread/callback emits Chunk -> BaseSource.data_queue ]
+  [ driver thread/callback emits Chunk -> BaseDevice.data_queue ]
 stop()
 close()
 ```
@@ -138,10 +138,10 @@ class Chunk:
 
 ---
 
-## BaseSource API (for consumers)
+## BaseDevice API (for consumers)
 
 ```python
-class BaseSource(ABC):
+class BaseDevice(ABC):
     # Device discovery
     def list_available_devices(self) -> list[DeviceInfo]: ...
     def get_capabilities(self, device_id: str) -> Capabilities: ...
@@ -233,11 +233,11 @@ Implement a subclass with five driver hooks and use the base utilities to emit d
 
 ```python
 # mydevice_source.py
-from base_source import BaseSource, DeviceInfo, ChannelInfo, Capabilities, ActualConfig
+from base_device import BaseDevice, DeviceInfo, ChannelInfo, Capabilities, ActualConfig
 import numpy as np
 import threading
 
-class MyDeviceSource(BaseSource):
+class MyDeviceSource(BaseDevice):
     def __init__(self, queue_maxsize: int = 64):
         super().__init__(queue_maxsize)
         self._thread = None
@@ -284,7 +284,7 @@ class MyDeviceSource(BaseSource):
         self._thread.start()
 
     def _stop_impl(self) -> None:
-        # Cooperatively stop; BaseSource.stop_event has already been set
+        # Cooperatively stop; BaseDevice.stop_event has already been set
         if self._thread:
             self._thread.join(timeout=2.0)
             self._thread = None
@@ -400,7 +400,7 @@ Use `device_time` if both devices supply accurate hardware timestamps. Otherwise
 
 ```
 daq/
-  base_source.py          # (this contract)
+  base_device.py          # (this contract)
   simulated_source.py     # reference implementation
   soundcard_source.py     # PortAudio/sounddevice-based driver
   __init__.py             # re-exports public classes for convenience
@@ -409,12 +409,12 @@ daq/
 `__init__.py` example:
 
 ```python
-from .base_source import BaseSource, DeviceInfo, ChannelInfo, Capabilities, ActualConfig, Chunk
+from .base_device import BaseDevice, DeviceInfo, ChannelInfo, Capabilities, ActualConfig, Chunk
 from .simulated_source import SimulatedSource
 from .soundcard_source import SoundCardSource
 
 __all__ = [
-    "BaseSource", "DeviceInfo", "ChannelInfo", "Capabilities", "ActualConfig", "Chunk",
+    "BaseDevice", "DeviceInfo", "ChannelInfo", "Capabilities", "ActualConfig", "Chunk",
     "SimulatedSource", "SoundCardSource",
 ]
 ```

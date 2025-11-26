@@ -5,7 +5,7 @@ import queue
 import threading
 from typing import Any, Optional, Sequence, TYPE_CHECKING, Tuple
 
-from daq.base_source import BaseSource
+from daq.base_device import BaseDevice
 
 from .conditioning import FilterSettings, SignalConditioner
 from .controller import DeviceManager
@@ -38,7 +38,7 @@ class SpikeHoundRuntime:
     ) -> None:
         self.app_settings_store = app_settings_store
         self.logger = logger or logging.getLogger(__name__)
-        self.daq_source: Optional[BaseSource] = None
+        self.daq_source: Optional[BaseDevice] = None
         self.conditioner = SignalConditioner()
         self._queues: dict[str, queue.Queue] = {}
         self._threads: dict[str, threading.Thread] = {}
@@ -87,7 +87,7 @@ class SpikeHoundRuntime:
                 pass
         raise AttributeError(f"{self.__class__.__name__!s} has no attribute {name!r}")
 
-    def open_device(self, driver: BaseSource, sample_rate: float, channels: Sequence[object]) -> None:
+    def open_device(self, driver: BaseDevice, sample_rate: float, channels: Sequence[object]) -> None:
         """Open and prepare the requested DAQ backend/device."""
         self.attach_source(driver, sample_rate, channels)
 
@@ -163,7 +163,7 @@ class SpikeHoundRuntime:
         #     pass
         # self.daq_source = None
 
-    def attach_source(self, driver: BaseSource, sample_rate: float, channels) -> None:
+    def attach_source(self, driver: BaseDevice, sample_rate: float, channels) -> None:
         """Attach a connected driver to the pipeline controller."""
         controller = self._pipeline
         if controller is None or driver is None:

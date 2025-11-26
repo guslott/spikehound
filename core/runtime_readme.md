@@ -26,7 +26,7 @@ from core import PipelineController
 runtime = SpikeHoundRuntime(pipeline=PipelineController())
 
 # Attach an already-open driver (from daq.registry) and configure
-driver = ...  # BaseSource
+driver = ...  # BaseDevice
 channels = driver.list_available_channels(driver.config.device_id)
 runtime.open_device(driver, sample_rate=20_000, channels=channels)
 runtime.configure_acquisition(channels=[ch.id for ch in channels])

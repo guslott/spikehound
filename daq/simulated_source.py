@@ -3,7 +3,7 @@ import numpy as np
 import time
 import threading
 from dataclasses import dataclass
-from .base_source import BaseSource, Chunk, DeviceInfo, ChannelInfo, Capabilities, ActualConfig
+from .base_device import BaseDevice, Chunk, DeviceInfo, ChannelInfo, Capabilities, ActualConfig
 
 
 @dataclass
@@ -14,7 +14,7 @@ class ActivePSP:
     gain: float  # Amplitude multiplier
     unit_index: int  # Which unit generated this PSP
 
-class SimulatedPhysiologySource(BaseSource):
+class SimulatedPhysiologySource(BaseDevice):
     """
     Simulates a multi-unit nerve bundle recorded on:
       - Extracellular Proximal (Ex-Prox)
@@ -201,7 +201,7 @@ class SimulatedPhysiologySource(BaseSource):
         # Reset PSP tracking
         self._active_psps.clear()
         self._global_sample_counter = 0
-    # ------------- BaseSource overrides -------------
+    # ------------- BaseDevice overrides -------------
 
     def _open_impl(self, device_id: str) -> None:
         # Nothing to open for the simulator
