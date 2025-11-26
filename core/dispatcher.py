@@ -88,6 +88,7 @@ class Dispatcher:
         self._analysis_lock = threading.Lock()
         self._analysis_queues: Dict[int, queue.Queue] = {}
         self._next_analysis_id = 1
+        self._last_filter_settings: Optional[FilterSettings] = filter_settings  # Initialize with provided settings
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -112,6 +113,7 @@ class Dispatcher:
             self._thread.join(timeout)
 
     def update_filter_settings(self, settings: FilterSettings) -> None:
+        self._last_filter_settings = settings  # Store for later retrieval
         self._conditioner.update_settings(settings)
 
     def set_active_channels(self, channel_ids: Sequence[int]) -> None:
@@ -160,6 +162,11 @@ class Dispatcher:
             if new_ids == self._channel_ids and new_names == self._channel_names:
                 # logger.info("Layout unchanged, skipping reset")
                 return
+            
+            # Check if channel count changed (important for filter re-initialization)
+            old_channel_count = len(self._channel_ids) if self._channel_ids else 0
+            new_channel_count = len(new_ids)
+            channel_count_changed = old_channel_count != new_channel_count
                 
             self._channel_ids = new_ids
             self._channel_names = new_names
@@ -168,6 +175,13 @@ class Dispatcher:
             min_capacity = self._source_buffer.capacity if self._source_buffer is not None else 1
             self._ensure_viz_buffer_locked(channels or 1, min_capacity=min_capacity)
             self._reset_viz_counters_locked() # Log this call?
+            
+            # CRITICAL: Reset filters if channel count changed
+            # Filters need to be re-initialized for the new channel configuration
+            if channel_count_changed and hasattr(self, '_conditioner'):
+                current_settings = self._conditioner.get_settings() if hasattr(self._conditioner, 'get_settings') else getattr(self, '_last_filter_settings', None)
+                if current_settings is not None:
+                    self._conditioner.update_settings(current_settings)
 
     def reset_buffers(self) -> None:
         with self._ring_lock:

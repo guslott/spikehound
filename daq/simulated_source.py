@@ -33,7 +33,7 @@ class SimulatedPhysiologySource(BaseSource):
 
     def __init__(self, queue_maxsize: int = 4) -> None:
         super().__init__(queue_maxsize=queue_maxsize)
-        self._noise_level = 0.0  # TEST: Disabled for verification
+        self._noise_level = 0.040  # Increased: ~10mV broadband noise
         self._distance_m = 0.02  # Prox→Dist electrode spacing for delay calc
         self._units = []
         self._worker: threading.Thread | None = None
@@ -46,7 +46,7 @@ class SimulatedPhysiologySource(BaseSource):
         self._psp_template = np.zeros(1)
         self._psp_len = 1
         self._buffer_margin = 0
-        self._default_line_hum_amp = 0.0  # TEST: Disabled for verification
+        self._default_line_hum_amp = 0.05  # Increased: ~5mV 60Hz line hum
         self._line_hum_amp = self._default_line_hum_amp
         self._line_hum_freq = 60.0
         self._line_hum_phase = 0.0
@@ -215,8 +215,8 @@ class SimulatedPhysiologySource(BaseSource):
         # Force fixed sample rate
         sample_rate = 20_000
         # Generate random units
-        # TEST: Single unit for verification (prevents overlap/summation)
-        n_units = 1
+        # Multiple units with variable amplitudes for realistic simulation
+        n_units = 8
         self._line_hum_amp = float(options.get('line_hum_amp', self._default_line_hum_amp))
         self._line_hum_freq = float(options.get('line_hum_freq', 60.0))
         self._line_hum_phase = 0.0

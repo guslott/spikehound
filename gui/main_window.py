@@ -1437,7 +1437,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_acquisition()
         self._drain_visualization_queue()
         self._clear_scope_display()
-        self.sample_rate_combo.clear()
+        # Don't clear sample_rate_combo - preserve rates for reconnection
         if self._dispatcher_signals is not None:
             try:
                 self._dispatcher_signals.tick.disconnect(self._on_dispatcher_tick)
