@@ -9,22 +9,52 @@ from .base_device import BaseDevice, Chunk, DeviceInfo, ChannelInfo, Capabilitie
 @dataclass
 class ActivePSP:
     """Represents an active PSP that spans multiple chunks."""
-    start_sample: int  # Global sample index when PSP starts
-    template: np.ndarray  # PSP waveform
-    gain: float  # Amplitude multiplier
-    unit_index: int  # Which unit generated this PSP
+    start_sample: int       # The absolute sample index (global counter) where this PSP begins.
+    template: np.ndarray    # The pre-calculated waveform array for this PSP (alpha function).
+    gain: float             # Scaling factor for the PSP amplitude (simulating synaptic strength).
+    unit_index: int         # ID of the presynaptic unit that triggered this event (for debugging).
 
 class SimulatedPhysiologySource(BaseDevice):
     """
-    Simulates a multi-unit nerve bundle recorded on:
-      - Extracellular Proximal (Ex-Prox)
-      - Extracellular Distal (Ex-Dist)
-      - Intracellular PSP (IC)
+    Simulated Physiology Source
+    ===========================
 
-    Only hard-coded input: the number of units in the bundle.
-    All other per-unit parameters (amplitudes, velocities/delays, firing rates,
-    synaptic delays, PSP gains) are randomly sampled once at initialization and
-    remain fixed throughout the session.
+    Theory of Operations
+    --------------------
+    This source simulates a multi-unit recording from a nerve bundle. It generates synthetic
+    neural data across three distinct channels, representing different recording modalities:
+
+    1.  **Extracellular Proximal (Ch 0)**:
+        -   Represents a recording electrode placed close to the nerve bundle.
+        -   Captures large-amplitude spikes from multiple units.
+        -   Signal = Sum of unit spikes + Broadband Noise + Line Hum.
+
+    2.  **Extracellular Distal (Ch 1)**:
+        -   Represents a second electrode placed further down the nerve (e.g., 20mm away).
+        -   Captures the same spikes as the proximal channel but with a conduction delay.
+        -   The delay is determined by the conduction velocity of each unit.
+        -   Signal = Sum of delayed unit spikes + Broadband Noise.
+
+    3.  **Intracellular (Ch 2)**:
+        -   Represents a patch-clamp or intracellular recording from a post-synaptic neuron.
+        -   Displays Post-Synaptic Potentials (PSPs) triggered by the spikes in the nerve bundle.
+        -   Each unit has a specific synaptic delay and PSP gain.
+        -   Signal = Sum of PSPs (alpha functions) + Baseline (-70mV) + Low-level Noise.
+
+    Simulation Logic
+    ----------------
+    -   **Initialization**: Randomly generates N units, assigning each a unique spike template,
+        firing rate, amplitude, conduction velocity, and synaptic properties.
+    -   **Loop**:
+        1.  **Shift Buffers**: Moves the rolling wave buffers for extracellular signals.
+        2.  **Generate Events**: Probabilistically triggers spikes for each unit based on its rate.
+            -   Spikes are added to the extracellular wave buffers.
+            -   PSPs are instantiated as `ActivePSP` objects with a start time and template.
+        3.  **Render Channels**:
+            -   Extracellular channels sum the wave buffers (with appropriate delays for Distal).
+            -   Intracellular channel sums the contributions of all `ActivePSP` objects that overlap
+                with the current data chunk.
+        4.  **Cleanup**: Removes completed PSPs and updates the global sample counter.
     """
 
     @classmethod
@@ -69,11 +99,18 @@ class SimulatedPhysiologySource(BaseDevice):
         ]
 
     def _initialize_units(self, sample_rate: int, num_units: int):
-        """Sample per-unit parameters and initialize rolling buffers.
+        """
+        Initialize simulated neural units with random parameters.
 
-        - Units get a spike template, firing rate, base amplitude at Prox,
-          distal amplitude ratio, conduction velocity, synaptic delay, and PSP gain.
-        - Buffers store generated waveforms and unit impulses (soma events).
+        This method defines the population of neurons that will be simulated.
+        Each unit is assigned:
+        -   **Spike Template**: A generated waveform shape (width, amplitude).
+        -   **Firing Rate**: Average Hz for Poisson spike generation.
+        -   **Amplitudes**: Base amplitude at the proximal electrode.
+        -   **Conduction Velocity**: Speed (m/s) for calculating distal delay.
+        -   **Synaptic Properties**: Delay (ms) and Gain (V) for generating PSPs.
+
+        It also pre-calculates the PSP template (alpha function) used for the intracellular channel.
         """
         # PSP kernel (alpha function) - 20ms duration
         psp_len = int(0.020 * sample_rate)
@@ -201,7 +238,7 @@ class SimulatedPhysiologySource(BaseDevice):
         # Reset PSP tracking
         self._active_psps.clear()
         self._global_sample_counter = 0
-    # ------------- BaseDevice overrides -------------
+    # ------------- BaseSource overrides -------------
 
     def _open_impl(self, device_id: str) -> None:
         # Nothing to open for the simulator
@@ -241,6 +278,10 @@ class SimulatedPhysiologySource(BaseDevice):
             
             wave_buffers = self._unit_wave_buffers
             buf_len = self._buf_len
+            # Main Simulation Loop
+            # --------------------
+            # Generates data in blocks of `chunk_size`.
+            # Maintains real-time timing by sleeping until the next deadline.
             next_deadline = time.perf_counter() + chunk_duration
             counter = 0
 

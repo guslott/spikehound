@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-Base classes and datamodels for streaming DAQ devices.
+Base classes and datamodels for streaming DAQ sources.
 
 Goals:
 - Simple, stable contract for GUI/consumers (ChunkPointers over a queue).
@@ -46,19 +46,19 @@ State = Literal["closed", "open", "running"]
 
 class BaseDevice(ABC):
     """
-    Abstract base for all DAQ devices (sources/sinks).
+    Abstract base for all DAQ input sources.
 
     Typical flow:
         devs = Driver.list_available_devices()
-        device = Driver()
-        device.open(devs[0].id)
-        caps = device.get_capabilities(devs[0].id)
-        chans = device.list_available_channels(devs[0].id)
-        device.configure(sample_rate=20_000, channels=[c.id for c in chans[:2]], chunk_size=1024)
-        device.start()
-        # Consume device.data_queue (ChunkPointer objects) in the GUI thread
-        device.stop()
-        device.close()
+        source = Driver()
+        source.open(devs[0].id)
+        caps = source.get_capabilities(devs[0].id)
+        chans = source.list_available_channels(devs[0].id)
+        source.configure(sample_rate=20_000, channels=[c.id for c in chans[:2]], chunk_size=1024)
+        source.start()
+        # Consume source.data_queue (ChunkPointer objects) in the GUI thread
+        source.stop()
+        source.close()
     """
 
     @classmethod
@@ -494,9 +494,9 @@ class BaseDevice(ABC):
             self.data_queue.put(ptr, block=True, timeout=10.0)
         except queue.Full:
             # This should NEVER happen with blocking mode - indicates deadlock or stuck consumer
-            print(f"\n!!! CRITICAL ERROR: Device data_queue BLOCKED for 10+ seconds !!!")
+            print(f"\n!!! CRITICAL ERROR: Source data_queue BLOCKED for 10+ seconds !!!")
             print(f"!!! Consumer (Dispatcher) is not keeping up - system deadlocked !!!")
-            raise RuntimeError("Device data_queue blocked - lossless constraint violated")
+            raise RuntimeError("Source data_queue blocked - lossless constraint violated")
 
     def _assert_state(self, expected: Iterable[State]) -> None:
         if self._state not in expected:

@@ -25,7 +25,7 @@ import pkgutil
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Type
 
-from .base_device import BaseDevice
+from .base_device import BaseDevice, DeviceInfo
 
 _EXCLUDE = {"base_device", "registry", "__init__"}
 _REGISTRY: Dict[str, "DeviceDescriptor"] = {}
