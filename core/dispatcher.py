@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 class DispatcherStats:
     received: int = 0
     processed: int = 0
+    processed_frames: int = 0
     forwarded: Counter = field(default_factory=Counter)
     evicted: Counter = field(default_factory=Counter)
     dropped: Counter = field(default_factory=Counter)
@@ -29,6 +30,7 @@ class DispatcherStats:
         return {
             "received": self.received,
             "processed": self.processed,
+            "processed_frames": self.processed_frames,
             "forwarded": dict(self.forwarded),
             "evicted": dict(self.evicted),
             "dropped": dict(self.dropped),
@@ -345,6 +347,7 @@ class Dispatcher:
 
         with self._stats_lock:
             self._stats.processed += 1
+            self._stats.processed_frames += raw.shape[1]
 
         viz_pointer = ChunkPointer(
             start_index=viz_start,

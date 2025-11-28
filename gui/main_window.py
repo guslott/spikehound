@@ -1374,6 +1374,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _populate_sample_rate_options(self, entry: Optional[dict]) -> None:
         self.sample_rate_combo.blockSignals(True)
+        
+        # Determine the target sample rate to restore
+        target_rate = 0.0
+        if self._device_connected:
+            # If connected, the driver config is the absolute source of truth
+            driver = getattr(self.runtime, "daq_source", None)
+            if driver is not None and getattr(driver, "config", None) is not None:
+                target_rate = driver.config.sample_rate
+            elif self.runtime.sample_rate > 0:
+                target_rate = self.runtime.sample_rate
+        else:
+            # Otherwise, try to preserve the current UI selection
+            target_rate = self._current_sample_rate_value()
+
         self.sample_rate_combo.clear()
         rates = []
         if entry is not None:
@@ -1382,10 +1396,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 rates = getattr(caps, "sample_rates") or []
             elif isinstance(caps, dict):
                 rates = caps.get("sample_rates") or []
+        
         for rate in rates:
             self.sample_rate_combo.addItem(f"{int(rate):,}", float(rate))
-        if self.sample_rate_combo.count():
+        
+        # Restore selection if possible
+        if target_rate > 0:
+            self._set_sample_rate_value(target_rate)
+        elif self.sample_rate_combo.count():
             self.sample_rate_combo.setCurrentIndex(0)
+            
         self.sample_rate_combo.setEnabled(bool(rates) and (not self._device_connected or self.active_list.count() == 0))
         self.sample_rate_combo.blockSignals(False)
 
@@ -1429,6 +1449,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._bind_dispatcher_signals()
         self._bind_app_settings_store()
         self._update_channel_buttons()
+        
+        # Sync UI with actual negotiated sample rate
+        # Prefer driver config (immediate) over runtime metric (delayed)
+        driver = getattr(self.runtime, "daq_source", None)
+        if driver is not None and getattr(driver, "config", None) is not None:
+            self._set_sample_rate_value(driver.config.sample_rate)
+        elif self.runtime.sample_rate > 0:
+            self._set_sample_rate_value(self.runtime.sample_rate)
 
     def _on_device_disconnected(self) -> None:
         self._device_connected = False

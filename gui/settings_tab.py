@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Dict, Optional
+import time
 from PySide6 import QtCore, QtWidgets
 
 from shared.app_settings import AppSettings
@@ -77,6 +78,7 @@ class SettingsTab(QtWidgets.QWidget):
             ("Audio queue", "audio_queue"),
             ("Logging queue", "logging_queue"),
             ("Chunk rate", "chunk_rate"),
+            ("Throughput", "throughput"),
             ("Plot refresh", "plot_refresh"),
         ]
         self._metric_fields: Dict[str, QtWidgets.QLabel] = {}
@@ -89,6 +91,11 @@ class SettingsTab(QtWidgets.QWidget):
             value.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
             grid.addWidget(value, row, 1)
             self._metric_fields[key] = value
+        
+        # State for rate calculation
+        self._last_frames = 0
+        self._last_time = time.perf_counter()
+        
         return box
 
     def _build_about_box(self) -> QtWidgets.QGroupBox:
@@ -206,6 +213,7 @@ class SettingsTab(QtWidgets.QWidget):
         forwarded = stats.get("forwarded", {}) if isinstance(stats, dict) else {}
         received = stats.get("received", 0)
         processed = stats.get("processed", 0)
+        processed_frames = stats.get("processed_frames", 0)
         evicted = stats.get("evicted", {}) if isinstance(stats, dict) else {}
         self._metric_fields["dispatcher"].setText(
             f"recv:{received} proc:{processed} fwd:{forwarded.get('analysis',0)} "
@@ -219,6 +227,19 @@ class SettingsTab(QtWidgets.QWidget):
 
         chunk_rate = snapshot.get("chunk_rate", 0.0)
         self._metric_fields["chunk_rate"].setText(f"{chunk_rate:5.2f} chunks/s")
+        
+        # Calculate throughput
+        now = time.perf_counter()
+        dt = now - getattr(self, "_last_time", now)
+        if dt > 0.0:
+            df = processed_frames - getattr(self, "_last_frames", 0)
+            # Handle counter reset or initial state
+            if df < 0:
+                df = 0
+            rate = df / dt
+            self._metric_fields["throughput"].setText(f"{rate:,.1f} samples/s")
+            self._last_frames = processed_frames
+            self._last_time = now
 
         plot_hz = snapshot.get("plot_refresh_hz", 0.0)
         self._metric_fields["plot_refresh"].setText(f"{plot_hz:5.1f} Hz")

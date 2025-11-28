@@ -225,7 +225,18 @@ class BackyardBrainsSource(BaseDevice):
             self._send_command(f"c:{req_channels};")
             time.sleep(0.05)
 
-        actual_rate = self._hint_sample_rate or sample_rate
+        # If the device has a fixed sample rate hint, we generally prefer it,
+        # BUT if the user requested a specific rate that is also valid (e.g. in capabilities),
+        # we should respect it.
+        # If sample_rate is 0 (unspecified), default to 1000 or the hint.
+        req_rate = sample_rate if sample_rate and sample_rate > 0 else 1000
+        actual_rate = req_rate
+        
+        if self._hint_sample_rate and req_rate != self._hint_sample_rate:
+            # Check if the requested rate is actually supported
+            caps = self.get_capabilities(self._device_id)
+            if req_rate not in caps.sample_rates:
+                actual_rate = self._hint_sample_rate
 
         return ActualConfig(
             sample_rate=actual_rate,
