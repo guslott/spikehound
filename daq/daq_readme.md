@@ -427,7 +427,3 @@ __all__ = [
 
   * Prefer `sample_rate` of `44_100` or `48_000` unless you’ve verified others on the target OS/driver.
   * When available, the driver stamps `device_time` with PortAudio’s `input_buffer_adc_time`.
-
----
-
-If you want, I can also save this as a `README.md` in your project so you can version it alongside the code.
