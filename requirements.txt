@@ -1,0 +1,7 @@
+numpy
+scipy
+PySide6
+pyqtgraph
+sounddevice
+pyserial
+pytest
