@@ -394,36 +394,53 @@ class Dispatcher:
                     self._stats.forwarded["analysis"] += 1
 
     def _enqueue(self, target_queue: queue.Queue, item: object, queue_name: str) -> None:
-        """Enqueue with blocking for critical queues (visualization), non-blocking for logging."""
-        # Logging is not critical - use drop-oldest policy
-        if queue_name == "logging":
+        """Enqueue with blocking for critical queues (logging), non-blocking for visualization."""
+        # Visualization is lossy - drop if full to prevent DAQ blocking
+        if queue_name == "visualization":
             try:
                 target_queue.put_nowait(item)
             except queue.Full:
-                # Drop oldest and try again (non-blocking for logging)
-                try:
-                    target_queue.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    target_queue.put_nowait(item)
-                except queue.Full:
-                    pass  # Give up silently
+                with self._stats_lock:
+                    self._stats.dropped[queue_name] += 1
             else:
                 with self._stats_lock:
                     self._stats.forwarded[queue_name] += 1
-        else:
-            # Visualization and audio are CRITICAL - use blocking mode
+
+        # Logging is critical/lossless - block until space available
+        elif queue_name == "logging":
             try:
                 # BLOCKING MODE: Wait up to 10 seconds. If still full, fatal error.
                 target_queue.put(item, block=True, timeout=10.0)
             except queue.Full:
-                # This should NEVER happen - indicates consumer deadlock
+                # This indicates disk I/O is too slow for too long
                 print(f"\n!!! CRITICAL ERROR: Dispatcher queue '{queue_name}' BLOCKED for 10+ seconds !!!")
-                print(f"!!! Consumer is not keeping up - system deadlocked !!!")
                 with self._stats_lock:
                     self._stats.evicted[queue_name] += 1
                 raise RuntimeError(f"Dispatcher queue '{queue_name}' blocked - lossless constraint violated")
+            else:
+                with self._stats_lock:
+                    self._stats.forwarded[queue_name] += 1
+
+        # Audio and others - keep as critical (blocking) for now, or lossy?
+        # User said "Only the Logging/Recording queue needs to be lossless."
+        # So Audio should probably be lossy too to avoid XRuns.
+        elif queue_name == "audio":
+            try:
+                target_queue.put_nowait(item)
+            except queue.Full:
+                with self._stats_lock:
+                    self._stats.dropped[queue_name] += 1
+            else:
+                with self._stats_lock:
+                    self._stats.forwarded[queue_name] += 1
+        
+        else:
+            # Default fallback (e.g. analysis if it used this method, but it doesn't)
+            try:
+                target_queue.put_nowait(item)
+            except queue.Full:
+                with self._stats_lock:
+                    self._stats.dropped[queue_name] += 1
             else:
                 with self._stats_lock:
                     self._stats.forwarded[queue_name] += 1
