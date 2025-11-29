@@ -396,40 +396,60 @@ class BackyardBrainsSource(BaseDevice):
                     pass
                 break
 
-            # 2. Process frames sample-wise.
-            # We align to the next byte with MSB=1 (frame start), then read
-            # expected_channels samples of two bytes each (high, low). If only the
-            # first sample is flagged, we still read the following pairs; if each
-            # channel is flagged, we tolerate MSB=1 on subsequent highs.
+            # 2. Process frames using vectorization
             frame_size = stream_channels * 2
-            while len(raw_buffer) >= 2:
-                # Align to a start marker
-                start_idx = next((i for i, b in enumerate(raw_buffer) if b & 0x80), -1)
-                if start_idx < 0:
-                    raw_buffer.clear()
-                    break
-                if start_idx > 0:
-                    del raw_buffer[:start_idx]
-                    if len(raw_buffer) < 2:
+            
+            # Align to start of a frame (first byte must have MSB=1)
+            if len(raw_buffer) > 0 and not (raw_buffer[0] & 0x80):
+                start_idx = -1
+                for i, b in enumerate(raw_buffer):
+                    if b & 0x80:
+                        start_idx = i
                         break
+                if start_idx == -1:
+                    raw_buffer.clear()
+                else:
+                    del raw_buffer[:start_idx]
 
-                if len(raw_buffer) < frame_size:
-                    break
-
-                # Decode expected_channels pairs
-                for ch_idx in range(stream_channels):
-                    hi = raw_buffer[2 * ch_idx]
-                    lo = raw_buffer[2 * ch_idx + 1]
-                    raw_val = ((hi & 0x7F) << 7) | (lo & 0x7F)
-                    sample_buffer[sample_idx, ch_idx] = (raw_val - center_val) / center_val
-
-                del raw_buffer[:frame_size]
-                sample_idx += 1
-
-                if sample_idx >= raw_chunk_size:
-                    self._emit_active(sample_buffer, sample_idx)
-                    sample_buffer.fill(0.0)
-                    sample_idx = 0
+            num_frames = len(raw_buffer) // frame_size
+            if num_frames > 0:
+                byte_count = num_frames * frame_size
+                
+                # Vectorized decoding
+                # Create a numpy view of the bytes
+                raw_bytes = np.frombuffer(raw_buffer[:byte_count], dtype=np.uint8)
+                
+                # Reshape to (num_frames, channels, 2 bytes)
+                frames_bytes = raw_bytes.reshape(num_frames, stream_channels, 2)
+                
+                # Extract high and low bytes
+                highs = frames_bytes[:, :, 0].astype(np.int32)
+                lows = frames_bytes[:, :, 1].astype(np.int32)
+                
+                # Combine 7 bits from each: ((hi & 0x7F) << 7) | (lo & 0x7F)
+                raw_vals = ((highs & 0x7F) << 7) | (lows & 0x7F)
+                
+                # Normalize
+                decoded = (raw_vals - center_val) / center_val
+                
+                # Fill sample buffer and emit chunks
+                source_idx = 0
+                while source_idx < num_frames:
+                    needed = raw_chunk_size - sample_idx
+                    available = num_frames - source_idx
+                    to_copy = min(needed, available)
+                    
+                    sample_buffer[sample_idx : sample_idx + to_copy] = decoded[source_idx : source_idx + to_copy]
+                    
+                    sample_idx += to_copy
+                    source_idx += to_copy
+                    
+                    if sample_idx >= raw_chunk_size:
+                        self._emit_active(sample_buffer, sample_idx)
+                        sample_idx = 0
+                
+                # Remove processed bytes
+                del raw_buffer[:byte_count]
 
     def _emit_active(self, sample_buffer: np.ndarray, frames: int) -> None:
         """
