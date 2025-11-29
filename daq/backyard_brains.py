@@ -147,12 +147,34 @@ class BackyardBrainsSource(BaseDevice):
         )
 
     def list_available_channels(self, device_id: str) -> List[ChannelInfo]:
-        # We'll expose the max likely channels. 
-        # The user configures how many they actually want to read.
-        return [
-            ChannelInfo(id=i, name=f"Channel {i+1}", units="V", range=(-5.0, 5.0))
-            for i in range(self._max_channels)
-        ]
+        # Resolve max channels for this device_id to ensure accurate listing
+        max_ch = self._max_channels
+        port_info = self._lookup_port(device_id)
+        
+        is_neuron_pro = False
+        if port_info:
+            hint = _DEVICE_HINTS.get((port_info.vid, port_info.pid))
+            if hint:
+                max_ch = int(hint.get("channels", max_ch))
+                # Explicit override for 0x0009 (Neuron SpikerBox Pro Serial+MFi)
+                if port_info.vid == 0x2E73 and port_info.pid == 0x0009:
+                    max_ch = 4
+            
+            # Check if this is a Neuron SpikerBox Pro variant
+            # 0x0002: HID, 0x0007: Serial, 0x0009: Serial+MFi
+            if port_info.vid == 0x2E73 and port_info.pid in (0x0002, 0x0007, 0x0009):
+                is_neuron_pro = True
+
+        channels = []
+        for i in range(max_ch):
+            name = f"Channel {i+1}"
+            # For Neuron SpikerBox Pro, channels 3 and 4 are the expansion port.
+            if is_neuron_pro and i >= 2:
+                name += " (Expansion Port)"
+            
+            channels.append(ChannelInfo(id=i, name=name, units="V", range=(-5.0, 5.0)))
+        
+        return channels
 
     def _lookup_port(self, device_id: str):
         if serial is None:
