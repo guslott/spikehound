@@ -31,15 +31,18 @@ _DEVICE_HINTS = {
     (0x2E73, 0x0001): {"label": "Muscle SpikerBox Pro (HID)", "channels": 4, "bits": 10, "start": True, "set_channels": False},
     (0x2E73, 0x0002): {"label": "Neuron SpikerBox Pro (HID)", "channels": 4, "bits": 10, "start": True, "set_channels": False},
     (0x2E73, 0x0004): {"label": "Human SpikerBox", "channels": 4, "bits": 14, "start": False, "set_channels": False},
-    (0x2E73, 0x0006): {"label": "Muscle SpikerBox Pro (Serial)", "channels": 4, "bits": 10, "start": True, "set_channels": False},
-    (0x2E73, 0x0007): {"label": "Neuron SpikerBox Pro (Serial)", "channels": 4, "bits": 10, "start": True, "set_channels": False},
-    # Field reports show the Serial + MFi Neuron SB streams 2 channels over CDC.
-    # Enable explicit channel count command to request both channels.
-    (0x2E73, 0x0009): {"label": "Neuron SpikerBox Pro (Serial + MFi)", "channels": 2, "bits": 14, "start": True, "set_channels": True},
+    (0x2E73, 0x0006): {"label": "Muscle SpikerBox Pro (Serial)", "channels": 4, "bits": 10, "start": True, "set_channels": False, "sample_rate": 10000},
+    (0x2E73, 0x0007): {"label": "Neuron SpikerBox Pro (Serial)", "channels": 4, "bits": 10, "start": True, "set_channels": False, "sample_rate": 10000},
+    # Neuron SpikerBox Pro (Serial + MFi) - PID 0x0009
+    # NOTE: Official docs say "2 channels", but the firmware streams 4 channels @ 10kHz (80kB/s).
+    # This is due to MFi requirements for fixed packet sizes; the device always streams
+    # the 2 main channels + 2 expansion port analog inputs (even if unused).
+    # We must parse 4 channels to correctly decode the 10kHz frame rate.
+    (0x2E73, 0x0009): {"label": "Neuron SpikerBox Pro (Serial + MFi)", "channels": 4, "bits": 14, "start": True, "set_channels": False, "sample_rate": 10000},
     (0x2E73, 0x000D): {"label": "Spike Station", "channels": 2, "bits": 14, "start": True, "set_channels": False, "sample_rate": 42661},
-    (0x2341, 0x8036): {"label": "Plant SpikerBox", "channels": 1, "bits": 10, "start": False, "set_channels": False},
-    (0x2341, 0x0043): {"label": "SpikerShield (Arduino)", "channels": 6, "bits": 10, "start": False, "set_channels": True},
-    (0x0403, 0x6015): {"label": "FTDI-based SpikerBox", "channels": 1, "bits": 10, "start": False, "set_channels": False},
+    (0x2341, 0x8036): {"label": "Plant SpikerBox", "channels": 1, "bits": 10, "start": False, "set_channels": False, "sample_rate": 10000},
+    (0x2341, 0x0043): {"label": "SpikerShield (Arduino)", "channels": 6, "bits": 10, "start": False, "set_channels": True, "sample_rate": 10000},
+    (0x0403, 0x6015): {"label": "FTDI-based SpikerBox", "channels": 1, "bits": 10, "start": False, "set_channels": False, "sample_rate": 10000},
 }
 
 # Escape sequences for custom messages
@@ -74,6 +77,8 @@ class BackyardBrainsSource(BaseDevice):
         self._requires_start = True
         self._supports_channel_cfg = False
         self._hint_sample_rate: Optional[int] = None
+        self._hint_sample_rate: Optional[int] = None
+        self._stream_channel_count = 1
         # Default capabilities fallback (updated on open)
         self._max_channels = 2
 
@@ -110,10 +115,31 @@ class BackyardBrainsSource(BaseDevice):
         return candidates
 
     def get_capabilities(self, device_id: str) -> Capabilities:
+        # Resolve hints for this device_id if we haven't already (e.g. before open)
+        hint_rate = self._hint_sample_rate
+        supports_cfg = self._supports_channel_cfg
+        
+        if hint_rate is None:
+            port_info = self._lookup_port(device_id)
+            if port_info:
+                hint = _DEVICE_HINTS.get((port_info.vid, port_info.pid))
+                if hint:
+                    hint_rate = int(hint["sample_rate"]) if "sample_rate" in hint else None
+                    supports_cfg = bool(hint.get("set_channels", False))
+                    
+                    # Explicit override for 0x0009
+                    if port_info.vid == 0x2E73 and port_info.pid == 0x0009:
+                        supports_cfg = False
+
         # Most BYB devices support up to 10kHz. Use hints if we have them.
-        sample_rates = [1000, 2500, 3333, 5000, 10000]
-        if self._hint_sample_rate:
-            sample_rates = sorted(set(sample_rates + [self._hint_sample_rate]))
+        if hint_rate and not supports_cfg:
+            # Fixed rate device - ONLY support the native rate
+            sample_rates = [hint_rate]
+        else:
+            sample_rates = [1000, 2500, 3333, 5000, 10000]
+            if hint_rate:
+                sample_rates = sorted(set(sample_rates + [hint_rate]))
+        
         notes = f"Serial/CDC SpikerBox. {self._bits}-bit resolution expected."
         return Capabilities(
             max_channels_in=self._max_channels,
@@ -155,6 +181,13 @@ class BackyardBrainsSource(BaseDevice):
             self._requires_start = bool(hint.get("start", self._requires_start))
             self._supports_channel_cfg = bool(hint.get("set_channels", False))
             self._hint_sample_rate = int(hint["sample_rate"]) if "sample_rate" in hint else None
+            
+            # Explicit override for 0x0009 to be absolutely sure
+            if port_info.vid == 0x2E73 and port_info.pid == 0x0009:
+                self._supports_channel_cfg = False
+                self._max_channels = 4
+                
+            _LOGGER.info(f"BYB Hint: {hint.get('label')}, max_ch={self._max_channels}, supp_cfg={self._supports_channel_cfg}, rate={self._hint_sample_rate}")
         else:
             # Unknown device: keep conservative defaults
             self._max_channels = max(1, 2)
@@ -162,6 +195,7 @@ class BackyardBrainsSource(BaseDevice):
             self._requires_start = True
             self._supports_channel_cfg = False
             self._hint_sample_rate = None
+            _LOGGER.info(f"BYB Hint: None (Unknown device) VID={port_info.vid} PID={port_info.pid}")
 
     def _open_impl(self, device_id: str) -> None:
         if serial is None:
@@ -216,6 +250,8 @@ class BackyardBrainsSource(BaseDevice):
 
         # Some devices allow channel-count configuration (SpikerShield family).
         # Others stream a fixed set; in those cases we simply decode that many.
+        # Some devices allow channel-count configuration (SpikerShield family).
+        # Others stream a fixed set; in those cases we simply decode that many.
         if self._supports_channel_cfg:
             # Stop first to be safe on devices that honor start/stop
             if self._requires_start:
@@ -224,19 +260,24 @@ class BackyardBrainsSource(BaseDevice):
             req_channels = num_channels
             self._send_command(f"c:{req_channels};")
             time.sleep(0.05)
+            self._stream_channel_count = req_channels
+        else:
+            self._stream_channel_count = self._max_channels
+            
+        _LOGGER.info(f"BYB Config Logic: supports_cfg={self._supports_channel_cfg}, stream_ch={self._stream_channel_count}, max_ch={self._max_channels}")
 
         # If the device has a fixed sample rate hint, we generally prefer it,
         # BUT if the user requested a specific rate that is also valid (e.g. in capabilities),
         # we should respect it.
         # If sample_rate is 0 (unspecified), default to 1000 or the hint.
         req_rate = sample_rate if sample_rate and sample_rate > 0 else 1000
-        actual_rate = req_rate
         
-        if self._hint_sample_rate and req_rate != self._hint_sample_rate:
-            # Check if the requested rate is actually supported
-            caps = self.get_capabilities(self._device_id)
-            if req_rate not in caps.sample_rates:
-                actual_rate = self._hint_sample_rate
+        native_rate = self._hint_sample_rate or 10000
+        
+        # We only support native rate now
+        actual_rate = native_rate
+
+        _LOGGER.info(f"BYB Config: req={req_rate}, native={native_rate}, actual={actual_rate}, stream_ch={self._stream_channel_count}")
 
         return ActualConfig(
             sample_rate=actual_rate,
@@ -276,16 +317,21 @@ class BackyardBrainsSource(BaseDevice):
             return
 
         # Always decode the full stream channel count (hardware order).
-        cfg_channels = getattr(self.config, "channels", None) or []
-        stream_channels = len(cfg_channels) if cfg_channels else len(self._available_channels) or len(self._active_channel_ids) or 1
+        # Always decode the full stream channel count (hardware order).
+        stream_channels = self._stream_channel_count
         stream_channels = max(1, stream_channels)
         bits = max(8, min(self._bits, 16))
         center_val = float(1 << (bits - 1))
-        chunk_size = self.config.chunk_size
+        
+        # We want to emit `chunk_size` samples.
+        # We need to collect `chunk_size` raw samples.
+        target_chunk_size = self.config.chunk_size
+        raw_chunk_size = target_chunk_size
         
         # Buffers
         raw_buffer = bytearray()
-        sample_buffer = np.zeros((chunk_size, stream_channels), dtype=np.float32)
+        # Buffer for unpacked raw samples
+        sample_buffer = np.zeros((raw_chunk_size, stream_channels), dtype=np.float32)
         sample_idx = 0
         
         # For un-escaping logic
@@ -365,7 +411,7 @@ class BackyardBrainsSource(BaseDevice):
                 del raw_buffer[:frame_size]
                 sample_idx += 1
 
-                if sample_idx >= chunk_size:
+                if sample_idx >= raw_chunk_size:
                     self._emit_active(sample_buffer, sample_idx)
                     sample_buffer.fill(0.0)
                     sample_idx = 0
@@ -387,5 +433,6 @@ class BackyardBrainsSource(BaseDevice):
             if src_idx is not None and src_idx < sample_buffer.shape[1]:
                 out[:, out_idx] = sample_buffer[:frames, src_idx]
 
+        # _LOGGER.info(f"Emit: frames={frames}, active={len(active_ids)}, shape={out.shape}")
         meta = {"active_channel_ids": active_ids}
         self.emit_array(out, mono_time=time.monotonic(), meta=meta)
