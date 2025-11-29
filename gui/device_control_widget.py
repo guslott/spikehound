@@ -18,7 +18,8 @@ class DeviceControlWidget(QtWidgets.QWidget):
     deviceSelected = QtCore.Signal(str)  # device_key
     deviceConnectRequested = QtCore.Signal(str, float)  # device_key, sample_rate
     deviceDisconnectRequested = QtCore.Signal()
-    deviceScanRequested = QtCore.Signal()
+    deviceDisconnectRequested = QtCore.Signal()
+    # deviceScanRequested = QtCore.Signal()  # Moved to SettingsTab
     channelAddRequested = QtCore.Signal(int)  # channel_id
     channelRemoveRequested = QtCore.Signal(int)  # channel_id
     activeChannelSelected = QtCore.Signal(int)  # index in active list
@@ -59,10 +60,7 @@ class DeviceControlWidget(QtWidgets.QWidget):
 
         controls_row = QtWidgets.QHBoxLayout()
         controls_row.setSpacing(6)
-        self.scan_hardware_btn = QtWidgets.QPushButton("Scan Hardware")
-        self.scan_hardware_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
-        self.scan_hardware_btn.setFixedHeight(32)
-        controls_row.addWidget(self.scan_hardware_btn)
+        # Scan button moved to Settings tab
         self.device_toggle_btn = QtWidgets.QPushButton("Connect")
         self.device_toggle_btn.setCheckable(True)
         self.device_toggle_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
@@ -124,7 +122,7 @@ class DeviceControlWidget(QtWidgets.QWidget):
 
         # Connect signals
         self.device_combo.currentIndexChanged.connect(self._on_device_selected)
-        self.scan_hardware_btn.clicked.connect(self._on_scan_clicked)
+        # self.scan_hardware_btn.clicked.connect(self._on_scan_clicked)
         self.device_toggle_btn.clicked.connect(self._on_toggle_clicked)
         self.sample_rate_combo.currentIndexChanged.connect(self._on_sample_rate_changed)
         self.settings_toggle_btn.toggled.connect(self._on_settings_toggled)
@@ -197,7 +195,7 @@ class DeviceControlWidget(QtWidgets.QWidget):
         self.device_toggle_btn.blockSignals(False)
         
         self.device_combo.setEnabled(not connected)
-        self.scan_hardware_btn.setEnabled(not connected)
+        # self.scan_hardware_btn.setEnabled(not connected)
         self.sample_rate_combo.setEnabled(not connected)
 
     def get_selected_device_key(self) -> Optional[str]:
@@ -282,9 +280,9 @@ class DeviceControlWidget(QtWidgets.QWidget):
         if device_key is not None:
             self.deviceSelected.emit(device_key)
 
-    def _on_scan_clicked(self) -> None:
-        """Handle scan hardware button click."""
-        self.deviceScanRequested.emit()
+    # def _on_scan_clicked(self) -> None:
+    #     """Handle scan hardware button click."""
+    #     self.deviceScanRequested.emit()
 
     def _on_toggle_clicked(self, checked: bool) -> None:
         """Handle connect/disconnect button click."""

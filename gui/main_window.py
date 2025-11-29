@@ -708,7 +708,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Keep references to individual widgets for backward compatibility
         self.device_group = self.device_control.device_group
         self.device_combo = self.device_control.device_combo
-        self.scan_hardware_btn = self.device_control.scan_hardware_btn
+        # self.scan_hardware_btn = self.device_control.scan_hardware_btn
         self.device_toggle_btn = self.device_control.device_toggle_btn
         self.sample_rate_combo = self.device_control.sample_rate_combo
         self.settings_toggle_btn = self.device_control.settings_toggle_btn
@@ -724,7 +724,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_control.deviceSelected.connect(self._on_device_selected)
         self.device_control.deviceConnectRequested.connect(self._on_device_connect_requested)
         self.device_control.deviceDisconnectRequested.connect(self._on_device_disconnect_requested)
-        self.device_control.deviceScanRequested.connect(self._on_scan_hardware)
+        # self.device_control.deviceScanRequested.connect(self._on_scan_hardware)
         self.device_control.channelAddRequested.connect(self._on_channel_add_requested)
         self.device_control.channelRemoveRequested.connect(self._on_channel_remove_requested)
         self.device_control.activeChannelSelected.connect(self._on_active_list_index_changed)

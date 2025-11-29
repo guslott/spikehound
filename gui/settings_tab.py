@@ -48,6 +48,10 @@ class SettingsTab(QtWidgets.QWidget):
         )
         form.addRow(self.list_audio_check)
 
+        self.rescan_btn = QtWidgets.QPushButton("Rescan Devices")
+        self.rescan_btn.clicked.connect(self._on_rescan_clicked)
+        form.addRow(self.rescan_btn)
+
         return box
 
     def _build_audio_box(self) -> QtWidgets.QGroupBox:
@@ -138,6 +142,11 @@ class SettingsTab(QtWidgets.QWidget):
         if store is None:
             return
         store.update(**kwargs)
+
+    def _on_rescan_clicked(self) -> None:
+        """Trigger a device scan via the controller."""
+        if self._controller and hasattr(self._controller, "scan_devices"):
+            self._controller.scan_devices()
 
     # ------------------------------------------------------------------
     # Audio helpers
