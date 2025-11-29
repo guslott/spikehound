@@ -52,10 +52,11 @@ class DeviceControlWidget(QtWidgets.QWidget):
         device_layout.setHorizontalSpacing(6)
         device_layout.setVerticalSpacing(6)
         device_layout.setColumnStretch(1, 1)
-        self.device_group.setMaximumWidth(320)
+        # self.device_group.setMaximumWidth(320)  # Removed to allow expansion
 
         device_layout.addWidget(self._label("Source"), 0, 0)
         self.device_combo = QtWidgets.QComboBox()
+        self.device_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         device_layout.addWidget(self.device_combo, 0, 1)
 
         controls_row = QtWidgets.QHBoxLayout()

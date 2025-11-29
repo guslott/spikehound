@@ -32,6 +32,75 @@ class AudioDevice:
     default_samplerate: float
 
 
+class LocalRingBuffer:
+    """
+    Simple circular buffer for accumulating audio frames without reallocation.
+    Optimized for (frames, channels) layout.
+    """
+    def __init__(self, capacity: int, channels: int, dtype: np.dtype):
+        self.capacity = capacity
+        self.channels = channels
+        self._data = np.zeros((capacity, channels), dtype=dtype)
+        self._write_pos = 0
+        self._filled = 0
+
+    def write(self, data: np.ndarray) -> None:
+        frames = data.shape[0]
+        if frames == 0:
+            return
+        
+        # Safety check for massive chunks
+        if frames > self.capacity:
+            # Reset and take only the latest
+            self._write_pos = 0
+            self._filled = 0
+            data = data[-self.capacity:]
+            frames = self.capacity
+
+        # Check for overflow - in this context, we just cap filled at capacity
+        # (assuming we are overwriting old unread data, which is bad but better than crashing)
+        
+        idx = self._write_pos
+        end = idx + frames
+        if end <= self.capacity:
+            self._data[idx:end] = data
+        else:
+            split = self.capacity - idx
+            self._data[idx:] = data[:split]
+            self._data[:end-self.capacity] = data[split:]
+        
+        self._write_pos = (self._write_pos + frames) % self.capacity
+        self._filled = min(self.capacity, self._filled + frames)
+
+    @property
+    def filled(self) -> int:
+        return self._filled
+
+    def read(self, frames: int) -> np.ndarray:
+        if frames > self._filled:
+            raise ValueError("Not enough data")
+        
+        # Calculate read position (tail)
+        # write_pos points to next write. 
+        # So tail is (write_pos - filled) % capacity
+        read_pos = (self._write_pos - self._filled) % self.capacity
+        
+        idx = read_pos
+        end = idx + frames
+        if end <= self.capacity:
+            out = self._data[idx:end].copy()
+        else:
+            split = self.capacity - idx
+            out = np.vstack((self._data[idx:], self._data[:end-self.capacity]))
+        
+        self._filled -= frames
+        return out
+    
+    def clear(self) -> None:
+        self._write_pos = 0
+        self._filled = 0
+
+
 class SoundCardSource(BaseDevice):
     """
     Audio input DAQ using PortAudio via `sounddevice`.
@@ -177,7 +246,7 @@ class SoundCardSource(BaseDevice):
         self._n_in: int = 0
         self._chan_names: List[str] = []
         self._buf_lock = threading.Lock()
-        self._residual = np.zeros((0, 1), dtype=np.float32)
+        self._residual_buffer: Optional[LocalRingBuffer] = None
         self._stream = None
 
     # ---------- Required interface --------------------------------------------
@@ -227,7 +296,10 @@ class SoundCardSource(BaseDevice):
         except Exception as exc:
             raise ValueError(f"Sample rate {sample_rate} Hz not supported: {exc}") from exc
 
-        self._residual = np.zeros((0, self._n_in), dtype=np.float32)
+        # Allocate residual buffer (1 second capacity to be safe)
+        capacity = max(int(sample_rate), int(chunk_size * 4))
+        self._residual_buffer = LocalRingBuffer(capacity, self._n_in, np.dtype(self.dtype))
+        
         id_to_info = {ch.id: ch for ch in self._available_channels}
         selected = [id_to_info[c] for c in channels]
         cfg = ActualConfig(sample_rate=sample_rate, channels=selected, chunk_size=chunk_size, dtype=self.dtype)
@@ -244,17 +316,18 @@ class SoundCardSource(BaseDevice):
                 pass
             data = np.asarray(indata, dtype=np.float32, order="C")
             with self._buf_lock:
-                if self._residual.size == 0:
-                    self._residual = data.copy()
-                else:
-                    self._residual = np.vstack((self._residual, data))
-                while self._residual.shape[0] >= self.config.chunk_size:
-                    frames_chunk = self._residual[: self.config.chunk_size, :]
-                    self._residual = self._residual[self.config.chunk_size :, :]
+                if self._residual_buffer is None:
+                    return
+                
+                self._residual_buffer.write(data)
+                
+                while self._residual_buffer.filled >= self.config.chunk_size:
+                    data_chunk = self._residual_buffer.read(self.config.chunk_size)
+                    
                     idxs = [c.id for c in self.get_active_channels()]
                     if not idxs:
                         continue
-                    data_chunk = frames_chunk[:, idxs]
+                    data_chunk = data_chunk[:, idxs]
                     # Emit via base to stamp counters
                     self.emit_array(data_chunk, mono_time=_time.monotonic())
 
@@ -291,7 +364,8 @@ class SoundCardSource(BaseDevice):
                     self._stream = None
         finally:
             with self._buf_lock:
-                self._residual = np.zeros((0, self._n_in if self._n_in else 1), dtype=np.float32)
+                if self._residual_buffer is not None:
+                    self._residual_buffer.clear()
 
     # ---------- Internals ------------------------------------------------------
 
