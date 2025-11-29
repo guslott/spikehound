@@ -126,12 +126,10 @@ class BackyardBrainsSource(BaseDevice):
                 if hint:
                     hint_rate = int(hint["sample_rate"]) if "sample_rate" in hint else None
                     supports_cfg = bool(hint.get("set_channels", False))
-                    
-                    # Explicit override for 0x0009
-                    if port_info.vid == 0x2E73 and port_info.pid == 0x0009:
-                        supports_cfg = False
 
         # Most BYB devices support up to 10kHz. Use hints if we have them.
+        # If a device has a specific sample rate hint AND does not support configuration,
+        # we treat it as a fixed-rate device.
         if hint_rate and not supports_cfg:
             # Fixed rate device - ONLY support the native rate
             sample_rates = [hint_rate]
@@ -182,11 +180,6 @@ class BackyardBrainsSource(BaseDevice):
             self._supports_channel_cfg = bool(hint.get("set_channels", False))
             self._hint_sample_rate = int(hint["sample_rate"]) if "sample_rate" in hint else None
             
-            # Explicit override for 0x0009 to be absolutely sure
-            if port_info.vid == 0x2E73 and port_info.pid == 0x0009:
-                self._supports_channel_cfg = False
-                self._max_channels = 4
-                
             _LOGGER.info(f"BYB Hint: {hint.get('label')}, max_ch={self._max_channels}, supp_cfg={self._supports_channel_cfg}, rate={self._hint_sample_rate}")
         else:
             # Unknown device: keep conservative defaults
