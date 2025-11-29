@@ -41,6 +41,10 @@ class AnalysisDock(QtWidgets.QDockWidget):
         self._settings_widget: Optional[QtWidgets.QWidget] = None
         self._active_channels: list["ChannelInfo"] = []
 
+    @property
+    def settings_tab(self) -> Optional[QtWidgets.QWidget]:
+        return self._settings_widget
+
     # ------------------------------------------------------------------
     # Scope management
     # ------------------------------------------------------------------

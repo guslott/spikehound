@@ -13,6 +13,8 @@ class AppSettings:
     default_window_sec: float = 1.0
     listen_output_key: Optional[str] = None
     list_all_audio_devices: bool = False
+    load_config_on_launch: bool = False
+    launch_config_path: Optional[str] = None
 
 
 class AppSettingsStore:
@@ -40,11 +42,21 @@ class AppSettingsStore:
             listen = str(listen)
         list_all_audio = qsettings.value("list_all_audio_devices", AppSettings.list_all_audio_devices)
         list_all_audio = bool(int(list_all_audio)) if isinstance(list_all_audio, str) else bool(list_all_audio)
+        
+        load_launch = qsettings.value("load_config_on_launch", AppSettings.load_config_on_launch)
+        load_launch = bool(int(load_launch)) if isinstance(load_launch, str) else bool(load_launch)
+        
+        launch_path = qsettings.value("launch_config_path", AppSettings.launch_config_path)
+        if launch_path is not None:
+            launch_path = str(launch_path)
+
         return AppSettings(
             plot_refresh_hz=refresh,
             default_window_sec=window_sec,
             listen_output_key=listen,
             list_all_audio_devices=list_all_audio,
+            load_config_on_launch=load_launch,
+            launch_config_path=launch_path,
         )
 
     def get(self) -> AppSettings:
@@ -87,6 +99,11 @@ class AppSettingsStore:
         else:
             self._qsettings.setValue("listen_output_key", settings.listen_output_key)
         self._qsettings.setValue("list_all_audio_devices", int(bool(settings.list_all_audio_devices)))
+        self._qsettings.setValue("load_config_on_launch", int(bool(settings.load_config_on_launch)))
+        if settings.launch_config_path is None:
+            self._qsettings.remove("launch_config_path")
+        else:
+            self._qsettings.setValue("launch_config_path", settings.launch_config_path)
 
 
 __all__ = ["AppSettings", "AppSettingsStore"]

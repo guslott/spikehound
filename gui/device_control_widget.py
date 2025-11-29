@@ -24,8 +24,6 @@ class DeviceControlWidget(QtWidgets.QWidget):
     channelRemoveRequested = QtCore.Signal(int)  # channel_id
     activeChannelSelected = QtCore.Signal(int)  # index in active list
     sampleRateChanged = QtCore.Signal(float)
-    saveConfigRequested = QtCore.Signal()
-    loadConfigRequested = QtCore.Signal()
     settingsToggled = QtCore.Signal(bool)
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
@@ -81,10 +79,6 @@ class DeviceControlWidget(QtWidgets.QWidget):
         self.settings_toggle_btn = QtWidgets.QPushButton("Settings")
         self.settings_toggle_btn.setCheckable(True)
         controls_row.addWidget(self.settings_toggle_btn)
-        self.save_config_btn = QtWidgets.QPushButton("Save Config")
-        controls_row.addWidget(self.save_config_btn)
-        self.load_config_btn = QtWidgets.QPushButton("Load Config")
-        controls_row.addWidget(self.load_config_btn)
         controls_row.addStretch(1)
         device_layout.addLayout(controls_row, 3, 0, 1, 2)
 
@@ -127,8 +121,6 @@ class DeviceControlWidget(QtWidgets.QWidget):
         self.device_toggle_btn.clicked.connect(self._on_toggle_clicked)
         self.sample_rate_combo.currentIndexChanged.connect(self._on_sample_rate_changed)
         self.settings_toggle_btn.toggled.connect(self._on_settings_toggled)
-        self.save_config_btn.clicked.connect(self._on_save_config)
-        self.load_config_btn.clicked.connect(self._on_load_config)
         self.add_channel_btn.clicked.connect(self._on_add_channel)
         self.remove_channel_btn.clicked.connect(self._on_remove_channel)
         self.active_list.currentRowChanged.connect(self._on_active_channel_selected)
@@ -304,14 +296,6 @@ class DeviceControlWidget(QtWidgets.QWidget):
     def _on_settings_toggled(self, checked: bool) -> None:
         """Handle settings button toggle."""
         self.settingsToggled.emit(checked)
-
-    def _on_save_config(self) -> None:
-        """Handle save config button click."""
-        self.saveConfigRequested.emit()
-
-    def _on_load_config(self) -> None:
-        """Handle load config button click."""
-        self.loadConfigRequested.emit()
 
     def _on_add_channel(self) -> None:
         """Handle add channel button click."""

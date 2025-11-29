@@ -10,6 +10,9 @@ from shared.app_settings import AppSettings
 class SettingsTab(QtWidgets.QWidget):
     """Settings & Debug panel embedded in the AnalysisDock."""
 
+    saveConfigRequested = QtCore.Signal()
+    loadConfigRequested = QtCore.Signal()
+
     def __init__(self, controller, main_window, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
         self._controller = controller
@@ -51,6 +54,32 @@ class SettingsTab(QtWidgets.QWidget):
         self.rescan_btn = QtWidgets.QPushButton("Rescan Devices")
         self.rescan_btn.clicked.connect(self._on_rescan_clicked)
         form.addRow(self.rescan_btn)
+
+        # Config management
+        config_row = QtWidgets.QHBoxLayout()
+        self.save_config_btn = QtWidgets.QPushButton("Save Config")
+        self.save_config_btn.clicked.connect(self.saveConfigRequested.emit)
+        self.load_config_btn = QtWidgets.QPushButton("Load Config")
+        self.load_config_btn.clicked.connect(self.loadConfigRequested.emit)
+        config_row.addWidget(self.save_config_btn)
+        config_row.addWidget(self.load_config_btn)
+        form.addRow(config_row)
+
+        # Launch config
+        self.load_launch_check = QtWidgets.QCheckBox("Load Config on Launch")
+        self.load_launch_check.stateChanged.connect(self._on_load_launch_toggled)
+        form.addRow(self.load_launch_check)
+
+        path_row = QtWidgets.QHBoxLayout()
+        self.launch_path_edit = QtWidgets.QLineEdit()
+        self.launch_path_edit.setReadOnly(True)
+        self.launch_path_edit.setPlaceholderText("No config selected")
+        path_row.addWidget(self.launch_path_edit)
+        self.browse_launch_btn = QtWidgets.QPushButton("...")
+        self.browse_launch_btn.setFixedWidth(30)
+        self.browse_launch_btn.clicked.connect(self._on_browse_launch_config)
+        path_row.addWidget(self.browse_launch_btn)
+        form.addRow(path_row)
 
         return box
 
@@ -134,6 +163,29 @@ class SettingsTab(QtWidgets.QWidget):
         self.list_audio_check.blockSignals(True)
         self.list_audio_check.setChecked(bool(settings.list_all_audio_devices))
         self.list_audio_check.blockSignals(False)
+        
+        self.load_launch_check.blockSignals(True)
+        self.load_launch_check.setChecked(bool(settings.load_config_on_launch))
+        self.load_launch_check.blockSignals(False)
+        
+        self.launch_path_edit.setText(settings.launch_config_path or "")
+
+    def _on_load_launch_toggled(self, state: int) -> None:
+        enabled = bool(state)
+        self._update_settings(load_config_on_launch=enabled)
+        if enabled and not self.launch_path_edit.text():
+            self._on_browse_launch_config()
+
+    def _on_browse_launch_config(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select Launch Configuration", "", "JSON Files (*.json);;All Files (*)"
+        )
+        if path:
+            self.launch_path_edit.setText(path)
+            self._update_settings(launch_config_path=path)
+            # Auto-enable if a file is picked
+            if not self.load_launch_check.isChecked():
+                self.load_launch_check.setChecked(True)
 
     def _update_settings(self, **kwargs) -> None:
         if self._controller is None:

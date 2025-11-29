@@ -423,6 +423,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addDockWidget(QtCore.Qt.TopDockWidgetArea, self._analysis_dock)
         self._analysis_dock.settingsClosed.connect(self._on_settings_tab_closed)
         self._analysis_dock.select_scope()
+        
         self._wire_placeholders()
         self._update_trigger_controls()
         self.runtime.device_manager.devicesChanged.connect(self._on_devices_changed)
@@ -712,8 +713,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_toggle_btn = self.device_control.device_toggle_btn
         self.sample_rate_combo = self.device_control.sample_rate_combo
         self.settings_toggle_btn = self.device_control.settings_toggle_btn
-        self.save_config_btn = self.device_control.save_config_btn
-        self.load_config_btn = self.device_control.load_config_btn
         self.channels_group = self.device_control.channels_group
         self.active_list = self.device_control.active_list
         self.add_channel_btn = self.device_control.add_channel_btn
@@ -728,8 +727,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_control.channelAddRequested.connect(self._on_channel_add_requested)
         self.device_control.channelRemoveRequested.connect(self._on_channel_remove_requested)
         self.device_control.activeChannelSelected.connect(self._on_active_list_index_changed)
-        self.device_control.saveConfigRequested.connect(self._on_save_scope_config)
-        self.device_control.loadConfigRequested.connect(self._on_load_scope_config)
         self.device_control.settingsToggled.connect(self._toggle_settings_tab)
 
         grid.addWidget(self.device_control, 1, 0)
@@ -1250,6 +1247,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_scope_config_data(data, source=str(path))
 
     def _try_load_default_config(self) -> None:
+        # Check for launch config preference
+        if self._controller and self._controller.app_settings_store:
+            settings = self._controller.app_settings_store.get()
+            if settings.load_config_on_launch and settings.launch_config_path:
+                launch_path = Path(settings.launch_config_path)
+                if launch_path.is_file():
+                    try:
+                        data = json.loads(launch_path.read_text())
+                        if isinstance(data, dict):
+                            self._apply_scope_config_data(data, source=str(launch_path), show_dialogs=False)
+                            self.statusBar().showMessage(f"Loaded launch config: {launch_path.name}", 5000)
+                            return
+                    except Exception as exc:
+                        self.statusBar().showMessage(f"Failed to load launch config: {exc}", 7000)
+
+        # Fallback to default_config.json in CWD
         default_path = Path.cwd() / "default_config.json"
         if not default_path.is_file():
             return
@@ -2208,8 +2221,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_toggle_btn.setText("Disconnect" if connected else "Connect")
         self.device_toggle_btn.setEnabled(connected or has_connectable)
         self.device_toggle_btn.blockSignals(False)
-        self.save_config_btn.setEnabled(has_entries)
-        self.load_config_btn.setEnabled(True)
         self.available_combo.setEnabled(connected)
         self.active_list.setEnabled(connected)
         self._update_channel_buttons()
@@ -3197,12 +3208,13 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._settings_tab is None:
                 self._settings_tab = SettingsTab(self.runtime, self)
                 self._settings_tab.set_listen_device(self._listen_device_key)
+                self._settings_tab.saveConfigRequested.connect(self._on_save_scope_config)
+                self._settings_tab.loadConfigRequested.connect(self._on_load_scope_config)
             dock.open_settings(self._settings_tab)
         else:
             dock.close_settings()
 
     def _on_settings_tab_closed(self) -> None:
         if hasattr(self, "settings_toggle_btn"):
-            self.settings_toggle_btn.blockSignals(True)
             self.settings_toggle_btn.setChecked(False)
             self.settings_toggle_btn.blockSignals(False)
