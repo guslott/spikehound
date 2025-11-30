@@ -242,9 +242,10 @@ class ScopeWidget(QtWidgets.QWidget):
         plot_item = self.plot_widget.getPlotItem()
         plot_item.setXRange(0.0, max(seconds, 0.001), padding=0.0)
 
-    def set_threshold(self, value: float, visible: bool = True) -> None:
+    def set_threshold(self, value: Optional[float] = None, visible: bool = True) -> None:
         """Set threshold line position and visibility."""
-        self.threshold_line.setValue(value)
+        if value is not None:
+            self.threshold_line.setValue(value)
         self.threshold_line.setVisible(visible)
 
     def set_pretrigger_position(self, time_sec: float, visible: bool = True) -> None:

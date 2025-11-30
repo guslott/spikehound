@@ -747,7 +747,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trigger_mode_continuous.toggled.connect(self._on_trigger_mode_changed)
         self.trigger_mode_single.toggled.connect(self._on_trigger_mode_changed)
         self.trigger_mode_repeating.toggled.connect(self._on_trigger_mode_changed)
-        self.threshold_spin.valueChanged.connect(self._emit_trigger_config)
+        self.threshold_spin.valueChanged.connect(self._on_threshold_spin_changed)
         self.pretrigger_combo.currentIndexChanged.connect(self._emit_trigger_config)
         self.window_combo.currentIndexChanged.connect(self._on_window_changed)
         # NOTE: threshold_line signal now handled by ScopeWidget.thresholdChanged
@@ -1163,7 +1163,7 @@ class MainWindow(QtWidgets.QMainWindow):
             msg = f"Scope configuration loaded{f' from {source}' if source else ''}."
             self.statusBar().showMessage(msg, 5000)
 
-    def _emit_trigger_config(self, *_) -> None:
+    def _emit_trigger_config(self, *args, reset_state: bool = True, update_line: bool = True) -> None:
         data = self.trigger_channel_combo.currentData()
         channel_id = int(data) if data is not None else None
         ui_mode = self._current_trigger_mode()
@@ -1172,7 +1172,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._trigger_threshold = float(self.threshold_spin.value())
         pre_value = self.pretrigger_combo.currentData()
         self._trigger_pre_seconds = float(pre_value if pre_value is not None else 0.0)
-        self._reset_trigger_state()
+        
+        if reset_state:
+            self._reset_trigger_state()
 
         idx = channel_id if channel_id is not None else -1
         visual_config = {
@@ -1183,9 +1185,13 @@ class MainWindow(QtWidgets.QMainWindow):
             "pretrigger_frac": self._trigger_pre_seconds,
             "window_sec": float(self.window_combo.currentData() or 0.0),
         }
-        self._update_trigger_visuals(visual_config)
+        self._update_trigger_visuals(visual_config, update_line=update_line)
 
         self.triggerConfigChanged.emit(dict(visual_config))
+
+    def _on_threshold_spin_changed(self, value: float) -> None:
+        """Handle threshold spinbox changes without resetting trigger state."""
+        self._emit_trigger_config(reset_state=False)
 
     def _current_trigger_mode(self) -> str:
         if self.trigger_mode_repeating.isChecked():
@@ -1193,6 +1199,67 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.trigger_mode_single.isChecked():
             return "single"
         return "stream"
+
+    # ... (skipping unchanged methods) ...
+
+    def _on_scope_threshold_changed(self, value: float) -> None:
+        """Handle threshold line moved by user."""
+        # value is in normalized 0-1 screen coordinates, convert to volts
+        cfg = self._channel_configs.get(self._trigger_channel_id) or self._channel_configs.get(self._active_channel_id)
+        if cfg is not None:
+            span = cfg.vertical_span_v
+            offset = cfg.screen_offset
+            # Convert from normalized screen coords to volts
+            voltage = (value - offset) * span
+        else:
+            # No channel config, can't convert properly
+            voltage = 0.0
+        
+        self.threshold_spin.blockSignals(True)
+        self.threshold_spin.setValue(voltage)
+        self.threshold_spin.blockSignals(False)
+        self._emit_trigger_config(reset_state=False, update_line=False)
+
+    # ... (skipping unchanged methods) ...
+
+    def _update_trigger_visuals(self, config: dict, update_line: bool = True) -> None:
+        mode = config.get("mode", "stream")
+        channel_valid = config.get("channel_index", -1) != -1
+        if mode == "stream" or not channel_valid:
+            # Use ScopeWidget API to hide threshold
+            self.scope.set_threshold(visible=False)
+            self.pretrigger_line.setVisible(False)
+            return
+        
+        # Calculate threshold position in screen coordinates
+        threshold_value = config.get("threshold", 0.0)
+        cfg = self._channel_configs.get(self._trigger_channel_id) or self._channel_configs.get(self._active_channel_id)
+        if cfg is not None:
+            span = cfg.vertical_span_v
+            offset = cfg.screen_offset
+            # Transform threshold from volts to normalized 0-1 screen coords
+            normalized_value = (threshold_value / span) + offset
+        else:
+            normalized_value = 0.5
+        
+        # Use ScopeWidget API to show and position threshold
+        if update_line:
+            self.scope.set_threshold(normalized_value, visible=True)
+        else:
+            self.scope.set_threshold(visible=True)
+        
+        pen = pg.mkPen((0, 0, 0), width=3)
+        self.threshold_line.setPen(pen)
+        try:
+            self.threshold_line.setZValue(100)
+        except AttributeError:
+            pass
+        pre_value = float(config.get("pretrigger_frac", 0.0) or 0.0)
+        if pre_value > 0.0:
+            self.pretrigger_line.setVisible(True)
+            self.pretrigger_line.setValue(0.0)
+        else:
+            self.pretrigger_line.setVisible(False)
 
     def _on_save_scope_config(self) -> None:
         payload = self._collect_scope_config()
@@ -1831,6 +1898,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._channel_last_samples.clear()
                 self._channel_display_buffers.clear()
                 self._last_times = np.zeros(0, dtype=np.float32)
+        
+        # If this channel is the current trigger source, update trigger visuals
+        # to reflect potential changes in vertical span or offset.
+        if self._trigger_channel_id is not None and channel_id == self._trigger_channel_id:
+            self._emit_trigger_config(reset_state=False)
         self._update_channel_display(channel_id)
         self._refresh_channel_layout()
         if filters_changed:
@@ -2313,27 +2385,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if panel is not None:
             panel.set_config(config)
 
+        # If this channel is the current trigger source, update trigger visuals
+        # so the threshold line follows the trace.
+        if self._trigger_channel_id is not None and channel_id == self._trigger_channel_id:
+            self._emit_trigger_config(reset_state=False)
+
     def _on_scope_drag_finished(self) -> None:
         """Handle end of channel drag operation."""
         pass  # Currently no additional action needed
-
-    def _on_scope_threshold_changed(self, value: float) -> None:
-        """Handle threshold line moved by user."""
-        # value is in normalized 0-1 screen coordinates, convert to volts
-        cfg = self._channel_configs.get(self._trigger_channel_id) or self._channel_configs.get(self._active_channel_id)
-        if cfg is not None:
-            span = cfg.vertical_span_v
-            offset = cfg.screen_offset
-            # Convert from normalized screen coords to volts
-            voltage = (value - offset) * span
-        else:
-            # No channel config, can't convert properly
-            voltage = 0.0
-        
-        self.threshold_spin.blockSignals(True)
-        self.threshold_spin.setValue(voltage)
-        self.threshold_spin.blockSignals(False)
-        self._emit_trigger_config()
 
     def _on_trigger_mode_changed(self) -> None:
         self._update_trigger_controls()
@@ -2365,42 +2424,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._trigger_mode != "single":
             self._trigger_single_armed = False
         self.pretrigger_line.setVisible(False)
-
-    def _update_trigger_visuals(self, config: dict) -> None:
-        mode = config.get("mode", "stream")
-        channel_valid = config.get("channel_index", -1) != -1
-        if mode == "stream" or not channel_valid:
-            # Use ScopeWidget API to hide threshold
-            self.scope.set_threshold(0.0, visible=False)
-            self.pretrigger_line.setVisible(False)
-            return
-        
-        # Calculate threshold position in screen coordinates
-        threshold_value = config.get("threshold", 0.0)
-        cfg = self._channel_configs.get(self._trigger_channel_id) or self._channel_configs.get(self._active_channel_id)
-        if cfg is not None:
-            span = cfg.vertical_span_v
-            offset = cfg.screen_offset
-            # Transform threshold from volts to normalized 0-1 screen coords
-            normalized_value = (threshold_value / span) + offset
-        else:
-            normalized_value = 0.5
-        
-        # Use ScopeWidget API to show and position threshold
-        self.scope.set_threshold(normalized_value, visible=True)
-        
-        pen = pg.mkPen((0, 0, 0), width=3)
-        self.threshold_line.setPen(pen)
-        try:
-            self.threshold_line.setZValue(100)
-        except AttributeError:
-            pass
-        pre_value = float(config.get("pretrigger_frac", 0.0) or 0.0)
-        if pre_value > 0.0:
-            self.pretrigger_line.setVisible(True)
-            self.pretrigger_line.setValue(0.0)
-        else:
-            self.pretrigger_line.setVisible(False)
 
     def _update_status(self, viz_depth: int) -> None:
         controller = self._controller
