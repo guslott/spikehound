@@ -2290,7 +2290,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_sample_rate_enabled()
         self.device_toggle_btn.blockSignals(True)
         self.device_toggle_btn.setChecked(connected)
-        self.device_toggle_btn.setText("Disconnect" if connected else "Connect")
+        self.device_toggle_btn.setText("Click to Disconnect" if connected else "Click to Connect")
         self.device_toggle_btn.setEnabled(connected or has_connectable)
         self.device_toggle_btn.blockSignals(False)
         self.available_combo.setEnabled(connected)

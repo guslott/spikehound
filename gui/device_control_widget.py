@@ -52,27 +52,27 @@ class DeviceControlWidget(QtWidgets.QWidget):
         device_layout.setColumnStretch(1, 1)
         # self.device_group.setMaximumWidth(320)  # Removed to allow expansion
 
-        device_layout.addWidget(self._label("Source"), 0, 0)
+        # device_layout.addWidget(self._label("Source"), 0, 0)
         self.device_combo = QtWidgets.QComboBox()
         self.device_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-        device_layout.addWidget(self.device_combo, 0, 1)
+        device_layout.addWidget(self.device_combo, 0, 0, 1, 2)
 
-        controls_row = QtWidgets.QHBoxLayout()
-        controls_row.setSpacing(6)
-        # Scan button moved to Settings tab
-        self.device_toggle_btn = QtWidgets.QPushButton("Connect")
-        self.device_toggle_btn.setCheckable(True)
-        self.device_toggle_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
-        self.device_toggle_btn.setFixedHeight(32)
-        controls_row.addWidget(self.device_toggle_btn)
-        device_layout.addLayout(controls_row, 1, 0, 1, 2)
-
-        device_layout.addWidget(self._label("Sample Rate (Hz)"), 2, 0)
+        device_layout.addWidget(self._label("Sample Rate (Hz)"), 1, 0)
         self.sample_rate_combo = QtWidgets.QComboBox()
         self.sample_rate_combo.setEditable(False)
         self.sample_rate_combo.setFixedHeight(24)
         self.sample_rate_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
-        device_layout.addWidget(self.sample_rate_combo, 2, 1)
+        device_layout.addWidget(self.sample_rate_combo, 1, 1)
+
+        controls_row = QtWidgets.QHBoxLayout()
+        controls_row.setSpacing(6)
+        # Scan button moved to Settings tab
+        self.device_toggle_btn = QtWidgets.QPushButton("Click to Connect")
+        self.device_toggle_btn.setCheckable(True)
+        self.device_toggle_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        self.device_toggle_btn.setFixedHeight(32)
+        controls_row.addWidget(self.device_toggle_btn)
+        device_layout.addLayout(controls_row, 2, 0, 1, 2)
 
         controls_row = QtWidgets.QHBoxLayout()
         controls_row.setSpacing(6)
@@ -184,7 +184,7 @@ class DeviceControlWidget(QtWidgets.QWidget):
         self._connected = connected
         self.device_toggle_btn.blockSignals(True)
         self.device_toggle_btn.setChecked(connected)
-        self.device_toggle_btn.setText("Disconnect" if connected else "Connect")
+        self.device_toggle_btn.setText("Click to Disconnect" if connected else "Click to Connect")
         self.device_toggle_btn.blockSignals(False)
         
         self.device_combo.setEnabled(not connected)
