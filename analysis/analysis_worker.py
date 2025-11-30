@@ -231,6 +231,8 @@ class AnalysisWorker(threading.Thread):
     def _on_settings_changed(self, settings: AnalysisSettings) -> None:
         with self._state_lock:
             self._event_window_ms = float(settings.event_window_ms)
+            if self._auto_detector is not None:
+                self._auto_detector.configure(window_ms=self._event_window_ms)
 
     def configure_threshold(
         self,

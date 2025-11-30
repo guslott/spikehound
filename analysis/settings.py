@@ -7,7 +7,7 @@ from typing import Callable, Dict, Optional
 
 @dataclass(frozen=True)
 class AnalysisSettings:
-    event_window_ms: float = 10.0
+    event_window_ms: float = 5.0
 
 
 class AnalysisSettingsStore:

@@ -89,14 +89,10 @@ class AmpThresholdDetector:
         
         samples = chunk.samples # (n_channels, n_samples)
         if samples.shape[1] == 0:
-            # If the current chunk is empty, just return any residue if it's also empty.
-            # Otherwise, the residue will be processed with the next non-empty chunk.
+            # If the current chunk is empty, preserve existing residue.
+            # If residue is also empty, there is nothing to process.
             if self._residue is None or self._residue.shape[1] == 0:
                 return []
-            # If there's residue but no new samples, we can't extend the buffer,
-            # so we'll just process the residue as if it were the full_samples
-            # but we won't update the residue at the end, as there's no new data.
-            # This case is handled by the logic below where `samples` is empty.
 
         # Calculate window parameters
         window_samples = int(self._window_ms * 1e-3 * self._sample_rate)
@@ -106,9 +102,8 @@ class AmpThresholdDetector:
         # Stitch residue
         if self._residue is not None and self._residue.shape[1] > 0:
             full_samples = np.concatenate([self._residue, samples], axis=1)
-            # Calculate start time of full_samples
-            # residue ends at chunk.start_time
-            # so residue starts at chunk.start_time - len(residue)*dt
+            # Calculate start time of the concatenated buffer.
+            # The residue precedes the current chunk start time.
             residue_len = self._residue.shape[1]
             full_start_time = chunk.start_time - (residue_len * chunk.dt)
         else:
@@ -125,18 +120,12 @@ class AmpThresholdDetector:
             # Avoid zero threshold
             self._noise_levels[self._noise_levels == 0] = 1.0
 
-        # We need to scan for events.
-        # We only care about events that we can fully window (or close to it).
-        # And we don't want to re-detect events that were already processed in residue.
-        # But wait, if an event was in residue but incomplete, we WANT to detect it now.
-        # So we scan the whole full_samples?
-        # Yes, but we filter by _last_event_time to avoid duplicates.
+        # Scan the full buffer for events.
+        # Duplicate detection is prevented by filtering against `_last_event_time`.
         
-        # Valid region for detection:
-        # We need pre_samples before the crossing and post_samples after.
-        # So crossing index 'idx' must satisfy:
-        # idx >= pre_samples
-        # idx < full_samples.shape[1] - post_samples
+        # Define the valid detection range to ensure sufficient pre- and post-event samples.
+        # Crossing index 'idx' must satisfy:
+        # pre_samples <= idx < full_samples.shape[1] - post_samples
         
         valid_end_idx = full_samples.shape[1] - post_samples
         if valid_end_idx <= pre_samples:
@@ -224,18 +213,9 @@ class AmpThresholdDetector:
                 self._last_event_time[ch] = real_t
                 last_t = real_t
                 
-        # Update residue
-        # Keep enough data for the next chunk's context.
-        # We need at least pre_samples.
-        # But we also need to keep any data that wasn't fully scanned?
-        # We scanned up to valid_end_idx.
-        # So we need to keep from valid_end_idx onwards?
-        # But we also need pre_samples context for the first point in that region.
-        # So we keep from (valid_end_idx - pre_samples) onwards.
-        
-        # Wait, valid_end_idx = len - post.
-        # So we keep len - post - pre = len - window.
-        # So we keep the last window_samples.
+        # Retain the end of the current buffer as residue for the next chunk.
+        # The residue length must be at least the window size to ensure continuity
+        # and allow detection of events straddling the chunk boundary.
         
         keep_len = window_samples
         if full_samples.shape[1] > keep_len:

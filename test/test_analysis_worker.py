@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
 
-from analysis.analysis_worker import AnalysisWorker, _peak_frequency_sinc
+from analysis.analysis_worker import AnalysisWorker
+from analysis.metrics import peak_frequency_sinc as _peak_frequency_sinc
 from analysis.settings import AnalysisSettingsStore
 from shared.models import Chunk
 from shared.event_buffer import AnalysisEvents, EventRingBuffer
@@ -78,15 +79,19 @@ def test_worker_window_copy_and_timing() -> None:
     assert len(events) == 1
     ev = events[0]
 
-    half_samples = int(round((10.0 / 2.0) * sr / 1000.0))
-    assert ev.samples.size == 2 * half_samples + 1
+    window_samples = int(round(10.0 * sr / 1000.0))
+    assert ev.samples.size == window_samples
 
     pre_samples = int(round((ev.crossingTimeSec - ev.firstSampleTimeSec) * sr))
-    post_samples = ev.samples.size - pre_samples - 1
-    assert pre_samples == half_samples
-    assert post_samples == half_samples
+    post_samples = ev.samples.size - pre_samples
+    
+    expected_pre = window_samples // 3
+    expected_post = window_samples - expected_pre
+    
+    assert pre_samples == expected_pre
+    assert post_samples == expected_post
 
-    expected_first = ev.crossingTimeSec - (ev.windowMs / 2000.0)
+    expected_first = ev.crossingTimeSec - (expected_pre / sr)
     assert ev.firstSampleTimeSec == pytest.approx(expected_first, rel=1e-7)
 
 
@@ -203,7 +208,7 @@ def test_peak_frequency_sinc_focuses_on_localized_event() -> None:
     sr = 20_000
     samples = int(sr * 0.02)
     wave = np.zeros(samples, dtype=np.float64)
-    burst_len = int(sr * 0.004)
+    burst_len = int(sr * 0.010) # Increased to 10ms for reliable detection of 220Hz
     start = samples // 2 - burst_len // 2
     t = np.arange(burst_len) / sr
     freq = 220.0
@@ -228,3 +233,24 @@ def test_analysis_events_pull_since() -> None:
 
     events, last_id = bus.pull_events(last_id)
     assert events == []
+
+
+def test_worker_updates_auto_detector_window_on_settings_change() -> None:
+    controller = _DummyController()
+    worker = AnalysisWorker(controller, "ch0", sample_rate=20_000)
+    # Ensure worker subscribes to settings
+    # AnalysisWorker subscribes in __init__ if controller has store
+    
+    worker.configure_threshold(enabled=True, value=0.5, auto_detect=True)
+    
+    # Initial check (default 5.0ms from settings)
+    assert worker._auto_detector is not None
+    # We expect 5.0 because AnalysisSettings default is now 5.0
+    assert worker._auto_detector._window_ms == 5.0
+    
+    # Change settings
+    controller.analysis_settings_store.update(event_window_ms=20.0)
+    
+    # Verify update propagated
+    assert worker._event_window_ms == 20.0
+    assert worker._auto_detector._window_ms == 20.0

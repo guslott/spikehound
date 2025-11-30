@@ -253,7 +253,7 @@ class SimulatedPhysiologySource(BaseDevice):
         sample_rate = 20_000
         # Generate random units
         # Multiple units with variable amplitudes for realistic simulation
-        n_units = 8
+        n_units = 6 #fix to 6 units
         self._line_hum_amp = float(options.get('line_hum_amp', self._default_line_hum_amp))
         self._line_hum_freq = float(options.get('line_hum_freq', 60.0))
         self._line_hum_phase = 0.0
@@ -335,13 +335,13 @@ class SimulatedPhysiologySource(BaseDevice):
                     templ_len = u['templ_len']
                     wave_buf = wave_buffers[ui]
                     # TEST: Fixed PSP gain 0.02 for verification
-                    psp_gain = 0.02
+                    psp_gain = u['psp_gain']
                     syn_delay = u['syn_delay_samples']
                     
                     for off in offs:
                         # Add extracellular spike to wave buffer
                         # TEST: Fixed amplitude 0.5V for verification
-                        amp = 0.5
+                        amp = u['amp_prox']
                         scaled = templ * amp
                         end = off + templ_len
                         if end > buf_len:
@@ -398,7 +398,7 @@ class SimulatedPhysiologySource(BaseDevice):
                                 padded[: seg.shape[0]] = seg
                                 seg = padded
                             # TEST: Force 0.5V amplitude on distal too (ignore ratio)
-                            sig += seg  # u['amp_dist_ratio'] ignored for test
+                            sig += seg * u['amp_dist_ratio']
                         sig += np.random.normal(0.0, self._noise_level, size=chunk_size).astype(np.float32)
                         data_chunk[:, col] = sig
                     else:  # intracellular - render PSPs

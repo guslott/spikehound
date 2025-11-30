@@ -877,11 +877,11 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def _initial_event_window_ms(self) -> float:
         if self._analysis_settings is None:
-            return 10.0
+            return 5.0
         try:
             return float(self._analysis_settings.get().event_window_ms)
         except Exception:
-            return 10.0
+            return 5.0
 
     def _set_event_window_selection(self, value_ms: float) -> None:
         target = float(value_ms)
@@ -1952,11 +1952,12 @@ class AnalysisTab(QtWidgets.QWidget):
                 counts: dict[int, int] = {cluster.id: 0 for cluster in self._clusters}
                 for cid in self._event_cluster_labels.values():
                     counts[cid] = counts.get(cid, 0) + 1
-                for cluster in self._clusters:
-                    item = self._cluster_items.get(cluster.id)
-                    if item is None:
-                        continue
-                    item.setText(f"{cluster.name} ({counts.get(cluster.id, 0)} events)")
+            for cluster in self._clusters:
+                item = self._cluster_items.get(cluster.id)
+                if item is None:
+                    continue
+                item.setText(f"{cluster.name} ({counts.get(cluster.id, 0)} events)")
+            if not self._viz_paused:
                 self._refresh_overlay_colors()
         default_brush_color = QtGui.QColor(UNCLASSIFIED_COLOR)
         default_brush_color.setAlpha(170)
