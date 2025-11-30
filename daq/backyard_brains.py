@@ -100,7 +100,10 @@ class BackyardBrainsSource(BaseDevice):
                 name = hint.get("label") if hint else None
                 if not name:
                     name = p.description or "Backyard Brains device"
-                name = f"{name} ({p.device})"
+                # Use p.name (short name like 'COM3' or 'cu.usbmodem...') for display
+                # instead of full path (p.device like '/dev/cu.usbmodem...')
+                display_port = p.name or p.device
+                name = f"{name} ({display_port})"
                 candidates.append(
                     DeviceInfo(
                         id=p.device,
