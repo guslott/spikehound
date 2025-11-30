@@ -29,4 +29,4 @@ if __name__ == "__main__":
 # - Test on Windows w/ a school laptop
 #   - (Low Priority) install NIDAQmx drivers
 #   - (Low Priority) simulate devices and write a windows only DAQ interface using pyDAQmx
-
+# - Add LabJack Hardware Support (low priority)
