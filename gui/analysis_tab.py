@@ -435,8 +435,8 @@ class AnalysisTab(QtWidgets.QWidget):
         threshold_layout = QtWidgets.QVBoxLayout()
         threshold_layout.setSpacing(4)
 
-        self.auto_detect_check = QtWidgets.QCheckBox("Auto-detect events (4\u03c3)")
-        self.auto_detect_check.setToolTip("Automatically detect events crossing 4 * MAD threshold (positive or negative).")
+        self.auto_detect_check = QtWidgets.QCheckBox("Auto-detect events (5\u03c3)")
+        self.auto_detect_check.setToolTip("Automatically detect events crossing 5 * MAD threshold (positive or negative).")
         self.auto_detect_check.toggled.connect(self._on_auto_detect_toggled)
         threshold_layout.addWidget(self.auto_detect_check)
 

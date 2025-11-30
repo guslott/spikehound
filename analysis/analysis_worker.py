@@ -14,7 +14,7 @@ from shared.types import Event
 from .models import AnalysisBatch
 from .settings import AnalysisSettings, AnalysisSettingsStore
 from .metrics import energy_density, peak_frequency_sinc
-from core.detection import AmpThresholdDetector
+from core.detection import AmpThresholdDetector, DETECTOR_REGISTRY
 
 
 class AnalysisWorker(threading.Thread):
@@ -257,9 +257,11 @@ class AnalysisWorker(threading.Thread):
             self._secondary_threshold_value = secondary_numeric
             self._auto_detect_enabled = bool(auto_detect)
             if self._auto_detect_enabled and self._auto_detector is None:
-                self._auto_detector = AmpThresholdDetector()
-                # Configure for 4*sigma, bidirectional
-                self._auto_detector.configure(factor=4.0, sign=0, window_ms=self._event_window_ms)
+                # Use registry to instantiate detector
+                det_cls = DETECTOR_REGISTRY["amp_threshold"]
+                self._auto_detector = det_cls()
+                # Configure for 5*sigma, bidirectional
+                self._auto_detector.configure(factor=5.0, sign=0, window_ms=self._event_window_ms)
                 if self.sample_rate > 0:
                     self._auto_detector.reset(self.sample_rate, 1)
             elif self._auto_detect_enabled and self._auto_detector is not None:
@@ -339,7 +341,7 @@ class AnalysisWorker(threading.Thread):
                 # Energy
                 energy = float(np.sum(wf.astype(np.float32) ** 2))
                 window_sec = max(1e-12, wf.size * dt)
-                ed = energy / window_sec
+                ed = float(np.sqrt(energy / window_sec))
                 
                 # Peak Freq
                 peak_freq = peak_frequency_sinc(centered_wf, sr)
@@ -539,7 +541,7 @@ class AnalysisWorker(threading.Thread):
                 peak_idx = pre_count
             energy = float(np.sum(wf.astype(np.float32) ** 2))
             window_sec = max(1e-12, wf.size * dt_sec)
-            energy_density = energy / window_sec
+            energy_density = float(np.sqrt(energy / window_sec))
             peak_freq = peak_frequency_sinc(centered_wf, sr, center_index=peak_idx)
             peak_wavelength = 1.0 / peak_freq if peak_freq > 1e-9 else 0.0
             event = Event(

@@ -24,7 +24,7 @@ def energy_density(x: np.ndarray, sr: float) -> float:
     weighted = x_detrend * window
     energy = np.sum(weighted * weighted, dtype=np.float64)
     window_sec = max(1e-12, arr.size / float(sr))
-    return float(energy / window_sec)
+    return float(np.sqrt(energy / window_sec))
 
 
 def min_max(x: np.ndarray) -> Tuple[float, float]:

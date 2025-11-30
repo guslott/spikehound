@@ -255,3 +255,41 @@ def test_amp_threshold_detector_cross_chunk():
     
     # Check pre_samples
     assert e.params["pre_samples"] == 1
+
+def test_amp_threshold_detector_dc_offset():
+    fs = 1000.0
+    dt = 1.0 / fs
+    # Signal with small DC offset
+    # If offset is too large, absolute thresholding fails unless we subtract baseline.
+    # But robust MAD helps keep threshold low enough to detect spikes that cross 0.
+    dc_offset = 0.5
+    noise_sigma = 0.1
+    signal = np.random.normal(dc_offset, noise_sigma, size=1000)
+    
+    # Add a spike relative to the DC level
+    spike_idx = 500
+    signal[spike_idx] = dc_offset - 1.5 # Spike of amplitude -1.5. Reaches -1.0.
+    
+    detector = AmpThresholdDetector()
+    # Factor 5.0. 
+    # Old MAD: median(|0.5|) = 0.5. Threshold = 2.5.
+    # Spike min = -1.0. -1.0 < -2.5 is False. Missed.
+    # New MAD: median(|0.5 - 0.5|) ~ 0.067. Threshold ~ 0.33.
+    # Spike min = -1.0. -1.0 < -0.33 is True. Detected.
+    detector.configure(factor=5.0, sign=-1, window_ms=5.0)
+    detector.reset(fs, 1)
+    
+    chunk = _make_chunk(signal.reshape(1, -1), start_time=0.0, dt=dt, seq=0)
+    events = detector.process_chunk(chunk)
+    
+    assert len(events) >= 1
+    found = False
+    for e in events:
+        if abs(e.t - 0.5) < 0.01:
+            found = True
+            # Check amplitude property
+            # The event property "amplitude" is raw value at peak.
+            # So it should be around -1.0
+            assert abs(e.properties["amplitude"] - (dc_offset - 1.5)) < 0.2
+            break
+    assert found

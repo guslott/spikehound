@@ -114,9 +114,10 @@ class AmpThresholdDetector:
         # Estimate noise if not yet done (simple one-shot for now, could be sliding)
         if self._noise_levels is None:
             # MAD = median(|x - median(x)|)
-            # For spike detection, we often assume median(x) ~ 0 after high-pass
-            # sigma = MAD / 0.6745
-            self._noise_levels = np.median(np.abs(full_samples), axis=1) / 0.6745
+            # Robust to DC offsets
+            med = np.median(full_samples, axis=1, keepdims=True)
+            mad = np.median(np.abs(full_samples - med), axis=1)
+            self._noise_levels = mad / 0.6745
             # Avoid zero threshold
             self._noise_levels[self._noise_levels == 0] = 1.0
 
