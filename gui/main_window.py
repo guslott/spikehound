@@ -1248,7 +1248,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.scope.set_threshold(visible=True)
         
-        pen = pg.mkPen((0, 0, 0), width=3)
+        pen = pg.mkPen((0, 0, 0), width=5)
         self.threshold_line.setPen(pen)
         try:
             self.threshold_line.setZValue(100)

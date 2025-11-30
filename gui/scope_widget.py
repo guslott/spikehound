@@ -127,7 +127,7 @@ class ScopeWidget(QtWidgets.QWidget):
         # Add threshold and pretrigger lines
         self.threshold_line = pg.InfiniteLine(
             angle=0,
-            pen=pg.mkPen((178, 34, 34), width=3),
+            pen=pg.mkPen((178, 34, 34), width=5),
             movable=True
         )
         self.threshold_line.setVisible(False)
