@@ -13,7 +13,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets, QtGui
 
-from analysis.analysis_worker import _peak_frequency_sinc
+
 from analysis.models import AnalysisBatch
 from shared.models import Chunk, EndOfStream
 from shared.event_buffer import AnalysisEvents
@@ -131,35 +131,7 @@ class _MeasureLine:
             self._guard = False
 
 
-def _baseline(samples: np.ndarray, pre_samples: int) -> float:
-    arr = np.asarray(samples, dtype=np.float32)
-    if pre_samples <= 0 or arr.size == 0:
-        return 0.0
-    return float(np.median(arr[: min(pre_samples, arr.size)]))
-
-
-def _blackman(n: int) -> np.ndarray:
-    return np.blackman(max(1, n))
-
-
-def _energy_density(x: np.ndarray, sr: float) -> float:
-    arr = np.asarray(x, dtype=np.float32)
-    if arr.size == 0 or sr <= 0:
-        return 0.0
-    base = _baseline(arr, max(1, int(0.1 * arr.size)))
-    x_detrend = arr - base
-    window = _blackman(arr.size)
-    weighted = x_detrend * window
-    energy = np.sum(weighted * weighted, dtype=np.float64)
-    window_sec = max(1e-12, arr.size / float(sr))
-    return float(energy / window_sec)
-
-
-def _min_max(x: np.ndarray) -> tuple[float, float]:
-    arr = np.asarray(x, dtype=np.float32)
-    if arr.size == 0:
-        return 0.0, 0.0
-    return float(np.max(arr)), float(np.min(arr))
+from analysis.metrics import baseline, energy_density, min_max, peak_frequency_sinc
 
 
 if TYPE_CHECKING:
@@ -2047,8 +2019,8 @@ class AnalysisTab(QtWidgets.QWidget):
         first_index = int(event.crossingIndex) - pre_samples if event.crossingIndex >= 0 else None
         times = float(event.firstSampleTimeSec) + (np.arange(samples.size, dtype=np.float64) / sr)
         last_time = float(times[-1]) if times.size else float(event.firstSampleTimeSec)
-        baseline = _baseline(samples, pre_samples)
-        x = samples.astype(np.float32) - baseline
+        baseline_val = baseline(samples, pre_samples)
+        x = samples.astype(np.float32) - baseline_val
         cross_idx = pre_samples
         search_radius = max(1, int(round(0.001 * sr)))
         i0 = max(0, cross_idx - search_radius)
@@ -2066,15 +2038,15 @@ class AnalysisTab(QtWidgets.QWidget):
         metrics: Optional[dict[str, float]] = None
         metric_values: dict[str, float] = {}
         if samples.size >= 4:
-            ed = _energy_density(x, sr)
-            mx, mn = _min_max(x)
-            fpk = _peak_frequency_sinc(x, sr, center_index=cross_idx)
+            ed = energy_density(samples, sr)
+            mx, mn = min_max(samples)
+            pf = peak_frequency_sinc(samples, sr, center_index=cross_idx)
             metric_values.update(
                 {
                     "ed": float(ed),
                     "max": float(mx),
                     "min": float(mn),
-                    "freq": float(fpk),
+                    "freq": float(pf),
                 }
             )
         interval_val = float(getattr(event, "intervalSinceLastSec", float("nan")))
@@ -2106,7 +2078,7 @@ class AnalysisTab(QtWidgets.QWidget):
             first_index=first_index,
             sr=sr,
             pre_samples=pre_samples,
-            baseline=baseline,
+            baseline=float(baseline_val),
             peak_idx=peak_idx,
             peak_time=peak_time,
             metrics=metrics,

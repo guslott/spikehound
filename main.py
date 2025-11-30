@@ -23,6 +23,8 @@ if __name__ == "__main__":
 
 # - Add analog output to DAQ devices to support input and output/stimulation
 
+# - Add auto-thresholding from background noise computation as a third checkbox vs manual thresholding
+
 # - Button to export of class events properties list to CSV (class ID - zero for non-classified events))
 # - Allow for custom channel names
 
