@@ -11,7 +11,8 @@ import numpy as np
 from PySide6 import QtCore
 
 from .conditioning import FilterSettings, SignalConditioner
-from shared.models import Chunk, ChunkPointer, EndOfStream, TriggerConfig
+from .detection import DETECTOR_REGISTRY, EventDetector
+from shared.models import Chunk, ChunkPointer, EndOfStream, TriggerConfig, Event
 from shared.ring_buffer import SharedRingBuffer
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,7 @@ class Dispatcher:
         visualization_queue: "queue.Queue[ChunkPointer | EndOfStream]",
         audio_queue: "queue.Queue[ChunkPointer | EndOfStream]",
         logging_queue: "queue.Queue[Chunk | EndOfStream]",
+        event_queue: "queue.Queue[Event | EndOfStream]",
         *,
         filter_settings: Optional[FilterSettings] = None,
         poll_timeout: float = 0.05,
@@ -58,6 +60,7 @@ class Dispatcher:
         self._output_queues: Dict[str, queue.Queue] = {
             "visualization": visualization_queue,
             "audio": audio_queue,
+            "events": event_queue,
         }
         self._logging_queue = logging_queue
         self._conditioner = SignalConditioner(filter_settings)
@@ -92,6 +95,10 @@ class Dispatcher:
         self._next_analysis_id = 1
         self._last_filter_settings: Optional[FilterSettings] = filter_settings  # Initialize with provided settings
 
+        # Detection
+        self._detectors: list[EventDetector] = []
+        self._detectors_lock = threading.Lock()
+
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
@@ -117,6 +124,26 @@ class Dispatcher:
     def update_filter_settings(self, settings: FilterSettings) -> None:
         self._last_filter_settings = settings  # Store for later retrieval
         self._conditioner.update_settings(settings)
+
+    def configure_detectors(self, detector_names: Sequence[str]) -> None:
+        """Instantiate and configure detectors by name."""
+        new_detectors = []
+        for name in detector_names:
+            cls = DETECTOR_REGISTRY.get(name)
+            if cls:
+                detector = cls()
+                # Auto-configure if possible, or leave defaults
+                # If we are running, we should reset them
+                if self._sample_rate and self._sample_rate > 0:
+                    channels = len(self._channel_ids) if self._channel_ids else 1
+                    detector.reset(self._sample_rate, channels)
+                new_detectors.append(detector)
+            else:
+                logger.warning(f"Unknown detector: {name}")
+        
+        with self._detectors_lock:
+            self._detectors = new_detectors
+            logger.info(f"Configured detectors: {[d.name for d in self._detectors]}")
 
     def set_active_channels(self, channel_ids: Sequence[int]) -> None:
         with self._ring_lock:
@@ -148,6 +175,11 @@ class Dispatcher:
             self._ensure_viz_buffer_locked(channels, min_capacity=buffer.capacity)
             self._reset_viz_counters_locked()
             logger.info("Dispatcher linked to source buffer: shape=%s, sr=%s", buffer.shape, self._sample_rate)
+
+            # Reset detectors
+            with self._detectors_lock:
+                for d in self._detectors:
+                    d.reset(self._sample_rate, channels)
 
     def clear_active_channels(self) -> None:
         with self._ring_lock:
@@ -184,6 +216,12 @@ class Dispatcher:
                 current_settings = self._conditioner.get_settings() if hasattr(self._conditioner, 'get_settings') else getattr(self, '_last_filter_settings', None)
                 if current_settings is not None:
                     self._conditioner.update_settings(current_settings)
+
+            # Reset detectors if channel count changed
+            if channel_count_changed and self._sample_rate:
+                with self._detectors_lock:
+                    for d in self._detectors:
+                        d.reset(self._sample_rate, channels)
 
     def reset_buffers(self) -> None:
         with self._ring_lock:
@@ -340,6 +378,17 @@ class Dispatcher:
             meta=filtered_meta,
         )
 
+        # Run detection
+        with self._detectors_lock:
+            if self._detectors:
+                for detector in self._detectors:
+                    try:
+                        events = detector.process_chunk(filtered_chunk)
+                        for event in events:
+                            self._enqueue(self._output_queues["events"], event, "events")
+                    except Exception as e:
+                        logger.error(f"Detector {detector.name} failed: {e}")
+
         with self._ring_lock:
             self._ensure_viz_buffer_locked(filtered_samples.shape[0], min_capacity=ptr.length)
             viz_start = self.viz_buffer.write(filtered_samples)
@@ -360,6 +409,8 @@ class Dispatcher:
         # DISABLED: Logging queue disabled until explicit data logging feature is added
         # self._enqueue(self._logging_queue, raw_chunk, "logging")
         for name, out_queue in self._output_queues.items():
+            if name == "events":
+                continue # Handled in _process_pointer
             if name in ("visualization", "audio"):
                 self._enqueue(out_queue, viz_pointer, name)
             else:

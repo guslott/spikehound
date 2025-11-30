@@ -227,6 +227,7 @@ class PipelineController:
         self.visualization_queue: "queue.Queue" = queue.Queue(maxsize=visualization_queue_size)
         self.audio_queue: "queue.Queue" = queue.Queue(maxsize=audio_queue_size)
         self.logging_queue: "queue.Queue" = queue.Queue(maxsize=logging_queue_size)
+        self.event_queue: "queue.Queue" = queue.Queue(maxsize=1024)
         self._analysis_settings = AnalysisSettingsStore()
         self._app_settings_store = AppSettingsStore()
         self._event_buffer = EventRingBuffer(capacity=1000)
@@ -388,6 +389,7 @@ class PipelineController:
                 visualization_queue=self.visualization_queue,
                 audio_queue=self.audio_queue,
                 logging_queue=self.logging_queue,
+                event_queue=self.event_queue,
                 filter_settings=self._filter_settings,
                 poll_timeout=self._dispatcher_timeout,
             )
@@ -508,6 +510,7 @@ class PipelineController:
                 visualization_queue=self.visualization_queue,
                 audio_queue=self.audio_queue,
                 logging_queue=self.logging_queue,
+                event_queue=self.event_queue,
                 filter_settings=self._filter_settings,
                 poll_timeout=self._dispatcher_timeout,
             )
@@ -727,7 +730,7 @@ class PipelineController:
 
     def _reset_output_queues(self) -> None:
         """Clear downstream queues so the next start() begins fresh."""
-        for q in (self.visualization_queue, self.audio_queue, self.logging_queue):
+        for q in (self.visualization_queue, self.audio_queue, self.logging_queue, self.event_queue):
             self._flush_queue(q)
         self._event_buffer.clear()
 

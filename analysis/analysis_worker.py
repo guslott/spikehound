@@ -13,6 +13,8 @@ from shared.types import Event
 
 from .models import AnalysisBatch
 from .settings import AnalysisSettings, AnalysisSettingsStore
+from .metrics import energy_density, peak_frequency_sinc
+from core.detection import AmpThresholdDetector
 
 
 class AnalysisWorker(threading.Thread):
@@ -43,6 +45,8 @@ class AnalysisWorker(threading.Thread):
         self._last_crossing_time_sec: Optional[float] = None
         self._event_id = 0
         self._channel_id: Optional[int] = None
+        self._auto_detect_enabled = False
+        self._auto_detector: Optional[AmpThresholdDetector] = None
         if isinstance(self._settings_store, AnalysisSettingsStore):
             self._settings_unsub = self._settings_store.subscribe(self._on_settings_changed)
 
@@ -235,6 +239,7 @@ class AnalysisWorker(threading.Thread):
         *,
         secondary_enabled: Optional[bool] = None,
         secondary_value: Optional[float] = None,
+        auto_detect: bool = False,
     ) -> None:
         numeric_value = float(value)
         direction = "above" if numeric_value >= 0 else "below"
@@ -248,6 +253,16 @@ class AnalysisWorker(threading.Thread):
             self._threshold_direction = direction
             self._secondary_threshold_enabled = secondary_flag
             self._secondary_threshold_value = secondary_numeric
+            self._auto_detect_enabled = bool(auto_detect)
+            if self._auto_detect_enabled and self._auto_detector is None:
+                self._auto_detector = AmpThresholdDetector()
+                # Configure for 4*sigma, bidirectional
+                self._auto_detector.configure(factor=4.0, sign=0, window_ms=self._event_window_ms)
+                if self.sample_rate > 0:
+                    self._auto_detector.reset(self.sample_rate, 1)
+            elif self._auto_detect_enabled and self._auto_detector is not None:
+                # Update window if needed
+                self._auto_detector.configure(window_ms=self._event_window_ms)
 
     def update_sample_rate(self, sample_rate: float) -> None:
         """Refresh fallback sample rate and drop stale refractory state when it changes."""
@@ -278,6 +293,140 @@ class AnalysisWorker(threading.Thread):
             secondary_value = float(self._secondary_threshold_value)
             last_window_end = self._last_window_end_sample
             last_crossing_time = self._last_crossing_time_sec
+            secondary_value = float(self._secondary_threshold_value)
+            last_window_end = self._last_window_end_sample
+            last_crossing_time = self._last_crossing_time_sec
+            auto_detect = self._auto_detect_enabled
+            detector = self._auto_detector
+        
+        if auto_detect and detector is not None:
+            # Use modular detector
+            # Ensure detector sample rate is correct
+            # We can't easily check internal state, but we can re-reset if needed or trust configure/reset
+            # For now, let's assume it's set correctly or we update it here if we track it.
+            # Actually, let's just use it.
+            
+            # Note: AmpThresholdDetector expects a Chunk.
+            # It returns core.detection.Event objects.
+            # We need to convert/augment them.
+            
+            detected_events = detector.process_chunk(chunk)
+            if not detected_events:
+                return []
+            
+            events: list[tuple[Event, int, float]] = []
+            
+            # We need to calculate metrics for these events
+            dt = float(chunk.dt)
+            sr = (1.0 / dt) if dt > 0 else self.sample_rate
+            
+            for de in detected_events:
+                # de is shared.models.Event
+                # We need to create shared.types.Event (which is the same class)
+                # But AnalysisWorker adds extra properties.
+                
+                wf = de.window
+                if wf.size == 0:
+                    continue
+                
+                # Calculate metrics
+                # Baseline
+                baseline_val = float(np.median(wf)) # Simple median
+                centered_wf = wf.astype(np.float64) - baseline_val
+                
+                # Energy
+                energy = float(np.sum(wf.astype(np.float32) ** 2))
+                window_sec = max(1e-12, wf.size * dt)
+                ed = energy / window_sec
+                
+                # Peak Freq
+                peak_freq = peak_frequency_sinc(centered_wf, sr)
+                peak_wavelength = 1.0 / peak_freq if peak_freq > 1e-9 else 0.0
+                
+                # Interval
+                crossing_time = de.t
+                interval_sec = float("nan")
+                if self._last_crossing_time_sec is not None:
+                    delta = crossing_time - self._last_crossing_time_sec
+                    if delta >= 0:
+                        interval_sec = delta
+                
+                # Create Event
+                # We need to map de.t (time) to sample index for last_end calculation
+                # t = start_time + idx * dt
+                # idx = (t - start_time) / dt
+                rel_time = de.t - chunk.start_time
+                rel_idx = int(round(rel_time / dt))
+                
+                start_sample = -1
+                if chunk.meta:
+                    try:
+                        start_sample = int(chunk.meta.get("start_sample", -1))
+                    except:
+                        pass
+                
+                abs_idx = rel_idx if start_sample < 0 else start_sample + rel_idx
+                
+                # Calculate pre/post ms based on window
+                # AmpThresholdDetector centers the event roughly?
+                # Actually AmpThresholdDetector extracts window around crossing.
+                # We can assume it's centered or just use the whole window.
+                
+                pre_samples = de.params.get("pre_samples")
+                if pre_samples is None:
+                    # Fallback if not provided
+                    pre_samples = wf.size // 2
+                else:
+                    pre_samples = int(pre_samples)
+                
+                first_time_sec = de.t - (pre_samples * dt)
+                
+                event = Event(
+                    id=self._next_event_id(),
+                    channelId=de.chan, # This might need mapping if we have multiple channels
+                    thresholdValue=de.params.get("threshold", 0.0),
+                    crossingIndex=abs_idx,
+                    crossingTimeSec=de.t,
+                    firstSampleTimeSec=first_time_sec,
+                    sampleRateHz=sr,
+                    windowMs=float(self._event_window_ms),
+                    preMs=float(pre_samples * dt * 1000.0),
+                    postMs=float((wf.size - pre_samples) * dt * 1000.0),
+                    samples=wf,
+                    intervalSinceLastSec=interval_sec
+                )
+                
+                props = getattr(event, "properties", None)
+                if isinstance(props, dict):
+                    props["energy"] = energy
+                    props["window_sec"] = window_sec
+                    props["energy_density"] = ed
+                    props["peak_freq_hz"] = peak_freq
+                    props["peak_wavelength_s"] = peak_wavelength
+                    if np.isfinite(interval_sec):
+                        props["interval_sec"] = float(interval_sec)
+                
+                # Update last_end
+                # We need to know where this event ends in absolute samples
+                # abs_idx is the crossing. Window end is approx abs_idx + half?
+                # Let's just say abs_idx + wf.size
+                this_end = abs_idx + wf.size
+                events.append((event, this_end, crossing_time))
+                
+                # Update internal state for interval calculation in loop
+                self._last_crossing_time_sec = crossing_time
+            
+            # Return collected events
+            collected: list[Event] = []
+            for event, new_last_end, crossing_time in events:
+                self.publish_event(event)
+                with self._state_lock:
+                    if new_last_end > self._last_window_end_sample:
+                        self._last_window_end_sample = new_last_end
+                    self._last_crossing_time_sec = float(crossing_time)
+                collected.append(event)
+            return collected
+
         if not threshold_enabled or threshold_value == 0.0 or event_window_ms <= 0:
             return []
         if chunk.samples.size == 0:
@@ -292,10 +441,11 @@ class AnalysisWorker(threading.Thread):
         if sr <= 0:
             return []
 
-        half_samples = int(round((event_window_ms / 2.0) * sr / 1000.0))
-        if half_samples <= 0:
-            half_samples = 1
-        window_samples = max(1, half_samples * 2)
+        window_samples = int(round(event_window_ms * sr / 1000.0))
+        if window_samples <= 0:
+            window_samples = 1
+        pre_samples = window_samples // 3
+        post_samples = window_samples - pre_samples
 
         if threshold_value > 0:
             idxs = np.flatnonzero(sig >= threshold_value)
@@ -323,14 +473,14 @@ class AnalysisWorker(threading.Thread):
         events: list[tuple[Event, int, float]] = []
         last_end = last_window_end
         prev_crossing_time = last_crossing_time
-        target_len = (half_samples * 2) + 1
+        target_len = window_samples
         for idx in idxs:
             abs_idx = idx if start_sample < 0 else start_sample + int(idx)
             if abs_idx < last_end:
                 continue
 
-            i0 = max(0, int(idx) - half_samples)
-            i1 = min(n, int(idx) + half_samples + 1)
+            i0 = max(0, int(idx) - pre_samples)
+            i1 = min(n, int(idx) + post_samples)
             if i1 <= i0:
                 continue
             wf = sig[i0:i1].astype(np.float32, copy=True)
@@ -344,16 +494,16 @@ class AnalysisWorker(threading.Thread):
             first_abs = crossing_index - pre_count
             candidate_last_end = first_abs + window_samples
             first_time = float(chunk.start_time) + i0 * dt_sec
-            has_full_pre = pre_count >= half_samples
-            has_full_post = post_count >= half_samples
+            has_full_pre = pre_count >= pre_samples
+            has_full_post = post_count >= post_samples
             if (not has_full_pre or not has_full_post) and self._controller is not None:
-                desired_start = crossing_index - half_samples
+                desired_start = crossing_index - pre_samples
                 if desired_start < 0:
                     desired_start = 0
                 extended = self._collect_waveform_samples(desired_start, target_len)
                 if extended.size == target_len:
                     wf = extended.astype(np.float32, copy=True)
-                    pre_count = min(half_samples, crossing_index - desired_start)
+                    pre_count = min(pre_samples, crossing_index - desired_start)
                     post_count = target_len - pre_count - 1
                     pre_ms = pre_count * dt_sec * 1000.0
                     post_ms = post_count * dt_sec * 1000.0

@@ -36,7 +36,7 @@ class SimulatedPhysiologySource(BaseDevice):
         -   Signal = Sum of delayed unit spikes + Broadband Noise.
 
     3.  **Intracellular (Ch 2)**:
-        -   Represents a patch-clamp or intracellular recording from a post-synaptic neuron.
+        -   Represents a patch-clamp or intracellular recording from a post-synaptic muscle fiber.
         -   Displays Post-Synaptic Potentials (PSPs) triggered by the spikes in the nerve bundle.
         -   Each unit has a specific synaptic delay and PSP gain.
         -   Signal = Sum of PSPs (alpha functions) + Baseline (-70mV) + Low-level Noise.

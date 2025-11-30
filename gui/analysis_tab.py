@@ -435,6 +435,11 @@ class AnalysisTab(QtWidgets.QWidget):
         threshold_layout = QtWidgets.QVBoxLayout()
         threshold_layout.setSpacing(4)
 
+        self.auto_detect_check = QtWidgets.QCheckBox("Auto-detect events (4\u03c3)")
+        self.auto_detect_check.setToolTip("Automatically detect events crossing 4 * MAD threshold (positive or negative).")
+        self.auto_detect_check.toggled.connect(self._on_auto_detect_toggled)
+        threshold_layout.addWidget(self.auto_detect_check)
+
         self.threshold1_check = QtWidgets.QCheckBox("Threshold 1")
         self.threshold1_spin = QtWidgets.QDoubleSpinBox()
         self.threshold1_spin.setDecimals(3)
@@ -916,6 +921,16 @@ class AnalysisTab(QtWidgets.QWidget):
         self.threshold2_spin.setEnabled(checked)
         self._notify_threshold_change()
 
+    def _on_auto_detect_toggled(self, checked: bool) -> None:
+        # Disable manual thresholds if auto-detect is on?
+        # User said "add a third checkbox above...".
+        # Let's disable manual controls to avoid confusion.
+        self.threshold1_check.setEnabled(not checked)
+        self.threshold1_spin.setEnabled(not checked and self.threshold1_check.isChecked())
+        self.threshold2_check.setEnabled(not checked and self.threshold1_check.isChecked())
+        self.threshold2_spin.setEnabled(not checked and self.threshold2_check.isChecked())
+        self._notify_threshold_change()
+
     def _notify_threshold_change(self) -> None:
         if self._worker is None:
             return
@@ -930,6 +945,7 @@ class AnalysisTab(QtWidgets.QWidget):
                 value,
                 secondary_enabled=secondary_enabled,
                 secondary_value=secondary_value,
+                auto_detect=self.auto_detect_check.isChecked(),
             )
         except Exception:
             pass
