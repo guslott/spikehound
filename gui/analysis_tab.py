@@ -481,7 +481,7 @@ class AnalysisTab(QtWidgets.QWidget):
         for label in (
             "Max in window (V)",
             "Min in window (V)",
-            "Energy Density (V²/s)",
+            "Energy Density",
             "Peak Frequency (Hz)",
             "Interval since last event (s)",
         ):
@@ -503,7 +503,7 @@ class AnalysisTab(QtWidgets.QWidget):
             "Time (s)",
             "Max in window (V)",
             "Min in window (V)",
-            "Energy Density (V²/s)",
+            "Energy Density",
             "Peak Frequency (Hz)",
         ):
             item = QtGui.QStandardItem(label)
@@ -584,7 +584,7 @@ class AnalysisTab(QtWidgets.QWidget):
 
         controls.setLayout(controls_layout)
         layout.addWidget(controls, stretch=2)
-        self._refresh_sta_source_options()
+        self._refresh_cluster_options()
 
         self.metrics_container = QtWidgets.QWidget(self)
         metrics_container_layout = QtWidgets.QHBoxLayout(self.metrics_container)
@@ -603,9 +603,17 @@ class AnalysisTab(QtWidgets.QWidget):
         self.remove_class_btn = QtWidgets.QPushButton("Remove class")
         self.remove_class_btn.clicked.connect(self._on_remove_class_clicked)
         cluster_layout.addWidget(self.remove_class_btn)
-        self.export_class_btn = QtWidgets.QPushButton("Export class to CSV…")
+        
+        export_row = QtWidgets.QHBoxLayout()
+        export_row.setSpacing(6)
+        self.export_class_btn = QtWidgets.QPushButton("Export to CSV")
         self.export_class_btn.clicked.connect(self._on_export_class_clicked)
-        cluster_layout.addWidget(self.export_class_btn)
+        export_row.addWidget(self.export_class_btn, stretch=1)
+        
+        self.export_class_combo = QtWidgets.QComboBox()
+        self.export_class_combo.addItem("All events", None)
+        export_row.addWidget(self.export_class_combo, stretch=1)
+        cluster_layout.addLayout(export_row)
         self.view_class_waveforms_btn = QtWidgets.QPushButton("View waveforms…")
         self.view_class_waveforms_btn.clicked.connect(self._on_view_class_waveforms_clicked)
         cluster_layout.addWidget(self.view_class_waveforms_btn)
@@ -1344,7 +1352,7 @@ class AnalysisTab(QtWidgets.QWidget):
     def _on_axis_metric_changed(self) -> None:
         metric = self._selected_y_metric()
         if metric == "ed":
-            self.metrics_plot.setLabel("left", "Energy Density (V²/s)")
+            self.metrics_plot.setLabel("left", "Energy Density")
         elif metric == "max":
             self.metrics_plot.setLabel("left", "Max Amplitude (V)")
         elif metric == "min":
@@ -1359,7 +1367,7 @@ class AnalysisTab(QtWidgets.QWidget):
         if x_metric == "time":
             self.metrics_plot.setLabel("bottom", "Time (s)")
         elif x_metric == "ed":
-            self.metrics_plot.setLabel("bottom", "Energy Density (V²/s)")
+            self.metrics_plot.setLabel("bottom", "Energy Density")
         elif x_metric == "max":
             self.metrics_plot.setLabel("bottom", "Max Amplitude (V)")
         elif x_metric == "min":
@@ -1367,7 +1375,7 @@ class AnalysisTab(QtWidgets.QWidget):
         elif x_metric == "freq":
             self.metrics_plot.setLabel("bottom", "Peak Frequency (Hz)")
         else:
-            self.metrics_plot.setLabel("bottom", "Energy Density (V²/s)")
+            self.metrics_plot.setLabel("bottom", "Energy Density")
         if metric in {"ed", "max", "min", "freq", "interval"}:
             self.energy_scatter.show()
         else:
@@ -1430,24 +1438,39 @@ class AnalysisTab(QtWidgets.QWidget):
             self.metrics_container_layout.setStretchFactor(self.metrics_plot, 1)
             self.metrics_container_layout.setStretchFactor(self.cluster_panel, 0)
 
-    def _refresh_sta_source_options(self) -> None:
-        """Populate the STA event source combo: 'All events' + spike classes."""
-        if not hasattr(self, "sta_source_combo"):
-            return
-        previous_selection = self._sta_source_cluster_id
-        was_blocked = self.sta_source_combo.blockSignals(True)
-        self.sta_source_combo.clear()
-        self.sta_source_combo.addItem("All events", None)
-        for cluster in self._clusters:
-            self.sta_source_combo.addItem(cluster.name, cluster.id)
-        target_index = self.sta_source_combo.findData(previous_selection)
-        if target_index >= 0:
-            self.sta_source_combo.setCurrentIndex(target_index)
-        else:
-            self.sta_source_combo.setCurrentIndex(0)
-        current_data = self.sta_source_combo.currentData()
-        self._sta_source_cluster_id = current_data if isinstance(current_data, int) else None
-        self.sta_source_combo.blockSignals(was_blocked)
+    def _refresh_cluster_options(self) -> None:
+        """Populate the STA event source and export class combos."""
+        # Update STA source combo
+        if hasattr(self, "sta_source_combo"):
+            previous_selection = self._sta_source_cluster_id
+            was_blocked = self.sta_source_combo.blockSignals(True)
+            self.sta_source_combo.clear()
+            self.sta_source_combo.addItem("All events", None)
+            for cluster in self._clusters:
+                self.sta_source_combo.addItem(cluster.name, cluster.id)
+            target_index = self.sta_source_combo.findData(previous_selection)
+            if target_index >= 0:
+                self.sta_source_combo.setCurrentIndex(target_index)
+            else:
+                self.sta_source_combo.setCurrentIndex(0)
+            current_data = self.sta_source_combo.currentData()
+            self._sta_source_cluster_id = current_data if isinstance(current_data, int) else None
+            self.sta_source_combo.blockSignals(was_blocked)
+
+        # Update Export class combo
+        if hasattr(self, "export_class_combo"):
+            previous_export = self.export_class_combo.currentData()
+            was_blocked = self.export_class_combo.blockSignals(True)
+            self.export_class_combo.clear()
+            self.export_class_combo.addItem("All events", None)
+            for cluster in self._clusters:
+                self.export_class_combo.addItem(cluster.name, cluster.id)
+            target_index = self.export_class_combo.findData(previous_export)
+            if target_index >= 0:
+                self.export_class_combo.setCurrentIndex(target_index)
+            else:
+                self.export_class_combo.setCurrentIndex(0)
+            self.export_class_combo.blockSignals(was_blocked)
 
     def _refresh_sta_channel_options(self, channels: Sequence["ChannelInfo"]) -> None:
         """Populate the STA signal channel combo from the active channels."""
@@ -1777,7 +1800,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self.class_list.addItem(item)
         self.class_list.setCurrentItem(item)
         self._cluster_items[cluster_id] = item
-        self._refresh_sta_source_options()
+        self._refresh_cluster_options()
         self._recompute_cluster_membership()
         self._update_metric_points()
         self._update_cluster_visuals()
@@ -1811,14 +1834,81 @@ class AnalysisTab(QtWidgets.QWidget):
         to_remove = [event_id for event_id, cid in self._event_cluster_labels.items() if cid == cluster_id]
         for event_id in to_remove:
             self._event_cluster_labels.pop(event_id, None)
-        self._refresh_sta_source_options()
+        self._refresh_cluster_options()
         self._recompute_cluster_membership()
         self._update_metric_points()
         self._update_cluster_visuals()
         self._update_cluster_button_states()
 
     def _on_export_class_clicked(self) -> None:
-        pass
+        """Export events to CSV based on the selected class."""
+        target_cluster_id = self.export_class_combo.currentData()
+        
+        # Filter events
+        events_to_export = []
+        for record in self._metric_events:
+            event_id = record.get("event_id")
+            if event_id is None:
+                continue
+            
+            # Get raw cluster ID
+            raw_cluster_id = self._event_cluster_labels.get(event_id) # None if unclassified
+            
+            # Filter
+            if target_cluster_id is not None:
+                # Specific class selected
+                if raw_cluster_id != target_cluster_id:
+                    continue
+            
+            # Map to user-facing Class ID (0=Unclassified, 1=Class 1, etc.)
+            if raw_cluster_id is None:
+                user_class_id = 0
+            else:
+                user_class_id = raw_cluster_id + 1
+            
+            # Prepare row data
+            row = {
+                "Class ID": user_class_id,
+                "Time (s)": record.get("time"),
+                "Max (V)": record.get("max"),
+                "Min (V)": record.get("min"),
+                "Energy Density": record.get("ed"),
+                "Peak Frequency (Hz)": record.get("freq"),
+                "Interval (s)": record.get("interval"),
+            }
+            events_to_export.append(row)
+            
+        if not events_to_export:
+            QtWidgets.QMessageBox.information(self, "Export CSV", "No events found to export for the selected class.")
+            return
+
+        # Prompt for file
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export Events to CSV", "", "CSV Files (*.csv)"
+        )
+        if not file_path:
+            return
+            
+        if not file_path.lower().endswith(".csv"):
+            file_path += ".csv"
+            
+        try:
+            with open(file_path, "w", newline="", encoding="utf-8") as f:
+                fieldnames = [
+                    "Class ID", 
+                    "Time (s)", 
+                    "Max (V)", 
+                    "Min (V)", 
+                    "Energy Density", 
+                    "Peak Frequency (Hz)", 
+                    "Interval (s)"
+                ]
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(events_to_export)
+            QtWidgets.QMessageBox.information(self, "Export CSV", f"Successfully exported {len(events_to_export)} events.")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Export Error", f"Failed to write CSV file:\n{e}")
 
     def _on_view_class_waveforms_clicked(self) -> None:
         if not self.clustering_enabled_check.isChecked():
