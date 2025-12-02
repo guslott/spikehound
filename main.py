@@ -29,3 +29,6 @@ if __name__ == "__main__":
 #   - (Low Priority) install NIDAQmx drivers
 #   - (Low Priority) simulate devices and write a windows only DAQ interface using pyDAQmx
 # - Add LabJack Hardware Support (low priority)
+
+# Bring available channel list into the device panel.  
+# Merge the big active channel list into a drop down on the channel config panel

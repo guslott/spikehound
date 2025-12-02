@@ -2635,29 +2635,8 @@ class MainWindow(QtWidgets.QMainWindow):
         active_samples: Dict[int, np.ndarray] = {}
         
         # Determine downsampling factor
-        # Simple peak downsampling logic:
-        # If we have too many points for the screen width, skip some.
-        # This is a basic implementation; TraceRenderer handles the actual slicing.
-        # Ideally, we calculate 'downsample' here or let TraceRenderer do it.
-        # Let's pass 'downsample' to TraceRenderer.
-        
-        # Estimate points per pixel
-        # view_width_pixels ~ 1000 (approx)
-        # total_points = data.shape[1]
-        # if total_points > 2000: ds = total_points // 1000 ...
-        # But here 'data' is just a chunk, not the whole history?
-        # Wait, 'data' in _process_streaming seems to be the *display buffer* from the ring buffer?
-        # Let's check how it's called.
-        # It's called from _on_dispatcher_tick with 'data' which comes from 'pointers'.
-        # If pointers are used, 'data' is read from ring buffer.
-        # The ring buffer read returns (channels, samples).
-        
-        # For now, let's assume 1:1 or let TraceRenderer handle it if we pass a stride.
-        # We'll use a simple stride based on sample count to keep performance high.
-        n_samples = data.shape[1]
+        # Handled by TraceRenderer (pyqtgraph peak downsampling)
         ds = 1
-        if n_samples > 4000:
-            ds = n_samples // 2000
             
         for i, cid in enumerate(channel_ids):
             if i >= data.shape[0]:

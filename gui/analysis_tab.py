@@ -32,6 +32,7 @@ WAVEFORM_MEDIAN_COLOR = QtGui.QColor(200, 0, 0)
 MAX_VISIBLE_METRIC_EVENTS = 3000
 METRIC_TIME_WINDOW_SEC = 60.0
 STA_TRACE_PEN = pg.mkPen(90, 90, 90, 110)
+SCOPE_BACKGROUND_COLOR = QtGui.QColor(211, 230, 204)
 
 
 class _MeasureLine:
@@ -319,7 +320,7 @@ class AnalysisTab(QtWidgets.QWidget):
             self.plot_widget.hideButtons()
         except Exception:
             pass
-        self.plot_widget.setBackground(pg.mkColor(236, 239, 244))
+        self.plot_widget.setBackground(SCOPE_BACKGROUND_COLOR)
         self.plot_widget.setAntialiasing(False)
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self.plot_widget.setLabel("bottom", "Time", units="s")
@@ -351,7 +352,7 @@ class AnalysisTab(QtWidgets.QWidget):
             self.sta_plot.hideButtons()
         except Exception:
             pass
-        self.sta_plot.setBackground(pg.mkColor(250, 250, 252))
+        self.sta_plot.setBackground(SCOPE_BACKGROUND_COLOR)
         self.sta_plot.showGrid(x=True, y=True, alpha=0.25)
         self.sta_plot.setLabel("bottom", "Lag", units="ms")
         self.sta_plot.setLabel("left", "Amplitude", units="mV")
@@ -372,7 +373,7 @@ class AnalysisTab(QtWidgets.QWidget):
             self.metrics_plot.hideButtons()
         except Exception:
             pass
-        self.metrics_plot.setBackground(pg.mkColor(245, 246, 250))
+        self.metrics_plot.setBackground(SCOPE_BACKGROUND_COLOR)
         self.metrics_plot.setLabel("bottom", "Time (s)")
         self.metrics_plot.setLabel("left", "Max Amplitude (V)")
         self.metrics_plot.showGrid(x=True, y=True, alpha=0.3)

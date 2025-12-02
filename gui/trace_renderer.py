@@ -15,7 +15,12 @@ class TraceRenderer:
     def __init__(self, plot_item: pg.PlotItem, config: ChannelConfig):
         self._plot_item = plot_item
         self._config = config
-        self._curve = pg.PlotCurveItem(pen=pg.mkPen(config.color, width=1))
+        self._curve = pg.PlotCurveItem(pen=pg.mkPen(config.color, width=3))
+        self._manual_downsampling = False
+        try:
+            self._curve.setDownsampling(ds=True, auto=True, method="peak")
+        except AttributeError:
+            self._manual_downsampling = True
         self._plot_item.addItem(self._curve)
         
         # State
@@ -25,7 +30,7 @@ class TraceRenderer:
     def update_config(self, config: ChannelConfig) -> None:
         """Update visual properties based on new config."""
         self._config = config
-        self._curve.setPen(pg.mkPen(config.color, width=1))
+        self._curve.setPen(pg.mkPen(config.color, width=3))
         self._curve.setVisible(config.display_enabled)
         # Re-render with new offset/scale if we have data
         if self._last_samples.size > 0:
@@ -48,9 +53,8 @@ class TraceRenderer:
             return
 
         # Apply downsampling
-        if downsample > 1:
-            display_y = samples[::downsample]
-            display_x = times[::downsample]
+        if self._manual_downsampling and samples.size > 4000:
+            display_y, display_x = self._resample_peak(samples, times, target=2000)
         else:
             display_y = samples
             display_x = times
@@ -89,7 +93,7 @@ class TraceRenderer:
 
     def set_active(self, active: bool) -> None:
         """Update visual style for active/inactive state."""
-        width = 3.0 if active else 1.0
+        width = 5.0 if active else 3.0
         self._curve.setPen(pg.mkPen(self._config.color, width=width))
         self._curve.setZValue(1.0 if active else 0.0)
         try:
@@ -107,3 +111,38 @@ class TraceRenderer:
             self._plot_item.removeItem(self._curve)
         except Exception:
             pass
+
+    def _resample_peak(self, samples: np.ndarray, times: np.ndarray, target: int) -> tuple[np.ndarray, np.ndarray]:
+        """Manual peak downsampling for older pyqtgraph versions."""
+        n = samples.size
+        if n <= target:
+            return samples, times
+            
+        # Chunk size
+        k = n // (target // 2)
+        if k <= 1:
+            return samples, times
+            
+        n_chunks = n // k
+        
+        # Reshape to find min/max in each chunk
+        # Truncate to multiple of k
+        n_trim = n_chunks * k
+        y_view = samples[:n_trim].reshape(n_chunks, k)
+        t_view = times[:n_trim].reshape(n_chunks, k)
+        
+        mins = y_view.min(axis=1)
+        maxs = y_view.max(axis=1)
+        t_starts = t_view[:, 0]
+        t_ends = t_view[:, -1]
+        
+        # Interleave
+        y_out = np.empty(n_chunks * 2, dtype=samples.dtype)
+        y_out[0::2] = mins
+        y_out[1::2] = maxs
+        
+        t_out = np.empty(n_chunks * 2, dtype=times.dtype)
+        t_out[0::2] = t_starts
+        t_out[1::2] = t_ends
+        
+        return y_out, t_out
