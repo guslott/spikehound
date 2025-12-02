@@ -25,23 +25,10 @@ from .analysis_dock import AnalysisDock
 from .settings_tab import SettingsTab
 from .scope_widget import ScopeWidget, ChannelConfig as ScopeChannelConfig
 from .device_control_widget import DeviceControlWidget
+from .types import ChannelConfig
+from .trace_renderer import TraceRenderer
 
 
-@dataclass
-class ChannelConfig:
-    color: QtGui.QColor = field(default_factory=lambda: QtGui.QColor(0, 0, 139))
-    display_enabled: bool = True
-    vertical_span_v: float = 1.0
-    screen_offset: float = 0.5
-    notch_enabled: bool = False
-    notch_freq: float = 60.0
-    highpass_enabled: bool = False
-    highpass_freq: float = 10.0
-    lowpass_enabled: bool = False
-    lowpass_freq: float = 1_000.0
-    listen_enabled: bool = False
-    analyze_enabled: bool = False
-    channel_name: str = ""
 
 
 
@@ -339,14 +326,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar()
 
         # Persistent view/model state for the plotting surface and UI panels
-        self._curves: List[pg.PlotCurveItem] = []
+        self._renderers: Dict[int, TraceRenderer] = {}
         self._channel_names: List[str] = []
         self._chunk_rate: float = 0.0
         self._device_map: Dict[str, dict] = {}
         self._device_connected = False
         self._active_channel_infos: List[object] = []
         self._channel_ids_current: List[int] = []
-        self._curve_map: Dict[int, pg.PlotCurveItem] = {}
+        self._channel_ids_current: List[int] = []
+        # self._curve_map removed in favor of self._renderers
         self._channel_configs: Dict[int, ChannelConfig] = {}
         self._channel_panels: Dict[int, ChannelOptionsPanel] = {}
         self._channel_last_samples: Dict[int, np.ndarray] = {}
@@ -1918,36 +1906,27 @@ class MainWindow(QtWidgets.QMainWindow):
         if channel_id not in self._channel_configs:
             return
         config = self._channel_configs[channel_id]
-        curve = self._curve_map.get(channel_id)
+        renderer = self._renderers.get(channel_id)
+        if renderer is None:
+            return
+            
+        # Update renderer config
+        renderer.update_config(config)
+        
+        # Re-push data if we have it
         raw = self._channel_last_samples.get(channel_id)
-        if curve is None:
-            return
-        if not config.display_enabled:
-            curve.clear()
-            return
-        if raw is None or raw.size == 0 or self._last_times.size == 0:
-            return
-        buf = self._channel_display_buffers.get(channel_id)
-        if buf is None or buf.shape != raw.shape:
-            buf = np.empty_like(raw)
-            self._channel_display_buffers[channel_id] = buf
-        buf[:] = self._transform_to_screen(raw, config.vertical_span_v, config.screen_offset)
-        curve.setData(self._last_times, buf, skipFiniteCheck=True)
+        if raw is not None and raw.size > 0 and self._last_times.size > 0:
+             # We assume times match raw data length roughly or exactly
+             # If mismatch, we might skip.
+             if raw.shape[-1] == self._last_times.shape[0]:
+                 renderer.update_data(raw, self._last_times, downsample=1)
+        
         self._apply_active_channel_style()
 
     def _apply_active_channel_style(self) -> None:
-        for cid, curve in self._curve_map.items():
-            config = self._channel_configs.get(cid)
-            if config is None or curve is None:
-                continue
+        for cid, renderer in self._renderers.items():
             is_active = cid == self._active_channel_id
-            pen = pg.mkPen(config.color, width=3.0 if is_active else 1.6)
-            curve.setPen(pen)
-            curve.setZValue(1.0 if is_active else 0.0)
-            try:
-                curve.setOpacity(1.0 if is_active else 0.6)
-            except AttributeError:
-                pass
+            renderer.set_active(is_active)
         self._update_axis_label()
 
     def _handle_listen_change(self, channel_id: int, enabled: bool) -> None:
@@ -2056,35 +2035,27 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _refresh_channel_layout(self) -> None:
         """Rebuild plot curves to track active channels and refresh styling."""
-        plot_item = self.plot_widget.getPlotItem()
         if not self._channel_ids_current:
-            for curve in self._curve_map.values():
-                plot_item.removeItem(curve)
-            self._curves = []
-            self._curve_map.clear()
+            for renderer in self._renderers.values():
+                renderer.cleanup()
+            self._renderers.clear()
             self._update_plot_y_range()
             return
 
-        # Remove orphaned curves
-        for cid, curve in list(self._curve_map.items()):
+        # Remove orphaned renderers
+        for cid in list(self._renderers.keys()):
             if cid not in self._channel_ids_current:
-                plot_item.removeItem(curve)
-                del self._curve_map[cid]
+                self._renderers[cid].cleanup()
+                del self._renderers[cid]
 
-        curves: List[pg.PlotCurveItem] = []
+        # Ensure all current channels have renderers
+        plot_item = self.plot_widget.getPlotItem()
         for cid, name in zip(self._channel_ids_current, self._channel_names):
             self._ensure_channel_config(cid, name)
-            curve = self._curve_map.get(cid)
-            if curve is None:
-                curve = pg.PlotCurveItem()
-                try:
-                    curve.setDownsampling(ds=True, auto=True, method="peak")
-                except Exception:
-                    pass
-                plot_item.addItem(curve)
-                self._curve_map[cid] = curve
-            curves.append(curve)
-        self._curves = curves
+            if cid not in self._renderers:
+                config = self._channel_configs[cid]
+                self._renderers[cid] = TraceRenderer(plot_item, config)
+        
         self._apply_active_channel_style()
 
         self._update_plot_y_range()
@@ -2516,7 +2487,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def set_active_channels(self, channels: Sequence[str]) -> None:
         """Display the channels currently routed to the plot."""
         names = [getattr(ch, "name", str(ch)) for ch in channels]
-        self._ensure_curves(names)
+        self._ensure_renderers_for_ids(self._channel_ids_current, names) # Changed from _ensure_curves
         self.set_trigger_channels(names)
 
     def set_trigger_channels(self, channels: Sequence[object], *, current: Optional[int] = None) -> None:
@@ -2537,13 +2508,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._emit_trigger_config()
 
     def _reset_scope_for_channels(self, channel_ids: Sequence[int], channel_names: Sequence[str]) -> None:
-        self._ensure_curves_for_ids(channel_ids, channel_names)
+        self._ensure_renderers_for_ids(channel_ids, channel_names)
         plot_item = self.plot_widget.getPlotItem()
         target_window = float(self.window_combo.currentData() or 1.0)
         self._current_window_sec = max(target_window, 1e-3)
         plot_item.setXRange(0.0, self._current_window_sec, padding=0.0)
-        for curve in self._curves:
-            curve.clear()
+        for renderer in self._renderers.values(): # Changed from _curves
+            renderer.clear()
         self._update_plot_y_range()
         self._ensure_active_channel_focus()
         self._current_sample_rate = 0.0
@@ -2562,18 +2533,12 @@ class MainWindow(QtWidgets.QMainWindow):
             plot_item.clear()
         except Exception:
             pass
-        for curve in list(self._curve_map.values()):
-            try:
-                plot_item.removeItem(curve)
-            except Exception:
-                pass
-        self._curve_map.clear()
-        for curve in self._curves:
-            try:
-                curve.clear()
-            except Exception:
-                pass
-        self._curves = []
+        
+        # Clear renderers
+        for renderer in self._renderers.values():
+            renderer.cleanup()
+        self._renderers.clear()
+        
         self._channel_display_buffers.clear()
         self._channel_ids_current = []
         self._channel_names = []
@@ -2593,58 +2558,47 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chunk_last_rate_update = time.perf_counter()
         self._update_status(viz_depth=0)
 
-    def _ensure_curves_for_ids(self, channel_ids: Sequence[int], channel_names: Sequence[str]) -> None:
-        """Synchronize the pyqtgraph PlotCurveItems with the current active channel list."""
+    def _ensure_renderers_for_ids(self, channel_ids: Sequence[int], channel_names: Sequence[str]) -> None:
+        """Synchronize the TraceRenderers with the current active channel list."""
         plot_item = self.plot_widget.getPlotItem()
         
         # If no channels, clear everything and return
         if not channel_ids:
             # Remove all tracked curves
-            for cid, curve in list(self._curve_map.items()):
-                plot_item.removeItem(curve)
-            self._curve_map.clear()
+            for renderer in self._renderers.values():
+                renderer.cleanup()
+            self._renderers.clear()
             self._channel_display_buffers.clear()
-            self._curves = []
             self._channel_names = []
             self._channel_ids_current = []
-            # Clear all curve items from the plot (in case of orphans)
-            for item in plot_item.listDataItems():
-                if isinstance(item, pg.PlotCurveItem):
-                    plot_item.removeItem(item)
+            self._active_channel_id = None
             self._update_plot_y_range()
-            # Force plot update
-            plot_item.update()
             return
-        
-        # Remove curves that are no longer needed
-        for cid, curve in list(self._curve_map.items()):
-            if cid not in channel_ids:
-                plot_item.removeItem(curve)
-                del self._curve_map[cid]
-                self._channel_display_buffers.pop(cid, None)
 
-        self._channel_names = list(channel_names)
+        # Update current IDs and names
         self._channel_ids_current = list(channel_ids)
+        self._channel_names = list(channel_names) if channel_names else [f"Ch {i}" for i in channel_ids]
 
-        self._curves = []
-        for cid, name in zip(self._channel_ids_current, self._channel_names):
+        # Remove renderers for channels no longer present
+        current_set = set(channel_ids)
+        for cid in list(self._renderers.keys()):
+            if cid not in current_set:
+                self._renderers[cid].cleanup()
+                del self._renderers[cid]
+                if cid in self._channel_display_buffers:
+                    del self._channel_display_buffers[cid]
+
+        # Create renderers for new channels
+        for cid, name in zip(channel_ids, self._channel_names):
             config = self._ensure_channel_config(cid, name)
-            curve = self._curve_map.get(cid)
-            if curve is None:
-                # print(f"Creating NEW curve for ch{cid}, color={config.color}")
-                curve = pg.PlotCurveItem(pen=pg.mkPen(config.color, width=2.0))
-                try:
-                    curve.setDownsampling(ds=True, auto=True, method="peak")
-                except Exception:
-                    pass
-                plot_item.addItem(curve)
-                self._curve_map[cid] = curve
+            if cid not in self._renderers:
+                renderer = TraceRenderer(plot_item, config)
+                self._renderers[cid] = renderer
             else:
-                # print(f"Reusing curve for ch{cid}, updating color to {config.color}")
-                curve.setPen(pg.mkPen(config.color, width=2.0))
-            self._curves.append(curve)
+                # Update existing renderer config just in case
+                self._renderers[cid].update_config(config)
 
-        # Force plot update after curve changes
+        # Force plot update
         plot_item.update()
         self._refresh_channel_layout()
 
@@ -2661,47 +2615,60 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pretrigger_line.setVisible(False)
 
         if data.ndim != 2 or data.size == 0:
-            for curve in self._curves:
-                curve.clear()
+            for renderer in self._renderers.values():
+                renderer.clear()
             self._current_sample_rate = sample_rate
             self._current_window_sec = window_sec
             self._chunk_rate = 0.0
             self._chunk_mean_samples = 0.0
             self._chunk_accum_count = 0
-            self._chunk_accum_samples = 0
-            self._chunk_last_rate_update = now
             self._update_status(viz_depth=0)
             return
 
+        # Update renderers
+        # data is (channels, samples)
+        # times_arr is (samples,)
+        
+        # We need to map data rows to channel IDs
+        # channel_ids matches the rows of data
+        
         active_samples: Dict[int, np.ndarray] = {}
-
-        for idx, curve in enumerate(self._curves):
-            if idx < data.shape[0] and idx < len(channel_ids):
-                cid = channel_ids[idx]
-                config = self._channel_configs.get(cid)
-                if config is None:
-                    if should_redraw:
-                        curve.clear()
-                    continue
-                raw = np.asarray(data[idx], dtype=np.float32)
-                active_samples[cid] = raw
-                if not should_redraw:
-                    continue
-                if not config.display_enabled:
-                    curve.clear()
-                    self._channel_display_buffers.pop(cid, None)
-                    continue
-                buf = self._channel_display_buffers.get(cid)
-                if buf is None or buf.shape != raw.shape:
-                    buf = np.empty_like(raw)
-                    self._channel_display_buffers[cid] = buf
-                buf[:] = self._transform_to_screen(raw, config.vertical_span_v, config.screen_offset)
-                curve.setData(times_arr, buf, skipFiniteCheck=True)
-                # if idx == 0 and should_redraw:  # Only log first curve to reduce spam
-                #     print(f"Set data for ch{cid}: {len(buf)} samples, enabled={config.display_enabled}")
-            else:
-                if should_redraw:
-                    curve.clear()
+        
+        # Determine downsampling factor
+        # Simple peak downsampling logic:
+        # If we have too many points for the screen width, skip some.
+        # This is a basic implementation; TraceRenderer handles the actual slicing.
+        # Ideally, we calculate 'downsample' here or let TraceRenderer do it.
+        # Let's pass 'downsample' to TraceRenderer.
+        
+        # Estimate points per pixel
+        # view_width_pixels ~ 1000 (approx)
+        # total_points = data.shape[1]
+        # if total_points > 2000: ds = total_points // 1000 ...
+        # But here 'data' is just a chunk, not the whole history?
+        # Wait, 'data' in _process_streaming seems to be the *display buffer* from the ring buffer?
+        # Let's check how it's called.
+        # It's called from _on_dispatcher_tick with 'data' which comes from 'pointers'.
+        # If pointers are used, 'data' is read from ring buffer.
+        # The ring buffer read returns (channels, samples).
+        
+        # For now, let's assume 1:1 or let TraceRenderer handle it if we pass a stride.
+        # We'll use a simple stride based on sample count to keep performance high.
+        n_samples = data.shape[1]
+        ds = 1
+        if n_samples > 4000:
+            ds = n_samples // 2000
+            
+        for i, cid in enumerate(channel_ids):
+            if i >= data.shape[0]:
+                break
+            
+            # Extract channel data
+            channel_data = data[i]
+            active_samples[cid] = channel_data
+            
+            if cid in self._renderers:
+                self._renderers[cid].update_data(channel_data, times_arr, downsample=ds)
 
         self._channel_last_samples = active_samples
         if should_redraw:
@@ -2919,34 +2886,18 @@ class MainWindow(QtWidgets.QMainWindow):
         dt = 1.0 / sr
         time_axis = np.arange(n, dtype=np.float32) * float(dt)
         self._trigger_display_times = np.asarray(time_axis, dtype=np.float32)
-        time_axis = self._trigger_display_times
+        
+        # data is (samples, channels) because it comes from history deque
+        # We need to transpose or index correctly
+        
+        for idx, cid in enumerate(channel_ids):
+            if idx >= data.shape[1]:
+                break
+            
+            if cid in self._renderers:
+                # data[:, idx] is the column for this channel
+                self._renderers[cid].update_data(data[:, idx], time_axis, downsample=1)
 
-        plot_item = self.plot_widget.getPlotItem()
-        span = max(window, max(n - 1, 0) * dt)
-        plot_item.setXRange(0.0, span, padding=0)
-
-        pre_samples = min(self._trigger_display_pre_samples, n - 1 if n > 0 else 0)
-        pre_time = pre_samples * dt
-        if pre_time > 0.0:
-            self.pretrigger_line.setVisible(True)
-            self.pretrigger_line.setValue(pre_time)
-        else:
-            self.pretrigger_line.setVisible(False)
-
-        for idx, curve in enumerate(self._curves):
-            if idx < data.shape[1]:
-                cid = channel_ids[idx]
-                config = self._channel_configs.get(cid)
-                if config is not None and not config.display_enabled:
-                    curve.clear()
-                    continue
-                if config is None:
-                    curve.setData(time_axis, data[:, idx], skipFiniteCheck=True)
-                else:
-                    transformed = self._transform_to_screen(data[:, idx], config.vertical_span_v, config.screen_offset)
-                    curve.setData(time_axis, transformed, skipFiniteCheck=True)
-            else:
-                curve.clear()
         self._channel_last_samples = {cid: data[:, i].astype(np.float32) for i, cid in enumerate(channel_ids) if i < data.shape[1]}
         self._last_times = time_axis
         self._last_plot_refresh = time.perf_counter()
@@ -3142,7 +3093,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # if channel_ids != self._channel_ids_current:
         #    self._ensure_curves_for_ids(channel_ids, channel_names)
 
-        if not self._curves:
+        if not self._renderers:
             self.plot_widget.getPlotItem().setXRange(0, max(window_sec, 0.001), padding=0)
             self._current_sample_rate = sample_rate
             self._current_window_sec = window_sec
