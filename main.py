@@ -23,7 +23,6 @@ if __name__ == "__main__":
 
 # - Add analog output to DAQ devices to support input and output/stimulation
 
-# - Button to export of class events properties list to CSV (class ID - zero for non-classified events))
 # - Allow for custom channel names
 
 # - Test on Windows w/ a school laptop

@@ -254,8 +254,8 @@ class AudioManager:
             out_channels=1,
             device=device_id,
             gain=self._audio_gain,
-            blocksize=512,
-            ring_seconds=0.5,
+            blocksize=256,
+            ring_seconds=0.2,
         )
         
         try:

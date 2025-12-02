@@ -23,8 +23,8 @@ class AudioConfig:
     out_channels: int = 1          # 1=mono (start simple)
     device: Optional[int | str] = None  # None = default output device
     gain: float = 0.35             # careful: spikes can be loud
-    blocksize: int = 512           # PortAudio block size (latency knob)
-    ring_seconds: float = 0.75      # size of the output ring buffer (seconds)
+    blocksize: int = 256           # PortAudio block size (latency knob)
+    ring_seconds: float = 0.2      # size of the output ring buffer (seconds)
 
 
 def list_output_devices() -> List[Dict[str, object]]:
@@ -267,6 +267,7 @@ class AudioPlayer(threading.Thread):
             dtype="float32",
             blocksize=self.cfg.blocksize,
             callback=self._callback,
+            latency="low",
         )
         self._stream.start()
 
