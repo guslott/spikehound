@@ -21,8 +21,7 @@ class DeviceControlWidget(QtWidgets.QWidget):
     deviceDisconnectRequested = QtCore.Signal()
     # deviceScanRequested = QtCore.Signal()  # Moved to SettingsTab
     channelAddRequested = QtCore.Signal(int)  # channel_id
-    channelRemoveRequested = QtCore.Signal(int)  # channel_id
-    activeChannelSelected = QtCore.Signal(int)  # index in active list
+    channelAddRequested = QtCore.Signal(int)  # channel_id
     sampleRateChanged = QtCore.Signal(float)
     settingsToggled = QtCore.Signal(bool)
 
@@ -58,21 +57,37 @@ class DeviceControlWidget(QtWidgets.QWidget):
         device_layout.addWidget(self.device_combo, 0, 0, 1, 2)
 
         device_layout.addWidget(self._label("Sample Rate (Hz)"), 1, 0)
+        
+        sample_rate_row = QtWidgets.QHBoxLayout()
+        sample_rate_row.setSpacing(6)
+        
         self.sample_rate_combo = QtWidgets.QComboBox()
         self.sample_rate_combo.setEditable(False)
         self.sample_rate_combo.setFixedHeight(24)
-        self.sample_rate_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
-        device_layout.addWidget(self.sample_rate_combo, 1, 1)
-
-        controls_row = QtWidgets.QHBoxLayout()
-        controls_row.setSpacing(6)
-        # Scan button moved to Settings tab
+        self.sample_rate_combo.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
+        sample_rate_row.addWidget(self.sample_rate_combo, stretch=1)
+        
         self.device_toggle_btn = QtWidgets.QPushButton("Click to Connect")
         self.device_toggle_btn.setCheckable(True)
-        self.device_toggle_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
-        self.device_toggle_btn.setFixedHeight(32)
-        controls_row.addWidget(self.device_toggle_btn)
-        device_layout.addLayout(controls_row, 2, 0, 1, 2)
+        self.device_toggle_btn.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
+        self.device_toggle_btn.setFixedHeight(24)
+        sample_rate_row.addWidget(self.device_toggle_btn, stretch=1)
+        
+        device_layout.addLayout(sample_rate_row, 1, 1)
+
+        # Available Channels Row
+        available_row = QtWidgets.QHBoxLayout()
+        available_row.setSpacing(6)
+        
+        self.available_combo = QtWidgets.QComboBox()
+        self.available_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        available_row.addWidget(self.available_combo, stretch=1)
+        
+        self.add_channel_btn = QtWidgets.QPushButton("Add Channel")
+        self.add_channel_btn.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        available_row.addWidget(self.add_channel_btn)
+        
+        device_layout.addLayout(available_row, 2, 0, 1, 2)
 
         controls_row = QtWidgets.QHBoxLayout()
         controls_row.setSpacing(6)
@@ -84,36 +99,6 @@ class DeviceControlWidget(QtWidgets.QWidget):
 
         layout.addWidget(self.device_group, 1)
 
-        # Channels group (right side)
-        self.channels_group = QtWidgets.QGroupBox("Channels")
-        channels_layout = QtWidgets.QVBoxLayout(self.channels_group)
-        channels_layout.setContentsMargins(8, 12, 8, 12)
-        channels_layout.setSpacing(6)
-
-        active_label = self._label("Active")
-        channels_layout.addWidget(active_label)
-        self.active_list = QtWidgets.QListWidget()
-        self.active_list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.active_list.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        self.active_list.setMinimumHeight(50)
-        self.active_list.setMaximumHeight(60)
-        channels_layout.addWidget(self.active_list)
-
-        available_row = QtWidgets.QHBoxLayout()
-        available_row.setContentsMargins(0, 0, 0, 0)
-        available_row.setSpacing(6)
-        available_label = self._label("Available")
-        available_row.addWidget(available_label)
-        available_row.addStretch(1)
-        self.add_channel_btn = QtWidgets.QPushButton("↑ Add")
-        available_row.addWidget(self.add_channel_btn)
-        self.remove_channel_btn = QtWidgets.QPushButton("↓ Remove")
-        available_row.addWidget(self.remove_channel_btn)
-        channels_layout.addLayout(available_row)
-        self.available_combo = QtWidgets.QComboBox()
-        channels_layout.addWidget(self.available_combo)
-
-        layout.addWidget(self.channels_group, 2)
 
         # Connect signals
         self.device_combo.currentIndexChanged.connect(self._on_device_selected)
@@ -122,8 +107,6 @@ class DeviceControlWidget(QtWidgets.QWidget):
         self.sample_rate_combo.currentIndexChanged.connect(self._on_sample_rate_changed)
         self.settings_toggle_btn.toggled.connect(self._on_settings_toggled)
         self.add_channel_btn.clicked.connect(self._on_add_channel)
-        self.remove_channel_btn.clicked.connect(self._on_remove_channel)
-        self.active_list.currentRowChanged.connect(self._on_active_channel_selected)
 
     def _label(self, text: str) -> QtWidgets.QLabel:
         """Create a standard label."""
@@ -241,29 +224,27 @@ class DeviceControlWidget(QtWidgets.QWidget):
         """Update the active channels list."""
         self._active_channel_infos = list(infos)
         
-        self.active_list.blockSignals(True)
-        self.active_list.clear()
+        self.active_combo.blockSignals(True)
+        self.active_combo.clear()
         
         for info in infos:
             name = getattr(info, "name", str(info))
-            item = QtWidgets.QListWidgetItem(name)
-            item.setData(QtCore.Qt.UserRole, info)
-            self.active_list.addItem(item)
+            self.active_combo.addItem(name, info)
         
-        self.active_list.blockSignals(False)
+        self.active_combo.blockSignals(False)
 
     def get_active_channel_count(self) -> int:
         """Return the number of active channels."""
-        return self.active_list.count()
+        return self.active_combo.count()
 
     def get_selected_active_index(self) -> int:
         """Return the index of the selected active channel (-1 if none)."""
-        return self.active_list.currentRow()
+        return self.active_combo.currentIndex()
 
     def set_selected_active_index(self, index: int) -> None:
         """Select an active channel by index."""
-        if 0 <= index < self.active_list.count():
-            self.active_list.setCurrentRow(index)
+        if 0 <= index < self.active_combo.count():
+            self.active_combo.setCurrentIndex(index)
 
     # Signal handlers
 
@@ -304,18 +285,3 @@ class DeviceControlWidget(QtWidgets.QWidget):
             ch_id = getattr(ch_info, "id", None)
             if ch_id is not None:
                 self.channelAddRequested.emit(ch_id)
-
-    def _on_remove_channel(self) -> None:
-        """Handle remove channel button click."""
-        current_row = self.active_list.currentRow()
-        if current_row >= 0:
-            item = self.active_list.item(current_row)
-            info = item.data(QtCore.Qt.UserRole)
-            ch_id = getattr(info, "id", None)
-            if ch_id is not None:
-                self.channelRemoveRequested.emit(ch_id)
-
-    def _on_active_channel_selected(self, index: int) -> None:
-        """Handle active channel selection change."""
-        if index >= 0:
-            self.activeChannelSelected.emit(index)

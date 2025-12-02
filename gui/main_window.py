@@ -24,6 +24,7 @@ from shared.ring_buffer import SharedRingBuffer
 from .analysis_dock import AnalysisDock
 from .settings_tab import SettingsTab
 from .scope_widget import ScopeWidget, ChannelConfig as ScopeChannelConfig
+from .channel_controls_widget import ChannelControlsWidget, ChannelDetailPanel
 from .device_control_widget import DeviceControlWidget
 from .types import ChannelConfig
 from .trace_renderer import TraceRenderer
@@ -34,266 +35,6 @@ from .trace_renderer import TraceRenderer
 
 
 
-class ChannelOptionsPanel(QtWidgets.QWidget):
-    """Per-channel configuration widget."""
-
-    configChanged = QtCore.Signal(ChannelConfig)
-    analysisRequested = QtCore.Signal()
-
-    def __init__(self, channel_id: int, channel_name: str, parent: Optional[QtWidgets.QWidget] = None) -> None:
-        super().__init__(parent)
-        self._channel_id = channel_id
-        self._config = ChannelConfig(channel_name=channel_name)
-        self._block_updates = False
-
-        self._build_ui()
-        self.set_channel_name(channel_name)
-        self.set_config(self._config)
-
-    def _apply_toggle_style(self, button: QtWidgets.QPushButton) -> None:
-        button.setCheckable(True)
-        button.setStyleSheet(
-            """
-QPushButton {
-    background-color: rgb(180, 180, 180);
-    border: 1px solid rgb(90, 90, 90);
-    padding: 4px 10px;
-}
-QPushButton:checked {
-    background-color: rgb(30, 144, 255);
-    color: rgb(255, 255, 255);
-    font-weight: bold;
-}
-"""
-        )
-
-    def _build_ui(self) -> None:
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)
-
-        self._title_label = QtWidgets.QLabel("")
-        self._title_label.setStyleSheet("font-weight: bold; font-size: 13px;")
-        layout.addWidget(self._title_label)
-
-        # Visual identity controls
-        color_row = QtWidgets.QHBoxLayout()
-        color_row.setSpacing(4)
-        color_row.addWidget(QtWidgets.QLabel("Color"))
-        self.color_btn = QtWidgets.QPushButton()
-        self.color_btn.setFixedWidth(48)
-        self.color_btn.clicked.connect(self._choose_color)
-        color_row.addWidget(self.color_btn)
-        color_row.addSpacing(12)
-        self.display_check = QtWidgets.QCheckBox("Display")
-        self.display_check.setChecked(True)
-        color_row.addWidget(self.display_check)
-        color_row.addStretch(1)
-        layout.addLayout(color_row)
-
-        # Plot scaling
-        range_row = QtWidgets.QHBoxLayout()
-        range_row.setSpacing(4)
-        range_row.addWidget(QtWidgets.QLabel("Vertical Range (±V)"))
-        self.range_combo = QtWidgets.QComboBox()
-        self.range_combo.setMaximumWidth(120)
-        for value in (0.1, 0.2, 0.5, 1.0, 2.0, 5.0):
-            self.range_combo.addItem(f"{value:.1f}", value)
-        range_row.addWidget(self.range_combo, 1)
-        layout.addLayout(range_row)
-
-        # Vertical offset adjustment (normalized 0-1)
-        offset_row = QtWidgets.QHBoxLayout()
-        offset_row.setSpacing(4)
-        offset_row.addWidget(QtWidgets.QLabel("Vertical Offset"))
-        self.offset_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.offset_slider.setRange(0, 100)
-        self.offset_slider.setSingleStep(1)
-        self.offset_slider.setPageStep(5)
-        self.offset_slider.setValue(50)
-        self.offset_slider.setFixedWidth(140)
-        offset_row.addWidget(self.offset_slider, 1)
-        layout.addLayout(offset_row)
-
-        # Filtering controls
-        filters_layout = QtWidgets.QVBoxLayout()
-        filters_layout.setContentsMargins(0, 0, 0, 0)
-        filters_layout.setSpacing(0)
-        layout.addLayout(filters_layout)
-
-        notch_row = QtWidgets.QHBoxLayout()
-        notch_row.setContentsMargins(0, 0, 0, 0)
-        notch_row.setSpacing(4)
-        self.notch_check = QtWidgets.QCheckBox("Notch Filter")
-        notch_row.addWidget(self.notch_check)
-        notch_row.addStretch(1)
-        notch_row.addWidget(QtWidgets.QLabel("Hz"))
-        self.notch_spin = QtWidgets.QDoubleSpinBox()
-        self.notch_spin.setRange(1.0, 1_000.0)
-        self.notch_spin.setValue(60.0)
-        self.notch_spin.setDecimals(1)
-        self.notch_spin.setSingleStep(1.0)
-        self.notch_spin.setMaximumWidth(110)
-        notch_row.addWidget(self.notch_spin)
-        filters_layout.addLayout(notch_row)
-
-        hp_row = QtWidgets.QHBoxLayout()
-        hp_row.setContentsMargins(0, 0, 0, 0)
-        hp_row.setSpacing(4)
-        self.highpass_check = QtWidgets.QCheckBox("High-pass")
-        hp_row.addWidget(self.highpass_check)
-        hp_row.addStretch(1)
-        hp_row.addWidget(QtWidgets.QLabel("Hz"))
-        self.highpass_spin = QtWidgets.QDoubleSpinBox()
-        self.highpass_spin.setRange(0.1, 10_000.0)
-        self.highpass_spin.setValue(10.0)
-        self.highpass_spin.setDecimals(1)
-        self.highpass_spin.setSingleStep(1.0)
-        self.highpass_spin.setMaximumWidth(110)
-        hp_row.addWidget(self.highpass_spin)
-        filters_layout.addLayout(hp_row)
-
-        lp_row = QtWidgets.QHBoxLayout()
-        lp_row.setContentsMargins(0, 0, 0, 0)
-        lp_row.setSpacing(4)
-        self.lowpass_check = QtWidgets.QCheckBox("Low-pass")
-        lp_row.addWidget(self.lowpass_check)
-        lp_row.addStretch(1)
-        lp_row.addWidget(QtWidgets.QLabel("Hz"))
-        self.lowpass_spin = QtWidgets.QDoubleSpinBox()
-        self.lowpass_spin.setRange(1.0, 50_000.0)
-        self.lowpass_spin.setValue(1_000.0)
-        self.lowpass_spin.setDecimals(1)
-        self.lowpass_spin.setSingleStep(10.0)
-        self.lowpass_spin.setMaximumWidth(110)
-        lp_row.addWidget(self.lowpass_spin)
-        filters_layout.addLayout(lp_row)
-
-        layout.addStretch(1)
-
-        # Downstream feature toggles
-        toggle_row = QtWidgets.QHBoxLayout()
-        self.listen_btn = QtWidgets.QPushButton("Listen")
-        self._apply_toggle_style(self.listen_btn)
-        toggle_row.addWidget(self.listen_btn, 1)
-        self.analyze_btn = QtWidgets.QPushButton("Analyze")
-        self.analyze_btn.setStyleSheet(
-            "background-color: rgb(180, 180, 180); border: 1px solid rgb(90,90,90); padding: 4px 10px;"
-        )
-        toggle_row.addWidget(self.analyze_btn, 1)
-        toggle_row.addStretch(1)
-        layout.addLayout(toggle_row)
-
-        # Wire signals
-        self.range_combo.currentIndexChanged.connect(self._on_widgets_changed)
-        self.notch_check.toggled.connect(self._on_notch_toggled)
-        self.notch_spin.valueChanged.connect(self._on_widgets_changed)
-        self.highpass_check.toggled.connect(self._on_highpass_toggled)
-        self.highpass_spin.valueChanged.connect(self._on_widgets_changed)
-        self.lowpass_check.toggled.connect(self._on_lowpass_toggled)
-        self.lowpass_spin.valueChanged.connect(self._on_widgets_changed)
-        self.offset_slider.valueChanged.connect(self._on_widgets_changed)
-        self.listen_btn.toggled.connect(self._on_widgets_changed)
-        self.display_check.toggled.connect(self._on_display_toggled)
-        self.analyze_btn.clicked.connect(self._on_analyze_clicked)
-
-    def set_channel_name(self, name: str) -> None:
-        self._config.channel_name = name
-        self._title_label.setText(f"Channel: {name}")
-
-    def set_config(self, config: ChannelConfig) -> None:
-        # Backwards compatibility for older configs
-        span = getattr(config, "vertical_span_v", getattr(config, "range_v", 1.0))
-        offset = getattr(config, "screen_offset", getattr(config, "offset_v", 0.5))
-        config.vertical_span_v = span
-        config.screen_offset = offset
-        self._config = replace(config)
-        self._block_updates = True
-        self._apply_color(config.color)
-        idx = self.range_combo.findData(config.vertical_span_v)
-        if idx >= 0:
-            self.range_combo.setCurrentIndex(idx)
-        else:
-            self.range_combo.addItem(f"{config.vertical_span_v:.3f}", config.vertical_span_v)
-            self.range_combo.setCurrentIndex(self.range_combo.count() - 1)
-        self.notch_check.setChecked(config.notch_enabled)
-        self.notch_spin.setValue(config.notch_freq)
-        self.notch_spin.setEnabled(config.notch_enabled)
-        self.highpass_check.setChecked(config.highpass_enabled)
-        self.highpass_spin.setValue(config.highpass_freq)
-        self.highpass_spin.setEnabled(config.highpass_enabled)
-        self.lowpass_check.setChecked(config.lowpass_enabled)
-        self.lowpass_spin.setValue(config.lowpass_freq)
-        self.lowpass_spin.setEnabled(config.lowpass_enabled)
-        self.offset_slider.blockSignals(True)
-        self.offset_slider.setValue(int(round(config.screen_offset * 100.0)))
-        self.offset_slider.blockSignals(False)
-        self.listen_btn.setChecked(config.listen_enabled)
-        self.display_check.setChecked(config.display_enabled)
-        self._block_updates = False
-
-    def _apply_color(self, color: QtGui.QColor) -> None:
-        qcolor = QtGui.QColor(color)
-        if not qcolor.isValid():
-            qcolor = QtGui.QColor(0, 0, 139)
-        self._config.color = qcolor
-        self.color_btn.setStyleSheet(
-            f"background-color: {qcolor.name()}; border: 1px solid rgb(40,40,40);"
-        )
-
-    def _choose_color(self) -> None:
-        initial = QtGui.QColor(self._config.color)
-        color = QtWidgets.QColorDialog.getColor(initial, self, "Select Channel Color")
-        if color.isValid():
-            self._apply_color(color)
-            self._emit_config()
-
-    def _on_notch_toggled(self, checked: bool) -> None:
-        self.notch_spin.setEnabled(checked)
-        self._on_widgets_changed()
-
-    def _on_highpass_toggled(self, checked: bool) -> None:
-        self.highpass_spin.setEnabled(checked)
-        self._on_widgets_changed()
-
-    def _on_lowpass_toggled(self, checked: bool) -> None:
-        self.lowpass_spin.setEnabled(checked)
-        self._on_widgets_changed()
-
-    def _on_widgets_changed(self) -> None:
-        if self._block_updates:
-            return
-        self._config.vertical_span_v = float(self.range_combo.currentData())
-        slider_val = float(self.offset_slider.value())
-        if abs(slider_val - 50.0) <= 5.0:
-            slider_val = 50.0
-            self.offset_slider.blockSignals(True)
-            self.offset_slider.setValue(int(slider_val))
-            self.offset_slider.blockSignals(False)
-        self._config.screen_offset = slider_val / 100.0
-        self._config.notch_enabled = self.notch_check.isChecked()
-        self._config.notch_freq = float(self.notch_spin.value())
-        self._config.highpass_enabled = self.highpass_check.isChecked()
-        self._config.highpass_freq = float(self.highpass_spin.value())
-        self._config.lowpass_enabled = self.lowpass_check.isChecked()
-        self._config.lowpass_freq = float(self.lowpass_spin.value())
-        self._config.listen_enabled = self.listen_btn.isChecked()
-        self._config.display_enabled = self.display_check.isChecked()
-        self._emit_config()
-
-    def _emit_config(self) -> None:
-        if self._block_updates:
-            return
-        self.configChanged.emit(replace(self._config))
-
-    def _on_display_toggled(self, checked: bool) -> None:
-        if self._block_updates:
-            return
-        self._config.display_enabled = checked
-        self._emit_config()
-
-    def _on_analyze_clicked(self) -> None:
-        self.analysisRequested.emit()
 
 
 
@@ -525,9 +266,9 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.setContentsMargins(8, 8, 8, 8)
         grid.setSpacing(8)
 
-        # Upper-left: ScopeWidget for multi-channel visualization
+        # Upper-left: ScopeWidget for multi-channel visualization (spans 2 columns)
         self.scope = ScopeWidget(self)
-        grid.addWidget(self.scope, 0, 0)
+        grid.addWidget(self.scope, 0, 0, 1, 2)
         
         # Keep references to threshold and pretrigger lines for compatibility
         self.threshold_line = self.scope.threshold_line
@@ -671,28 +412,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         side_layout.addWidget(self.trigger_group)
 
-        self.channel_opts_group = QtWidgets.QGroupBox("Channel Options")
-        channel_opts_layout = QtWidgets.QVBoxLayout(self.channel_opts_group)
-        channel_opts_layout.setContentsMargins(8, 12, 8, 12)
-        channel_opts_layout.setSpacing(6)
-
-        self.channel_opts_stack = QtWidgets.QStackedWidget()
-        placeholder_widget = QtWidgets.QWidget()
-        placeholder_layout = QtWidgets.QVBoxLayout(placeholder_widget)
-        placeholder_layout.addStretch(1)
-        placeholder_label = QtWidgets.QLabel("Select an active channel to configure.")
-        placeholder_label.setAlignment(QtCore.Qt.AlignCenter)
-        placeholder_label.setStyleSheet("color: rgb(60,60,60); font-style: italic;")
-        placeholder_layout.addWidget(placeholder_label)
-        placeholder_layout.addStretch(1)
-        self.channel_opts_stack.addWidget(placeholder_widget)
-        channel_opts_layout.addWidget(self.channel_opts_stack)
-
-        side_layout.addWidget(self.channel_opts_group, 1)
-        grid.addWidget(side_panel, 0, 1, 2, 1)
-
         # Bottom row (spanning full width): device / channel controls.
         self.device_control = DeviceControlWidget(self)
+        self.channel_controls = ChannelControlsWidget(self)
         
         # Keep references to individual widgets for backward compatibility
         self.device_group = self.device_control.device_group
@@ -701,10 +423,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_toggle_btn = self.device_control.device_toggle_btn
         self.sample_rate_combo = self.device_control.sample_rate_combo
         self.settings_toggle_btn = self.device_control.settings_toggle_btn
-        self.channels_group = self.device_control.channels_group
-        self.active_list = self.device_control.active_list
+        self.active_combo = self.channel_controls.active_combo
         self.add_channel_btn = self.device_control.add_channel_btn
-        self.remove_channel_btn = self.device_control.remove_channel_btn
         self.available_combo = self.device_control.available_combo
         
         # Connect DeviceControlWidget signals
@@ -713,16 +433,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_control.deviceDisconnectRequested.connect(self._on_device_disconnect_requested)
         # self.device_control.deviceScanRequested.connect(self._on_scan_hardware)
         self.device_control.channelAddRequested.connect(self._on_channel_add_requested)
-        self.device_control.channelRemoveRequested.connect(self._on_channel_remove_requested)
-        self.device_control.activeChannelSelected.connect(self._on_active_list_index_changed)
+        self.channel_controls.activeChannelSelected.connect(self._on_active_list_index_changed)
         self.device_control.settingsToggled.connect(self._toggle_settings_tab)
 
-        grid.addWidget(self.device_control, 1, 0)
+        grid.addWidget(side_panel, 0, 2)  # Trigger panel top right (col 2)
+        grid.addWidget(self.device_control, 1, 0) # Device control bottom left (col 0)
+        grid.addWidget(self.channel_controls, 1, 1, 1, 2) # Channel control bottom right (cols 1-2)
 
         grid.setRowStretch(0, 1)
         grid.setRowStretch(1, 0)
-        grid.setColumnStretch(0, 5)
-        grid.setColumnStretch(1, 3)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
 
         return scope
 
@@ -739,7 +461,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pretrigger_combo.currentIndexChanged.connect(self._emit_trigger_config)
         self.window_combo.currentIndexChanged.connect(self._on_window_changed)
         # NOTE: threshold_line signal now handled by ScopeWidget.thresholdChanged
-        self.active_list.currentItemChanged.connect(self._on_active_channel_selected)
+        # self.active_list.currentItemChanged.connect(self._on_active_channel_selected)
         self.trigger_single_button.clicked.connect(self._on_trigger_single_clicked)
 
     def attach_controller(self, controller: Optional[PipelineController]) -> None:
@@ -1115,9 +837,9 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
         missing_channels: list[int] = []
-        self.active_list.blockSignals(True)
+        self.active_combo.blockSignals(True)
         self.available_combo.blockSignals(True)
-        self.active_list.clear()
+        self.active_combo.clear()
         self._channel_configs.clear()
         try:
             for entry in channels_payload:
@@ -1130,17 +852,17 @@ class MainWindow(QtWidgets.QMainWindow):
                     continue
                 info = self.available_combo.itemData(idx)
                 name = entry.get("name") or self.available_combo.itemText(idx)
-                item = QtWidgets.QListWidgetItem(name)
-                item.setData(QtCore.Qt.UserRole, info)
-                self.active_list.addItem(item)
+                
+                self.active_combo.addItem(name, info)
                 self.available_combo.removeItem(idx)
+                
                 cfg = self._channel_config_from_dict(entry.get("config") or {}, fallback_name=name)
                 cfg.channel_name = name
                 self._channel_configs[int(cid)] = cfg
-            if self.active_list.count():
-                self.active_list.setCurrentRow(0)
+            if self.active_combo.count():
+                self.active_combo.setCurrentIndex(0)
         finally:
-            self.active_list.blockSignals(False)
+            self.active_combo.blockSignals(False)
             self.available_combo.blockSignals(False)
 
         self._publish_active_channels()
@@ -1381,16 +1103,12 @@ class MainWindow(QtWidgets.QMainWindow):
         """Handle add channel request from DeviceControlWidget."""
         self._on_add_channel()
 
-    def _on_channel_remove_requested(self, channel_id: int) -> None:
-        """Handle remove channel request from DeviceControlWidget."""
-        self._on_remove_channel()
 
     def _on_active_list_index_changed(self, index: int) -> None:
         """Handle active channel selection change by index."""
-        if 0 <= index < self.active_list.count():
-            item = self.active_list.item(index)
-            if item is not None:
-                self._on_active_channel_selected(item, None)
+        if 0 <= index < self.active_combo.count():
+            info = self.active_combo.itemData(index)
+            self._on_active_channel_selected(info)
 
 
     def _on_devices_changed(self, entries: List[dict]) -> None:
@@ -1474,7 +1192,7 @@ class MainWindow(QtWidgets.QMainWindow):
         elif self.sample_rate_combo.count():
             self.sample_rate_combo.setCurrentIndex(0)
             
-        self.sample_rate_combo.setEnabled(bool(rates) and (not self._device_connected or self.active_list.count() == 0))
+        self.sample_rate_combo.setEnabled(bool(rates) and (not self._device_connected or self.active_combo.count() == 0))
         self.sample_rate_combo.blockSignals(False)
 
     def _set_sample_rate_value(self, sample_rate: float) -> None:
@@ -1504,12 +1222,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_sample_rate_enabled(self) -> None:
         connected = self._device_connected
-        has_active = self.active_list.count() > 0
+        has_active = self.active_combo.count() > 0
         self.sample_rate_combo.setEnabled(self.sample_rate_combo.count() > 0 and ((not connected) or (connected and not has_active)))
 
     def _on_device_connected(self, key: str) -> None:
         self._device_connected = True
-        self._reset_color_cycle()
         self._apply_device_state(True)
         idx = self.device_combo.findData(key)
         if idx >= 0:
@@ -1528,7 +1245,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_device_disconnected(self) -> None:
         self._device_connected = False
-        self._reset_color_cycle()
         self._apply_device_state(False)
         self.stop_acquisition()
         self._drain_visualization_queue()
@@ -1543,7 +1259,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._clear_listen_channel()
         self._reset_trigger_state()
         self.available_combo.clear()
-        self.active_list.clear()
+        self.active_combo.clear()
         self._clear_channel_panels()
         self.set_trigger_channels([])
         self._update_channel_buttons()
@@ -1571,7 +1287,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_control.set_available_channels(list(channels))
         
         # Clear active channels
-        self.active_list.clear()
+        self.active_combo.clear()
         self._clear_channel_panels()
         
         # Set trigger channels and update UI
@@ -1587,50 +1303,29 @@ class MainWindow(QtWidgets.QMainWindow):
         if idx < 0:
             return
         info = self.available_combo.itemData(idx)
-        item = QtWidgets.QListWidgetItem(self.available_combo.currentText())
-        item.setData(QtCore.Qt.UserRole, info)
-        self.active_list.addItem(item)
+        text = self.available_combo.currentText()
+        
+        self.active_combo.addItem(text, info)
         self.available_combo.removeItem(idx)
+        
         if self.available_combo.count():
             self.available_combo.setCurrentIndex(min(idx, self.available_combo.count() - 1))
+            
         # Activate and focus the newly added channel without extra signal chatter.
-        self.active_list.blockSignals(True)
-        self.active_list.setCurrentItem(item)
-        self.active_list.blockSignals(False)
+        self.active_combo.blockSignals(True)
+        self.active_combo.setCurrentIndex(self.active_combo.count() - 1)
+        self.active_combo.blockSignals(False)
+        
         self._update_channel_buttons()
         self._publish_active_channels()
         self._set_active_channel_focus(getattr(info, "id", None))
         self._emit_trigger_config()
 
-    def _on_remove_channel(self) -> None:
-        current = self.active_list.currentItem()
-        if current is None:
-            return
-        info = current.data(QtCore.Qt.UserRole)
-        item = QtWidgets.QListWidgetItem(current.text())
-        item.setData(QtCore.Qt.UserRole, info)
-        self.available_combo.addItem(item.text(), info)
-        row = self.active_list.row(current)
-        self.active_list.takeItem(row)
-        if self.active_list.count() > 0:
-            self.active_list.setCurrentRow(0)
-        else:
-            self._show_channel_panel(None)
-        if self.available_combo.count():
-            self.available_combo.setCurrentIndex(self.available_combo.count() - 1)
-        self._update_channel_buttons()
-        self._publish_active_channels()
-        self._emit_trigger_config()
-        
-        # FIX: Decrement color index so re-added channels reuse the released color slot.
-        if self._next_color_index > 0:
-            self._next_color_index -= 1
 
     def _publish_active_channels(self) -> None:
         infos = []
-        for index in range(self.active_list.count()):
-            item = self.active_list.item(index)
-            info = item.data(QtCore.Qt.UserRole)
+        for index in range(self.active_combo.count()):
+            info = self.active_combo.itemData(index)
             if info is not None:
                 infos.append(info)
         self._active_channel_infos = infos
@@ -1706,8 +1401,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if config is not None and hasattr(self, "_analysis_dock"):
                     channel_name = config.channel_name or f"Channel {cid}"
                     self._analysis_dock.close_tab(channel_name)
-                self.channel_opts_stack.removeWidget(panel)
-                panel.deleteLater()
+                self.channel_controls.remove_panel(cid)
                 del self._channel_panels[cid]
                 self._channel_configs.pop(cid, None)
         if not channel_ids:
@@ -1717,16 +1411,15 @@ class MainWindow(QtWidgets.QMainWindow):
             config = self._ensure_channel_config(cid, name)
             panel = self._channel_panels.get(cid)
             if panel is None:
-                panel = ChannelOptionsPanel(cid, name, self.channel_opts_stack)
+                panel = ChannelDetailPanel(cid, name, self.channel_controls.stack)
                 panel.configChanged.connect(lambda cfg, cid=cid: self._on_channel_config_changed(cid, cfg))
                 panel.analysisRequested.connect(lambda cid=cid: self._open_analysis_for_channel(cid))
-                self.channel_opts_stack.addWidget(panel)
+                self.channel_controls.add_panel(cid, panel)
                 self._channel_panels[cid] = panel
-            panel.set_channel_name(name)
             panel.set_config(config)
-        current = self.active_list.currentItem()
-        if current is not None:
-            info = current.data(QtCore.Qt.UserRole)
+        idx = self.active_combo.currentIndex()
+        if idx >= 0:
+            info = self.active_combo.itemData(idx)
             cid = getattr(info, "id", None)
             self._show_channel_panel(cid)
         else:
@@ -1735,9 +1428,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._set_active_channel_focus(channel_ids[0])
 
     def _clear_channel_panels(self) -> None:
-        for panel in list(self._channel_panels.values()):
-            self.channel_opts_stack.removeWidget(panel)
-            panel.deleteLater()
+        self.channel_controls.clear_panels()
         self._channel_panels.clear()
         # Don't clear _channel_configs - configs should persist so channels maintain
         # their color/settings when re-added. Configs are cleared on device disconnect.
@@ -1746,27 +1437,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._show_channel_panel(None)
 
     def _show_channel_panel(self, channel_id: Optional[int]) -> None:
-        if channel_id is None:
-            self.channel_opts_stack.setCurrentIndex(0)
-            return
-        panel = self._channel_panels.get(channel_id)
-        if panel is None:
-            self.channel_opts_stack.setCurrentIndex(0)
-            return
-        index = self.channel_opts_stack.indexOf(panel)
-        if index >= 0:
-            self.channel_opts_stack.setCurrentIndex(index)
+        self.channel_controls.show_panel(channel_id)
 
-    def _on_active_channel_selected(
-        self,
-        current: Optional[QtWidgets.QListWidgetItem],
-        previous: Optional[QtWidgets.QListWidgetItem],
-    ) -> None:
-        _ = previous
-        if current is None:
+    def _on_active_channel_selected(self, info: Optional[object]) -> None:
+        if info is None:
             self._show_channel_panel(None)
             return
-        info = current.data(QtCore.Qt.UserRole)
         channel_id = getattr(info, "id", None)
         name = getattr(info, "name", str(info))
         if channel_id is None:
@@ -1775,28 +1451,26 @@ class MainWindow(QtWidgets.QMainWindow):
         config = self._ensure_channel_config(channel_id, name)
         panel = self._channel_panels.get(channel_id)
         if panel is None:
-            panel = ChannelOptionsPanel(channel_id, name, self.channel_opts_stack)
+            panel = ChannelDetailPanel(channel_id, name, self.channel_controls.stack)
             panel.configChanged.connect(lambda cfg, cid=channel_id: self._on_channel_config_changed(cid, cfg))
             panel.analysisRequested.connect(lambda cid=channel_id: self._open_analysis_for_channel(cid))
-            self.channel_opts_stack.addWidget(panel)
+            self.channel_controls.add_panel(channel_id, panel)
             self._channel_panels[channel_id] = panel
-        panel.set_channel_name(name)
         panel.set_config(config)
         self._set_active_channel_focus(channel_id)
         self._show_channel_panel(channel_id)
 
     def _select_active_channel_by_id(self, channel_id: int) -> None:
-        target_row = None
-        for idx in range(self.active_list.count()):
-            item = self.active_list.item(idx)
-            info = item.data(QtCore.Qt.UserRole)
+        target_idx = None
+        for idx in range(self.active_combo.count()):
+            info = self.active_combo.itemData(idx)
             if getattr(info, "id", None) == channel_id:
-                target_row = idx
+                target_idx = idx
                 break
-        if target_row is None:
+        if target_idx is None:
             return
-        if self.active_list.currentRow() != target_row:
-            self.active_list.setCurrentRow(target_row)
+        if self.active_combo.currentIndex() != target_idx:
+            self.active_combo.setCurrentIndex(target_idx)
         else:
             self._set_active_channel_focus(channel_id)
             self._show_channel_panel(channel_id)
@@ -2196,11 +1870,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_channel_buttons(self) -> None:
         connected = self._device_connected
         self.add_channel_btn.setEnabled(connected and self.available_combo.count() > 0)
-        self.remove_channel_btn.setEnabled(connected and self.active_list.count() > 0)
-        self._update_trigger_controls()
 
     def _update_trigger_controls(self) -> None:
-        has_active = self.active_list.count() > 0
+        has_active = self.active_combo.count() > 0
         for widget in (
             self.trigger_mode_continuous,
             self.trigger_mode_single,
@@ -2249,10 +1921,15 @@ class MainWindow(QtWidgets.QMainWindow):
             panel.setEnabled(enabled)
         self.record_path_edit.setEnabled(enabled)
         self.record_autoinc.setEnabled(enabled)
-        self.record_toggle_btn.setEnabled(True)
-        self.threshold_line.setMovable(enabled)
+        self.device_combo.setEnabled(not self._device_connected)
+        self.sample_rate_combo.setEnabled(not self._device_connected)
         self.available_combo.setEnabled(enabled and self._device_connected)
-        self.active_list.setEnabled(enabled and self._device_connected)
+        self.active_combo.setEnabled(enabled and self._device_connected)
+        self.add_channel_btn.setEnabled(enabled and self._device_connected)
+        
+        # If disabling, ensure we don't leave stale state
+        if not enabled:
+            self._update_channel_buttons()
 
     def _apply_device_state(self, connected: bool) -> None:
         has_entries = bool(self._device_map)
@@ -2265,7 +1942,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_toggle_btn.setEnabled(connected or has_connectable)
         self.device_toggle_btn.blockSignals(False)
         self.available_combo.setEnabled(connected)
-        self.active_list.setEnabled(connected)
+        self.active_combo.setEnabled(connected)
         self._update_channel_buttons()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[override]

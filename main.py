@@ -18,7 +18,7 @@ if __name__ == "__main__":
 #TODO Notes:
 # - Add spectrogram view in analysis mode, also, simply fft amplitudes view
 #    - Add spectrogram button next to analyze and have it pop up a spectrogram tab for a channel
-# - Integrate in taylor's logging code (for .wav raw files).
+# - (READY) Integrate in taylor's logging code (for .wav raw files).
 # - Implement a DAQ for wav file playback 
 
 # - Add analog output to DAQ devices to support input and output/stimulation
