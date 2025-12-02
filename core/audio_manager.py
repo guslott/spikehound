@@ -248,14 +248,14 @@ class AudioManager:
                 pass
         
         # Create new player
-        queue_obj: queue.Queue = queue.Queue(maxsize=128)
+        queue_obj: queue.Queue = queue.Queue(maxsize=4)
         config = AudioConfig(
             out_samplerate=44_100,
             out_channels=1,
             device=device_id,
             gain=self._audio_gain,
-            blocksize=256,
-            ring_seconds=0.2,
+            blocksize=128,
+            ring_seconds=0.1,
         )
         
         try:

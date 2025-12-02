@@ -115,6 +115,13 @@ class AudioPlayer(threading.Thread):
         n = int(x.size)
         if n == 0:
             return
+            
+        # Handle case where input is larger than the entire buffer
+        if n > self._ring.size:
+            # Just take the last self._ring.size samples
+            x = x[-self._ring.size:]
+            n = self._ring.size
+            
         with self._r_lock:
             space = self._ring_space()
             if n > space:
@@ -127,7 +134,6 @@ class AudioPlayer(threading.Thread):
             if rem:
                 self._ring[:rem] = x[end:]
             self._r_head = (self._r_head + n) % self._ring.size
-            self._r_head = self._r_head % self._ring.size # Ensure wrap
 
     def _ring_read(self, n: int) -> np.ndarray:
         with self._r_lock:
@@ -255,7 +261,7 @@ class AudioPlayer(threading.Thread):
 
     def run(self) -> None:
         # Calculate buffer size in milliseconds
-        buf_msec = max(10, int(self.cfg.blocksize * 4 * 1000 / self.cfg.out_samplerate))
+        buf_msec = max(5, int(self.cfg.blocksize * 4 * 1000 / self.cfg.out_samplerate))
         
         # Configure miniaudio device
         try:
