@@ -44,7 +44,7 @@ SpikeHound uses a plugin-based architecture to support various input sources:
 ### Dependencies
 SpikeHound relies on the scientific Python stack and Qt for its GUI:
 ```bash
-pip install numpy scipy PySide6 pyqtgraph sounddevice pyserial
+pip install numpy scipy PySide6 pyqtgraph miniaudio pyserial
 ```
 
 ### Running the Application

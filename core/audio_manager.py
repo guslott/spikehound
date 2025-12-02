@@ -100,11 +100,11 @@ class AudioManager:
         else:
             logger.debug(f"Audio monitoring channel {channel_id}")
 
-    def set_output_device(self, device_id: Optional[int]) -> None:
+    def set_output_device(self, device_id: Optional[object]) -> None:
         """Set audio output device.
         
         Args:
-            device_id: Device ID for audio output, or None for default
+            device_id: Device ID for audio output (int or object), or None for default
         """
         with self._audio_lock:
             if self._audio_current_device != device_id:

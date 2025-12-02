@@ -2,6 +2,6 @@ numpy
 scipy
 PySide6
 pyqtgraph
-sounddevice
+miniaudio
 pyserial
 pytest

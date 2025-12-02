@@ -402,7 +402,7 @@ Use `device_time` if both devices supply accurate hardware timestamps. Otherwise
 daq/
   base_device.py          # (this contract)
   simulated_source.py     # reference implementation
-  soundcard_source.py     # PortAudio/sounddevice-based driver
+  soundcard_source.py     # miniaudio-based driver
   __init__.py             # re-exports public classes for convenience
 ```
 
@@ -423,7 +423,7 @@ __all__ = [
 
 ## Compatibility notes
 
-* **SoundCardSource** uses PortAudio via `sounddevice`; it supports macOS, Windows, and Linux.
+* **SoundCardSource** uses `miniaudio`; it supports macOS, Windows, and Linux.
 
   * Prefer `sample_rate` of `44_100` or `48_000` unless you’ve verified others on the target OS/driver.
   * When available, the driver stamps `device_time` with PortAudio’s `input_buffer_adc_time`.

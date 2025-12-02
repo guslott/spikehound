@@ -3,15 +3,15 @@ from __future__ import annotations
 import threading
 import queue
 from dataclasses import dataclass
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 
 import numpy as np
 
 try:
-    import sounddevice as sd
-except Exception as e:  # pragma: no cover
-    sd = None
-    _SD_IMPORT_ERR = e
+    import miniaudio
+except ImportError as e:  # pragma: no cover
+    miniaudio = None
+    _IMPORT_ERR = e
 
 from shared.models import ChunkPointer
 from shared.ring_buffer import SharedRingBuffer
@@ -21,37 +21,26 @@ from shared.ring_buffer import SharedRingBuffer
 class AudioConfig:
     out_samplerate: int = 44_100   # soundcard output Hz
     out_channels: int = 1          # 1=mono (start simple)
-    device: Optional[int | str] = None  # None = default output device
+    device: Any = None             # None = default output device
     gain: float = 0.35             # careful: spikes can be loud
-    blocksize: int = 256           # PortAudio block size (latency knob)
+    blocksize: int = 256           # miniaudio buffer size (frames)
     ring_seconds: float = 0.2      # size of the output ring buffer (seconds)
 
 
-def list_output_devices() -> List[Dict[str, object]]:
-    """Return a list of available output devices using sounddevice."""
-    if sd is None:
+def list_output_devices(list_all: bool = False) -> List[Dict[str, object]]:
+    """Return a list of available output devices using miniaudio."""
+    if miniaudio is None:
         return []
     devices: List[Dict[str, object]] = []
     try:
-        all_devices = sd.query_devices()
-        hostapis = {}
-        for idx, info in enumerate(all_devices):
-            if info.get("max_output_channels", 0) <= 0:
-                continue
-            hostapi_idx = info.get("hostapi")
-            if isinstance(hostapi_idx, int):
-                if hostapi_idx not in hostapis:
-                    try:
-                        hostapis[hostapi_idx] = sd.query_hostapis(hostapi_idx).get("name", "")
-                    except Exception:
-                        hostapis[hostapi_idx] = ""
-                host_name = hostapis[hostapi_idx]
-            else:
-                host_name = ""
-            label = info.get("name", f"Device {idx}")
-            if host_name:
-                label = f"{label} ({host_name})"
-            devices.append({"id": idx, "label": label, "name": info.get("name", label)})
+        playback_devices = miniaudio.Devices().get_playbacks()
+        for idx, dev in enumerate(playback_devices):
+            label = dev.name
+            devices.append({"id": dev.id, "label": label, "name": dev.name})
+            
+            if not list_all:
+                # Just return the first one (default)
+                break
     except Exception:
         return []
     return devices
@@ -62,7 +51,7 @@ class AudioPlayer(threading.Thread):
     Consumes Chunk/ChunkPointer-like objects from an audio_queue. Each item must
     resolve to samples shaped (frames, channels) at input_sr. We select one
     channel, resample to out_sr (linear interpolation), and play via
-    sounddevice.OutputStream.
+    miniaudio.PlaybackDevice.
     """
 
     def __init__(
@@ -75,8 +64,8 @@ class AudioPlayer(threading.Thread):
         ring_buffer: Optional[SharedRingBuffer] = None,
     ) -> None:
         super().__init__(name="AudioPlayer", daemon=True)
-        if sd is None:
-            raise RuntimeError(f"`sounddevice` is not available: {_SD_IMPORT_ERR!r}")
+        if miniaudio is None:
+            raise RuntimeError(f"`miniaudio` is not available: {_IMPORT_ERR!r}")
 
         self.q = audio_queue
         self.in_sr = int(input_samplerate)
@@ -95,7 +84,7 @@ class AudioPlayer(threading.Thread):
         self._t_in_cursor = 0.0  # seconds in input timebase
 
         self._stop_evt = threading.Event()
-        self._stream = None
+        self._device: Optional[miniaudio.PlaybackDevice] = None
 
     # ---- Public control ------------------------------------------------------
 
@@ -138,6 +127,7 @@ class AudioPlayer(threading.Thread):
             if rem:
                 self._ring[:rem] = x[end:]
             self._r_head = (self._r_head + n) % self._ring.size
+            self._r_head = self._r_head % self._ring.size # Ensure wrap
 
     def _ring_read(self, n: int) -> np.ndarray:
         with self._r_lock:
@@ -153,7 +143,8 @@ class AudioPlayer(threading.Thread):
                 out[end:] = self._ring[:rem]
             self._r_tail = (self._r_tail + n) % self._ring.size
             return out
-        # ---- Input chunk extraction -----------------------------------------
+
+    # ---- Input chunk extraction -----------------------------------------
     def _extract_frames(self, ch) -> Optional[np.ndarray]:
         """
         Accepts a variety of 'chunk-like' objects and returns a float32 array
@@ -237,39 +228,54 @@ class AudioPlayer(threading.Thread):
         y = np.interp(t_out, t, mono_in.astype(np.float64, copy=False)).astype(np.float32, copy=False)
         return y
 
-    # ---- PortAudio callback --------------------------------------------------
+    # ---- Miniaudio generator -------------------------------------------------
 
-    def _callback(self, outdata, frames, time_info, status):
-        if status:
-            # xruns/underruns may be reported here; we just keep streaming
-            pass
-        wanted = int(frames)
-        mono = self._ring_read(wanted)
-        if mono.size < wanted:
-            mono = np.pad(mono, (0, wanted - mono.size))  # underrun -> silence
-        mono *= self.cfg.gain
-
-        # map mono -> (frames,channels) as required by PortAudio/sounddevice
-        if self.cfg.out_channels == 1:
-            out = mono[:, None] #shape (frames, 1)
-        else:
-            out = np.tile(mono[:, None], (1, self.cfg.out_channels)) #(frames, C)
-        outdata[:] = out
+    def _audio_generator(self):
+        """
+        Generator that yields audio data for miniaudio.
+        """
+        required_frames = yield b""  # Initial yield
+        
+        while True:
+            wanted = required_frames
+            mono = self._ring_read(wanted)
+            
+            # Underrun handling: pad with silence
+            if mono.size < wanted:
+                mono = np.pad(mono, (0, wanted - mono.size))
+                
+            mono *= self.cfg.gain
+            
+            # Convert to bytes (float32)
+            data_bytes = mono.tobytes()
+            
+            required_frames = yield data_bytes
 
     # ---- Thread body ---------------------------------------------------------
 
     def run(self) -> None:
-        # Open the soundcard stream
-        self._stream = sd.OutputStream(
-            device=self.cfg.device,
-            samplerate=self.cfg.out_samplerate,
-            channels=self.cfg.out_channels,
-            dtype="float32",
-            blocksize=self.cfg.blocksize,
-            callback=self._callback,
-            latency="low",
-        )
-        self._stream.start()
+        # Calculate buffer size in milliseconds
+        buf_msec = max(10, int(self.cfg.blocksize * 4 * 1000 / self.cfg.out_samplerate))
+        
+        # Configure miniaudio device
+        try:
+            self._device = miniaudio.PlaybackDevice(
+                device_id=self.cfg.device,
+                nchannels=self.cfg.out_channels,
+                sample_rate=self.cfg.out_samplerate,
+                output_format=miniaudio.SampleFormat.FLOAT32,
+                buffersize_msec=buf_msec,
+            )
+            
+            # Start playback with our generator
+            # Generator must be started (primed) before passing to start()
+            gen = self._audio_generator()
+            next(gen)
+            self._device.start(gen)
+            
+        except Exception as e:
+            print(f"Error starting miniaudio device: {e}")
+            return
 
         try:
             while not self._stop_evt.is_set():
@@ -296,9 +302,7 @@ class AudioPlayer(threading.Thread):
                         mono_out = mono_out / peak
                     self._ring_write(mono_out)
         finally:
-            try:
-                if self._stream:
-                    self._stream.stop()
-                    self._stream.close()
-            finally:
-                self._stream = None
+            if self._device and self._device.running:
+                self._device.stop()
+                self._device.close()
+            self._device = None

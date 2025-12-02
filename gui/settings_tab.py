@@ -47,7 +47,7 @@ class SettingsTab(QtWidgets.QWidget):
 
         self.list_audio_check = QtWidgets.QCheckBox("List all audio devices")
         self.list_audio_check.stateChanged.connect(
-            lambda state: self._update_settings(list_all_audio_devices=bool(state))
+            lambda state: self._on_list_audio_toggled(bool(state))
         )
         form.addRow(self.list_audio_check)
 
@@ -161,8 +161,16 @@ class SettingsTab(QtWidgets.QWidget):
 
     def _apply_settings(self, settings: AppSettings) -> None:
         self.list_audio_check.blockSignals(True)
-        self.list_audio_check.setChecked(bool(settings.list_all_audio_devices))
+        list_all = bool(settings.list_all_audio_devices)
+        self.list_audio_check.setChecked(list_all)
         self.list_audio_check.blockSignals(False)
+        
+        # Sync SoundcardSource flag
+        try:
+            from daq.soundcard_source import SoundCardSource
+            SoundCardSource.set_list_all_devices(list_all)
+        except ImportError:
+            pass
         
         self.load_launch_check.blockSignals(True)
         self.load_launch_check.setChecked(bool(settings.load_config_on_launch))
@@ -195,6 +203,23 @@ class SettingsTab(QtWidgets.QWidget):
             return
         store.update(**kwargs)
 
+    def _on_list_audio_toggled(self, enabled: bool) -> None:
+        self._update_settings(list_all_audio_devices=enabled)
+        
+        # Update SoundcardSource flag
+        # We need to import it safely
+        try:
+            from daq.soundcard_source import SoundCardSource
+            SoundCardSource.set_list_all_devices(enabled)
+        except ImportError:
+            pass
+            
+        # Refresh output list
+        self._populate_listen_devices()
+        
+        # Refresh input list (via controller scan)
+        self._on_rescan_clicked()
+
     def _on_rescan_clicked(self) -> None:
         """Trigger a device scan via the controller."""
         if self._controller and hasattr(self._controller, "scan_devices"):
@@ -207,7 +232,8 @@ class SettingsTab(QtWidgets.QWidget):
     def _populate_listen_devices(self) -> None:
         from audio.player import list_output_devices  # local import to avoid cycles
 
-        devices = list_output_devices()
+        list_all = self.list_audio_check.isChecked()
+        devices = list_output_devices(list_all=list_all)
         self.listen_combo.blockSignals(True)
         self.listen_combo.clear()
         self.listen_combo.addItem("System Default", None)
