@@ -128,21 +128,26 @@ class SoundCardSource(BaseDevice):
                 f"`miniaudio` is not available: {_IMPORT_ERROR!r}"
             )
         
+        # If not listing all, return a single "System Default" entry
+        if not cls._list_all_devices():
+            return [
+                DeviceInfo(
+                    id="default",
+                    name="System Default",
+                    details={
+                        "channels": 2, # Assume stereo for default
+                        "sample_rate": 44100,
+                        "real_id": None # None means default in miniaudio
+                    },
+                )
+            ]
+        
         try:
             devices = miniaudio.Devices().get_captures()
         except Exception:
             return []
             
         out: List[DeviceInfo] = []
-        
-        # If not listing all, just try to find the default or first one
-        # Miniaudio doesn't explicitly flag "default", but usually the first one or OS default is used if ID is None.
-        # However, get_captures() returns all.
-        
-        # For now, we'll just list them all if _LIST_ALL_DEVICES is True, 
-        # or just the first one if False (simulating "Default").
-        # Actually, let's just list them all but maybe prioritize naming?
-        # The original code had logic to prefer system default.
         
         for idx, dev in enumerate(devices):
             # dev is a dict: {'name': str, 'id': cdata, 'type': enum, 'formats': list}
@@ -167,10 +172,6 @@ class SoundCardSource(BaseDevice):
                     },
                 )
             )
-            
-            if not cls._list_all_devices():
-                # Just return the first one (usually default)
-                break
                 
         return out
 
@@ -206,6 +207,10 @@ class SoundCardSource(BaseDevice):
         if miniaudio is None:
             raise RuntimeError(f"`miniaudio` unavailable: {_IMPORT_ERROR!r}")
         
+        # Handle default device
+        if device_id == "default":
+            return Capabilities(max_channels_in=2, sample_rates=[44100, 48000, 88200, 96000], dtype=self.dtype)
+        
         # Resolve device info
         idx = int(device_id)
         captures = miniaudio.Devices().get_captures()
@@ -227,6 +232,10 @@ class SoundCardSource(BaseDevice):
         if miniaudio is None:
             raise RuntimeError(f"`miniaudio` unavailable: {_IMPORT_ERROR!r}")
             
+        # Handle default device
+        if device_id == "default":
+            return [ChannelInfo(id=i, name=f"In {i+1}", units="V") for i in range(2)]
+            
         idx = int(device_id)
         captures = miniaudio.Devices().get_captures()
         if idx < 0 or idx >= len(captures):
@@ -244,6 +253,12 @@ class SoundCardSource(BaseDevice):
     def _open_impl(self, device_id: str) -> None:
         if miniaudio is None:
             raise RuntimeError(f"`miniaudio` unavailable: {_IMPORT_ERROR!r}")
+            
+        if device_id == "default":
+            self._miniaudio_device_id = None # None means default in miniaudio
+            self._n_in = 2 # Assume stereo
+            self._chan_names = ["In 1", "In 2"]
+            return
             
         idx = int(device_id)
         captures = miniaudio.Devices().get_captures()
