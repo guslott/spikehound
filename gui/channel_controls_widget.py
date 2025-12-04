@@ -64,7 +64,8 @@ QPushButton:checked {
         range_row = QtWidgets.QHBoxLayout()
         range_row.addWidget(QtWidgets.QLabel("Range (±V)"))
         self.range_combo = QtWidgets.QComboBox()
-        self.range_combo.setMaximumWidth(80)
+        self.range_combo.setMinimumWidth(150)
+        self.range_combo.setSizePolicy(QtWidgets.QSizePolicy.MinimumExpanding, QtWidgets.QSizePolicy.Fixed)
         for value in (0.1, 0.2, 0.5, 1.0, 2.0, 5.0):
             self.range_combo.addItem(f"{value:.1f}", value)
         range_row.addWidget(self.range_combo)
@@ -87,7 +88,15 @@ QPushButton:checked {
 
         # --- Column 2: Filters ---
         col2 = QtWidgets.QVBoxLayout()
-        col2.setSpacing(6)
+        col2.setSpacing(2)
+
+        disabled_spin_style = """
+            QDoubleSpinBox:disabled {
+                background-color: #e0e0e0;
+                color: #808080;
+                border: 1px solid #c0c0c0;
+            }
+        """
 
         # Notch
         notch_row = QtWidgets.QHBoxLayout()
@@ -96,7 +105,9 @@ QPushButton:checked {
         self.notch_spin = QtWidgets.QDoubleSpinBox()
         self.notch_spin.setRange(1.0, 1000.0)
         self.notch_spin.setValue(60.0)
+        self.notch_spin.setDecimals(0)
         self.notch_spin.setSuffix(" Hz")
+        self.notch_spin.setStyleSheet(disabled_spin_style)
         notch_row.addWidget(self.notch_spin)
         col2.addLayout(notch_row)
 
@@ -107,7 +118,9 @@ QPushButton:checked {
         self.highpass_spin = QtWidgets.QDoubleSpinBox()
         self.highpass_spin.setRange(0.1, 10000.0)
         self.highpass_spin.setValue(10.0)
+        self.highpass_spin.setDecimals(0)
         self.highpass_spin.setSuffix(" Hz")
+        self.highpass_spin.setStyleSheet(disabled_spin_style)
         hp_row.addWidget(self.highpass_spin)
         col2.addLayout(hp_row)
 
@@ -118,7 +131,9 @@ QPushButton:checked {
         self.lowpass_spin = QtWidgets.QDoubleSpinBox()
         self.lowpass_spin.setRange(1.0, 50000.0)
         self.lowpass_spin.setValue(1000.0)
+        self.lowpass_spin.setDecimals(0)
         self.lowpass_spin.setSuffix(" Hz")
+        self.lowpass_spin.setStyleSheet(disabled_spin_style)
         lp_row.addWidget(self.lowpass_spin)
         col2.addLayout(lp_row)
 
@@ -264,7 +279,7 @@ class ChannelControlsWidget(QtWidgets.QGroupBox):
     activeChannelSelected = QtCore.Signal(int)  # index
     
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
-        super().__init__("Channel Controls", parent)
+        super().__init__("Channel Controls:", parent)
         self._panels = {}  # channel_id -> ChannelDetailPanel
         self._build_ui()
         
@@ -273,11 +288,12 @@ class ChannelControlsWidget(QtWidgets.QGroupBox):
         layout.setContentsMargins(8, 12, 8, 12)
         layout.setSpacing(6)
         
-        # Active Channel Dropdown
-        self.active_combo = QtWidgets.QComboBox()
-        self.active_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        # Active Channel Dropdown - Manually positioned in resizeEvent
+        self.active_combo = QtWidgets.QComboBox(self)
+        self.active_combo.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        self.active_combo.setFixedHeight(20) # Match typical title bar height
         self.active_combo.currentIndexChanged.connect(self._on_active_index_changed)
-        layout.addWidget(self.active_combo)
+        # layout.addWidget(self.active_combo) # Removed from layout
         
         # Stacked Widget for Channel Panels
         self.stack = QtWidgets.QStackedWidget()
@@ -295,6 +311,27 @@ class ChannelControlsWidget(QtWidgets.QGroupBox):
         
     def _on_active_index_changed(self, index: int) -> None:
         self.activeChannelSelected.emit(index)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        # Position the combo box next to the title
+        # "Channel Controls:" text width
+        fm = self.fontMetrics()
+        title_width = fm.horizontalAdvance("Channel Controls:")
+        
+        # Position: x = title_width + padding, y = 0 (fix clipping)
+        x_pos = title_width + 35 # Increased padding to avoid text overlap
+        y_pos = 0 
+        
+        # Width: Reduced fixed width to ensure border shows on the right
+        combo_width = 160
+        # Ensure it doesn't go beyond the widget width
+        max_width = self.width() - x_pos - 10
+        final_width = min(combo_width, max_width)
+        
+        if final_width > 0:
+            self.active_combo.setGeometry(x_pos, y_pos, final_width, 22)
+            self.active_combo.raise_()
         
     def add_panel(self, channel_id: int, panel: ChannelDetailPanel) -> None:
         self._panels[channel_id] = panel

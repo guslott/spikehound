@@ -54,9 +54,23 @@ class DeviceControlWidget(QtWidgets.QWidget):
         # device_layout.addWidget(self._label("Source"), 0, 0)
         self.device_combo = QtWidgets.QComboBox()
         self.device_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        
+        disabled_style = """
+            QComboBox:disabled {
+                background-color: #e0e0e0;
+                color: #808080;
+                border: 1px solid #c0c0c0;
+            }
+            QLabel:disabled {
+                color: #808080;
+            }
+        """
+        self.device_combo.setStyleSheet(disabled_style)
         device_layout.addWidget(self.device_combo, 0, 0, 1, 2)
 
-        device_layout.addWidget(self._label("Sample Rate (Hz)"), 1, 0)
+        self.sample_rate_label = self._label("Sample Rate (Hz)")
+        self.sample_rate_label.setStyleSheet(disabled_style)
+        device_layout.addWidget(self.sample_rate_label, 1, 0)
         
         sample_rate_row = QtWidgets.QHBoxLayout()
         sample_rate_row.setSpacing(6)
@@ -65,6 +79,7 @@ class DeviceControlWidget(QtWidgets.QWidget):
         self.sample_rate_combo.setEditable(False)
         self.sample_rate_combo.setFixedHeight(24)
         self.sample_rate_combo.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
+        self.sample_rate_combo.setStyleSheet(disabled_style)
         sample_rate_row.addWidget(self.sample_rate_combo, stretch=1)
         
         self.device_toggle_btn = QtWidgets.QPushButton("Click to Connect")
@@ -86,6 +101,10 @@ class DeviceControlWidget(QtWidgets.QWidget):
         self.add_channel_btn = QtWidgets.QPushButton("Add Channel")
         self.add_channel_btn.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
         available_row.addWidget(self.add_channel_btn)
+        
+        # Initially hidden until connected
+        self.available_combo.setVisible(False)
+        self.add_channel_btn.setVisible(False)
         
         device_layout.addLayout(available_row, 2, 0, 1, 2)
 
@@ -173,6 +192,9 @@ class DeviceControlWidget(QtWidgets.QWidget):
         self.device_combo.setEnabled(not connected)
         # self.scan_hardware_btn.setEnabled(not connected)
         self.sample_rate_combo.setEnabled(not connected)
+        
+        self.available_combo.setVisible(connected)
+        self.add_channel_btn.setVisible(connected)
 
     def get_selected_device_key(self) -> Optional[str]:
         """Return the currently selected device key."""

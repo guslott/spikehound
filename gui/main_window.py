@@ -405,7 +405,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.window_combo.setMaximumWidth(110)
         for value in (0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0):
             self.window_combo.addItem(f"{value:.1f}", value)
-        default_index = 3 if self.window_combo.count() > 3 else self.window_combo.count() - 1
+        default_index = 1 if self.window_combo.count() > 1 else self.window_combo.count() - 1
         self.window_combo.setCurrentIndex(max(0, default_index))
         window_box.addWidget(self.window_combo)
         trigger_layout.addLayout(window_box, row, 0, 1, 2)
@@ -1223,7 +1223,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_sample_rate_enabled(self) -> None:
         connected = self._device_connected
         has_active = self.active_combo.count() > 0
-        self.sample_rate_combo.setEnabled(self.sample_rate_combo.count() > 0 and ((not connected) or (connected and not has_active)))
+        enabled = self.sample_rate_combo.count() > 0 and not connected
+        self.sample_rate_combo.setEnabled(enabled)
+        if hasattr(self, "device_control") and hasattr(self.device_control, "sample_rate_label"):
+            self.device_control.sample_rate_label.setEnabled(enabled)
 
     def _on_device_connected(self, key: str) -> None:
         self._device_connected = True
@@ -1551,9 +1554,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._channel_configs[channel_id] = config
         if display_changed:
             if not config.display_enabled:
-                curve = self._curve_map.get(channel_id)
-                if curve is not None:
-                    curve.clear()
+                renderer = self._renderers.get(channel_id)
+                if renderer is not None:
+                    renderer.clear()
                 self._channel_last_samples.pop(channel_id, None)
                 self._channel_display_buffers.pop(channel_id, None)
             else:
@@ -1782,11 +1785,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     offset = float(config.screen_offset)
                     step = span / 10.0
                     vals: list[tuple[float, Optional[str]]] = []
-                    start = int(np.floor(((0.0 - offset) * span) / step) - 2)
-                    end = int(np.ceil(((1.0 - offset) * span) / step) + 2)
+                    # Use 2.0 * span because span is the half-range (+/- V)
+                    # and the viewport 0.0-1.0 covers the full range (2*span).
+                    start = int(np.floor(((0.0 - offset) * 2.0 * span) / step) - 2)
+                    end = int(np.ceil(((1.0 - offset) * 2.0 * span) / step) + 2)
                     for n in range(start, end + 1):
                         v = n * step
-                        pos = (v / span) + offset
+                        pos = (v / (2.0 * span)) + offset
                         if 0.0 <= pos <= 1.0:
                             vals.append((pos, f"{v:.3g}"))
                     axis.setTicks([vals])
@@ -1942,7 +1947,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_toggle_btn.setEnabled(connected or has_connectable)
         self.device_toggle_btn.blockSignals(False)
         self.available_combo.setEnabled(connected)
+        self.available_combo.setVisible(connected)
         self.active_combo.setEnabled(connected)
+        self.add_channel_btn.setVisible(connected)
         self._update_channel_buttons()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[override]
