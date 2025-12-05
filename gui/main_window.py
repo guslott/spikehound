@@ -359,6 +359,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trigger_mode_single.setEnabled(False)
         self.trigger_mode_repeating = QtWidgets.QRadioButton("Continuous Trigger")
         self.trigger_mode_repeating.setEnabled(False)
+        
+        # Group radio buttons
+        self.trigger_button_group = QtWidgets.QButtonGroup(self)
+        self.trigger_button_group.addButton(self.trigger_mode_continuous)
+        self.trigger_button_group.addButton(self.trigger_mode_single)
+        self.trigger_button_group.addButton(self.trigger_mode_repeating)
+        
         self.trigger_mode_continuous.setChecked(True)
         mode_layout.addWidget(self.trigger_mode_continuous)
         single_row = QtWidgets.QHBoxLayout()
@@ -1875,6 +1882,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_channel_buttons(self) -> None:
         connected = self._device_connected
         self.add_channel_btn.setEnabled(connected and self.available_combo.count() > 0)
+        self._update_trigger_controls()
 
     def _update_trigger_controls(self) -> None:
         has_active = self.active_combo.count() > 0

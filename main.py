@@ -23,12 +23,7 @@ if __name__ == "__main__":
 
 # - Add analog output to DAQ devices to support input and output/stimulation
 
-# - Allow for custom channel names
-
 # - Test on Windows w/ a school laptop
 #   - (Low Priority) install NIDAQmx drivers
 #   - (Low Priority) simulate devices and write a windows only DAQ interface using pyDAQmx
 # - Add LabJack Hardware Support (low priority)
-
-# Bring available channel list into the device panel.  
-# Merge the big active channel list into a drop down on the channel config panel
