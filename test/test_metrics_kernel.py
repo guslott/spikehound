@@ -28,19 +28,21 @@ def test_min_max_matches_signal():
     assert math.isclose(mx, -mn, rel_tol=0.1)
 
 
-@pytest.mark.skip(
-    reason="peak_frequency_sinc is optimized for localized spike events (tested in test_analysis_worker), "
-    "not continuous sine waves - this test is redundant"
-)
-def test_peak_frequency_sinc_accuracy():
+def test_peak_frequency_sinc_with_localized_burst():
+    """Test peak_frequency_sinc detects frequency in a localized burst (like a spike event)."""
     sr = 20000.0
-    freq = 500.0  # Lower frequency for more reliable detection
-    # Use more samples for better frequency resolution
-    t = np.arange(0, 1000, dtype=np.float32) / sr
-    wave = np.sin(2 * np.pi * freq * t)
-    detected = peak_frequency_sinc(wave, sr)
-    # Allow 10% tolerance for frequency detection
-    assert abs(detected - freq) / freq < 0.10
-
-
-
+    samples = 400  # 20ms window
+    wave = np.zeros(samples, dtype=np.float64)
+    
+    # Create a localized burst centered in the window
+    burst_len = int(sr * 0.008)  # 8ms burst
+    start = samples // 2 - burst_len // 2
+    t = np.arange(burst_len) / sr
+    freq = 300.0  # Target frequency
+    burst = np.sin(2 * np.pi * freq * t) * np.hanning(burst_len)
+    wave[start : start + burst_len] = burst
+    center = start + burst_len // 2
+    
+    detected = peak_frequency_sinc(wave, sr, center_index=center)
+    # Allow 15% tolerance for frequency detection
+    assert abs(detected - freq) / freq < 0.15, f"Expected ~{freq}Hz, got {detected}Hz"

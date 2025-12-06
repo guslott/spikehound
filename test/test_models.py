@@ -32,9 +32,8 @@ def test_chunk_samples_are_channel_major_and_readonly():
     with pytest.raises(ValueError):
         chunk.samples[0, 0] = 0.0
 
-
-@pytest.mark.skip(reason="emit_array now returns ChunkPointer, not Chunk - test needs rewrite")
-def test_emit_array_produces_monotonic_sequence_and_metadata():
+def test_emit_array_produces_monotonic_pointers_and_writes_to_buffer():
+    """Test that emit_array returns ChunkPointers and writes data to ring buffer."""
     source = SimulatedPhysiologySource()
     device = source.list_available_devices()[0]
     source.open(device.id)
@@ -53,15 +52,26 @@ def test_emit_array_produces_monotonic_sequence_and_metadata():
     data = np.ones((frames, chans), dtype=np.float32)
     dt = 1.0 / cfg.sample_rate
 
-    chunk_a = source.emit_array(data, mono_time=1.0)
-    chunk_b = source.emit_array(data, mono_time=1.0 + frames * dt)
+    # emit_array now returns ChunkPointer
+    pointer_a = source.emit_array(data, mono_time=1.0)
+    pointer_b = source.emit_array(data, mono_time=1.0 + frames * dt)
 
-    assert chunk_a.seq == 0
-    assert chunk_b.seq == 1
-    assert chunk_a.meta is not None and chunk_a.meta["start_sample"] == 0
-    assert chunk_b.meta is not None and chunk_b.meta["start_sample"] == frames
-    assert np.array_equal(chunk_a.samples, data.T)
-    assert chunk_b.start_time == pytest.approx(chunk_a.start_time + chunk_a.n_samples * chunk_a.dt)
+    # Validate pointer properties
+    assert pointer_a.length == frames
+    assert pointer_b.length == frames
+    assert pointer_a.render_time == pytest.approx(1.0)
+    assert pointer_b.render_time == pytest.approx(1.0 + frames * dt)
+    
+    # Read data back from ring buffer and verify content
+    rb = source.ring_buffer
+    assert rb is not None
+    
+    read_a = rb.read(pointer_a.start_index, pointer_a.length)
+    read_b = rb.read(pointer_b.start_index, pointer_b.length)
+    
+    # Data should match what we wrote (channel-major in buffer)
+    assert np.allclose(read_a, data.T)
+    assert np.allclose(read_b, data.T)
 
     source.close()
 
