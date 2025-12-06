@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 import threading
 import queue
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 try:
     import miniaudio
@@ -41,7 +44,8 @@ def list_output_devices(list_all: bool = False) -> List[Dict[str, object]]:
             if not list_all:
                 # Just return the first one (default)
                 break
-    except Exception:
+    except Exception as exc:
+        logger.warning("Failed to list output devices: %s", exc)
         return []
     return devices
 
@@ -164,7 +168,8 @@ class AudioPlayer(threading.Thread):
                 return None
             try:
                 block = self._ring_buffer.read(ch.start_index, ch.length)
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to read from ring buffer: %s", exc)
                 return None
             arr = np.asarray(block, dtype=np.float32, order="C").T
         elif hasattr(ch, "data"):
@@ -181,7 +186,8 @@ class AudioPlayer(threading.Thread):
             # e.g., list/tuple of samples or per-channel arrays
             try:
                 arr = np.asarray(ch)
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to convert chunk to array: %s", exc)
                 arr = None
 
         if arr is None:

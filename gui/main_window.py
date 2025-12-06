@@ -28,6 +28,7 @@ from .channel_controls_widget import ChannelControlsWidget, ChannelDetailPanel
 from .device_control_widget import DeviceControlWidget
 from .types import ChannelConfig
 from .trace_renderer import TraceRenderer
+from .trigger_controller import TriggerController
 
 
 
@@ -99,25 +100,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # Track which channel is being monitored (for UI state only, AudioManager handles actual routing)
         self._listen_channel_id: Optional[int] = None
         self._listen_device_key: Optional[str] = None
-        self._trigger_mode: str = "stream"
-        self._trigger_channel_id: Optional[int] = None
-        self._trigger_threshold: float = 0.0
-        self._trigger_pre_seconds: float = 0.01
-        self._trigger_pre_samples: int = 0
-        self._trigger_window_samples: int = 1
-        self._trigger_last_sample_rate: float = 0.0
-        self._trigger_history: deque[np.ndarray] = deque()
-        self._trigger_history_length: int = 0
-        self._trigger_history_total: int = 0
-        self._trigger_max_chunk: int = 0
-        self._trigger_prev_value: float = 0.0
-        self._trigger_capture_start_abs: Optional[int] = None
-        self._trigger_capture_end_abs: Optional[int] = None
-        self._trigger_display: Optional[np.ndarray] = None
-        self._trigger_display_times: Optional[np.ndarray] = None
-        self._trigger_hold_until: float = 0.0
-        self._trigger_single_armed: bool = False
-        self._trigger_display_pre_samples: int = 0
+        # TriggerController manages all trigger state and detection logic
+        self._trigger_controller = TriggerController(parent=self)
         self._plot_refresh_hz = 40.0
         self._plot_interval = 1.0 / self._plot_refresh_hz
         self._last_plot_refresh = 0.0
@@ -193,14 +177,166 @@ class MainWindow(QtWidgets.QMainWindow):
     def plot_refresh_hz(self) -> float:
         return float(getattr(self, "_plot_refresh_hz", 0.0))
 
+    # -------------------------------------------------------------------------
+    # Trigger state properties (delegate to TriggerController)
+    # -------------------------------------------------------------------------
+    
+    @property
+    def _trigger_mode(self) -> str:
+        return self._trigger_controller._mode
+    
+    @_trigger_mode.setter
+    def _trigger_mode(self, value: str) -> None:
+        self._trigger_controller._mode = value
+    
+    @property
+    def _trigger_channel_id(self) -> Optional[int]:
+        return self._trigger_controller._channel_id
+    
+    @_trigger_channel_id.setter
+    def _trigger_channel_id(self, value: Optional[int]) -> None:
+        self._trigger_controller._channel_id = value
+    
+    @property
+    def _trigger_threshold(self) -> float:
+        return self._trigger_controller._threshold
+    
+    @_trigger_threshold.setter
+    def _trigger_threshold(self, value: float) -> None:
+        self._trigger_controller._threshold = value
+    
+    @property
+    def _trigger_pre_seconds(self) -> float:
+        return self._trigger_controller._pre_seconds
+    
+    @_trigger_pre_seconds.setter
+    def _trigger_pre_seconds(self, value: float) -> None:
+        self._trigger_controller._pre_seconds = value
+    
+    @property
+    def _trigger_pre_samples(self) -> int:
+        return self._trigger_controller._pre_samples
+    
+    @_trigger_pre_samples.setter
+    def _trigger_pre_samples(self, value: int) -> None:
+        self._trigger_controller._pre_samples = value
+    
+    @property
+    def _trigger_window_samples(self) -> int:
+        return self._trigger_controller._window_samples
+    
+    @_trigger_window_samples.setter
+    def _trigger_window_samples(self, value: int) -> None:
+        self._trigger_controller._window_samples = value
+    
+    @property
+    def _trigger_last_sample_rate(self) -> float:
+        return self._trigger_controller._last_sample_rate
+    
+    @_trigger_last_sample_rate.setter
+    def _trigger_last_sample_rate(self, value: float) -> None:
+        self._trigger_controller._last_sample_rate = value
+    
+    @property
+    def _trigger_history(self) -> deque:
+        return self._trigger_controller._history
+    
+    @property
+    def _trigger_history_length(self) -> int:
+        return self._trigger_controller._history_length
+    
+    @_trigger_history_length.setter
+    def _trigger_history_length(self, value: int) -> None:
+        self._trigger_controller._history_length = value
+    
+    @property
+    def _trigger_history_total(self) -> int:
+        return self._trigger_controller._history_total
+    
+    @_trigger_history_total.setter
+    def _trigger_history_total(self, value: int) -> None:
+        self._trigger_controller._history_total = value
+    
+    @property
+    def _trigger_max_chunk(self) -> int:
+        return self._trigger_controller._max_chunk
+    
+    @_trigger_max_chunk.setter
+    def _trigger_max_chunk(self, value: int) -> None:
+        self._trigger_controller._max_chunk = value
+    
+    @property
+    def _trigger_prev_value(self) -> float:
+        return self._trigger_controller._prev_value
+    
+    @_trigger_prev_value.setter
+    def _trigger_prev_value(self, value: float) -> None:
+        self._trigger_controller._prev_value = value
+    
+    @property
+    def _trigger_capture_start_abs(self) -> Optional[int]:
+        return self._trigger_controller._capture_start_abs
+    
+    @_trigger_capture_start_abs.setter
+    def _trigger_capture_start_abs(self, value: Optional[int]) -> None:
+        self._trigger_controller._capture_start_abs = value
+    
+    @property
+    def _trigger_capture_end_abs(self) -> Optional[int]:
+        return self._trigger_controller._capture_end_abs
+    
+    @_trigger_capture_end_abs.setter
+    def _trigger_capture_end_abs(self, value: Optional[int]) -> None:
+        self._trigger_controller._capture_end_abs = value
+    
+    @property
+    def _trigger_display(self) -> Optional[np.ndarray]:
+        return self._trigger_controller._display
+    
+    @_trigger_display.setter
+    def _trigger_display(self, value: Optional[np.ndarray]) -> None:
+        self._trigger_controller._display = value
+    
+    @property
+    def _trigger_display_times(self) -> Optional[np.ndarray]:
+        return self._trigger_controller._display_times
+    
+    @_trigger_display_times.setter
+    def _trigger_display_times(self, value: Optional[np.ndarray]) -> None:
+        self._trigger_controller._display_times = value
+    
+    @property
+    def _trigger_hold_until(self) -> float:
+        return self._trigger_controller._hold_until
+    
+    @_trigger_hold_until.setter
+    def _trigger_hold_until(self, value: float) -> None:
+        self._trigger_controller._hold_until = value
+    
+    @property
+    def _trigger_single_armed(self) -> bool:
+        return self._trigger_controller._single_armed
+    
+    @_trigger_single_armed.setter
+    def _trigger_single_armed(self, value: bool) -> None:
+        self._trigger_controller._single_armed = value
+    
+    @property
+    def _trigger_display_pre_samples(self) -> int:
+        return self._trigger_controller._display_pre_samples
+    
+    @_trigger_display_pre_samples.setter
+    def _trigger_display_pre_samples(self, value: int) -> None:
+        self._trigger_controller._display_pre_samples = value
+
     def set_plot_refresh_hz(self, hz: float) -> None:
         hz = max(1.0, float(hz))
         self._plot_refresh_hz = hz
         self._plot_interval = 1.0 / hz
         try:
             self.runtime.update_metrics(plot_refresh_hz=hz)
-        except Exception:
-            pass
+        except Exception as exc:
+            self._logger.debug("Failed to update plot refresh metrics: %s", exc)
 
     # ------------------------------------------------------------------
     # Runtime delegation
@@ -210,7 +346,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """Delegate device attachment to the runtime/pipeline controller."""
         try:
             self.runtime.open_device(driver, sample_rate, channels)
-        except Exception:
+        except Exception as exc:
+            self._logger.warning("Failed to open device: %s", exc)
             return
         self._bind_dispatcher_signals()
         self._bind_app_settings_store()
@@ -233,21 +370,24 @@ class MainWindow(QtWidgets.QMainWindow):
                 filter_settings=filter_settings,
                 trigger_cfg=cfg_trigger,
             )
-        except Exception:
+        except Exception as exc:
+            self._logger.warning("Failed to configure acquisition: %s", exc)
             return
 
     def start_acquisition(self) -> None:
         """Start streaming via the runtime."""
         try:
             self.runtime.start_acquisition()
-        except Exception:
+        except Exception as exc:
+            self._logger.warning("Failed to start acquisition: %s", exc)
             return
 
     def stop_acquisition(self) -> None:
         """Stop streaming via the runtime."""
         try:
             self.runtime.stop_acquisition()
-        except Exception:
+        except Exception as exc:
+            self._logger.warning("Failed to stop acquisition: %s", exc)
             return
 
     def set_default_window_sec(self, value: float) -> None:
@@ -504,8 +644,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "runtime") and self.runtime is not None:
             try:
                 self.runtime.set_pipeline(controller)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._logger.debug("Failed to set pipeline on runtime: %s", exc)
 
         self._controller = controller
         if hasattr(self, "_analysis_dock") and self._analysis_dock is not None:
@@ -710,7 +850,8 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             r, g, b, a = (int(x) for x in data)
             return QtGui.QColor(r, g, b, a)
-        except Exception:
+        except Exception as exc:
+            self._logger.debug("Failed to parse color tuple: %s", exc)
             return QtGui.QColor(0, 0, 139)
 
     def _channel_config_to_dict(self, config: ChannelConfig) -> dict:
@@ -746,7 +887,8 @@ class MainWindow(QtWidgets.QMainWindow):
             cfg.listen_enabled = bool(payload.get("listen_enabled", False))
             cfg.analyze_enabled = bool(payload.get("analyze_enabled", False))
             cfg.channel_name = str(payload.get("channel_name") or fallback_name or "")
-        except Exception:
+        except Exception as exc:
+            self._logger.debug("Failed to parse channel config: %s", exc)
             cfg.channel_name = fallback_name
         return cfg
 
@@ -840,8 +982,8 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             available_channels = self.runtime.device_manager.get_available_channels()
             self._on_available_channels(available_channels)
-        except Exception:
-            pass
+        except Exception as exc:
+            self._logger.debug("Failed to refresh channels after load: %s", exc)
 
         missing_channels: list[int] = []
         self.active_combo.blockSignals(True)
@@ -890,6 +1032,17 @@ class MainWindow(QtWidgets.QMainWindow):
         pre_value = self.pretrigger_combo.currentData()
         self._trigger_pre_seconds = float(pre_value if pre_value is not None else 0.0)
         
+        # Sync with TriggerController
+        window_sec = float(self.window_combo.currentData() or 1.0)
+        self._trigger_controller.configure(
+            mode=ui_mode,
+            channel_id=channel_id,
+            threshold=self._trigger_threshold,
+            pre_seconds=self._trigger_pre_seconds,
+            window_sec=window_sec,
+            reset_state=reset_state,
+        )
+        
         if reset_state:
             self._reset_trigger_state()
 
@@ -900,7 +1053,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "threshold": self.threshold_spin.value(),
             "hysteresis": 0.0,
             "pretrigger_frac": self._trigger_pre_seconds,
-            "window_sec": float(self.window_combo.currentData() or 0.0),
+            "window_sec": window_sec,
         }
         self._update_trigger_visuals(visual_config, update_line=update_line)
 
@@ -1214,13 +1367,15 @@ class MainWindow(QtWidgets.QMainWindow):
         data = self.sample_rate_combo.currentData()
         try:
             value = float(data)
-        except Exception:
+        except Exception as exc:
+            self._logger.debug("Failed to parse sample rate: %s", exc)
             value = 0.0
             if self.sample_rate_combo.count() > 0:
                 d = self.sample_rate_combo.itemData(0)
                 try:
                     value = float(d)
-                except Exception:
+                except Exception as exc:
+                    self._logger.debug("Failed to parse fallback sample rate: %s", exc)
                     value = 0.0
         # If still zero, use a reasonable default rather than failing
         if value == 0.0:
@@ -1281,15 +1436,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         try:
             dm.refresh_devices()
-        except Exception:
-            pass
+        except Exception as exc:
+            self._logger.debug("Failed to refresh devices: %s", exc)
         self._publish_active_channels()
         self._clear_scope_display()
         if hasattr(self, "_analysis_dock") and self._analysis_dock is not None:
             try:
                 self._analysis_dock.shutdown()
-            except Exception:
-                pass
+            except Exception as exc:
+                self._logger.debug("Failed to shutdown analysis dock: %s", exc)
             self._analysis_dock.select_scope()
 
     def _on_available_channels(self, channels: Sequence[object]) -> None:
@@ -2072,20 +2227,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._trigger_hold_until = 0.0
 
     def _reset_trigger_state(self) -> None:
-        self._trigger_history.clear()
-        self._trigger_history_length = 0
-        self._trigger_history_total = 0
-        self._trigger_max_chunk = 0
-        self._trigger_last_sample_rate = 0.0
-        self._trigger_prev_value = 0.0
-        self._trigger_capture_start_abs = None
-        self._trigger_capture_end_abs = None
-        self._trigger_display = None
-        self._trigger_display_times = None
-        self._trigger_hold_until = 0.0
-        self._trigger_display_pre_samples = 0
-        if self._trigger_mode != "single":
-            self._trigger_single_armed = False
+        """Reset trigger state. Delegates to TriggerController."""
+        self._trigger_controller.reset_state()
         self.pretrigger_line.setVisible(False)
 
     def _update_status(self, viz_depth: int) -> None:
@@ -2369,179 +2512,41 @@ class MainWindow(QtWidgets.QMainWindow):
             dock.update_sample_rate(sample_rate)
 
     def _update_trigger_sample_parameters(self, sample_rate: float) -> None:
-        self._trigger_last_sample_rate = sample_rate
-        self._trigger_window_samples = max(1, int(round(self._current_window_sec * sample_rate)))
-        pre = min(self._trigger_pre_seconds, self._current_window_sec)
-        self._trigger_pre_samples = int(round(pre * sample_rate))
-        if self._trigger_pre_samples >= self._trigger_window_samples:
-            self._trigger_pre_samples = max(0, self._trigger_window_samples - 1)
+        """Update trigger timing parameters. Delegates to TriggerController."""
+        self._trigger_controller._window_sec = self._current_window_sec
+        self._trigger_controller.update_sample_rate(sample_rate)
 
     def _append_trigger_history(self, chunk_samples: np.ndarray) -> None:
+        """Append samples to trigger history. Delegates to TriggerController."""
         if chunk_samples.size == 0:
             return
-        if not self._trigger_history:
-            self._trigger_history = deque()
-        
-        # Check for channel count mismatch
-        if self._trigger_history:
-            last_chunk = self._trigger_history[-1]
-            if last_chunk.shape[1] != chunk_samples.shape[1]:
-                print(f"Trigger history channel mismatch: had {last_chunk.shape[1]}, got {chunk_samples.shape[1]}. Resetting history.")
-                self._trigger_history.clear()
-                self._trigger_history_length = 0
-                self._trigger_history_total = 0
-                self._trigger_max_chunk = 0
-                
-        self._trigger_history.append(chunk_samples)
-        self._trigger_history_length += chunk_samples.shape[0]
-        self._trigger_history_total += chunk_samples.shape[0]
-        self._trigger_max_chunk = max(self._trigger_max_chunk, chunk_samples.shape[0])
-        # Keep 3x the trigger window to prevent evicting PSP tails before capture finalizes
-        # OLD: max_keep = max(self._trigger_window_samples + self._trigger_max_chunk, ...)
-        # This was too aggressive and evicted PSP tail chunks before finalization!
-        max_keep = self._trigger_window_samples * 3
-        while self._trigger_history_length > max_keep and self._trigger_history:
-            left = self._trigger_history.popleft()
-            self._trigger_history_length -= left.shape[0]
+        # Push to controller's history buffer
+        self._trigger_controller._history.append(chunk_samples)
+        self._trigger_controller._history_length += chunk_samples.shape[0]
+        self._trigger_controller._history_total += chunk_samples.shape[0]
+        self._trigger_controller._max_chunk = max(self._trigger_controller._max_chunk, chunk_samples.shape[0])
+        # Keep 3x window to prevent evicting tails before capture
+        max_keep = self._trigger_controller._window_samples * 3
+        while self._trigger_controller._history_length > max_keep and self._trigger_controller._history:
+            left = self._trigger_controller._history.popleft()
+            self._trigger_controller._history_length -= left.shape[0]
 
     def _detect_trigger_crossing(self, samples: np.ndarray) -> Optional[int]:
-        threshold = float(self.threshold_spin.value())
-        prev = self._trigger_prev_value
-        for idx, sample in enumerate(samples):
-            if prev < threshold <= sample:
-                self._trigger_prev_value = float(samples[-1])
-                return idx
-            prev = sample
-        self._trigger_prev_value = float(samples[-1])
-        return None
+        """Detect rising threshold crossing. Delegates to TriggerController."""
+        self._trigger_controller._threshold = float(self.threshold_spin.value())
+        return self._trigger_controller.detect_crossing(samples)
 
     def _should_arm_trigger(self, now: float) -> bool:
-        if self._trigger_display is not None and now < self._trigger_hold_until:
-            return False
-        if self._trigger_capture_start_abs is not None:
-            return False
-        if self._trigger_mode == "continuous":
-            return True
-        if self._trigger_mode == "single":
-            return self._trigger_single_armed
-        return False
+        """Check if trigger should be armed. Delegates to TriggerController."""
+        return self._trigger_controller.should_arm(now)
 
     def _start_trigger_capture(self, chunk_start_abs: int, trigger_idx: int) -> None:
-        window = self._trigger_window_samples
-        if window <= 0:
-            return
-        pre = self._trigger_pre_samples
-        start_abs = max(chunk_start_abs + trigger_idx - pre, self._trigger_history_total - self._trigger_history_length)
-        self._trigger_capture_start_abs = start_abs
-        self._trigger_capture_end_abs = start_abs + window
-        if self._trigger_mode == "single":
-            self._trigger_single_armed = False
+        """Start a trigger capture. Delegates to TriggerController."""
+        self._trigger_controller.start_capture(chunk_start_abs, trigger_idx)
 
     def _finalize_trigger_capture(self) -> None:
-        if self._trigger_capture_start_abs is None or self._trigger_capture_end_abs is None:
-            return
-        if self._trigger_history_total < self._trigger_capture_end_abs:
-            # Waiting for more data...
-            return
-        if not self._trigger_history:
-            return
-            
-        # Calculate absolute range we need
-        earliest_abs = self._trigger_history_total - self._trigger_history_length
-        start_abs = max(self._trigger_capture_start_abs, earliest_abs)
-        end_abs = start_abs + self._trigger_window_samples
-        
-        # Efficiently collect only the relevant chunks
-        relevant_chunks = []
-        current_abs = earliest_abs
-        
-        for chunk in self._trigger_history:
-            chunk_len = chunk.shape[0]
-            chunk_end = current_abs + chunk_len
-            
-            # Check if this chunk overlaps with [start_abs, end_abs]
-            if chunk_end > start_abs and current_abs < end_abs:
-                relevant_chunks.append(chunk)
-                
-            current_abs += chunk_len
-            
-            # Optimization: Stop if we've passed the end of the requested window
-            if current_abs >= end_abs:
-                break
-                
-        if not relevant_chunks:
-            return
-
-        # Concatenate only the relevant chunks
-        data = np.concatenate(relevant_chunks, axis=0)
-        
-        # Adjust indices relative to the concatenated 'data' buffer
-        # The 'data' buffer starts at the 'current_abs' of the first chunk in relevant_chunks
-        first_chunk_start_abs = start_abs  # Fallback
-        
-        # Re-calculate the absolute start of the first chunk we grabbed
-        # We need to find the start_abs of relevant_chunks[0]
-        # We can do this by backtracking or just being smarter above.
-        # Let's just use the offset logic:
-        
-        # Find the absolute start of the first chunk in the list
-        # We know 'earliest_abs' is the start of the *entire* history.
-        # We need to find the offset of relevant_chunks[0] from earliest_abs.
-        # Actually, let's just re-calculate it properly.
-        
-        # Simpler approach: Concatenate everything (it's safe now that we only grabbed relevant ones)
-        # But we need to know where 'data' starts in absolute terms to slice it correctly.
-        
-        # Let's find the absolute start of relevant_chunks[0]
-        scan_abs = earliest_abs
-        data_start_abs = earliest_abs # Default
-        found_start = False
-        for chunk in self._trigger_history:
-            if chunk is relevant_chunks[0]:
-                data_start_abs = scan_abs
-                found_start = True
-                break
-            scan_abs += chunk.shape[0]
-            
-        if not found_start:
-            # Should never happen
-            return
-            
-        # Now slice 'data' to get exactly [start_abs, end_abs]
-        # relative_start = start_abs - data_start_abs
-        start_idx = start_abs - data_start_abs
-        end_idx = start_idx + self._trigger_window_samples
-        
-        # DIAGNOSTIC: Check for truncation
-        if end_idx > data.shape[0]:
-            missing_samples = end_idx - data.shape[0]
-            print(f"!!! TRIGGER TRUNCATION: requested {end_idx} samples, only have {data.shape[0]}, missing {missing_samples} samples")
-            print(f"!!! This explains PSP tail truncation in trigger mode!")
-            end_idx = data.shape[0]
-        snippet = data[start_idx:end_idx]
-        if snippet.shape[0] < self._trigger_window_samples:
-            pad = self._trigger_window_samples - snippet.shape[0]
-            missing_ms = (pad / self._trigger_last_sample_rate) * 1000 if self._trigger_last_sample_rate > 0 else 0
-            print(f"!!! TRIGGER PADDING: snippet has {snippet.shape[0]} samples, need {self._trigger_window_samples}, padding {pad} samples ({missing_ms:.1f}ms)")
-            print(f"!!! This explains PSP truncation - trigger finalized before PSP tail arrived!")
-            print(f"!!! History stats: total={self._trigger_history_total}, length={self._trigger_history_length}, data.shape={data.shape}")
-            if snippet.shape[0] > 0:
-                last_row = snippet[-1:]
-            else:
-                last_row = np.zeros((1, data.shape[1]), dtype=np.float32)
-            snippet = np.vstack((snippet, np.repeat(last_row, pad, axis=0)))
-        if snippet.shape[0] == 0:
-            snippet = np.zeros((self._trigger_window_samples, data.shape[1]), dtype=np.float32)
-        self._trigger_display = snippet
-        self._trigger_display_times = None
-        self._trigger_display_pre_samples = min(self._trigger_pre_samples, max(snippet.shape[0] - 1, 0))
-        if self._trigger_last_sample_rate > 0:
-            duration = self._trigger_window_samples / self._trigger_last_sample_rate
-        else:
-            duration = self._current_window_sec
-        self._trigger_hold_until = time.perf_counter() + max(duration, 1e-3)
-        self._trigger_capture_start_abs = None
-        self._trigger_capture_end_abs = None
+        """Finalize trigger capture. Delegates to TriggerController."""
+        self._trigger_controller.finalize_capture()
 
     def _render_trigger_display(self, channel_ids: List[int], window_sec: float) -> None:
         if self._trigger_display is None:

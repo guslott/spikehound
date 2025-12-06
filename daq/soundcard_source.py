@@ -1,11 +1,14 @@
 # daq/soundcard_source.py
 from __future__ import annotations
 
+import logging
 import threading
 import numpy as np
 import time as _time
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Union, Any
+
+logger = logging.getLogger(__name__)
 
 try:
     import miniaudio
@@ -144,7 +147,8 @@ class SoundCardSource(BaseDevice):
         
         try:
             devices = miniaudio.Devices().get_captures()
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to get capture devices: %s", exc)
             return []
             
         out: List[DeviceInfo] = []

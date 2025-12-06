@@ -6,12 +6,15 @@ channel display management, and trigger visualization.
 
 from __future__ import annotations
 
+import logging
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 
 import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -39,7 +42,8 @@ class VoltageAxis(pg.AxisItem):
     def tickStrings(self, values, scale, spacing):
         try:
             return [f"{(float(v) - self._offset) * self._span:.3g}" for v in values]
-        except Exception:
+        except Exception as exc:
+            logger.debug("VoltageAxis tickStrings failed: %s", exc)
             return super().tickStrings(values, scale, spacing)
 
 
@@ -109,8 +113,8 @@ class ScopeWidget(QtWidgets.QWidget):
         # Configure plot appearance
         try:
             self.plot_widget.hideButtons()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to hide plot buttons: %s", exc)
 
         self.plot_widget.setMenuEnabled(False)
         self.plot_widget.setMouseEnabled(x=False, y=False)
@@ -164,8 +168,8 @@ class ScopeWidget(QtWidgets.QWidget):
             curve = pg.PlotCurveItem()
             try:
                 curve.setDownsampling(ds=True, auto=True, method="peak")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Failed to set downsampling on curve: %s", exc)
             self.plot_widget.getPlotItem().addItem(curve)
             self._curves[channel_id] = curve
         

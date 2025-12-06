@@ -186,7 +186,8 @@ class BackyardBrainsSource(BaseDevice):
             for p in serial.tools.list_ports.comports():
                 if p.device == device_id:
                     return p
-        except Exception:
+        except Exception as exc:
+            _LOGGER.debug("Failed to lookup port %s: %s", device_id, exc)
             return None
         return None
 
@@ -249,8 +250,8 @@ class BackyardBrainsSource(BaseDevice):
         if self._ser:
             try:
                 self._ser.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                _LOGGER.debug("Failed to close serial port: %s", exc)
             self._ser = None
 
     def _configure_impl(
@@ -323,8 +324,8 @@ class BackyardBrainsSource(BaseDevice):
         if self._requires_start and self._ser and self._ser.is_open:
             try:
                 self._send_command("h:;")
-            except Exception:
-                pass
+            except Exception as exc:
+                _LOGGER.debug("Failed to send halt command: %s", exc)
 
     def _send_command(self, cmd: str) -> None:
         if self._ser:
@@ -389,14 +390,14 @@ class BackyardBrainsSource(BaseDevice):
                                 # e.g. "EVNT: 4;"
                                 if msg_str:
                                     _LOGGER.info("SpikerBox Message: %s", msg_str)
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                _LOGGER.debug("Failed to decode SpikerBox message: %s", exc)
                             
                             # Remove message from buffer
                             del raw_buffer[start_idx : end_idx + len(_MSG_END)]
                             continue # Check for more messages
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _LOGGER.debug("Failed to process escape sequences: %s", exc)
                 break
 
             # 2. Process frames using vectorization

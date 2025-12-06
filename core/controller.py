@@ -422,8 +422,8 @@ class PipelineController:
             if self._source.running:
                 try:
                     self._source.stop()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("Failed to stop source during pipeline stop: %s", exc)
 
             if self._dispatcher is not None:
                 self._push_end_of_stream()
@@ -740,8 +740,8 @@ class PipelineController:
         try:
             self._dispatcher.stop()
             self._dispatcher.emit_empty_tick()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to stop dispatcher: %s", exc)
         self._dispatcher = None
 
     def _close_source(self) -> None:
@@ -751,8 +751,8 @@ class PipelineController:
             if self._source.running:
                 self._source.stop()
             self._source.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to close source: %s", exc)
         self._source = None
         self._streaming = False
         self._active_channel_ids = []
@@ -767,12 +767,12 @@ class PipelineController:
             self._dispatcher.set_channel_layout(full_ids, full_names)
             self._dispatcher.set_active_channels(self._active_channel_ids)
             self._dispatcher.start()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to start dispatcher: %s", exc)
         try:
             self._source.start()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to start source: %s", exc)
         self._streaming = True
 
     def _stop_streaming_locked(self) -> None:
@@ -782,14 +782,14 @@ class PipelineController:
             try:
                 if self._source.running:
                     self._source.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to stop source: %s", exc)
         if self._dispatcher is not None:
             try:
                 self._dispatcher.clear_active_channels()
                 self._dispatcher.reset_buffers()
                 self._dispatcher.emit_empty_tick()
                 self._dispatcher.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to stop dispatcher during stream stop: %s", exc)
         self._streaming = False

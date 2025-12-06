@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from typing import Dict, Optional
 import time
 from PySide6 import QtCore, QtWidgets
 
 from shared.app_settings import AppSettings
+
+logger = logging.getLogger(__name__)
 
 
 class SettingsTab(QtWidgets.QWidget):
@@ -259,8 +262,8 @@ class SettingsTab(QtWidgets.QWidget):
             try:
                 self._controller.set_listen_output_device(value)
                 return
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Failed to set listen output device via controller: %s", exc)
         if hasattr(self._main_window, "set_listen_output_device"):
             self._main_window.set_listen_output_device(value)
             return
@@ -293,7 +296,8 @@ class SettingsTab(QtWidgets.QWidget):
         if hasattr(self._main_window, "health_snapshot"):
             try:
                 snapshot = self._main_window.health_snapshot()
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to get health snapshot: %s", exc)
                 snapshot = {}
         stats = snapshot.get("dispatcher", {})
         dropped = stats.get("dropped", {}) if isinstance(stats, dict) else {}

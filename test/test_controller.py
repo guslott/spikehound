@@ -22,7 +22,8 @@ def test_pipeline_controller_start_stop_cycles():
         dispatcher_poll_timeout=0.01,
     )
 
-    for sample_rate in (1000, 4000):
+    # SimulatedPhysiologySource only supports sample_rate=20000
+    for sample_rate in (20000,):
         actual = controller.switch_source(
             SimulatedPhysiologySource,
             configure_kwargs={
@@ -56,7 +57,7 @@ def test_pipeline_controller_backpressure_tracks_evictions():
     controller.switch_source(
         SimulatedPhysiologySource,
         configure_kwargs={
-            "sample_rate": 2000,
+            "sample_rate": 20000,
             "chunk_size": 32,
             "num_units": 3,
         },

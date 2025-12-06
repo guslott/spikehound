@@ -14,6 +14,7 @@ Subclasses implement the *_impl() methods to integrate real hardware
 (or simulators) while relying on the shared utilities here.
 """
 
+import logging
 import queue
 import threading
 import time as _time
@@ -21,6 +22,8 @@ from abc import ABC, abstractmethod
 from typing import Any, Iterable, List, Literal, Optional, Sequence
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from shared.models import (
     Chunk,
@@ -178,7 +181,8 @@ class BaseDevice(ABC):
             if self._device_id is not None:
                 try:
                     caps = self.get_capabilities(self._device_id)
-                except Exception:
+                except Exception as exc:
+                    logger.debug("Failed to get capabilities for %s: %s", self._device_id, exc)
                     caps = None
                 if caps is not None and caps.sample_rates:
                     if int(sample_rate) not in [int(sr) for sr in caps.sample_rates]:

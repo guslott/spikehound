@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 import threading
 from typing import Callable, Dict, Optional
 
 from PySide6.QtCore import QSettings
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -72,7 +75,8 @@ class AppSettingsStore:
         for callback in callbacks:
             try:
                 callback(new_settings)
-            except Exception:
+            except Exception as exc:
+                logger.debug("App settings subscriber callback failed: %s", exc)
                 continue
         return new_settings
 

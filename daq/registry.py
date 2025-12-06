@@ -20,12 +20,15 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import logging
 import os
 import pkgutil
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Type
 
 from .base_device import BaseDevice, DeviceInfo
+
+logger = logging.getLogger(__name__)
 
 _EXCLUDE = {"base_device", "registry", "__init__"}
 _REGISTRY: Dict[str, "DeviceDescriptor"] = {}
@@ -58,7 +61,8 @@ def scan_devices(force: bool = False) -> None:
             continue
         try:
             module = importlib.import_module(module_info.name)
-        except Exception:
+        except Exception as exc:
+            logger.debug("Failed to import DAQ module %s: %s", module_info.name, exc)
             continue
 
         for _, obj in inspect.getmembers(module, inspect.isclass):

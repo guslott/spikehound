@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtGui
 
 from .types import ChannelConfig
+
+logger = logging.getLogger(__name__)
 
 class TraceRenderer:
     """
@@ -109,8 +112,8 @@ class TraceRenderer:
         """Remove curve from plot."""
         try:
             self._plot_item.removeItem(self._curve)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to remove curve from plot: %s", exc)
 
     def _resample_peak(self, samples: np.ndarray, times: np.ndarray, target: int) -> tuple[np.ndarray, np.ndarray]:
         """Manual peak downsampling for older pyqtgraph versions."""

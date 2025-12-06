@@ -117,24 +117,24 @@ class SpikeHoundRuntime:
         if filter_settings is not None:
             try:
                 controller.update_filter_settings(filter_settings)
-            except Exception:
-                pass
+            except Exception as exc:
+                self.logger.warning("Failed to update filter settings: %s", exc)
         if trigger_cfg is not None:
             try:
                 controller.update_trigger_config(trigger_cfg.__dict__ if hasattr(trigger_cfg, "__dict__") else trigger_cfg)
-            except Exception:
-                pass
+            except Exception as exc:
+                self.logger.warning("Failed to update trigger config: %s", exc)
         if channels is not None:
             if channels:
                 try:
                     controller.set_active_channels(channels)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self.logger.warning("Failed to set active channels: %s", exc)
             else:
                 try:
                     controller.clear_active_channels()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self.logger.warning("Failed to clear active channels: %s", exc)
 
     def start_acquisition(self) -> None:
         """Placeholder: start streaming from the current DAQ source into the pipeline."""
@@ -143,7 +143,8 @@ class SpikeHoundRuntime:
             return
         try:
             controller.start()
-        except Exception:
+        except Exception as exc:
+            self.logger.warning("Failed to start acquisition: %s", exc)
             return
 
     def stop_acquisition(self) -> None:
@@ -153,8 +154,8 @@ class SpikeHoundRuntime:
             return
         try:
             controller.stop(join=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            self.logger.warning("Failed to stop acquisition: %s", exc)
         # FIX: Do not detach device here. MainWindow calls this when channels are empty,
         # but we want to keep the device open so we can resume later when channels are added.
         # try:
@@ -171,7 +172,8 @@ class SpikeHoundRuntime:
         self.daq_source = driver
         try:
             controller.attach_source(driver, float(sample_rate), channels)
-        except Exception:
+        except Exception as exc:
+            self.logger.warning("Failed to attach source: %s", exc)
             return
         self.dispatcher = getattr(controller, "dispatcher", None)
         self.visualization_queue = getattr(controller, "visualization_queue", None)
@@ -231,15 +233,16 @@ class SpikeHoundRuntime:
         if self.app_settings_store is not None:
             try:
                 self.app_settings_store.update(listen_output_key=device_key)
-            except Exception:
+            except Exception as exc:
+                self.logger.warning("Failed to set listen output device: %s", exc)
                 return
 
     def set_list_all_audio_devices(self, enabled: bool) -> None:
         """Propagate audio device listing preference to the device manager."""
         try:
             self.device_manager.set_list_all_audio_devices(enabled, refresh=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            self.logger.warning("Failed to set list all audio devices: %s", exc)
 
     def open_analysis_stream(self, channel_name: str, sample_rate: float) -> tuple[Optional[queue.Queue], Optional["AnalysisWorker"]]:
         """
