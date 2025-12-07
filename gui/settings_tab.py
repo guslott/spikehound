@@ -104,13 +104,23 @@ class SettingsTab(QtWidgets.QWidget):
         grid.setVerticalSpacing(6)
 
         labels = [
-            ("Dispatcher", "dispatcher"),
-            ("Visualization queue", "viz_queue"),
-            ("Audio queue", "audio_queue"),
-            ("Logging queue", "logging_queue"),
+            # Pipeline status
+            ("Sample Rate", "sample_rate"),
+            ("Uptime", "uptime"),
             ("Chunk rate", "chunk_rate"),
             ("Throughput", "throughput"),
             ("Plot refresh", "plot_refresh"),
+            # Queue health
+            ("Source queue", "source_queue"),
+            ("Viz queue", "viz_queue"),
+            ("Audio queue", "audio_queue"),
+            ("Logging queue", "logging_queue"),
+            # Buffer status
+            ("Viz buffer", "viz_buffer"),
+            # Data integrity
+            ("Xruns", "xruns"),
+            ("Drops", "drops"),
+            ("Dispatcher", "dispatcher"),
         ]
         self._metric_fields: Dict[str, QtWidgets.QLabel] = {}
         for row, (title, key) in enumerate(labels):
@@ -118,10 +128,13 @@ class SettingsTab(QtWidgets.QWidget):
             name_label.setStyleSheet("font-weight: bold;")
             grid.addWidget(name_label, row, 0, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
             value = QtWidgets.QLabel("–")
-            value.setMinimumWidth(220)
             value.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
             grid.addWidget(value, row, 1)
             self._metric_fields[key] = value
+        
+        # Keep columns close together - label column fixed, value column can stretch
+        grid.setColumnStretch(0, 0)
+        grid.setColumnStretch(1, 1)
         
         # State for rate calculation
         self._last_frames = 0
@@ -320,32 +333,35 @@ class SettingsTab(QtWidgets.QWidget):
             except Exception as exc:
                 logger.debug("Failed to get health snapshot: %s", exc)
                 snapshot = {}
-        stats = snapshot.get("dispatcher", {})
-        dropped = stats.get("dropped", {}) if isinstance(stats, dict) else {}
-        forwarded = stats.get("forwarded", {}) if isinstance(stats, dict) else {}
-        received = stats.get("received", 0)
-        processed = stats.get("processed", 0)
-        processed_frames = stats.get("processed_frames", 0)
-        evicted = stats.get("evicted", {}) if isinstance(stats, dict) else {}
-        self._metric_fields["dispatcher"].setText(
-            f"recv:{received} proc:{processed} fwd:{forwarded.get('analysis',0)} "
-            f"drop:{dropped.get('analysis',0)} evict:{evicted.get('analysis',0)}"
-        )
-
-        depths = snapshot.get("queues", {})
-        self._metric_fields["viz_queue"].setText(self._format_queue(depths.get("visualization")))
-        self._metric_fields["audio_queue"].setText(self._format_queue(depths.get("audio")))
-        self._metric_fields["logging_queue"].setText(self._format_queue(depths.get("logging")))
-
+        
+        # Sample rate
+        sample_rate = snapshot.get("sample_rate", 0.0)
+        if sample_rate >= 1000:
+            self._metric_fields["sample_rate"].setText(f"{sample_rate / 1000:.1f} kHz")
+        else:
+            self._metric_fields["sample_rate"].setText(f"{sample_rate:.0f} Hz")
+        
+        # Uptime (format as HH:MM:SS)
+        uptime = snapshot.get("uptime")
+        if uptime is not None:
+            hours = int(uptime // 3600)
+            minutes = int((uptime % 3600) // 60)
+            seconds = int(uptime % 60)
+            self._metric_fields["uptime"].setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
+        else:
+            self._metric_fields["uptime"].setText("–")
+        
+        # Chunk rate
         chunk_rate = snapshot.get("chunk_rate", 0.0)
         self._metric_fields["chunk_rate"].setText(f"{chunk_rate:5.2f} chunks/s")
         
-        # Calculate throughput
+        # Throughput (from dispatcher processed_frames)
+        stats = snapshot.get("dispatcher", {})
+        processed_frames = stats.get("processed_frames", 0) if isinstance(stats, dict) else 0
         now = time.perf_counter()
         dt = now - getattr(self, "_last_time", now)
         if dt > 0.0:
             df = processed_frames - getattr(self, "_last_frames", 0)
-            # Handle counter reset or initial state
             if df < 0:
                 df = 0
             rate = df / dt
@@ -353,15 +369,60 @@ class SettingsTab(QtWidgets.QWidget):
             self._last_frames = processed_frames
             self._last_time = now
 
+        # Plot refresh
         plot_hz = snapshot.get("plot_refresh_hz", 0.0)
         self._metric_fields["plot_refresh"].setText(f"{plot_hz:5.1f} Hz")
+        
+        # Source queue
+        source = snapshot.get("source", {})
+        src_queue_size = source.get("queue_size", 0)
+        src_queue_max = source.get("queue_max", 0)
+        if src_queue_max > 0:
+            src_util = (src_queue_size / src_queue_max) * 100
+            self._metric_fields["source_queue"].setText(f"{src_queue_size}/{src_queue_max} ({src_util:.0f}%)")
+        else:
+            self._metric_fields["source_queue"].setText("–")
+        
+        # Queue health
+        depths = snapshot.get("queues", {})
+        self._metric_fields["viz_queue"].setText(self._format_queue(depths.get("visualization")))
+        self._metric_fields["audio_queue"].setText(self._format_queue(depths.get("audio")))
+        self._metric_fields["logging_queue"].setText(self._format_queue(depths.get("logging")))
+        
+        # Viz buffer status
+        viz_buf = depths.get("viz_buffer", {})
+        if viz_buf:
+            seconds_filled = viz_buf.get("seconds", 0.0)
+            capacity_sec = viz_buf.get("capacity_seconds", 0.0)
+            utilization = viz_buf.get("utilization", 0.0) * 100
+            self._metric_fields["viz_buffer"].setText(f"{seconds_filled:.2f} / {capacity_sec:.2f} sec ({utilization:.0f}%)")
+        else:
+            self._metric_fields["viz_buffer"].setText("–")
+        
+        # Xruns and Drops
+        xruns = source.get("xruns", 0)
+        drops = source.get("drops", 0)
+        self._metric_fields["xruns"].setText(str(xruns))
+        self._metric_fields["drops"].setText(str(drops))
+        
+        # Dispatcher stats
+        dropped = stats.get("dropped", {}) if isinstance(stats, dict) else {}
+        forwarded = stats.get("forwarded", {}) if isinstance(stats, dict) else {}
+        received = stats.get("received", 0) if isinstance(stats, dict) else 0
+        processed = stats.get("processed", 0) if isinstance(stats, dict) else 0
+        evicted = stats.get("evicted", {}) if isinstance(stats, dict) else {}
+        self._metric_fields["dispatcher"].setText(
+            f"recv:{received} proc:{processed} fwd:{forwarded.get('analysis',0)} "
+            f"drop:{dropped.get('analysis',0)} evict:{evicted.get('analysis',0)}"
+        )
 
     def _format_queue(self, info: Optional[dict]) -> str:
         if not info:
-            return "0/0 (0%)"
+            return "–"
         size = int(info.get("size", 0))
         maxsize = int(info.get("max", 0))
         util = float(info.get("utilization", 0.0)) * 100.0
         if maxsize <= 0:
             return f"{size}/∞"
         return f"{size}/{maxsize} ({util:3.0f}%)"
+

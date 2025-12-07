@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from typing import Any, Optional, Sequence, TYPE_CHECKING, Tuple
 
 from daq.base_device import BaseDevice
@@ -52,6 +53,7 @@ class SpikeHoundRuntime:
         self.chunk_rate: float = 0.0
         self.plot_refresh_hz: float = 0.0
         self.sample_rate: float = 0.0
+        self._acquisition_start_time: Optional[float] = None  # For uptime tracking
         
         # Initialize AudioManager and wire it to pipeline
         from .audio_manager import AudioManager
@@ -143,6 +145,7 @@ class SpikeHoundRuntime:
             return
         try:
             controller.start()
+            self._acquisition_start_time = time.monotonic()  # Track uptime
         except Exception as exc:
             self.logger.warning("Failed to start acquisition: %s", exc)
             return
@@ -152,6 +155,7 @@ class SpikeHoundRuntime:
         controller = self._pipeline
         if controller is None:
             return
+        self._acquisition_start_time = None  # Reset uptime
         try:
             controller.stop(join=True)
         except Exception as exc:
@@ -181,7 +185,7 @@ class SpikeHoundRuntime:
         self.logging_queue = getattr(controller, "logging_queue", None)
 
     def health_snapshot(self) -> dict[str, object]:
-        """Placeholder: return current queue depths, rates, and dispatcher health."""
+        """Return current queue depths, rates, source stats, and dispatcher health."""
         controller = self._pipeline
         stats = controller.dispatcher_stats() if controller is not None else {}
         queues: dict[str, dict] = {}
@@ -205,10 +209,32 @@ class SpikeHoundRuntime:
             except Exception:
                 queues["viz_buffer"] = {}
 
+        # Source device stats
+        source_stats: dict[str, object] = {}
+        source = controller.source if controller is not None else None
+        if source is not None:
+            try:
+                src_info = source.stats()
+                source_stats = {
+                    "xruns": src_info.get("xruns", 0),
+                    "drops": src_info.get("drops", 0),
+                    "queue_size": src_info.get("queue_size", 0),
+                    "queue_max": src_info.get("queue_maxsize", 0),
+                }
+            except Exception:
+                pass
+
+        # Uptime calculation
+        uptime: Optional[float] = None
+        if self._acquisition_start_time is not None:
+            uptime = time.monotonic() - self._acquisition_start_time
+
         return {
             "chunk_rate": float(self.chunk_rate),
             "plot_refresh_hz": float(self.plot_refresh_hz),
             "sample_rate": float(self.sample_rate),
+            "uptime": uptime,
+            "source": source_stats,
             "dispatcher": stats,
             "queues": queues,
         }
