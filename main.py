@@ -16,9 +16,6 @@ if __name__ == "__main__":
 
 
 #TODO Notes:
-# - Add spectrogram view in analysis mode, also, simply fft amplitudes view
-#    - Add spectrogram button next to analyze and have it pop up a spectrogram tab for a channel
+# - (Taylor) Add spectrogram view in separate tab, also, simply fft amplitudes view
 
 # - Add analog output to DAQ devices to support input and output/stimulation
-
-#verify channel add after recording/filter settings issue

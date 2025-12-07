@@ -37,7 +37,6 @@ class SettingsTab(QtWidgets.QWidget):
         layout.setSpacing(10)
 
         layout.addWidget(self._build_global_box())
-        layout.addWidget(self._build_audio_box())
         layout.addWidget(self._build_health_box())
         layout.addWidget(self._build_about_box())
         layout.addStretch(1)
@@ -48,57 +47,53 @@ class SettingsTab(QtWidgets.QWidget):
         form.setContentsMargins(12, 10, 12, 10)
         form.setSpacing(6)
 
-        self.list_audio_check = QtWidgets.QCheckBox("List all audio devices")
+        self.list_audio_check = QtWidgets.QCheckBox("List all audio devices (not just the system default)")
         self.list_audio_check.stateChanged.connect(
             lambda state: self._on_list_audio_toggled(bool(state))
         )
-        form.addRow(self.list_audio_check)
-
+        
+        # Rescan button on left, checkbox on right
+        audio_devices_row = QtWidgets.QHBoxLayout()
         self.rescan_btn = QtWidgets.QPushButton("Rescan Devices")
+        self.rescan_btn.setFixedWidth(130)
         self.rescan_btn.clicked.connect(self._on_rescan_clicked)
-        form.addRow(self.rescan_btn)
+        audio_devices_row.addWidget(self.rescan_btn)
+        audio_devices_row.addWidget(self.list_audio_check)
+        audio_devices_row.addStretch()
+        form.addRow(audio_devices_row)
 
-        # Config management
+        # Config management and auto-load on same row
+        # Save/Load buttons on left, auto-load checkbox on right
         config_row = QtWidgets.QHBoxLayout()
         self.save_config_btn = QtWidgets.QPushButton("Save Config")
+        self.save_config_btn.setFixedWidth(90)
         self.save_config_btn.clicked.connect(self.saveConfigRequested.emit)
         self.load_config_btn = QtWidgets.QPushButton("Load Config")
+        self.load_config_btn.setFixedWidth(90)
         self.load_config_btn.clicked.connect(self.loadConfigRequested.emit)
         config_row.addWidget(self.save_config_btn)
         config_row.addWidget(self.load_config_btn)
-        form.addRow(config_row)
-
-        # Launch config
+        
+        # Launch config checkbox - label will be updated to show path when set
+        self._launch_config_path: Optional[str] = None
         self.load_launch_check = QtWidgets.QCheckBox("Load Config on Launch")
         self.load_launch_check.stateChanged.connect(self._on_load_launch_toggled)
-        form.addRow(self.load_launch_check)
+        config_row.addWidget(self.load_launch_check)
+        config_row.addStretch()
+        form.addRow(config_row)
 
-        path_row = QtWidgets.QHBoxLayout()
-        self.launch_path_edit = QtWidgets.QLineEdit()
-        self.launch_path_edit.setReadOnly(True)
-        self.launch_path_edit.setPlaceholderText("No config selected")
-        path_row.addWidget(self.launch_path_edit)
-        self.browse_launch_btn = QtWidgets.QPushButton("...")
-        self.browse_launch_btn.setFixedWidth(30)
-        self.browse_launch_btn.clicked.connect(self._on_browse_launch_config)
-        path_row.addWidget(self.browse_launch_btn)
-        form.addRow(path_row)
-
-        return box
-
-    def _build_audio_box(self) -> QtWidgets.QGroupBox:
-        box = QtWidgets.QGroupBox("Audio Monitoring")
-        layout = QtWidgets.QHBoxLayout(box)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(6)
-
+        # Audio output device selection
+        audio_row = QtWidgets.QHBoxLayout()
         self.listen_combo = QtWidgets.QComboBox()
-        layout.addWidget(self.listen_combo, 1)
-        refresh_btn = QtWidgets.QPushButton("Refresh")
-        refresh_btn.setFixedWidth(90)
-        refresh_btn.clicked.connect(self._populate_listen_devices)
-        layout.addWidget(refresh_btn)
+        self.listen_combo.setMinimumWidth(200)
         self.listen_combo.currentIndexChanged.connect(self._on_listen_device_changed)
+        audio_row.addWidget(self.listen_combo, 1)
+        self.audio_refresh_btn = QtWidgets.QPushButton("Refresh")
+        self.audio_refresh_btn.setFixedWidth(70)
+        self.audio_refresh_btn.clicked.connect(self._populate_listen_devices)
+        audio_row.addWidget(self.audio_refresh_btn)
+        form.addRow("\"Listen\" Output Device:", audio_row)
+
         return box
 
     def _build_health_box(self) -> QtWidgets.QGroupBox:
@@ -175,28 +170,54 @@ class SettingsTab(QtWidgets.QWidget):
         except ImportError:
             pass
         
+        # Update launch config checkbox state and label
+        self._launch_config_path = settings.launch_config_path or None
         self.load_launch_check.blockSignals(True)
         self.load_launch_check.setChecked(bool(settings.load_config_on_launch))
         self.load_launch_check.blockSignals(False)
-        
-        self.launch_path_edit.setText(settings.launch_config_path or "")
+        self._update_launch_checkbox_label()
+
+    def _update_launch_checkbox_label(self) -> None:
+        """Update the launch config checkbox label to show path if set."""
+        if self._launch_config_path:
+            self.load_launch_check.setText(f"Load Config on Launch: {self._launch_config_path}")
+        else:
+            self.load_launch_check.setText("Load Config on Launch")
 
     def _on_load_launch_toggled(self, state: int) -> None:
         enabled = bool(state)
+        if enabled:
+            # Opening file picker - show dialog
+            if not self._launch_config_path:
+                self._on_browse_launch_config()
+                # If user cancelled, uncheck the box
+                if not self._launch_config_path:
+                    self.load_launch_check.blockSignals(True)
+                    self.load_launch_check.setChecked(False)
+                    self.load_launch_check.blockSignals(False)
+                    return
+        else:
+            # Unchecking - clear the path
+            self._launch_config_path = None
+            self._update_settings(load_config_on_launch=False, launch_config_path=None)
+            self._update_launch_checkbox_label()
+            return
+        
         self._update_settings(load_config_on_launch=enabled)
-        if enabled and not self.launch_path_edit.text():
-            self._on_browse_launch_config()
 
     def _on_browse_launch_config(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Select Launch Configuration", "", "JSON Files (*.json);;All Files (*)"
         )
         if path:
-            self.launch_path_edit.setText(path)
-            self._update_settings(launch_config_path=path)
-            # Auto-enable if a file is picked
+            self._launch_config_path = path
+            self._update_settings(launch_config_path=path, load_config_on_launch=True)
+            self._update_launch_checkbox_label()
+            # Ensure checkbox is checked
             if not self.load_launch_check.isChecked():
+                self.load_launch_check.blockSignals(True)
                 self.load_launch_check.setChecked(True)
+                self.load_launch_check.blockSignals(False)
 
     def _update_settings(self, **kwargs) -> None:
         if self._controller is None:

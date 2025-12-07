@@ -105,6 +105,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._plot_refresh_hz = 40.0
         self._plot_interval = 1.0 / self._plot_refresh_hz
         self._last_plot_refresh = 0.0
+        # Actual measured plot refresh rate tracking
+        self._actual_plot_refresh_hz = 0.0
+        self._plot_refresh_count = 0
+        self._plot_refresh_last_calc = time.perf_counter()
         self._chunk_mean_samples: float = 0.0
         self._chunk_accum_count: int = 0
         self._chunk_accum_samples: int = 0
@@ -1976,8 +1980,8 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self._chunk_mean_samples = 0.0
             self._chunk_accum_count = 0
-        self._chunk_accum_samples = 0
-        self._chunk_last_rate_update = now
+            self._chunk_accum_samples = 0
+            self._chunk_last_rate_update = now
         try:
             self.runtime.update_metrics(chunk_rate=self._chunk_rate, sample_rate=self._current_sample_rate)
         except Exception:
@@ -2649,6 +2653,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.plot_widget.getPlotItem().setXRange(0, window_sec, padding=0)
             self._update_plot_y_range()
             self._last_plot_refresh = now
+            
+            # Track actual plot refresh rate
+            self._plot_refresh_count += 1
+            elapsed = now - self._plot_refresh_last_calc
+            if elapsed >= 1.0:  # Calculate rate every second
+                self._actual_plot_refresh_hz = self._plot_refresh_count / elapsed
+                self._plot_refresh_count = 0
+                self._plot_refresh_last_calc = now
+                try:
+                    self.runtime.update_metrics(plot_refresh_hz=self._actual_plot_refresh_hz)
+                except Exception:
+                    pass
 
         self._current_sample_rate = sample_rate
         self._current_window_sec = window_sec

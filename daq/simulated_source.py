@@ -360,15 +360,19 @@ class SimulatedPhysiologySource(BaseDevice):
                         )
                         self._active_psps.append(new_psp)
 
-                # Sort active_ids to ensure stable column ordering
-                sorted_ids = sorted(list(active_ids))
+
+                # CRITICAL: Preserve the order of active_ids as provided by the UI.
+                # The dispatcher and UI expect data columns to match the user-added order,
+                # NOT sorted by channel ID. Sorting here caused data mismatches when
+                # channels were added out of order (e.g., adding ch0, ch2, ch1).
+
                 
                 # ============================================================
                 # STEP 3: RENDER CHANNELS
                 # ============================================================
                 chunk_end_sample = chunk_start_sample + chunk_size
                 
-                for col, cid in enumerate(sorted_ids):
+                for col, cid in enumerate(active_ids):
                     ch_type = id_to_type.get(cid, 'extracellular_prox')
                     if ch_type == 'extracellular_prox':
                         sig = np.zeros(chunk_size, dtype=np.float32)
@@ -445,7 +449,7 @@ class SimulatedPhysiologySource(BaseDevice):
                     data_chunk += hum[:, None]
                     self._line_hum_phase = (self._line_hum_phase + self._line_hum_omega * chunk_size) % (2.0 * np.pi)
 
-                chunk_meta = {"active_channel_ids": sorted_ids}
+                chunk_meta = {"active_channel_ids": active_ids}
                 
                 # Emit the chunk
                 self.emit_array(data_chunk, mono_time=loop_start, meta=chunk_meta)

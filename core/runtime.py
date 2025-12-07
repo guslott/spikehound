@@ -256,6 +256,14 @@ class SpikeHoundRuntime:
             return None, None
         key = (str(channel_name), float(sample_rate))
         worker = self._analysis_workers.get(key)
+        
+        # Check if the cached worker is still alive - if the analysis tab was closed,
+        # the worker was stopped and is no longer running. We need to create a new one.
+        if worker is not None and not worker.is_alive():
+            # Worker was stopped (e.g., tab was closed) - remove from cache
+            del self._analysis_workers[key]
+            worker = None
+        
         if worker is None:
             try:
                 worker = AnalysisWorker(self._pipeline, channel_name, sample_rate)
