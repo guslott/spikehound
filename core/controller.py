@@ -249,6 +249,9 @@ class PipelineController:
         
         # Audio management (will be initialized by Runtime)
         self._audio_manager: Optional[AudioManager] = None
+        
+        # WAV recording
+        self._wav_logger: Optional["WavLoggerThread"] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -328,6 +331,11 @@ class PipelineController:
     @property
     def sample_rate(self) -> Optional[float]:
         return None if self._actual_config is None else float(self._actual_config.sample_rate)
+
+    @property
+    def is_recording(self) -> bool:
+        """Return True if currently recording to a WAV file."""
+        return self._wav_logger is not None
 
     def active_channels(self) -> Sequence[ChannelInfo]:
         return [] if self._actual_config is None else list(self._actual_config.channels)
@@ -437,7 +445,15 @@ class PipelineController:
     def shutdown(self) -> None:
         """Stop everything and close the active source."""
         with self._lock:
-            # Stop audio manager first
+            # Stop recording first
+            if self._wav_logger is not None:
+                try:
+                    self._wav_logger.stop()
+                except Exception:
+                    pass
+                self._wav_logger = None
+            
+            # Stop audio manager
             if self._audio_manager is not None:
                 self._audio_manager.stop()
             
@@ -598,13 +614,61 @@ class PipelineController:
     def clear_active_channels(self) -> None:
         self.set_active_channels([])
 
-    def start_recording(self, path: str, rollover: bool) -> None:
-        """Placeholder for future recording start logic."""
-        _ = (path, rollover)
+    def start_recording(self, path: str, rollover: bool = False) -> None:
+        """
+        Start recording to a WAV file.
+        
+        Args:
+            path: Output file path for the WAV file
+            rollover: Reserved for future segment/rollover support
+        """
+        with self._lock:
+            if self._wav_logger is not None:
+                logger.warning("Recording already in progress")
+                return
+            
+            if self._actual_config is None:
+                raise RuntimeError("Cannot start recording: no device configured")
+            
+            sample_rate = int(self._actual_config.sample_rate)
+            channels = len(self._active_channel_ids) if self._active_channel_ids else len(self._actual_config.channels)
+            
+            if channels <= 0:
+                raise RuntimeError("Cannot start recording: no active channels")
+            
+            from recording.wav_logger import WavLoggerThread
+            
+            self._wav_logger = WavLoggerThread(
+                data_queue=self.logging_queue,
+                out_path=path,
+                sample_rate=sample_rate,
+                channels=channels,
+            )
+            self._wav_logger.start()
+            
+            # Enable data flow to logging queue
+            if self._dispatcher is not None:
+                self._dispatcher.set_recording_enabled(True)
+            
+            logger.info("Recording started: %s", path)
 
     def stop_recording(self) -> None:
-        """Placeholder for future recording stop logic."""
-        pass
+        """Stop recording and finalize the WAV file."""
+        with self._lock:
+            # Disable data flow first to prevent queue backup
+            if self._dispatcher is not None:
+                self._dispatcher.set_recording_enabled(False)
+            
+            if self._wav_logger is None:
+                return
+            
+            try:
+                self._wav_logger.stop()
+                logger.info("Recording stopped")
+            except Exception as exc:
+                logger.error("Error stopping recording: %s", exc)
+            finally:
+                self._wav_logger = None
 
     def update_window_span(self, window_sec: float) -> None:
         with self._lock:

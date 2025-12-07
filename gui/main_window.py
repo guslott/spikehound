@@ -117,6 +117,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._splash_label: Optional[QtWidgets.QLabel] = None
         self._splash_aspect_ratio: float = 1.0
 
+        # Recording timer state
+        self._recording_start_time: Optional[float] = None
+        self._recording_timer: Optional[QtCore.QTimer] = None
+
         self._settings_tab: Optional[SettingsTab] = None
         self._apply_palette()
         self._style_plot()
@@ -471,7 +475,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.record_toggle_btn = QtWidgets.QPushButton("Start Recording")
         self.record_toggle_btn.setCheckable(True)
         self._apply_record_button_style(False)
+        self.record_toggle_btn.setEnabled(False)  # Disabled until filename is set
         self.record_toggle_btn.clicked.connect(self._toggle_recording)
+        self.record_path_edit.textChanged.connect(self._update_record_button_enabled)
         record_layout.addWidget(self.record_toggle_btn)
 
         record_layout.addStretch(1)
@@ -2052,9 +2058,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trigger_single_button.setEnabled(has_active and self.trigger_mode_single.isChecked())
 
     def _on_browse_record_path(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Select Recording File", "", "HDF5 (*.h5);;All Files (*)")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Select Recording File", "", "WAV Files (*.wav);;HDF5 (*.h5);;All Files (*)"
+        )
         if path:
             self.record_path_edit.setText(path)
+
+    def _update_record_button_enabled(self, text: str = "") -> None:
+        """Enable/disable the record button based on whether a filename is set."""
+        has_path = bool(self.record_path_edit.text().strip())
+        self.record_toggle_btn.setEnabled(has_path)
 
     def _toggle_recording(self, checked: bool) -> None:
         if checked:
@@ -2064,13 +2077,86 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.record_toggle_btn.setChecked(False)
                 return
             rollover = self.record_autoinc.isChecked()
+            
+            # Auto-increment filename if enabled
+            if rollover:
+                path = self._get_next_filename(path)
+            
+            self._start_recording_timer()
             self._apply_record_button_style(True)
             self._set_panels_enabled(False)
             self.startRecording.emit(path, rollover)
         else:
+            self._stop_recording_timer()
             self._apply_record_button_style(False)
             self._set_panels_enabled(True)
             self.stopRecording.emit()
+
+    def _get_next_filename(self, base_path: str) -> str:
+        """
+        Find the next available filename with auto-increment.
+        
+        Given 'path/to/file.wav', checks for:
+        - file.wav (returns this if doesn't exist)
+        - file1.wav
+        - file2.wav
+        - etc.
+        """
+        import os
+        import re
+        
+        directory = os.path.dirname(base_path) or "."
+        basename = os.path.basename(base_path)
+        name, ext = os.path.splitext(basename)
+        
+        # If the base file doesn't exist, use it
+        if not os.path.exists(base_path):
+            return base_path
+        
+        # Find all existing files matching the pattern
+        pattern = re.compile(rf"^{re.escape(name)}(\d*)\.wav$", re.IGNORECASE)
+        max_num = 0
+        
+        try:
+            for filename in os.listdir(directory):
+                match = pattern.match(filename)
+                if match:
+                    num_str = match.group(1)
+                    if num_str:
+                        max_num = max(max_num, int(num_str))
+                    else:
+                        # Base file exists, we need at least 1
+                        max_num = max(max_num, 0)
+        except OSError:
+            pass
+        
+        # Next number is max + 1 (but at least 1 if base file exists)
+        next_num = max_num + 1
+        new_path = os.path.join(directory, f"{name}{next_num}{ext}")
+        return new_path
+
+    def _start_recording_timer(self) -> None:
+        """Start the recording duration timer."""
+        self._recording_start_time = time.perf_counter()
+        if self._recording_timer is None:
+            self._recording_timer = QtCore.QTimer(self)
+            self._recording_timer.timeout.connect(self._update_recording_duration)
+        self._recording_timer.start(1000)  # Update every second
+
+    def _stop_recording_timer(self) -> None:
+        """Stop the recording duration timer."""
+        if self._recording_timer is not None:
+            self._recording_timer.stop()
+        self._recording_start_time = None
+
+    def _update_recording_duration(self) -> None:
+        """Update the record button with elapsed time."""
+        if self._recording_start_time is None:
+            return
+        elapsed = time.perf_counter() - self._recording_start_time
+        minutes = int(elapsed // 60)
+        seconds = int(elapsed % 60)
+        self.record_toggle_btn.setText(f"Stop Recording ({minutes:02d}:{seconds:02d})")
 
     def _apply_record_button_style(self, recording: bool) -> None:
         if recording:
@@ -2085,18 +2171,30 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
     def _set_panels_enabled(self, enabled: bool) -> None:
-        for panel in (self.trigger_group, self.device_group, self.channels_group, self.channel_opts_group):
-            panel.setEnabled(enabled)
-        self.record_path_edit.setEnabled(enabled)
-        self.record_autoinc.setEnabled(enabled)
-        self.device_combo.setEnabled(not self._device_connected)
-        self.sample_rate_combo.setEnabled(not self._device_connected)
-        self.available_combo.setEnabled(enabled and self._device_connected)
-        self.active_combo.setEnabled(enabled and self._device_connected)
-        self.add_channel_btn.setEnabled(enabled and self._device_connected)
+        # Safely enable/disable panels that may or may not exist
+        for attr_name in ("trigger_group", "device_group", "channels_group", "channel_opts_group"):
+            panel = getattr(self, attr_name, None)
+            if panel is not None:
+                panel.setEnabled(enabled)
+        
+        # Handle individual widgets that should exist
+        if hasattr(self, "record_path_edit"):
+            self.record_path_edit.setEnabled(enabled)
+        if hasattr(self, "record_autoinc"):
+            self.record_autoinc.setEnabled(enabled)
+        if hasattr(self, "device_combo"):
+            self.device_combo.setEnabled(not self._device_connected)
+        if hasattr(self, "sample_rate_combo"):
+            self.sample_rate_combo.setEnabled(not self._device_connected)
+        if hasattr(self, "available_combo"):
+            self.available_combo.setEnabled(enabled and self._device_connected)
+        if hasattr(self, "active_combo"):
+            self.active_combo.setEnabled(enabled and self._device_connected)
+        if hasattr(self, "add_channel_btn"):
+            self.add_channel_btn.setEnabled(enabled and self._device_connected)
         
         # If disabling, ensure we don't leave stale state
-        if not enabled:
+        if not enabled and hasattr(self, "_update_channel_buttons"):
             self._update_channel_buttons()
 
     def _apply_device_state(self, connected: bool) -> None:

@@ -99,6 +99,9 @@ class Dispatcher:
         self._detectors: list[EventDetector] = []
         self._detectors_lock = threading.Lock()
 
+        # Recording state - only enqueue to logging when True
+        self._recording_enabled: bool = False
+
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
@@ -124,6 +127,11 @@ class Dispatcher:
     def update_filter_settings(self, settings: FilterSettings) -> None:
         self._last_filter_settings = settings  # Store for later retrieval
         self._conditioner.update_settings(settings)
+
+    def set_recording_enabled(self, enabled: bool) -> None:
+        """Enable or disable data flow to the logging queue."""
+        self._recording_enabled = bool(enabled)
+        logger.info("Recording %s", "enabled" if enabled else "disabled")
 
     def configure_detectors(self, detector_names: Sequence[str]) -> None:
         """Instantiate and configure detectors by name."""
@@ -406,8 +414,8 @@ class Dispatcher:
         return raw_chunk, filtered_chunk, viz_pointer
 
     def _fan_out(self, raw_chunk: Chunk, filtered_chunk: Chunk, viz_pointer: ChunkPointer) -> None:
-        # DISABLED: Logging queue disabled until explicit data logging feature is added
-        # self._enqueue(self._logging_queue, raw_chunk, "logging")
+        if self._recording_enabled:
+            self._enqueue(self._logging_queue, raw_chunk, "logging")
         for name, out_queue in self._output_queues.items():
             if name == "events":
                 continue # Handled in _process_pointer
