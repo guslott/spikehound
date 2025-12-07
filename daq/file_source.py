@@ -298,24 +298,26 @@ class FileSource(BaseDevice):
         next_deadline = time.perf_counter() + chunk_duration
         
         while not self.stop_event.is_set():
-            # Check for pause
+            # Check for pause and seek requests
             with self._lock:
                 paused = self._paused
                 seek_frame = self._seek_requested
                 self._seek_requested = None
             
-            if paused:
-                time.sleep(0.01)
-                next_deadline = time.perf_counter() + chunk_duration
-                continue
-            
-            # Handle seek request
+            # Handle seek request FIRST (even when paused)
             if seek_frame is not None:
                 try:
                     self._wav_file.setpos(seek_frame)
                     self._current_frame = seek_frame
                 except Exception as exc:
                     logger.warning("Seek failed: %s", exc)
+            
+            # If paused, just wait and loop
+            if paused:
+                time.sleep(0.01)
+                next_deadline = time.perf_counter() + chunk_duration
+                continue
+
             
             # Read chunk from file
             try:
@@ -325,14 +327,20 @@ class FileSource(BaseDevice):
                 break
             
             if not raw_bytes:
-                # End of file
-                logger.info("End of file reached")
-                break
+                # End of file - pause and wait for seek or stop
+                logger.info("End of file reached, paused at end")
+                with self._lock:
+                    self._paused = True
+                # Stay in loop, waiting for seek or stop
+                continue
             
             # Decode to float32
             data = self._decode_frames(raw_bytes)
             if data is None or data.size == 0:
-                break
+                # Empty decode - pause and wait like EOF
+                with self._lock:
+                    self._paused = True
+                continue
             
             frames_read = data.shape[0]
             self._current_frame += frames_read
@@ -351,6 +359,7 @@ class FileSource(BaseDevice):
         
         # Streaming complete - transition back to 'open' state
         # This is handled by the base class when stop_event is set
+
 
     def _decode_frames(self, raw_bytes: bytes) -> Optional[np.ndarray]:
         """

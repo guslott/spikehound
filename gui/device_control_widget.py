@@ -155,12 +155,15 @@ class DeviceControlWidget(QtWidgets.QWidget):
         self.position_slider.setTracking(True)  # Emit valueChanged while dragging
         playback_row.addWidget(self.position_slider, stretch=1)
         
-        # Time label: "0:00.00 / 0:00.00"
-        self.time_label = QtWidgets.QLabel("0:00.00 / 0:00.00")
+        # Time label: "0:00.00/0:00.00"
+        self.time_label = QtWidgets.QLabel("0:00.00/0:00.00")
         self.time_label.setFixedWidth(120)
         self.time_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        self.time_label.setStyleSheet("font-family: monospace; font-size: 11px;")
+        self.time_label.setStyleSheet("font-family: 'Menlo', 'Consolas', 'Courier New', monospace; font-size: 11px;")
         playback_row.addWidget(self.time_label)
+        
+        # Flag to prevent snap-back after seek
+        self._seek_pending = False
         
         # Create a widget to contain the playback row so we can show/hide it
         self.playback_widget = QtWidgets.QWidget()
@@ -181,6 +184,7 @@ class DeviceControlWidget(QtWidgets.QWidget):
         # Playback control signals
         self.play_pause_btn.toggled.connect(self._on_play_pause_toggled)
         self.position_slider.sliderReleased.connect(self._on_slider_released)
+        self.position_slider.valueChanged.connect(self._on_slider_value_changed)
 
     def _label(self, text: str) -> QtWidgets.QLabel:
         """Create a standard label."""
@@ -360,16 +364,20 @@ class DeviceControlWidget(QtWidgets.QWidget):
         """Update the playback position display (for file source)."""
         self._total_duration_secs = total_secs
         
-        # Update time label
-        self.time_label.setText(f"{_format_time(position_secs)} / {_format_time(total_secs)}")
+        # Skip all updates if slider is being dragged or seek is pending
+        if self.position_slider.isSliderDown() or self._seek_pending:
+            return
         
-        # Update slider (only if not being dragged)
-        if not self.position_slider.isSliderDown():
-            if total_secs > 0:
-                slider_pos = int((position_secs / total_secs) * 1000)
-                self.position_slider.blockSignals(True)
-                self.position_slider.setValue(slider_pos)
-                self.position_slider.blockSignals(False)
+        # Update time label
+        self.time_label.setText(f"{_format_time(position_secs)}/{_format_time(total_secs)}")
+        
+        # Update slider position
+        if total_secs > 0:
+            slider_pos = int((position_secs / total_secs) * 1000)
+            self.position_slider.blockSignals(True)
+            self.position_slider.setValue(slider_pos)
+            self.position_slider.blockSignals(False)
+
 
     def set_playing(self, is_playing: bool) -> None:
         """Update the play/pause button state."""
@@ -381,7 +389,7 @@ class DeviceControlWidget(QtWidgets.QWidget):
     def reset_playback_controls(self) -> None:
         """Reset playback controls to initial state."""
         self._total_duration_secs = 0.0
-        self.time_label.setText("0:00.00 / 0:00.00")
+        self.time_label.setText("0:00.00/0:00.00")
         self.position_slider.setValue(0)
         self.set_playing(False)
 
@@ -435,4 +443,26 @@ class DeviceControlWidget(QtWidgets.QWidget):
             return
         slider_pos = self.position_slider.value()
         position_secs = (slider_pos / 1000.0) * self._total_duration_secs
+        
+        # Set pending flag to prevent snap-back
+        self._seek_pending = True
         self.seekRequested.emit(position_secs)
+
+    def clear_seek_pending(self) -> None:
+        """Clear the seek pending flag (called after seek completes)."""
+        self._seek_pending = False
+
+    def _on_slider_value_changed(self, value: int) -> None:
+        """Update time display and seek while slider is being dragged."""
+        if not self.position_slider.isSliderDown():
+            return  # Only update during drag
+        if self._total_duration_secs <= 0:
+            return
+        position_secs = (value / 1000.0) * self._total_duration_secs
+        self.time_label.setText(f"{_format_time(position_secs)}/{_format_time(self._total_duration_secs)}")
+        
+        # Emit live seek for smooth scrubbing
+        self._seek_pending = True
+        self.seekRequested.emit(position_secs)
+
+

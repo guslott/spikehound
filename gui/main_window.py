@@ -1337,9 +1337,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # Detect if this is a file source device
         is_file_source = False
         if entry is not None:
-            driver_name = entry.get("driver_name", "")
-            # Check if this is the file source device
-            if "File" in driver_name or (key and "file" in key.lower()):
+            driver_name = str(entry.get("driver_name", ""))
+            device_name = str(entry.get("name", ""))
+            # Check if this is the file source device (check multiple fields)
+            if "File" in driver_name or "File" in device_name or (key and "file" in key.lower()):
                 is_file_source = True
         
         # Update device control widget mode
@@ -1347,6 +1348,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         self._populate_sample_rate_options(entry)
         self._update_sample_rate_enabled()
+
 
 
     def _populate_sample_rate_options(self, entry: Optional[dict]) -> None:
@@ -1439,9 +1441,13 @@ class MainWindow(QtWidgets.QMainWindow):
         elif self.runtime.sample_rate > 0:
             self._set_sample_rate_value(self.runtime.sample_rate)
         
-        # For file source, populate sample rate dropdown with file's rate
+        # For file source, configure playback controls
         file_source = self._get_file_source()
         if file_source is not None:
+            # Ensure file source mode is enabled (triggers playback controls visibility)
+            self.device_control.set_file_source_mode(True)
+            self.device_control.set_connected(True)  # Re-trigger to show playback controls
+            
             # Populate sample rate dropdown with the file's sample rate
             file_rate = file_source._sample_rate
             if file_rate > 0:
@@ -1453,6 +1459,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # Set initial playback position
             self._update_playback_position()
             self.device_control.set_playing(True)  # Start in playing state
+
 
     def _on_device_disconnected(self) -> None:
         # Stop playback timer
@@ -3021,8 +3028,15 @@ class MainWindow(QtWidgets.QMainWindow):
         """Handle seek request from device control widget."""
         source = self._get_file_source()
         if source is None:
+            self.device_control.clear_seek_pending()
             return
         source.seek_to_position(position_secs)
+        # Immediately update the display to show the new position
+        self._update_playback_position()
+        # Clear the seek pending flag now that seek is complete
+        self.device_control.clear_seek_pending()
+
+
 
     def _update_playback_position(self) -> None:
         """Update playback position display (called by timer)."""
