@@ -29,6 +29,7 @@ from .device_control_widget import DeviceControlWidget
 from .types import ChannelConfig
 from .trace_renderer import TraceRenderer
 from .trigger_controller import TriggerController
+from .plot_manager import PlotManager
 
 
 
@@ -130,6 +131,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._style_plot()
 
         scope_widget = self._create_scope_widget()
+        
+        # Create PlotManager to handle rendering and data processing
+        self._plot_manager = PlotManager(
+            plot_widget=self.plot_widget,
+            trigger_controller=self._trigger_controller,
+            parent=self,
+        )
+        self._plot_manager.sampleRateChanged.connect(self._maybe_update_analysis_sample_rate)
+        
         central_placeholder = QtWidgets.QWidget(self)
         central_placeholder.setSizePolicy(
             QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
@@ -1967,21 +1977,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_axis_label()
 
     def _register_chunk(self, data: np.ndarray) -> None:
-        if data.ndim != 2 or data.size == 0:
-            return
-        self._chunk_accum_count += 1
-        self._chunk_accum_samples += data.shape[1]
-        now = time.perf_counter()
-        elapsed = now - self._chunk_last_rate_update
-        if elapsed >= self._chunk_rate_window:
-            self._chunk_rate = self._chunk_accum_count / elapsed if elapsed > 0 else 0.0
-            if self._chunk_accum_count > 0:
-                self._chunk_mean_samples = self._chunk_accum_samples / self._chunk_accum_count
-            else:
-                self._chunk_mean_samples = 0.0
-            self._chunk_accum_count = 0
-            self._chunk_accum_samples = 0
-            self._chunk_last_rate_update = now
+        self._plot_manager.register_chunk(data)
+        # Sync stats back from PlotManager
+        self._chunk_rate = self._plot_manager.chunk_rate
+        self._chunk_mean_samples = self._plot_manager.chunk_mean_samples
         try:
             self.runtime.update_metrics(chunk_rate=self._chunk_rate, sample_rate=self._current_sample_rate)
         except Exception:
@@ -2557,125 +2556,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _ensure_renderers_for_ids(self, channel_ids: Sequence[int], channel_names: Sequence[str]) -> None:
         """Synchronize the TraceRenderers with the current active channel list."""
-        plot_item = self.plot_widget.getPlotItem()
+        # Ensure configs exist for all channels before delegating
+        for cid, name in zip(channel_ids, channel_names):
+            self._ensure_channel_config(cid, name)
         
-        # If no channels, clear everything and return
-        if not channel_ids:
-            # Remove all tracked curves
-            for renderer in self._renderers.values():
-                renderer.cleanup()
-            self._renderers.clear()
-            self._channel_display_buffers.clear()
-            self._channel_names = []
-            self._channel_ids_current = []
-            self._active_channel_id = None
-            self._update_plot_y_range()
-            return
-
-        # Update current IDs and names
+        # Delegate to PlotManager
+        self._plot_manager.ensure_renderers_for_ids(
+            channel_ids, channel_names, self._channel_configs
+        )
+        
+        # Sync state back
         self._channel_ids_current = list(channel_ids)
         self._channel_names = list(channel_names) if channel_names else [f"Ch {i}" for i in channel_ids]
-
-        # Remove renderers for channels no longer present
-        current_set = set(channel_ids)
-        for cid in list(self._renderers.keys()):
-            if cid not in current_set:
-                self._renderers[cid].cleanup()
-                del self._renderers[cid]
-                if cid in self._channel_display_buffers:
-                    del self._channel_display_buffers[cid]
-
-        # Create renderers for new channels
-        for cid, name in zip(channel_ids, self._channel_names):
-            config = self._ensure_channel_config(cid, name)
-            if cid not in self._renderers:
-                renderer = TraceRenderer(plot_item, config)
-                self._renderers[cid] = renderer
-            else:
-                # Update existing renderer config just in case
-                self._renderers[cid].update_config(config)
-
+        self._renderers = self._plot_manager.renderers
+        
         # Force plot update
-        plot_item.update()
+        self.plot_widget.getPlotItem().update()
         self._refresh_channel_layout()
 
-    def _process_streaming(
-        self,
-        data: np.ndarray,
-        times_arr: np.ndarray,
-        sample_rate: float,
-        window_sec: float,
-        channel_ids: List[int],
-        now: float,
-    ) -> None:
-        should_redraw = (now - self._last_plot_refresh) >= self._plot_interval
-        self.pretrigger_line.setVisible(False)
-
-        if data.ndim != 2 or data.size == 0:
-            for renderer in self._renderers.values():
-                renderer.clear()
-            self._current_sample_rate = sample_rate
-            self._current_window_sec = window_sec
-            self._chunk_rate = 0.0
-            self._chunk_mean_samples = 0.0
-            self._chunk_accum_count = 0
-            self._update_status(viz_depth=0)
-            return
-
-        # Update renderers
-        # data is (channels, samples)
-        # times_arr is (samples,)
-        
-        # We need to map data rows to channel IDs
-        # channel_ids matches the rows of data
-        
-        active_samples: Dict[int, np.ndarray] = {}
-        
-        # Determine downsampling factor
-        # Handled by TraceRenderer (pyqtgraph peak downsampling)
-        ds = 1
-            
-        for i, cid in enumerate(channel_ids):
-            if i >= data.shape[0]:
-                break
-            
-            # Extract channel data
-            channel_data = data[i]
-            active_samples[cid] = channel_data
-            
-            if cid in self._renderers:
-                self._renderers[cid].update_data(channel_data, times_arr, downsample=ds)
-
-        self._channel_last_samples = active_samples
-        if should_redraw:
-            self._apply_active_channel_style()
-            if window_sec > 0:
-                self.plot_widget.getPlotItem().setXRange(0, window_sec, padding=0)
-            self._update_plot_y_range()
-            self._last_plot_refresh = now
-            
-            # Track actual plot refresh rate
-            self._plot_refresh_count += 1
-            elapsed = now - self._plot_refresh_last_calc
-            if elapsed >= 1.0:  # Calculate rate every second
-                self._actual_plot_refresh_hz = self._plot_refresh_count / elapsed
-                self._plot_refresh_count = 0
-                self._plot_refresh_last_calc = now
-                try:
-                    self.runtime.update_metrics(plot_refresh_hz=self._actual_plot_refresh_hz)
-                except Exception:
-                    pass
-
-        self._current_sample_rate = sample_rate
-        self._current_window_sec = window_sec
-        try:
-            self.runtime.update_metrics(sample_rate=sample_rate)
-        except Exception:
-            pass
-        self._update_status(viz_depth=0)
-        self._maybe_update_analysis_sample_rate(sample_rate)
-
     def _maybe_update_analysis_sample_rate(self, sample_rate: float) -> None:
+        """Update analysis dock with sample rate changes."""
         if sample_rate <= 0:
             return
         if abs(sample_rate - self._analysis_sample_rate) < 1e-3:
@@ -2684,155 +2584,6 @@ class MainWindow(QtWidgets.QMainWindow):
         dock = getattr(self, "_analysis_dock", None)
         if isinstance(dock, AnalysisDock):
             dock.update_sample_rate(sample_rate)
-
-    def _update_trigger_sample_parameters(self, sample_rate: float) -> None:
-        """Update trigger timing parameters. Delegates to TriggerController."""
-        self._trigger_controller._window_sec = self._current_window_sec
-        self._trigger_controller.update_sample_rate(sample_rate)
-
-    def _append_trigger_history(self, chunk_samples: np.ndarray) -> None:
-        """Append samples to trigger history. Delegates to TriggerController."""
-        if chunk_samples.size == 0:
-            return
-        # Push to controller's history buffer
-        self._trigger_controller._history.append(chunk_samples)
-        self._trigger_controller._history_length += chunk_samples.shape[0]
-        self._trigger_controller._history_total += chunk_samples.shape[0]
-        self._trigger_controller._max_chunk = max(self._trigger_controller._max_chunk, chunk_samples.shape[0])
-        # Keep 3x window to prevent evicting tails before capture
-        max_keep = self._trigger_controller._window_samples * 3
-        while self._trigger_controller._history_length > max_keep and self._trigger_controller._history:
-            left = self._trigger_controller._history.popleft()
-            self._trigger_controller._history_length -= left.shape[0]
-
-    def _detect_trigger_crossing(self, samples: np.ndarray) -> Optional[int]:
-        """Detect rising threshold crossing. Delegates to TriggerController."""
-        self._trigger_controller._threshold = float(self.threshold_spin.value())
-        return self._trigger_controller.detect_crossing(samples)
-
-    def _should_arm_trigger(self, now: float) -> bool:
-        """Check if trigger should be armed. Delegates to TriggerController."""
-        return self._trigger_controller.should_arm(now)
-
-    def _start_trigger_capture(self, chunk_start_abs: int, trigger_idx: int) -> None:
-        """Start a trigger capture. Delegates to TriggerController."""
-        self._trigger_controller.start_capture(chunk_start_abs, trigger_idx)
-
-    def _finalize_trigger_capture(self) -> None:
-        """Finalize trigger capture. Delegates to TriggerController."""
-        self._trigger_controller.finalize_capture()
-
-    def _render_trigger_display(self, channel_ids: List[int], window_sec: float) -> None:
-        if self._trigger_display is None:
-            return
-        window = max(window_sec, 1e-6)
-        data = self._trigger_display
-        n = data.shape[0]
-        sr = self._trigger_last_sample_rate if self._trigger_last_sample_rate > 0 else self._current_sample_rate
-        if sr <= 0 and window > 0 and n > 0:
-            sr = n / window
-        if sr <= 0:
-            sr = max(n / max(window, 1e-6), 1.0)
-        dt = 1.0 / sr
-        time_axis = np.arange(n, dtype=np.float32) * float(dt)
-        self._trigger_display_times = np.asarray(time_axis, dtype=np.float32)
-        
-        # data is (samples, channels) because it comes from history deque
-        # We need to transpose or index correctly
-        
-        for idx, cid in enumerate(channel_ids):
-            if idx >= data.shape[1]:
-                break
-            
-            if cid in self._renderers:
-                # data[:, idx] is the column for this channel
-                self._renderers[cid].update_data(data[:, idx], time_axis, downsample=1)
-
-        self._channel_last_samples = {cid: data[:, i].astype(np.float32) for i, cid in enumerate(channel_ids) if i < data.shape[1]}
-        self._last_times = time_axis
-        self._last_plot_refresh = time.perf_counter()
-
-    def _process_trigger_mode(
-        self,
-        data: np.ndarray,
-        times_arr: np.ndarray,
-        sample_rate: float,
-        window_sec: float,
-        channel_ids: List[int],
-        now: float,
-    ) -> None:
-        if data.ndim != 2 or data.size == 0:
-            self._process_streaming(data, times_arr, sample_rate, window_sec, channel_ids, now)
-            return
-        if sample_rate > 0 and abs(sample_rate - self._trigger_last_sample_rate) > 1e-6:
-            self._update_trigger_sample_parameters(sample_rate)
-
-        chunk_samples = data.T  # shape (samples, channels)
-        if chunk_samples.ndim != 2 or chunk_samples.size == 0:
-            self._process_streaming(data, times_arr, sample_rate, window_sec, channel_ids, now)
-            return
-        self._append_trigger_history(chunk_samples)
-
-        monitor_idx = None
-        if self._trigger_channel_id is not None and self._trigger_channel_id in channel_ids:
-            monitor_idx = channel_ids.index(self._trigger_channel_id)
-
-        if (
-            self._trigger_display is not None
-            and self._trigger_mode != "single"
-            and now >= self._trigger_hold_until
-        ):
-            self._trigger_display = None
-            self._trigger_display_times = None
-            self.pretrigger_line.setVisible(False)
-            self._trigger_hold_until = 0.0
-
-        if monitor_idx is not None and self._should_arm_trigger(now) and self._trigger_display is None:
-            cross_idx = self._detect_trigger_crossing(chunk_samples[:, monitor_idx])
-            if cross_idx is not None:
-                chunk_start_abs = self._trigger_history_total - chunk_samples.shape[0]
-                self._start_trigger_capture(chunk_start_abs, cross_idx)
-        elif monitor_idx is not None and self._trigger_display is None:
-            # Maintain previous value even if not armed
-            self._detect_trigger_crossing(chunk_samples[:, monitor_idx])
-
-        self._finalize_trigger_capture()
-
-        if self._trigger_display is not None:
-            self._current_sample_rate = sample_rate
-            self._current_window_sec = window_sec
-            try:
-                self.runtime.update_metrics(sample_rate=sample_rate)
-            except Exception:
-                pass
-            self._render_trigger_display(channel_ids, window_sec)
-            self._update_status(viz_depth=0)
-
-            return
-
-        if self._trigger_mode == "single":
-            self._current_sample_rate = sample_rate
-            self._current_window_sec = window_sec
-            try:
-                self.runtime.update_metrics(sample_rate=sample_rate)
-            except Exception:
-                pass
-            self._update_status(viz_depth=0)
-
-            return
-
-        if self._trigger_mode == "continuous":
-            # Only update the plot when we have a trigger display; otherwise hold.
-            self._current_sample_rate = sample_rate
-            self._current_window_sec = window_sec
-            try:
-                self.runtime.update_metrics(sample_rate=sample_rate)
-            except Exception:
-                pass
-            self._update_status(viz_depth=0)
-            return
-
-        self._process_streaming(data, times_arr, sample_rate, window_sec, channel_ids, now)
 
 
     @QtCore.Slot(object)
@@ -2946,7 +2697,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # If channel_ids from payload don't match any renderers, the rendering loop
         # will simply skip them (no crash, just no display for removed channels).
 
-        if not self._renderers:
+        if not self._plot_manager.renderers:
             self.plot_widget.getPlotItem().setXRange(0, max(window_sec, 0.001), padding=0)
             self._current_sample_rate = sample_rate
             self._current_window_sec = window_sec
@@ -2959,9 +2710,35 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         mode = self._trigger_mode or "stream"
         if mode == "stream":
-            self._process_streaming(data, times_arr, sample_rate, window_sec, channel_ids, now)
+            self._plot_manager.process_streaming(data, times_arr, sample_rate, window_sec, channel_ids, now)
+            # Sync state back from PlotManager
+            self._current_sample_rate = self._plot_manager.sample_rate
+            self._current_window_sec = self._plot_manager.window_sec
+            self._chunk_rate = self._plot_manager.chunk_rate
+            self._chunk_mean_samples = self._plot_manager.chunk_mean_samples
+            self._channel_last_samples = self._plot_manager.channel_last_samples
+            self._last_times = self._plot_manager.last_times
+            try:
+                self.runtime.update_metrics(sample_rate=sample_rate, plot_refresh_hz=self._plot_manager.actual_plot_refresh_hz)
+            except Exception:
+                pass
         else:
-            self._process_trigger_mode(data, times_arr, sample_rate, window_sec, channel_ids, now)
+            self._plot_manager.process_trigger_mode(
+                data, times_arr, sample_rate, window_sec, channel_ids, now,
+                trigger_mode=self._trigger_mode,
+                trigger_channel_id=self._trigger_channel_id,
+                pretrigger_line=self.pretrigger_line,
+            )
+            # Sync state back from PlotManager
+            self._current_sample_rate = self._plot_manager.sample_rate
+            self._current_window_sec = self._plot_manager.window_sec
+            self._channel_last_samples = self._plot_manager.channel_last_samples
+            self._last_times = self._plot_manager.last_times
+            try:
+                self.runtime.update_metrics(sample_rate=sample_rate)
+            except Exception:
+                pass
+        self._update_status(viz_depth=0)
 
     @QtCore.Slot(bool)
     def on_record_toggled(self, enabled: bool) -> None:
