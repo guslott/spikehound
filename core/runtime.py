@@ -9,7 +9,7 @@ from typing import Any, Optional, Sequence, TYPE_CHECKING, Tuple
 from daq.base_device import BaseDevice
 
 from .conditioning import FilterSettings, SignalConditioner
-from .controller import DeviceManager
+from .device_registry import DeviceRegistry
 from shared.app_settings import AppSettingsStore
 from shared.models import TriggerConfig
 from shared.types import Event
@@ -45,7 +45,10 @@ class SpikeHoundRuntime:
         self._threads: dict[str, threading.Thread] = {}
         self._pipeline: Optional["PipelineController"] = pipeline
         self._analysis_workers: dict[Tuple[str, float], "AnalysisWorker"] = {}
-        self.device_manager = DeviceManager()
+        # Core registry (pure Python) + Qt adapter
+        self._device_registry = DeviceRegistry()
+        from gui.device_manager import DeviceManager
+        self.device_manager = DeviceManager(self._device_registry)
         self.dispatcher = getattr(pipeline, "dispatcher", None) if pipeline is not None else None
         self.visualization_queue: Optional[queue.Queue] = getattr(pipeline, "visualization_queue", None)
         self.audio_queue: Optional[queue.Queue] = getattr(pipeline, "audio_queue", None)
@@ -99,7 +102,7 @@ class SpikeHoundRuntime:
         channels = self.device_manager.get_available_channels()
         self.attach_source(driver, sample_rate, channels)
         # Emit deviceConnected AFTER dispatcher is created so GUI can bind to it
-        self.device_manager.deviceConnected.emit(device_key)
+        self._device_registry.emit_device_connected(device_key)
 
     def configure_acquisition(
         self,

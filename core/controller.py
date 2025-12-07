@@ -6,7 +6,6 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Type
 
 import numpy as np
-from PySide6 import QtCore
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from daq.base_device import ActualConfig, BaseDevice, ChannelInfo
@@ -35,196 +34,6 @@ def _registry():
 
 
 logger = logging.getLogger(__name__)
-
-
-class DeviceManager(QtCore.QObject):
-    """Tracks available DAQ drivers and manages a single active connection."""
-
-    devicesChanged = QtCore.Signal(list)
-    deviceConnected = QtCore.Signal(str)
-    deviceDisconnected = QtCore.Signal()
-    availableChannelsChanged = QtCore.Signal(list)
-
-    def __init__(self, parent: Optional[QtCore.QObject] = None) -> None:
-        super().__init__(parent)
-        self._descriptors: Dict[str, DeviceDescriptor] = {}
-        self._device_entries: Dict[str, Dict[str, object]] = {}
-        self._active_key: Optional[str] = None
-        self._driver: Optional[BaseDevice] = None
-        self._channels: List[ChannelInfo] = []
-        self._list_all_audio_devices = False
-        self.refresh_devices()
-
-    def set_list_all_audio_devices(self, enabled: bool, *, refresh: bool = False) -> None:
-        self._list_all_audio_devices = bool(enabled)
-        if refresh:
-            self.refresh_devices()
-
-    def refresh_devices(self) -> None:
-        reg = _registry()
-        reg.scan_devices(force=True)
-        descriptors = reg.list_devices()
-        try:
-            from daq.soundcard_source import SoundCardSource
-            SoundCardSource.set_list_all_devices(self._list_all_audio_devices)
-        except Exception:
-            pass
-        self._descriptors = {d.key: d for d in descriptors}
-        self._device_entries = {}
-        payload: List[Dict[str, object]] = []
-        for descriptor in descriptors:
-            try:
-                available = descriptor.cls.list_available_devices()
-            except Exception:
-                continue
-
-            if not available:
-                continue
-
-            for device in sorted(available, key=lambda info: info.name.lower()):
-                entry_key = f"{descriptor.key}::{device.id}"
-                self._device_entries[entry_key] = {
-                    "descriptor_key": descriptor.key,
-                    "device_id": device.id,
-                }
-                capabilities = descriptor.capabilities
-                try:
-                    drv = reg.create_device(descriptor.key)
-                    capabilities = drv.get_capabilities(device.id)
-                except Exception:
-                    pass
-                entry: Dict[str, object] = {
-                    "key": entry_key,
-                    "name": f"{descriptor.name} - {device.name}",
-                    "module": descriptor.module,
-                    "capabilities": capabilities,
-                    "driver_key": descriptor.key,
-                    "driver_name": descriptor.name,
-                    "device_id": device.id,
-                    "device_name": device.name,
-                }
-                vendor = getattr(device, "vendor", None)
-                if vendor:
-                    entry["device_vendor"] = vendor
-                details = getattr(device, "details", None)
-                if details:
-                    entry["device_details"] = details
-                payload.append(entry)
-
-        def _priority(item: Dict[str, object]) -> tuple:
-            driver = str(item.get("driver_name", "")).lower()
-            module = str(item.get("module", "")).lower()
-            name = str(item.get("device_name", item.get("name", ""))).lower()
-            # Prioritize: 1) Sound card (default), 2) Simulated, 3) Other DAQ
-            if "sound card" in driver or "soundcard" in module:
-                rank = 0
-            elif "simulated" in driver or "simulated" in module:
-                rank = 1
-            else:
-                rank = 2
-            return (rank, driver, name)
-
-        payload.sort(key=_priority)
-        self.devicesChanged.emit(payload)
-
-    def get_device_list(self) -> List[DeviceDescriptor]:
-        return list(self._descriptors.values())
-
-    def connect_device(self, device_key: str, sample_rate: float, *, chunk_size: int = 1024, **driver_kwargs) -> BaseDevice:
-        self.disconnect_device()
-
-        entry = self._device_entries.get(device_key)
-        if entry is None:
-            raise KeyError(f"Unknown device key: {device_key!r}")
-
-        descriptor_key = entry.get("descriptor_key")
-        device_id = entry.get("device_id")
-        if descriptor_key is None or not isinstance(descriptor_key, str):
-            raise KeyError(f"Invalid descriptor for key: {device_key!r}")
-
-        descriptor = self._descriptors.get(descriptor_key)
-        if descriptor is None:
-            raise KeyError(f"Unknown descriptor key: {descriptor_key!r}")
-
-        if device_id is None or device_id == "":
-            error_message = entry.get("error") or "No hardware devices detected for this driver."
-            raise RuntimeError(error_message)
-
-        reg = _registry()
-        driver = reg.create_device(descriptor_key, **driver_kwargs)
-        available = descriptor.cls.list_available_devices()
-        target = next((dev for dev in available if str(dev.id) == str(device_id)), None)
-        if target is None:
-            raise RuntimeError(f"Selected device is no longer available: {device_id!r}")
-
-        driver.open(target.id)
-        channels = driver.list_available_channels(target.id)
-
-        # For devices that determine sample rate after opening (e.g., FileSource),
-        # get the sample rate from the driver's capabilities
-        effective_sample_rate = sample_rate
-        if effective_sample_rate <= 0:
-            try:
-                caps = driver.get_capabilities(target.id)
-                if caps.sample_rates and len(caps.sample_rates) > 0:
-                    effective_sample_rate = caps.sample_rates[0]
-            except Exception:
-                pass
-        
-        if effective_sample_rate <= 0:
-            driver.close()
-            raise RuntimeError("Could not determine sample rate for device")
-
-        configure_kwargs = {
-            "sample_rate": int(effective_sample_rate),
-            "channels": [ch.id for ch in channels] if channels else None,
-            "chunk_size": chunk_size,
-        }
-        configure_kwargs = {k: v for k, v in configure_kwargs.items() if v is not None}
-
-        try:
-            driver.configure(**configure_kwargs)
-        except Exception:
-            driver.close()
-            raise
-
-        self._driver = driver
-        self._active_key = device_key
-        self._channels = list(channels)
-        self.availableChannelsChanged.emit(list(self._channels))
-        # NOTE: deviceConnected signal is now emitted from runtime.connect_device()
-        # after attach_source() completes to ensure dispatcher is ready
-        return driver
-
-
-    def disconnect_device(self) -> None:
-        if self._driver is None:
-            return
-        try:
-            if getattr(self._driver, "running", False):
-                try:
-                    self._driver.stop()
-                except Exception:
-                    pass
-            try:
-                self._driver.close()
-            except Exception:
-                pass
-        finally:
-            self._driver = None
-            self._active_key = None
-            self._channels = []
-            self.availableChannelsChanged.emit([])
-            self.deviceDisconnected.emit()
-
-    def get_available_channels(self) -> List[ChannelInfo]:
-        return list(self._channels)
-
-    def active_key(self) -> Optional[str]:
-        return self._active_key
-
-    def current_driver(self) -> Optional[BaseDevice]:
-        return self._driver
 
 
 class PipelineController:
@@ -309,8 +118,9 @@ class PipelineController:
     def app_settings(self) -> AppSettings:
         return self._app_settings_store.get()
 
-    def update_app_settings(self, **kwargs) -> None:
-        self._app_settings_store.update_app_settings(**kwargs)
+    def update_app_settings(self, **kwargs) -> AppSettings:
+        """Update application settings and return the updated settings."""
+        return self._app_settings_store.update(**kwargs)
 
     # Audio control API (delegates to AudioManager)
     

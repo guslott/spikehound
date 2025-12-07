@@ -1,7 +1,8 @@
 """Core application utilities."""
 
 from .conditioning import ChannelFilterSettings, FilterSettings, SignalConditioner
-from .controller import DeviceManager, PipelineController
+from .controller import PipelineController
+from .device_registry import DeviceRegistry
 from .dispatcher import Dispatcher, DispatcherStats
 from .runtime import SpikeHoundRuntime
 from shared.models import Chunk, EndOfStream, Event, TriggerConfig, ChannelInfo, DeviceInfo, Capabilities, ActualConfig
@@ -15,7 +16,7 @@ __all__ = [
     "DeviceInfo",
     "Capabilities",
     "ActualConfig",
-    "DeviceManager",
+    "DeviceRegistry",
     "PipelineController",
     "SpikeHoundRuntime",
     "ChannelFilterSettings",
