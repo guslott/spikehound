@@ -462,10 +462,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.record_path_edit.setMaximumWidth(220)
         self.record_path_edit.setPlaceholderText("Select output file...")
         path_row.addWidget(self.record_path_edit, 1)
-        browse_btn = QtWidgets.QPushButton("Browse…")
-        browse_btn.setFixedWidth(80)
-        browse_btn.clicked.connect(self._on_browse_record_path)
-        path_row.addWidget(browse_btn)
+        self.record_browse_btn = QtWidgets.QPushButton("Browse…")
+        self.record_browse_btn.setFixedWidth(80)
+        self.record_browse_btn.clicked.connect(self._on_browse_record_path)
+        path_row.addWidget(self.record_browse_btn)
         record_layout.addLayout(path_row)
 
         self.record_autoinc = QtWidgets.QCheckBox("Auto-increment filename if exists")
@@ -2180,6 +2180,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # Handle individual widgets that should exist
         if hasattr(self, "record_path_edit"):
             self.record_path_edit.setEnabled(enabled)
+        if hasattr(self, "record_browse_btn"):
+            self.record_browse_btn.setEnabled(enabled)
         if hasattr(self, "record_autoinc"):
             self.record_autoinc.setEnabled(enabled)
         if hasattr(self, "device_combo"):
