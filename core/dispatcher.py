@@ -23,6 +23,7 @@ class DispatcherStats:
     received: int = 0
     processed: int = 0
     processed_frames: int = 0
+    sample_gaps: int = 0
     forwarded: Counter = field(default_factory=Counter)
     evicted: Counter = field(default_factory=Counter)
     dropped: Counter = field(default_factory=Counter)
@@ -32,6 +33,7 @@ class DispatcherStats:
             "received": self.received,
             "processed": self.processed,
             "processed_frames": self.processed_frames,
+            "sample_gaps": self.sample_gaps,
             "forwarded": dict(self.forwarded),
             "evicted": dict(self.evicted),
             "dropped": dict(self.dropped),

@@ -28,6 +28,9 @@ class SpikeHoundRuntime:
 
     This will evolve into the headless controller that replaces direct MainWindow
     ownership of pipeline pieces.
+    
+    Both device_registry and device_manager can be injected for GUI integration.
+    When running headless, omit device_manager to avoid Qt dependencies.
     """
 
     def __init__(
@@ -36,6 +39,8 @@ class SpikeHoundRuntime:
         app_settings_store: Optional[AppSettingsStore] = None,
         logger: Optional[logging.Logger] = None,
         pipeline: Optional["PipelineController"] = None,
+        device_registry: Optional["DeviceRegistry"] = None,
+        device_manager: Optional[Any] = None,
     ) -> None:
         self.app_settings_store = app_settings_store
         self.logger = logger or logging.getLogger(__name__)
@@ -45,10 +50,10 @@ class SpikeHoundRuntime:
         self._threads: dict[str, threading.Thread] = {}
         self._pipeline: Optional["PipelineController"] = pipeline
         self._analysis_workers: dict[Tuple[str, float], "AnalysisWorker"] = {}
-        # Core registry (pure Python) + Qt adapter
-        self._device_registry = DeviceRegistry()
-        from gui.device_manager import DeviceManager
-        self.device_manager = DeviceManager(self._device_registry)
+        # Core registry (pure Python) - use provided or create default
+        self._device_registry = device_registry if device_registry is not None else DeviceRegistry()
+        # Qt adapter is injected from GUI layer (or None for headless)
+        self.device_manager = device_manager
         self.dispatcher = getattr(pipeline, "dispatcher", None) if pipeline is not None else None
         self.visualization_queue: Optional[queue.Queue] = getattr(pipeline, "visualization_queue", None)
         self.audio_queue: Optional[queue.Queue] = getattr(pipeline, "audio_queue", None)

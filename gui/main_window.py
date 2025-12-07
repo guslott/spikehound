@@ -30,6 +30,7 @@ from .types import ChannelConfig
 from .trace_renderer import TraceRenderer
 from .trigger_controller import TriggerController
 from .plot_manager import PlotManager
+from .device_manager import DeviceManager
 
 
 
@@ -57,11 +58,19 @@ class MainWindow(QtWidgets.QMainWindow):
         if controller is None:
             controller = PipelineController()
         self._logger = logging.getLogger(__name__)
+        
+        # Create runtime with dependency-injected DeviceManager (keeps core free of Qt imports)
+        from core.device_registry import DeviceRegistry
+        device_registry = DeviceRegistry()
+        device_manager = DeviceManager(device_registry)
         self.runtime = SpikeHoundRuntime(
             app_settings_store=getattr(controller, "app_settings_store", None),
             logger=self._logger,
             pipeline=controller,
+            device_registry=device_registry,
+            device_manager=device_manager,
         )
+        
         self._controller: Optional[PipelineController] = None
         self._app_settings_unsub: Optional[Callable[[], None]] = None
         self.setWindowTitle("SpikeHound - Manlius Pebble Hill School & Cornell University")
@@ -75,7 +84,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._device_map: Dict[str, dict] = {}
         self._device_connected = False
         self._active_channel_infos: List[object] = []
-        self._channel_ids_current: List[int] = []
         self._channel_ids_current: List[int] = []
         # self._curve_map removed in favor of self._renderers
         self._channel_configs: Dict[int, ChannelConfig] = {}
