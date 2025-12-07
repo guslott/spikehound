@@ -163,6 +163,14 @@ class AudioManager:
                 except queue.Empty:
                     continue
                 
+                # Check if we have a listen channel selected
+                with self._audio_lock:
+                    listen_id = self._listen_channel_id
+
+                if listen_id is not None:
+                     pass
+                     # logger.debug(f"AudioRouter: Item received. Type: {type(item)}, ListenID: {listen_id}, Active: {self._channel_ids_current}")
+                
                 # Skip end-of-stream markers
                 if item is EndOfStream:
                     continue

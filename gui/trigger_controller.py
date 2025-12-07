@@ -173,6 +173,7 @@ class TriggerController(QtCore.QObject):
 
     def arm_single(self) -> None:
         """Arm single-shot trigger mode."""
+        self.clear_display()
         self._single_armed = True
 
     def disarm_single(self) -> None:

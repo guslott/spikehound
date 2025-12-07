@@ -368,6 +368,15 @@ class PlotManager(QtCore.QObject):
     ) -> None:
         """Process data in triggered mode (single or continuous)."""
         if data.ndim != 2 or data.size == 0:
+            # If we represent a triggered state with existing display data,
+            # we should update the display regardless of new input.
+            if self._trigger_controller.display_data is not None:
+                self._current_sample_rate = sample_rate
+                self._current_window_sec = window_sec
+                self._render_trigger_display(channel_ids, window_sec, pretrigger_line)
+                return
+            
+            # Otherwise fall back to streaming (which clears/resets)
             self.process_streaming(data, times_arr, sample_rate, window_sec, channel_ids, now)
             return
             
@@ -467,6 +476,10 @@ class PlotManager(QtCore.QObject):
         time_axis = np.arange(n, dtype=np.float32) * float(dt)
         tc._display_times = np.asarray(time_axis, dtype=np.float32)
         
+        # Enforce view range to match the configured window
+        if window > 0:
+            self._plot_widget.getPlotItem().setXRange(0, window, padding=0)
+        
         # data is (samples, channels) from history deque
         for idx, cid in enumerate(channel_ids):
             if idx >= data.shape[1]:
@@ -542,3 +555,21 @@ class PlotManager(QtCore.QObject):
         with np.errstate(divide='ignore', invalid='ignore'):
             result = np.asarray(raw_data, dtype=np.float32) / span + float(offset_pct)
         return np.nan_to_num(result, nan=offset_pct, posinf=offset_pct, neginf=offset_pct)
+
+    def get_channel_at_y(self, y: float) -> Optional[int]:
+        """Return the channel with screen offset closest to y, if within range."""
+        candidates = []
+        for cid, config in self._channel_configs.items():
+            dist = abs(float(y) - config.screen_offset)
+            candidates.append((dist, cid))
+        
+        if not candidates:
+            return None
+            
+        candidates.sort(key=lambda x: x[0])
+        dist, cid = candidates[0]
+        
+        # 5% tolerance
+        if dist > 0.05:
+            return None
+        return cid

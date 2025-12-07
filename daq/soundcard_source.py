@@ -353,7 +353,7 @@ class SoundCardSource(BaseDevice):
             self._device.start(gen)
             
         except Exception as e:
-            print(f"Error starting miniaudio capture: {e}")
+            logger.error("Error starting miniaudio capture", exc_info=e)
             self._device = None
 
     def _stop_impl(self) -> None:

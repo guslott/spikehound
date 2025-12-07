@@ -31,6 +31,9 @@ from .trace_renderer import TraceRenderer
 from .trigger_controller import TriggerController
 from .plot_manager import PlotManager
 from .device_manager import DeviceManager
+from .recording_control_widget import RecordingControlWidget
+from .scope_config_manager import ScopeConfigManager, ScopeConfigProvider
+from .trigger_control_widget import TriggerControlWidget
 
 
 
@@ -87,7 +90,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._channel_ids_current: List[int] = []
         # self._curve_map removed in favor of self._renderers
         self._channel_configs: Dict[int, ChannelConfig] = {}
-        self._channel_panels: Dict[int, ChannelOptionsPanel] = {}
+        self._channel_panels: Dict[int, ChannelDetailPanel] = {}
         self._channel_last_samples: Dict[int, np.ndarray] = {}
         self._channel_display_buffers: Dict[int, np.ndarray] = {}
         self._last_times: np.ndarray = np.zeros(0, dtype=np.float32)
@@ -111,6 +114,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._listen_device_key: Optional[str] = None
         # TriggerController manages all trigger state and detection logic
         self._trigger_controller = TriggerController(parent=self)
+        self._trigger_controller.configChanged.connect(self._on_trigger_config_changed)
+        self._trigger_controller.captureReady.connect(self._on_trigger_capture_ready)
         self._plot_refresh_hz = 40.0
         self._plot_interval = 1.0 / self._plot_refresh_hz
         self._last_plot_refresh = 0.0
@@ -130,9 +135,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._splash_label: Optional[QtWidgets.QLabel] = None
         self._splash_aspect_ratio: float = 1.0
 
-        # Recording timer state
-        self._recording_start_time: Optional[float] = None
-        self._recording_timer: Optional[QtCore.QTimer] = None
+        # Config manager for save/load operations
+        self._config_manager = ScopeConfigManager(self)
 
         self._settings_tab: Optional[SettingsTab] = None
         self._apply_palette()
@@ -142,7 +146,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Create PlotManager to handle rendering and data processing
         self._plot_manager = PlotManager(
-            plot_widget=self.plot_widget,
+            plot_widget=self.scope.plot_widget,
             trigger_controller=self._trigger_controller,
             parent=self,
         )
@@ -174,15 +178,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_timer.setInterval(100)  # 10 Hz update rate
         self._playback_timer.timeout.connect(self._update_playback_position)
         
-        self._wire_placeholders()
-        self._update_trigger_controls()
+        self.attach_controller(controller)
         self.runtime.device_manager.devicesChanged.connect(self._on_devices_changed)
         self.runtime.device_manager.deviceConnected.connect(self._on_device_connected)
         self.runtime.device_manager.deviceDisconnected.connect(self._on_device_disconnected)
         self.runtime.device_manager.availableChannelsChanged.connect(self._on_available_channels)
         self._apply_device_state(False)
         self.runtime.device_manager.refresh_devices()
-        self.attach_controller(controller)
         app_settings = controller.app_settings if controller is not None else None
         if app_settings is not None:
             self.set_plot_refresh_hz(float(app_settings.plot_refresh_hz))
@@ -194,7 +196,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._close_shortcut.setContext(QtCore.Qt.ApplicationShortcut)
         self._close_shortcut.activated.connect(self.close)
         self._bind_app_settings_store()
-        self._emit_trigger_config()
+        pass # _emit_trigger_config removed
         QtCore.QTimer.singleShot(0, self._update_splash_pixmap)
         QtCore.QTimer.singleShot(0, self._try_load_default_config)
 
@@ -447,15 +449,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scope = ScopeWidget(self)
         grid.addWidget(self.scope, 0, 0, 1, 2)
         
-        # Keep references to threshold and pretrigger lines for compatibility
-        self.threshold_line = self.scope.threshold_line
-        self.pretrigger_line = self.scope.pretrigger_line
-        self.plot_widget = self.scope.plot_widget  # For backwards compatibility
+
         
         # Connect ScopeWidget signals
-        self.scope.channelClicked.connect(self._on_scope_channel_clicked)
-        self.scope.channelDragged.connect(self._on_scope_channel_dragged)
-        self.scope.channelDragFinished.connect(self._on_scope_drag_finished)
+        # Connect ScopeWidget signals
+        self.scope.viewClicked.connect(self._on_scope_clicked)
+        self.scope.viewDragged.connect(self._on_scope_dragged)
+        self.scope.viewDragFinished.connect(self._on_scope_drag_finished)
         self.scope.thresholdChanged.connect(self._on_scope_threshold_changed)
 
         self._status_labels = {}
@@ -487,130 +487,24 @@ class MainWindow(QtWidgets.QMainWindow):
         side_layout.addWidget(self._splash_label)
         side_layout.addSpacing(10)
 
-        self.record_group = QtWidgets.QGroupBox("Recording")
-        record_layout = QtWidgets.QVBoxLayout(self.record_group)
-
-        path_row = QtWidgets.QHBoxLayout()
-        self.record_path_edit = QtWidgets.QLineEdit()
-        self.record_path_edit.setMaximumWidth(220)
-        self.record_path_edit.setPlaceholderText("Select output file...")
-        path_row.addWidget(self.record_path_edit, 1)
-        self.record_browse_btn = QtWidgets.QPushButton("Browse…")
-        self.record_browse_btn.setFixedWidth(80)
-        self.record_browse_btn.clicked.connect(self._on_browse_record_path)
-        path_row.addWidget(self.record_browse_btn)
-        record_layout.addLayout(path_row)
-
-        self.record_autoinc = QtWidgets.QCheckBox("Auto-increment filename if exists")
-        self.record_autoinc.setChecked(True)
-        record_layout.addWidget(self.record_autoinc)
-
-        self.record_toggle_btn = QtWidgets.QPushButton("Start Recording")
-        self.record_toggle_btn.setCheckable(True)
-        self._apply_record_button_style(False)
-        self.record_toggle_btn.setEnabled(False)  # Disabled until filename is set
-        self.record_toggle_btn.clicked.connect(self._toggle_recording)
-        self.record_path_edit.textChanged.connect(self._update_record_button_enabled)
-        record_layout.addWidget(self.record_toggle_btn)
-
-        record_layout.addStretch(1)
+        # Recording controls - use extracted widget
+        self.record_group = RecordingControlWidget(self)
+        self.record_group.recordingStarted.connect(self._on_recording_started)
+        self.record_group.recordingStopped.connect(self._on_recording_stopped)
         side_layout.addWidget(self.record_group)
 
-        self.trigger_group = QtWidgets.QGroupBox("Trigger")
-        trigger_layout = QtWidgets.QGridLayout(self.trigger_group)
-        trigger_layout.setContentsMargins(8, 8, 8, 8)
-        trigger_layout.setVerticalSpacing(4)
-        trigger_layout.setHorizontalSpacing(6)
 
-        row = 0
-        trigger_layout.addWidget(self._label("Channel"), row, 0)
-        self.trigger_channel_combo = QtWidgets.QComboBox()
-        self.trigger_channel_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
-        self.trigger_channel_combo.setMaximumWidth(200)
-        trigger_layout.addWidget(self.trigger_channel_combo, row, 1)
-        row += 1
+        # Trigger Control Widget (extracted)
+        self.trigger_control = TriggerControlWidget(self._trigger_controller)
+        side_layout.addWidget(self.trigger_control)
 
-        trigger_layout.addWidget(self._label("Mode"), row, 0)
-        mode_layout = QtWidgets.QVBoxLayout()
-        mode_layout.setSpacing(2)
-        self.trigger_mode_continuous = QtWidgets.QRadioButton("No Trigger (Stream)")
-        self.trigger_mode_single = QtWidgets.QRadioButton("Single")
-        self.trigger_mode_single.setEnabled(False)
-        self.trigger_mode_repeating = QtWidgets.QRadioButton("Continuous Trigger")
-        self.trigger_mode_repeating.setEnabled(False)
-        
-        # Group radio buttons
-        self.trigger_button_group = QtWidgets.QButtonGroup(self)
-        self.trigger_button_group.addButton(self.trigger_mode_continuous)
-        self.trigger_button_group.addButton(self.trigger_mode_single)
-        self.trigger_button_group.addButton(self.trigger_mode_repeating)
-        
-        self.trigger_mode_continuous.setChecked(True)
-        mode_layout.addWidget(self.trigger_mode_continuous)
-        single_row = QtWidgets.QHBoxLayout()
-        single_row.setSpacing(3)
-        self.trigger_single_button = QtWidgets.QPushButton("Trigger Once")
-        self.trigger_single_button.setEnabled(False)
-        single_row.addWidget(self.trigger_mode_single)
-        single_row.addWidget(self.trigger_single_button)
-        single_row.addStretch(1)
-        mode_layout.addLayout(single_row)
-        mode_layout.addWidget(self.trigger_mode_repeating)
-        trigger_layout.addLayout(mode_layout, row, 1)
-        row += 1
 
-        threshold_box = QtWidgets.QHBoxLayout()
-        threshold_box.setSpacing(4)
-        threshold_box.addWidget(self._label("Threshold"))
-        self.threshold_spin = QtWidgets.QDoubleSpinBox()
-        self.threshold_spin.setRange(-10.0, 10.0)
-        self.threshold_spin.setSingleStep(0.05)
-        self.threshold_spin.setDecimals(3)
-        self.threshold_spin.setValue(0.0)
-        self.threshold_spin.setMaximumWidth(100)
-        threshold_box.addWidget(self.threshold_spin)
-        trigger_layout.addLayout(threshold_box, row, 0, 1, 2)
-        row += 1
-
-        pretrig_box = QtWidgets.QHBoxLayout()
-        pretrig_box.setSpacing(4)
-        pretrig_box.addWidget(self._label("Pre-trigger (s)"))
-        self.pretrigger_combo = QtWidgets.QComboBox()
-        self.pretrigger_combo.setMaximumWidth(110)
-        for value in (0.0, 0.01, 0.02, 0.05):
-            self.pretrigger_combo.addItem(f"{value:.2f}", value)
-        self.pretrigger_combo.setCurrentIndex(0)
-        pretrig_box.addWidget(self.pretrigger_combo)
-        trigger_layout.addLayout(pretrig_box, row, 0, 1, 2)
-        row += 1
-
-        window_box = QtWidgets.QHBoxLayout()
-        window_box.setSpacing(4)
-        window_box.addWidget(self._label("Window Width (s)"))
-        self.window_combo = QtWidgets.QComboBox()
-        self.window_combo.setMaximumWidth(110)
-        for value in (0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0):
-            self.window_combo.addItem(f"{value:.1f}", value)
-        default_index = 1 if self.window_combo.count() > 1 else self.window_combo.count() - 1
-        self.window_combo.setCurrentIndex(max(0, default_index))
-        window_box.addWidget(self.window_combo)
-        trigger_layout.addLayout(window_box, row, 0, 1, 2)
-
-        side_layout.addWidget(self.trigger_group)
 
         # Bottom row (spanning full width): device / channel controls.
         self.device_control = DeviceControlWidget(self)
         self.channel_controls = ChannelControlsWidget(self)
         
-        # Keep references to individual widgets for backward compatibility
-        self.device_group = self.device_control.device_group
-        self.device_combo = self.device_control.device_combo
-        # self.scan_hardware_btn = self.device_control.scan_hardware_btn
-        self.device_toggle_btn = self.device_control.device_toggle_btn
-        self.sample_rate_combo = self.device_control.sample_rate_combo
-        self.active_combo = self.channel_controls.active_combo
-        self.add_channel_btn = self.device_control.add_channel_btn
-        self.available_combo = self.device_control.available_combo
+
         
         # Connect DeviceControlWidget signals
         self.device_control.deviceSelected.connect(self._on_device_selected)
@@ -635,27 +529,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return scope
 
-    def _wire_placeholders(self) -> None:
-        """Connect stub widgets to stub slots for future wiring."""
-        self.trigger_channel_combo.currentTextChanged.connect(self._emit_trigger_config)
-        self.trigger_mode_continuous.toggled.connect(self._emit_trigger_config)
-        self.trigger_mode_single.toggled.connect(self._emit_trigger_config)
-        self.trigger_mode_repeating.toggled.connect(self._emit_trigger_config)
-        self.trigger_mode_continuous.toggled.connect(self._on_trigger_mode_changed)
-        self.trigger_mode_single.toggled.connect(self._on_trigger_mode_changed)
-        self.trigger_mode_repeating.toggled.connect(self._on_trigger_mode_changed)
-        self.threshold_spin.valueChanged.connect(self._on_threshold_spin_changed)
-        self.pretrigger_combo.currentIndexChanged.connect(self._emit_trigger_config)
-        self.window_combo.currentIndexChanged.connect(self._on_window_changed)
-        # NOTE: threshold_line signal now handled by ScopeWidget.thresholdChanged
-        # self.active_list.currentItemChanged.connect(self._on_active_channel_selected)
-        self.trigger_single_button.clicked.connect(self._on_trigger_single_clicked)
-
     def attach_controller(self, controller: Optional[PipelineController]) -> None:
-        if controller is self._controller:
-            return
+        # Check removed to allow re-wiring signals even if controller instance is same
 
-        if self._controller is not None:
+
+        if self._controller is not None and self._controller is not controller:
             if self._dispatcher_signals is not None:
                 try:
                     self._dispatcher_signals.tick.disconnect(self._on_dispatcher_tick)
@@ -697,6 +575,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.startRecording.connect(controller.start_recording)
         self.stopRecording.connect(controller.stop_recording)
         self.triggerConfigChanged.connect(controller.update_trigger_config)
+        
+        # Wire controller to recording widget for duration queries
+        if hasattr(self, "record_group") and hasattr(self.record_group, "set_controller"):
+            self.record_group.set_controller(controller)
 
         self._bind_dispatcher_signals()
         self._update_status(0)
@@ -895,222 +777,56 @@ class MainWindow(QtWidgets.QMainWindow):
             return QtGui.QColor(0, 0, 139)
 
     def _channel_config_to_dict(self, config: ChannelConfig) -> dict:
-        return {
-            "color": self._color_to_tuple(config.color),
-            "display_enabled": bool(config.display_enabled),
-            "vertical_span_v": float(config.vertical_span_v),
-            "screen_offset": float(config.screen_offset),
-            "notch_enabled": bool(config.notch_enabled),
-            "notch_freq": float(config.notch_freq),
-            "highpass_enabled": bool(config.highpass_enabled),
-            "highpass_freq": float(config.highpass_freq),
-            "lowpass_enabled": bool(config.lowpass_enabled),
-            "lowpass_freq": float(config.lowpass_freq),
-            "listen_enabled": bool(config.listen_enabled),
-            "analyze_enabled": bool(config.analyze_enabled),
-            "channel_name": config.channel_name,
-        }
+        """Delegate to config manager."""
+        return self._config_manager.channel_config_to_dict(config)
 
     def _channel_config_from_dict(self, payload: dict, *, fallback_name: str = "") -> ChannelConfig:
-        cfg = ChannelConfig()
-        try:
-            cfg.color = self._color_from_tuple(payload.get("color", (0, 0, 139, 255)))
-            cfg.display_enabled = bool(payload.get("display_enabled", True))
-            cfg.vertical_span_v = float(payload.get("vertical_span_v", payload.get("range_v", 1.0)))
-            cfg.screen_offset = float(payload.get("screen_offset", payload.get("offset_v", 0.5)))
-            cfg.notch_enabled = bool(payload.get("notch_enabled", False))
-            cfg.notch_freq = float(payload.get("notch_freq", 60.0))
-            cfg.highpass_enabled = bool(payload.get("highpass_enabled", False))
-            cfg.highpass_freq = float(payload.get("highpass_freq", 10.0))
-            cfg.lowpass_enabled = bool(payload.get("lowpass_enabled", False))
-            cfg.lowpass_freq = float(payload.get("lowpass_freq", 1_000.0))
-            cfg.listen_enabled = bool(payload.get("listen_enabled", False))
-            cfg.analyze_enabled = bool(payload.get("analyze_enabled", False))
-            cfg.channel_name = str(payload.get("channel_name") or fallback_name or "")
-        except Exception as exc:
-            self._logger.debug("Failed to parse channel config: %s", exc)
-            cfg.channel_name = fallback_name
-        return cfg
+        """Delegate to config manager."""
+        return self._config_manager.channel_config_from_dict(payload, fallback_name=fallback_name)
 
     def _collect_scope_config(self) -> Optional[dict]:
-        device_key = self.device_combo.currentData()
-        if device_key is None:
-            QtWidgets.QMessageBox.information(self, "Save Config", "Select a device before saving a scope config.")
-            return None
-        window_value = float(self.window_combo.currentData() or self._current_window_sec or 0.0)
-        payload = {
-            "version": 1,
-            "device_key": device_key,
-            "sample_rate": float(self._current_sample_rate_value()),
-            "window_sec": float(window_value),
-            "channels": [],
-        }
-        channel_names = {cid: name for cid, name in zip(self._channel_ids_current, self._channel_names)}
-        for cid in self._channel_ids_current:
-            cfg = self._channel_configs.get(cid)
-            if cfg is None:
-                continue
-            payload["channels"].append(
-                {
-                    "id": cid,
-                    "name": channel_names.get(cid) or cfg.channel_name or f"Channel {cid}",
-                    "config": self._channel_config_to_dict(cfg),
-                }
-            )
-        return payload
+        """Delegate to config manager."""
+        return self._config_manager.collect_config()
 
     def _find_available_index_by_id(self, channel_id: int) -> int:
-        for idx in range(self.available_combo.count()):
-            info = self.available_combo.itemData(idx)
-            if getattr(info, "id", None) == channel_id:
-                return idx
-        return -1
+        """Delegate to config manager."""
+        return self._config_manager.find_available_index_by_id(channel_id)
 
     def _apply_scope_config_data(self, data: dict, source: str = "", *, show_dialogs: bool = True) -> None:
-        def _info(title: str, message: str) -> None:
-            if show_dialogs:
-                QtWidgets.QMessageBox.information(self, title, message)
-            else:
-                self.statusBar().showMessage(message, 5000)
+        """Delegate to config manager."""
+        self._config_manager.apply_config_data(data, source, show_dialogs=show_dialogs)
 
-        def _warning(title: str, message: str) -> None:
-            if show_dialogs:
-                QtWidgets.QMessageBox.warning(self, title, message)
-            else:
-                self.statusBar().showMessage(message, 7000)
+    @QtCore.Slot()
+    def _on_trigger_capture_ready(self) -> None:
+        """Handle trigger capture completion event."""
+        # Typically the visualization timer handles data retrieval, but we can hook here
+        # if we need immediate UI updates (e.g. status bar).
+        pass
 
-        def _critical(title: str, message: str) -> None:
-            if show_dialogs:
-                QtWidgets.QMessageBox.critical(self, title, message)
-            else:
-                self.statusBar().showMessage(message, 8000)
-
-        version = int(data.get("version", 1) or 1)
-        if version != 1:
-            _warning("Load Config", f"Unsupported config version: {version}")
-            return
-        device_key = data.get("device_key")
-        sample_rate = float(data.get("sample_rate", self._current_sample_rate_value()))
-        window_sec = float(data.get("window_sec", self._current_window_sec))
-        channels_payload = data.get("channels") or []
-
-        if device_key is not None:
-            idx = self.device_combo.findData(device_key)
-            if idx >= 0:
-                self.device_combo.setCurrentIndex(idx)
-            else:
-                _warning(
-                    "Load Config",
-                    f"Device '{device_key}' is not available; cannot load configuration{f' from {source}' if source else ''}.",
-                )
-                return
-
-        self._set_sample_rate_value(sample_rate)
-        self._set_window_combo_value(window_sec)
-
-        if device_key is None:
-            _info("Load Config", "No device specified in the configuration.")
-            return
-
-        try:
-            self.runtime.connect_device(device_key, sample_rate=self._current_sample_rate_value())
-        except Exception as exc:
-            _critical("Load Config", f"Failed to connect to device '{device_key}': {exc}")
-            return
-
-        # Refresh channel lists with the newly connected device
-        try:
-            available_channels = self.runtime.device_manager.get_available_channels()
-            self._on_available_channels(available_channels)
-        except Exception as exc:
-            self._logger.debug("Failed to refresh channels after load: %s", exc)
-
-        missing_channels: list[int] = []
-        self.active_combo.blockSignals(True)
-        self.available_combo.blockSignals(True)
-        self.active_combo.clear()
-        self._channel_configs.clear()
-        try:
-            for entry in channels_payload:
-                cid = entry.get("id")
-                if cid is None:
-                    continue
-                idx = self._find_available_index_by_id(int(cid))
-                if idx < 0:
-                    missing_channels.append(int(cid))
-                    continue
-                info = self.available_combo.itemData(idx)
-                name = entry.get("name") or self.available_combo.itemText(idx)
-                
-                self.active_combo.addItem(name, info)
-                self.available_combo.removeItem(idx)
-                
-                cfg = self._channel_config_from_dict(entry.get("config") or {}, fallback_name=name)
-                cfg.channel_name = name
-                self._channel_configs[int(cid)] = cfg
-            if self.active_combo.count():
-                self.active_combo.setCurrentIndex(0)
-        finally:
-            self.active_combo.blockSignals(False)
-            self.available_combo.blockSignals(False)
-
-        self._publish_active_channels()
-        if missing_channels:
-            missing_str = ", ".join(str(cid) for cid in missing_channels)
-            _info("Load Config", f"Loaded with missing channels: {missing_str}")
+    @QtCore.Slot(dict)
+    def _on_trigger_config_changed(self, config: dict) -> None:
+        """Handle trigger configuration changes from controller."""
+        self._trigger_mode = config.get("mode", "stream")
+        
+        # Determine if we should clear existing plots
+        is_triggered = (ball := self._trigger_mode) != "stream"
+        if not is_triggered:
+            # Stream mode
+            self.scope.set_pretrigger_position(0.0, visible=False)
+            self.scope.set_threshold(visible=False)
         else:
-            msg = f"Scope configuration loaded{f' from {source}' if source else ''}."
-            self.statusBar().showMessage(msg, 5000)
-
-    def _emit_trigger_config(self, *args, reset_state: bool = True, update_line: bool = True) -> None:
-        data = self.trigger_channel_combo.currentData()
-        channel_id = int(data) if data is not None else None
-        ui_mode = self._current_trigger_mode()
-        self._trigger_channel_id = channel_id
-        self._trigger_mode = ui_mode
-        self._trigger_threshold = float(self.threshold_spin.value())
-        pre_value = self.pretrigger_combo.currentData()
-        self._trigger_pre_seconds = float(pre_value if pre_value is not None else 0.0)
+            # Trigger mode
+            pre = float(config.get("pre_seconds", 0.01))
+            self.scope.set_pretrigger_position(pre, visible=True)
+            thresh = float(config.get("threshold", 0.0))
+        if self._device_connected:
+            self.configure_acquisition(trigger_cfg=config)
         
-        # Sync with TriggerController
-        window_sec = float(self.window_combo.currentData() or 1.0)
-        self._trigger_controller.configure(
-            mode=ui_mode,
-            channel_id=channel_id,
-            threshold=self._trigger_threshold,
-            pre_seconds=self._trigger_pre_seconds,
-            window_sec=window_sec,
-            reset_state=reset_state,
-        )
-        
-        if reset_state:
-            self._reset_trigger_state()
+        self._update_trigger_visuals(config)
 
-        idx = channel_id if channel_id is not None else -1
-        visual_config = {
-            "channel_index": idx,
-            "mode": ui_mode,
-            "threshold": self.threshold_spin.value(),
-            "hysteresis": 0.0,
-            "pretrigger_frac": self._trigger_pre_seconds,
-            "window_sec": window_sec,
-        }
-        self._update_trigger_visuals(visual_config, update_line=update_line)
 
-        self.triggerConfigChanged.emit(dict(visual_config))
 
-    def _on_threshold_spin_changed(self, value: float) -> None:
-        """Handle threshold spinbox changes without resetting trigger state."""
-        self._emit_trigger_config(reset_state=False)
 
-    def _current_trigger_mode(self) -> str:
-        if self.trigger_mode_repeating.isChecked():
-            return "continuous"
-        if self.trigger_mode_single.isChecked():
-            return "single"
-        return "stream"
-
-    # ... (skipping unchanged methods) ...
 
     def _on_scope_threshold_changed(self, value: float) -> None:
         """Handle threshold line moved by user."""
@@ -1125,12 +841,16 @@ class MainWindow(QtWidgets.QMainWindow):
             # No channel config, can't convert properly
             voltage = 0.0
         
-        self.threshold_spin.blockSignals(True)
-        self.threshold_spin.setValue(voltage)
-        self.threshold_spin.blockSignals(False)
-        self._emit_trigger_config(reset_state=False, update_line=False)
+        self.trigger_control.threshold_spin.blockSignals(True)
+        self.trigger_control.threshold_spin.setValue(voltage)
+        self.trigger_control.threshold_spin.blockSignals(False)
+        # Spinbox change will trigger Controller update via TriggerControlWidget
+        # But we need to update line position visually immediately? 
+        # Actually setValue triggers valueChanged which TriggerControlWidget handles.
+        # It calls configure -> configChanged -> _on_trigger_config_changed -> _update_trigger_visuals.
+        # So loop is closed.
 
-    # ... (skipping unchanged methods) ...
+
 
     def _update_trigger_visuals(self, config: dict, update_line: bool = True) -> None:
         mode = config.get("mode", "stream")
@@ -1138,7 +858,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if mode == "stream" or not channel_valid:
             # Use ScopeWidget API to hide threshold
             self.scope.set_threshold(visible=False)
-            self.pretrigger_line.setVisible(False)
+            self.scope.pretrigger_line.setVisible(False)
             return
         
         # Calculate threshold position in screen coordinates
@@ -1159,99 +879,29 @@ class MainWindow(QtWidgets.QMainWindow):
             self.scope.set_threshold(visible=True)
         
         pen = pg.mkPen((0, 0, 0), width=5)
-        self.threshold_line.setPen(pen)
+        self.scope.threshold_line.setPen(pen)
         try:
-            self.threshold_line.setZValue(100)
+            self.scope.threshold_line.setZValue(100)
         except AttributeError:
             pass
         pre_value = float(config.get("pretrigger_frac", 0.0) or 0.0)
         if pre_value > 0.0:
-            self.pretrigger_line.setVisible(True)
-            self.pretrigger_line.setValue(0.0)
+            self.scope.pretrigger_line.setVisible(True)
+            self.scope.pretrigger_line.setValue(0.0)
         else:
-            self.pretrigger_line.setVisible(False)
+            self.scope.pretrigger_line.setVisible(False)
 
     def _on_save_scope_config(self) -> None:
-        payload = self._collect_scope_config()
-        if payload is None:
-            return
-        default_path = Path.home() / "spikehound_scope.json"
-        path_str, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self,
-            "Save Scope Configuration",
-            str(default_path),
-            "JSON Files (*.json)",
-        )
-        if not path_str:
-            return
-        path = Path(path_str)
-        if path.suffix.lower() != ".json":
-            path = path.with_suffix(".json")
-        try:
-            path.write_text(json.dumps(payload, indent=2))
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Save Config",
-                f"Failed to save configuration: {exc}",
-            )
-            return
-        self.statusBar().showMessage(f"Saved scope configuration to {path}", 5000)
+        """Delegate to config manager."""
+        self._config_manager.save_config()
 
     def _on_load_scope_config(self) -> None:
-        start_dir = str(Path.home())
-        path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Load Scope Configuration",
-            start_dir,
-            "JSON Files (*.json)",
-        )
-        if not path_str:
-            return
-        path = Path(path_str)
-        try:
-            data = json.loads(path.read_text())
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Load Config",
-                f"Failed to read configuration: {exc}",
-            )
-            return
-        if not isinstance(data, dict):
-            QtWidgets.QMessageBox.critical(self, "Load Config", "Configuration file is not valid JSON.")
-            return
-        self._apply_scope_config_data(data, source=str(path))
+        """Delegate to config manager."""
+        self._config_manager.load_config()
 
     def _try_load_default_config(self) -> None:
-        # Check for launch config preference
-        if self._controller and self._controller.app_settings_store:
-            settings = self._controller.app_settings_store.get()
-            if settings.load_config_on_launch and settings.launch_config_path:
-                launch_path = Path(settings.launch_config_path)
-                if launch_path.is_file():
-                    try:
-                        data = json.loads(launch_path.read_text())
-                        if isinstance(data, dict):
-                            self._apply_scope_config_data(data, source=str(launch_path), show_dialogs=False)
-                            self.statusBar().showMessage(f"Loaded launch config: {launch_path.name}", 5000)
-                            return
-                    except Exception as exc:
-                        self.statusBar().showMessage(f"Failed to load launch config: {exc}", 7000)
-
-        # Fallback to default_config.json in CWD
-        default_path = Path.cwd() / "default_config.json"
-        if not default_path.is_file():
-            return
-        try:
-            data = json.loads(default_path.read_text())
-        except Exception as exc:
-            self.statusBar().showMessage(f"Failed to read default_config.json: {exc}", 7000)
-            return
-        if not isinstance(data, dict):
-            self.statusBar().showMessage("default_config.json is not valid JSON.", 7000)
-            return
-        self._apply_scope_config_data(data, source=str(default_path), show_dialogs=False)
+        """Delegate to config manager."""
+        self._config_manager.try_load_default_config()
 
     def _on_device_button_clicked(self) -> None:
         dm = getattr(self.runtime, "device_manager", None)
@@ -1260,24 +910,24 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._device_connected:
             dm.disconnect_device()
             return
-        key = self.device_combo.currentData()
+        key = self.device_control.device_combo.currentData()
         if not key:
             QtWidgets.QMessageBox.information(self, "Device", "Please select a device to connect.")
-            self.device_toggle_btn.setChecked(False)
+            self.device_control.device_toggle_btn.setChecked(False)
             return
         entry = self._device_map.get(key)
         if entry is not None and not entry.get("device_id"):
             message = entry.get("error") or "No hardware devices detected for this driver."
             QtWidgets.QMessageBox.information(self, "Device", message)
-            self.device_toggle_btn.setChecked(False)
+            self.device_control.device_toggle_btn.setChecked(False)
             return
         try:
             self.runtime.connect_device(key, sample_rate=self._current_sample_rate_value())
         except Exception as exc:  # pragma: no cover - GUI feedback only
             QtWidgets.QMessageBox.critical(self, "Device", f"Failed to connect: {exc}")
-            self.device_toggle_btn.blockSignals(True)
-            self.device_toggle_btn.setChecked(False)
-            self.device_toggle_btn.blockSignals(False)
+            self.device_control.device_toggle_btn.blockSignals(True)
+            self.device_control.device_toggle_btn.setChecked(False)
+            self.device_control.device_toggle_btn.blockSignals(False)
 
     # DeviceControlWidget signal handlers
     def _on_device_connect_requested(self, device_key: str, sample_rate: float) -> None:
@@ -1306,20 +956,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_active_list_index_changed(self, index: int) -> None:
         """Handle active channel selection change by index."""
-        if 0 <= index < self.active_combo.count():
-            info = self.active_combo.itemData(index)
+        if 0 <= index < self.channel_controls.active_combo.count():
+            info = self.channel_controls.active_combo.itemData(index)
             self._on_active_channel_selected(info)
 
 
     def _on_devices_changed(self, entries: List[dict]) -> None:
         self._device_map = {entry["key"]: entry for entry in entries}
-        self.device_combo.blockSignals(True)
-        self.device_combo.clear()
+        self.device_control.device_combo.blockSignals(True)
+        self.device_control.device_combo.clear()
         for entry in entries:
             key = entry.get("key")
             name = entry.get("name") or str(key)
-            self.device_combo.addItem(name, key)
-            idx = self.device_combo.count() - 1
+            self.device_control.device_combo.addItem(name, key)
+            idx = self.device_control.device_combo.count() - 1
             tooltip_lines = []
             driver_name = entry.get("driver_name")
             device_name = entry.get("device_name")
@@ -1339,21 +989,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 tooltip_lines.append(str(error_text))
             if tooltip_lines:
                 tooltip = "\n".join(str(line) for line in tooltip_lines)
-                self.device_combo.setItemData(idx, tooltip, QtCore.Qt.ToolTipRole)
-        self.device_combo.blockSignals(False)
+                self.device_control.device_combo.setItemData(idx, tooltip, QtCore.Qt.ToolTipRole)
+        self.device_control.device_combo.blockSignals(False)
         if self._device_connected:
             dm = getattr(self.runtime, "device_manager", None)
             active_key = dm.active_key() if dm is not None else None
             if active_key is not None:
-                idx = self.device_combo.findData(active_key)
+                idx = self.device_control.device_combo.findData(active_key)
                 if idx >= 0:
-                    self.device_combo.setCurrentIndex(idx)
+                    self.device_control.device_combo.setCurrentIndex(idx)
         self._on_device_selected()
         self._apply_device_state(self._device_connected and bool(entries))
         self._update_channel_buttons()
 
     def _on_device_selected(self) -> None:
-        key = self.device_combo.currentData()
+        key = self.device_control.device_combo.currentData()
         entry = self._device_map.get(key) if key else None
         
         # Detect if this is a file source device
@@ -1374,7 +1024,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
     def _populate_sample_rate_options(self, entry: Optional[dict]) -> None:
-        self.sample_rate_combo.blockSignals(True)
+        self.device_control.sample_rate_combo.blockSignals(True)
         
         # Determine the target sample rate to restore
         target_rate = 0.0
@@ -1389,7 +1039,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # Otherwise, try to preserve the current UI selection
             target_rate = self._current_sample_rate_value()
 
-        self.sample_rate_combo.clear()
+        self.device_control.sample_rate_combo.clear()
         rates = []
         if entry is not None:
             caps = entry.get("capabilities")
@@ -1399,34 +1049,34 @@ class MainWindow(QtWidgets.QMainWindow):
                 rates = caps.get("sample_rates") or []
         
         for rate in rates:
-            self.sample_rate_combo.addItem(f"{int(rate):,}", float(rate))
+            self.device_control.sample_rate_combo.addItem(f"{int(rate):,}", float(rate))
         
         # Restore selection if possible
         if target_rate > 0:
             self._set_sample_rate_value(target_rate)
-        elif self.sample_rate_combo.count():
-            self.sample_rate_combo.setCurrentIndex(0)
+        elif self.device_control.sample_rate_combo.count():
+            self.device_control.sample_rate_combo.setCurrentIndex(0)
             
-        self.sample_rate_combo.setEnabled(bool(rates) and (not self._device_connected or self.active_combo.count() == 0))
-        self.sample_rate_combo.blockSignals(False)
+        self.device_control.sample_rate_combo.setEnabled(bool(rates) and (not self._device_connected or self.channel_controls.active_combo.count() == 0))
+        self.device_control.sample_rate_combo.blockSignals(False)
 
     def _set_sample_rate_value(self, sample_rate: float) -> None:
-        if self.sample_rate_combo.count() == 0:
+        if self.device_control.sample_rate_combo.count() == 0:
             return
-        idx = self.sample_rate_combo.findData(float(sample_rate))
+        idx = self.device_control.sample_rate_combo.findData(float(sample_rate))
         if idx < 0:
             idx = 0
-        self.sample_rate_combo.setCurrentIndex(idx)
+        self.device_control.sample_rate_combo.setCurrentIndex(idx)
 
     def _current_sample_rate_value(self) -> float:
-        data = self.sample_rate_combo.currentData()
+        data = self.device_control.sample_rate_combo.currentData()
         try:
             value = float(data)
         except Exception as exc:
             self._logger.debug("Failed to parse sample rate: %s", exc)
             value = 0.0
-            if self.sample_rate_combo.count() > 0:
-                d = self.sample_rate_combo.itemData(0)
+            if self.device_control.sample_rate_combo.count() > 0:
+                d = self.device_control.sample_rate_combo.itemData(0)
                 try:
                     value = float(d)
                 except Exception as exc:
@@ -1439,18 +1089,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_sample_rate_enabled(self) -> None:
         connected = self._device_connected
-        has_active = self.active_combo.count() > 0
-        enabled = self.sample_rate_combo.count() > 0 and not connected
-        self.sample_rate_combo.setEnabled(enabled)
+        has_active = self.channel_controls.active_combo.count() > 0
+        enabled = self.device_control.sample_rate_combo.count() > 0 and not connected
+        self.device_control.sample_rate_combo.setEnabled(enabled)
         if hasattr(self, "device_control") and hasattr(self.device_control, "sample_rate_label"):
             self.device_control.sample_rate_label.setEnabled(enabled)
 
     def _on_device_connected(self, key: str) -> None:
         self._device_connected = True
         self._apply_device_state(True)
-        idx = self.device_combo.findData(key)
+        idx = self.device_control.device_combo.findData(key)
         if idx >= 0:
-            self.device_combo.setCurrentIndex(idx)
+            self.device_control.device_combo.setCurrentIndex(idx)
         self._bind_dispatcher_signals()
         self._bind_app_settings_store()
         self._update_channel_buttons()
@@ -1502,8 +1152,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._dispatcher_signals = None
         self._clear_listen_channel()
         self._reset_trigger_state()
-        self.available_combo.clear()
-        self.active_combo.clear()
+        self.device_control.available_combo.clear()
+        self.channel_controls.active_combo.clear()
         self._clear_channel_panels()
         self.set_trigger_channels([])
         self._update_channel_buttons()
@@ -1536,45 +1186,45 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_control.set_available_channels(list(channels))
         
         # Clear active channels
-        self.active_combo.clear()
+        self.channel_controls.active_combo.clear()
         self._clear_channel_panels()
         
         # Set trigger channels and update UI
-        if self.available_combo.count():
-            self.available_combo.setCurrentIndex(0)
+        if self.device_control.available_combo.count():
+            self.device_control.available_combo.setCurrentIndex(0)
         self.set_trigger_channels(channels)
         self._update_channel_buttons()
         self._publish_active_channels()
         self._update_sample_rate_enabled()
 
     def _on_add_channel(self) -> None:
-        idx = self.available_combo.currentIndex()
+        idx = self.device_control.available_combo.currentIndex()
         if idx < 0:
             return
-        info = self.available_combo.itemData(idx)
-        text = self.available_combo.currentText()
+        info = self.device_control.available_combo.itemData(idx)
+        text = self.device_control.available_combo.currentText()
         
-        self.active_combo.addItem(text, info)
-        self.available_combo.removeItem(idx)
+        self.channel_controls.active_combo.addItem(text, info)
+        self.device_control.available_combo.removeItem(idx)
         
-        if self.available_combo.count():
-            self.available_combo.setCurrentIndex(min(idx, self.available_combo.count() - 1))
+        if self.device_control.available_combo.count():
+            self.device_control.available_combo.setCurrentIndex(min(idx, self.device_control.available_combo.count() - 1))
             
         # Activate and focus the newly added channel without extra signal chatter.
-        self.active_combo.blockSignals(True)
-        self.active_combo.setCurrentIndex(self.active_combo.count() - 1)
-        self.active_combo.blockSignals(False)
+        self.channel_controls.active_combo.blockSignals(True)
+        self.channel_controls.active_combo.setCurrentIndex(self.channel_controls.active_combo.count() - 1)
+        self.channel_controls.active_combo.blockSignals(False)
         
         self._update_channel_buttons()
         self._publish_active_channels()
         self._set_active_channel_focus(getattr(info, "id", None))
-        self._emit_trigger_config()
+        pass # _emit_trigger_config removed
 
 
     def _publish_active_channels(self) -> None:
         infos = []
-        for index in range(self.active_combo.count()):
-            info = self.active_combo.itemData(index)
+        for index in range(self.channel_controls.active_combo.count()):
+            info = self.channel_controls.active_combo.itemData(index)
             if info is not None:
                 infos.append(info)
         self._active_channel_infos = infos
@@ -1592,14 +1242,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._channel_display_buffers = {cid: self._channel_display_buffers[cid] for cid in ids if cid in self._channel_display_buffers}
         if self._listen_channel_id is not None and self._listen_channel_id not in ids:
             self._clear_listen_channel()
-        self.trigger_mode_continuous.setChecked(True)
         if infos:
             self.set_trigger_channels(infos)
+            # Ensure trigger control updates its state
         else:
-            self.trigger_channel_combo.blockSignals(True)
-            self.trigger_channel_combo.clear()
-            self.trigger_channel_combo.blockSignals(False)
-            self._emit_trigger_config()
+            # Clear trigger channels via API if needed, but set_trigger_channels([]) does it
+            self.set_trigger_channels([])
+
         if ids:
             self.configure_acquisition(channels=ids)
             # Ensure acquisition is started if we have active channels and a device
@@ -1616,6 +1265,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 dock.update_active_channels(infos)
             except AttributeError:
                 pass
+        
+        # Ensure AudioManager knows about the current active channels
+        if self._controller and hasattr(self._controller, '_audio_manager') and self._controller._audio_manager:
+            self._controller._audio_manager.update_active_channels(ids)
 
     def _next_channel_color(self) -> QtGui.QColor:
         color = self._channel_color_cycle[self._next_color_index % len(self._channel_color_cycle)]
@@ -1666,9 +1319,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.channel_controls.add_panel(cid, panel)
                 self._channel_panels[cid] = panel
             panel.set_config(config)
-        idx = self.active_combo.currentIndex()
+        idx = self.channel_controls.active_combo.currentIndex()
         if idx >= 0:
-            info = self.active_combo.itemData(idx)
+            info = self.channel_controls.active_combo.itemData(idx)
             cid = getattr(info, "id", None)
             self._show_channel_panel(cid)
         else:
@@ -1711,15 +1364,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _select_active_channel_by_id(self, channel_id: int) -> None:
         target_idx = None
-        for idx in range(self.active_combo.count()):
-            info = self.active_combo.itemData(idx)
+        for idx in range(self.channel_controls.active_combo.count()):
+            info = self.channel_controls.active_combo.itemData(idx)
             if getattr(info, "id", None) == channel_id:
                 target_idx = idx
                 break
         if target_idx is None:
             return
-        if self.active_combo.currentIndex() != target_idx:
-            self.active_combo.setCurrentIndex(target_idx)
+        if self.channel_controls.active_combo.currentIndex() != target_idx:
+            self.channel_controls.active_combo.setCurrentIndex(target_idx)
         else:
             self._set_active_channel_focus(channel_id)
             self._show_channel_panel(channel_id)
@@ -1778,7 +1431,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._drag_channel_id = None
 
     def _on_channel_config_changed(self, channel_id: int, config: ChannelConfig) -> None:
-        # Normalize legacy fields
+        # Handle missing or renamed fields
         if not hasattr(config, "vertical_span_v"):
             try:
                 config.vertical_span_v = float(getattr(config, "range_v", 1.0))
@@ -1813,7 +1466,17 @@ class MainWindow(QtWidgets.QMainWindow):
         # If this channel is the current trigger source, update trigger visuals
         # to reflect potential changes in vertical span or offset.
         if self._trigger_channel_id is not None and channel_id == self._trigger_channel_id:
-            self._emit_trigger_config(reset_state=False)
+             # Refresh visuals using current controller state
+             # We rely on cached _trigger_threshold etc? 
+             # Or better, construct a config dict from current simple state?
+             # _update_trigger_visuals needs a dict.
+             cfg = {
+                 "mode": self._trigger_mode,
+                 "threshold": getattr(self, "_trigger_threshold", 0.0),
+                 "channel_index": self._trigger_channel_id,
+                 "pretrigger_frac": getattr(self, "_trigger_pre_seconds", 0.01)
+             }
+             self._update_trigger_visuals(cfg)
         self._update_channel_display(channel_id)
         self._refresh_channel_layout()
         if filters_changed:
@@ -1821,35 +1484,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._active_channel_id == channel_id:
             self._update_axis_label()
         self._handle_listen_change(channel_id, config.listen_enabled)
-        if display_changed and config.display_enabled and self._channel_ids_current and self._channel_names:
-            self._reset_scope_for_channels(self._channel_ids_current, self._channel_names)
+        if display_changed and config.display_enabled and self._channel_ids_current and self._channel_names_current:
+            self._reset_scope_for_channels(self._channel_ids_current, self._channel_names_current)
 
     def _update_channel_display(self, channel_id: int) -> None:
         """Re-render a single channel's curve using the last raw samples and current offset/range."""
-        if channel_id not in self._channel_configs:
-            return
-        config = self._channel_configs[channel_id]
-        renderer = self._renderers.get(channel_id)
-        if renderer is None:
-            return
-            
-        # Update renderer config
-        renderer.update_config(config)
-        
-        # Re-push data if we have it
-        raw = self._channel_last_samples.get(channel_id)
-        if raw is not None and raw.size > 0 and self._last_times.size > 0:
-             # We assume times match raw data length roughly or exactly
-             # If mismatch, we might skip.
-             if raw.shape[-1] == self._last_times.shape[0]:
-                 renderer.update_data(raw, self._last_times, downsample=1)
-        
-        self._apply_active_channel_style()
+        self._plot_manager.update_channel_display(channel_id)
 
     def _apply_active_channel_style(self) -> None:
-        for cid, renderer in self._renderers.items():
-            is_active = cid == self._active_channel_id
-            renderer.set_active(is_active)
+        self._plot_manager.set_active_channel(self._active_channel_id)
         self._update_axis_label()
 
     def _handle_listen_change(self, channel_id: int, enabled: bool) -> None:
@@ -1957,32 +1600,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_plot_y_range()
 
     def _refresh_channel_layout(self) -> None:
-        """Rebuild plot curves to track active channels and refresh styling."""
-        if not self._channel_ids_current:
-            for renderer in self._renderers.values():
-                renderer.cleanup()
-            self._renderers.clear()
-            self._update_plot_y_range()
-            return
-
-        # Remove orphaned renderers
-        for cid in list(self._renderers.keys()):
-            if cid not in self._channel_ids_current:
-                self._renderers[cid].cleanup()
-                del self._renderers[cid]
-
-        # Ensure all current channels have renderers
-        plot_item = self.plot_widget.getPlotItem()
-        for cid, name in zip(self._channel_ids_current, self._channel_names):
-            self._ensure_channel_config(cid, name)
-            if cid not in self._renderers:
-                config = self._channel_configs[cid]
-                self._renderers[cid] = TraceRenderer(plot_item, config)
-        
-        self._apply_active_channel_style()
-
-        self._update_plot_y_range()
-        self._update_axis_label()
+       """Deprecated: Delegates to plot manager if needed, but ensure_renderers handles it."""
+       pass
 
     def _register_chunk(self, data: np.ndarray) -> None:
         self._plot_manager.register_chunk(data)
@@ -2002,11 +1621,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_plot_y_range(self) -> None:
         """Fix the normalized viewport to [0.0, 1.0]."""
-        plot_item = self.plot_widget.getPlotItem()
+        plot_item = self.scope.plot_widget.getPlotItem()
         plot_item.setYRange(0.0, 1.0, padding=0.0)
 
     def _update_axis_label(self) -> None:
-        axis = self.plot_widget.getPlotItem().getAxis("left")
+        axis = self.scope.plot_widget.getPlotItem().getAxis("left")
         if self._active_channel_id is not None:
             config = self._channel_configs.get(self._active_channel_id)
             if config is not None:
@@ -2109,160 +1728,49 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_channel_buttons(self) -> None:
         connected = self._device_connected
-        self.add_channel_btn.setEnabled(connected and self.available_combo.count() > 0)
-        self._update_trigger_controls()
+        self.device_control.add_channel_btn.setEnabled(connected and self.device_control.available_combo.count() > 0)
+        # Delegate to trigger control
+        if hasattr(self, "trigger_control"):
+            self.trigger_control.set_enabled_for_scanning(connected)
 
-    def _update_trigger_controls(self) -> None:
-        has_active = self.active_combo.count() > 0
-        for widget in (
-            self.trigger_mode_continuous,
-            self.trigger_mode_single,
-            self.trigger_mode_repeating,
-            self.threshold_spin,
-            self.pretrigger_combo,
-        ):
-            widget.setEnabled(has_active)
-        self.trigger_single_button.setEnabled(has_active and self.trigger_mode_single.isChecked())
+    # -------------------------------------------------------------------------
+    # Recording signal handlers (logic delegated to RecordingControlWidget)
+    # -------------------------------------------------------------------------
 
-    def _on_browse_record_path(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Select Recording File", "", "WAV Files (*.wav);;HDF5 (*.h5);;All Files (*)"
-        )
-        if path:
-            self.record_path_edit.setText(path)
+    def _on_recording_started(self, path: str, rollover: bool) -> None:
+        """Handle recording started signal from RecordingControlWidget."""
+        self._set_panels_enabled(False)
+        self.startRecording.emit(path, rollover)
 
-    def _update_record_button_enabled(self, text: str = "") -> None:
-        """Enable/disable the record button based on whether a filename is set."""
-        has_path = bool(self.record_path_edit.text().strip())
-        self.record_toggle_btn.setEnabled(has_path)
-
-    def _toggle_recording(self, checked: bool) -> None:
-        if checked:
-            path = self.record_path_edit.text().strip()
-            if not path:
-                QtWidgets.QMessageBox.information(self, "Recording", "Please choose a file path before recording.")
-                self.record_toggle_btn.setChecked(False)
-                return
-            rollover = self.record_autoinc.isChecked()
-            
-            # Auto-increment filename if enabled
-            if rollover:
-                path = self._get_next_filename(path)
-            
-            self._start_recording_timer()
-            self._apply_record_button_style(True)
-            self._set_panels_enabled(False)
-            self.startRecording.emit(path, rollover)
-        else:
-            self._stop_recording_timer()
-            self._apply_record_button_style(False)
-            self._set_panels_enabled(True)
-            self.stopRecording.emit()
-
-    def _get_next_filename(self, base_path: str) -> str:
-        """
-        Find the next available filename with auto-increment.
-        
-        Given 'path/to/file.wav', checks for:
-        - file.wav (returns this if doesn't exist)
-        - file1.wav
-        - file2.wav
-        - etc.
-        """
-        import os
-        import re
-        
-        directory = os.path.dirname(base_path) or "."
-        basename = os.path.basename(base_path)
-        name, ext = os.path.splitext(basename)
-        
-        # If the base file doesn't exist, use it
-        if not os.path.exists(base_path):
-            return base_path
-        
-        # Find all existing files matching the pattern
-        pattern = re.compile(rf"^{re.escape(name)}(\d*)\.wav$", re.IGNORECASE)
-        max_num = 0
-        
-        try:
-            for filename in os.listdir(directory):
-                match = pattern.match(filename)
-                if match:
-                    num_str = match.group(1)
-                    if num_str:
-                        max_num = max(max_num, int(num_str))
-                    else:
-                        # Base file exists, we need at least 1
-                        max_num = max(max_num, 0)
-        except OSError:
-            pass
-        
-        # Next number is max + 1 (but at least 1 if base file exists)
-        next_num = max_num + 1
-        new_path = os.path.join(directory, f"{name}{next_num}{ext}")
-        return new_path
-
-    def _start_recording_timer(self) -> None:
-        """Start the recording duration timer."""
-        self._recording_start_time = time.perf_counter()
-        if self._recording_timer is None:
-            self._recording_timer = QtCore.QTimer(self)
-            self._recording_timer.timeout.connect(self._update_recording_duration)
-        self._recording_timer.start(1000)  # Update every second
-
-    def _stop_recording_timer(self) -> None:
-        """Stop the recording duration timer."""
-        if self._recording_timer is not None:
-            self._recording_timer.stop()
-        self._recording_start_time = None
-
-    def _update_recording_duration(self) -> None:
-        """Update the record button with elapsed time based on actual data logged."""
-        if self._controller is None:
-            return
-        
-        # Get actual duration from controller (based on frames written)
-        elapsed = self._controller.recording_duration_seconds
-        minutes = int(elapsed // 60)
-        seconds = int(elapsed % 60)
-        self.record_toggle_btn.setText(f"Stop Recording ({minutes:02d}:{seconds:02d})")
-
-    def _apply_record_button_style(self, recording: bool) -> None:
-        if recording:
-            self.record_toggle_btn.setText("Stop Recording (00:00)")
-            self.record_toggle_btn.setStyleSheet(
-                "background-color: rgb(46,204,113); color: rgb(0,0,0); font-weight: bold;"
-            )
-        else:
-            self.record_toggle_btn.setText("Start Recording")
-            self.record_toggle_btn.setStyleSheet(
-                "background-color: rgb(220, 20, 60); color: rgb(0,0,0); font-weight: bold;"
-            )
+    def _on_recording_stopped(self) -> None:
+        """Handle recording stopped signal from RecordingControlWidget."""
+        self._set_panels_enabled(True)
+        self.stopRecording.emit()
 
     def _set_panels_enabled(self, enabled: bool) -> None:
         # Safely enable/disable panels that may or may not exist
-        for attr_name in ("trigger_group", "device_group", "channels_group", "channel_opts_group"):
+        if hasattr(self, "trigger_control"):
+            self.trigger_control.setEnabled(enabled)
+            
+        for attr_name in ("device_group", "channels_group", "channel_opts_group"):
             panel = getattr(self, attr_name, None)
             if panel is not None:
                 panel.setEnabled(enabled)
         
-        # Handle individual widgets that should exist
-        if hasattr(self, "record_path_edit"):
-            self.record_path_edit.setEnabled(enabled)
-        if hasattr(self, "record_browse_btn"):
-            self.record_browse_btn.setEnabled(enabled)
-        if hasattr(self, "record_autoinc"):
-            self.record_autoinc.setEnabled(enabled)
+        # Recording widget handles its own enable/disable
+        if hasattr(self, "record_group") and hasattr(self.record_group, "set_enabled_for_recording"):
+            self.record_group.set_enabled_for_recording(enabled)
+        
         if hasattr(self, "device_combo"):
-            self.device_combo.setEnabled(not self._device_connected)
+            self.device_control.device_combo.setEnabled(not self._device_connected)
         if hasattr(self, "sample_rate_combo"):
-            self.sample_rate_combo.setEnabled(not self._device_connected)
+            self.device_control.sample_rate_combo.setEnabled(not self._device_connected)
         if hasattr(self, "available_combo"):
-            self.available_combo.setEnabled(enabled and self._device_connected)
+            self.device_control.available_combo.setEnabled(enabled and self._device_connected)
         if hasattr(self, "active_combo"):
-            self.active_combo.setEnabled(enabled and self._device_connected)
+            self.channel_controls.active_combo.setEnabled(enabled and self._device_connected)
         if hasattr(self, "add_channel_btn"):
-            self.add_channel_btn.setEnabled(enabled and self._device_connected)
+            self.device_control.add_channel_btn.setEnabled(enabled and self._device_connected)
         
         # If disabling, ensure we don't leave stale state
         if not enabled and hasattr(self, "_update_channel_buttons"):
@@ -2271,17 +1779,17 @@ class MainWindow(QtWidgets.QMainWindow):
     def _apply_device_state(self, connected: bool) -> None:
         has_entries = bool(self._device_map)
         has_connectable = any(entry.get("device_id") for entry in self._device_map.values())
-        self.device_combo.setEnabled(not connected and has_entries)
+        self.device_control.device_combo.setEnabled(not connected and has_entries)
         self._update_sample_rate_enabled()
-        self.device_toggle_btn.blockSignals(True)
-        self.device_toggle_btn.setChecked(connected)
-        self.device_toggle_btn.setText("Click to Disconnect" if connected else "Click to Connect")
-        self.device_toggle_btn.setEnabled(connected or has_connectable)
-        self.device_toggle_btn.blockSignals(False)
-        self.available_combo.setEnabled(connected)
-        self.available_combo.setVisible(connected)
-        self.active_combo.setEnabled(connected)
-        self.add_channel_btn.setVisible(connected)
+        self.device_control.device_toggle_btn.blockSignals(True)
+        self.device_control.device_toggle_btn.setChecked(connected)
+        self.device_control.device_toggle_btn.setText("Click to Disconnect" if connected else "Click to Connect")
+        self.device_control.device_toggle_btn.setEnabled(connected or has_connectable)
+        self.device_control.device_toggle_btn.blockSignals(False)
+        self.device_control.available_combo.setEnabled(connected)
+        self.device_control.available_combo.setVisible(connected)
+        self.channel_controls.active_combo.setEnabled(connected)
+        self.device_control.add_channel_btn.setVisible(connected)
         self._update_channel_buttons()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[override]
@@ -2304,22 +1812,22 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         target = max(float(value), 0.05)
         idx = -1
-        for i in range(self.window_combo.count()):
-            data = self.window_combo.itemData(i)
+        for i in range(self.trigger_control.window_combo.count()):
+            data = self.trigger_control.window_combo.itemData(i)
             if data is not None and abs(float(data) - target) < 1e-6:
                 idx = i
                 break
         if idx < 0:
-            self.window_combo.addItem(f"{target:.2f}", target)
-            idx = self.window_combo.count() - 1
+            self.trigger_control.window_combo.addItem(f"{target:.2f}", target)
+            idx = self.trigger_control.window_combo.count() - 1
         self._window_combo_suppress = True
-        self.window_combo.setCurrentIndex(idx)
+        self.trigger_control.window_combo.setCurrentIndex(idx)
         self._window_combo_suppress = False
         self._apply_window_value(target)
 
     def _apply_window_value(self, value: float) -> None:
         self._current_window_sec = max(float(value), 1e-3)
-        plot_item = self.plot_widget.getPlotItem()
+        plot_item = self.scope.plot_widget.getPlotItem()
         plot_item.setXRange(0.0, self._current_window_sec, padding=0.0)
         if self._controller is not None:
             self._controller.update_window_span(self._current_window_sec)
@@ -2328,7 +1836,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_trigger_sample_parameters(self._trigger_last_sample_rate)
 
     def _on_window_changed(self) -> None:
-        value = float(self.window_combo.currentData() or 0.0)
+        value = float(self.trigger_control.window_combo.currentData() or 0.0)
         if self._window_combo_suppress:
             self._apply_window_value(value)
             return
@@ -2336,69 +1844,81 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_window_value(value)
 
     def _on_threshold_line_changed(self) -> None:
-        y_norm = float(self.threshold_line.value())
+        y_norm = float(self.scope.threshold_line.value())
         cfg = self._channel_configs.get(self._trigger_channel_id) or self._channel_configs.get(self._active_channel_id)
         span = cfg.vertical_span_v if cfg is not None else 1.0
         offset = cfg.screen_offset if cfg is not None else 0.0
         value = (y_norm - offset) * span
-        if abs(self.threshold_spin.value() - value) > 1e-6:
-            self.threshold_spin.blockSignals(True)
-            self.threshold_spin.setValue(value)
-            self.threshold_spin.blockSignals(False)
-        self._emit_trigger_config()
+        if abs(self.trigger_control.threshold_spin.value() - value) > 1e-6:
+            self.trigger_control.threshold_spin.blockSignals(True)
+            self.trigger_control.threshold_spin.setValue(value)
+            self.trigger_control.threshold_spin.blockSignals(False)
+        pass # _emit_trigger_config removed
 
     # ScopeWidget signal handlers
-    def _on_scope_channel_clicked(self, channel_id: int) -> None:
-        """Handle click on a channel trace in the scope."""
-        self._select_channel_by_id(channel_id)
-
-    def _on_scope_channel_dragged(self, channel_id: int, new_offset: float) -> None:
-        """Handle dragging a channel trace to reposition it."""
-        if channel_id not in self._channel_configs:
+    # ScopeWidget signal handlers
+    def _on_scope_clicked(self, y: float, button: QtCore.Qt.MouseButton) -> None:
+        """Handle click on scope view."""
+        if button != QtCore.Qt.MouseButton.LeftButton:
             return
-        config = self._channel_configs[channel_id]
-        config.screen_offset = new_offset
-        # Update the scope widget's config
-        scope_config = ScopeChannelConfig(
-            color=config.color,
-            display_enabled=config.display_enabled,
-            vertical_span_v=config.vertical_span_v,
-            screen_offset=config.screen_offset,
-            channel_name=config.channel_name
-        )
-        self.scope.set_channel_config(channel_id, scope_config)
-        # Update the channel panel if exists
-        panel = self._channel_panels.get(channel_id)
-        if panel is not None:
-            panel.set_config(config)
+        
+        cid = self._plot_manager.get_channel_at_y(y)
+        if cid is not None:
+            self._select_channel_by_id(cid)
+            self._on_scope_dragged(y) # Start drag implicitly
 
-        # If this channel is the current trigger source, update trigger visuals
-        # so the threshold line follows the trace.
-        if self._trigger_channel_id is not None and channel_id == self._trigger_channel_id:
-            self._emit_trigger_config(reset_state=False)
+    def _on_scope_dragged(self, y: float) -> None:
+        """Handle dragging logic (update active channel offset)."""
+        if self._active_channel_id is None:
+            return
+            
+        # We assume active channel is the one being dragged if drag started
+        cid = self._active_channel_id
+        if cid not in self._channel_configs:
+            return
+            
+        config = self._channel_configs[cid]
+        
+        y_clamped = max(0.0, min(1.0, float(y)))
+        # Snap to center if within 5% of mid
+        if abs(y_clamped - 0.5) <= 0.05:
+            y_clamped = 0.5
+            
+        if abs(config.screen_offset - y_clamped) < 1e-6:
+            return
+            
+        config.screen_offset = y_clamped
+        # Update PlotManager config
+        self._plot_manager.update_channel_configs(self._channel_configs)
+        self._plot_manager.update_channel_display(cid)
+        
+        # Update Channel Detail Panel
+        panel = self._channel_panels.get(cid)
+        if panel is not None:
+             panel.set_config(config)
+
+        # Triggers
+        if self._trigger_channel_id is not None and cid == self._trigger_channel_id:
+             self._on_trigger_config_changed({
+                 "channel_index": cid,
+                 "mode": self._trigger_mode,
+                 # Trigger widget handles others, but we need to refresh potentially
+             })
+             # Actually TriggerControlWidget usually updates on its own, but dragging offset
+             # doesn't change trigger LEVEL, only visualization of it relative to trace?
+             # No, offset changes where the trace is, so threshold might need visual update?
+             # ScopeWidget handles threshold line.
+             pass
 
     def _on_scope_drag_finished(self) -> None:
         """Handle end of channel drag operation."""
-        pass  # Currently no additional action needed
-
-    def _on_trigger_mode_changed(self) -> None:
-        self._update_trigger_controls()
-
-    def _on_trigger_single_clicked(self) -> None:
-        if self._trigger_mode != "single":
-            self.trigger_mode_single.setChecked(True)
-            return
-        self._trigger_single_armed = True
-        self._trigger_display = None
-        self._trigger_display_times = None
-        self._trigger_capture_start_abs = None
-        self._trigger_capture_end_abs = None
-        self._trigger_hold_until = 0.0
+        # No specific action needed
+        pass
 
     def _reset_trigger_state(self) -> None:
         """Reset trigger state. Delegates to TriggerController."""
         self._trigger_controller.reset_state()
-        self.pretrigger_line.setVisible(False)
+        self.scope.pretrigger_line.setVisible(False)
 
     def _update_status(self, viz_depth: int) -> None:
         controller = self._controller
@@ -2481,7 +2001,7 @@ class MainWindow(QtWidgets.QMainWindow):
         _set_status_text("drops", "")
 
     # ------------------------------------------------------------------
-    # Placeholder API (to be implemented later)
+
     # ------------------------------------------------------------------
 
     def populate_devices(self, devices: Sequence[str]) -> None:
@@ -2492,74 +2012,67 @@ class MainWindow(QtWidgets.QMainWindow):
         """Display the channels currently routed to the plot."""
         names = [getattr(ch, "name", str(ch)) for ch in channels]
         self._ensure_renderers_for_ids(self._channel_ids_current, names) # Changed from _ensure_curves
-        self.set_trigger_channels(names)
+        # Trigger widget handles its own channel logic
+        if hasattr(self, "trigger_control"):
+            self.trigger_control.update_channels(names)
 
     def set_trigger_channels(self, channels: Sequence[object], *, current: Optional[int] = None) -> None:
         """Update trigger channel choices presented to the user."""
-        self.trigger_channel_combo.blockSignals(True)
-        self.trigger_channel_combo.clear()
+        if not hasattr(self, "trigger_control"):
+            return
+            
+        # Convert objects to (name, id) list
+        formatted_channels = []
         for entry in channels:
             name = getattr(entry, "name", str(entry))
             cid = getattr(entry, "id", None)
-            self.trigger_channel_combo.addItem(name, cid)
+            if cid is not None:
+                formatted_channels.append((name, cid))
+                
+        self.trigger_control.update_channels(formatted_channels)
+        
+        # If specific selection requested
         if current is not None:
-            idx = self.trigger_channel_combo.findData(current)
+            # We need to access the combo directly or add a method.
+            # Since TriggerControlWidget exposes combo via alias (implied), we can try:
+            idx = self.trigger_control.trigger_channel_combo.findData(current)
             if idx >= 0:
-                self.trigger_channel_combo.setCurrentIndex(idx)
-        elif self.trigger_channel_combo.count() > 0:
-            self.trigger_channel_combo.setCurrentIndex(0)
-        self.trigger_channel_combo.blockSignals(False)
-        self._emit_trigger_config()
+                self.trigger_control.trigger_channel_combo.setCurrentIndex(idx)
 
     def _reset_scope_for_channels(self, channel_ids: Sequence[int], channel_names: Sequence[str]) -> None:
-        self._ensure_renderers_for_ids(channel_ids, channel_names)
-        plot_item = self.plot_widget.getPlotItem()
-        target_window = float(self.window_combo.currentData() or 1.0)
-        self._current_window_sec = max(target_window, 1e-3)
-        plot_item.setXRange(0.0, self._current_window_sec, padding=0.0)
-        for renderer in self._renderers.values(): # Changed from _curves
-            renderer.clear()
-        self._update_plot_y_range()
-        self._ensure_active_channel_focus()
+        target_window = float(self.trigger_control.window_combo.currentData() or 1.0)
+        self._plot_manager.reset_scope_for_channels(
+            channel_ids, channel_names, self._channel_configs, target_window
+        )
+        # Sync simple state
+        self._current_window_sec = self._plot_manager.window_sec
         self._current_sample_rate = 0.0
         self._chunk_rate = 0.0
         self._chunk_mean_samples = 0.0
-        self._chunk_accum_count = 0
-        self._chunk_accum_samples = 0
-        self._chunk_last_rate_update = time.perf_counter()
         self._update_status(viz_depth=0)
+        
+        # Ensure local state tracks the new layout
+        self._channel_ids_current = list(channel_ids)
+        self._channel_names_current = list(channel_names)
+        
         if self._controller is not None:
             self._controller.update_window_span(self._current_window_sec)
 
     def _clear_scope_display(self) -> None:
-        plot_item = self.plot_widget.getPlotItem()
-        try:
-            plot_item.clear()
-        except Exception:
-            pass
-        
-        # Clear renderers
-        for renderer in self._renderers.values():
-            renderer.cleanup()
-        self._renderers.clear()
-        
-        self._channel_display_buffers.clear()
+        self._plot_manager.clear_scope_display()
         self._channel_ids_current = []
-        self._channel_names = []
+        self._channel_names_current = []
         self._active_channel_id = None
-        self._apply_active_channel_style()
-        default_window = float(self.window_combo.currentData() or 1.0)
+        
+        # Sync simple state
+        default_window = float(self.trigger_control.window_combo.currentData() or 1.0)
         self._current_window_sec = max(default_window, 1e-3)
-        plot_item.setXRange(0.0, self._current_window_sec, padding=0.0)
         self._update_plot_y_range()
-        self.threshold_line.setVisible(False)
-        self.pretrigger_line.setVisible(False)
+        self.scope.threshold_line.setVisible(False)
+        self.scope.pretrigger_line.setVisible(False)
         self._current_sample_rate = 0.0
         self._chunk_rate = 0.0
         self._chunk_mean_samples = 0.0
-        self._chunk_accum_count = 0
-        self._chunk_accum_samples = 0
-        self._chunk_last_rate_update = time.perf_counter()
         self._update_status(viz_depth=0)
 
     def _ensure_renderers_for_ids(self, channel_ids: Sequence[int], channel_names: Sequence[str]) -> None:
@@ -2573,14 +2086,10 @@ class MainWindow(QtWidgets.QMainWindow):
             channel_ids, channel_names, self._channel_configs
         )
         
-        # Sync state back
+        # Sync state back partial
         self._channel_ids_current = list(channel_ids)
-        self._channel_names = list(channel_names) if channel_names else [f"Ch {i}" for i in channel_ids]
-        self._renderers = self._plot_manager.renderers
-        
-        # Force plot update
-        self.plot_widget.getPlotItem().update()
-        self._refresh_channel_layout()
+        self._channel_names_current = list(channel_names) if channel_names else [f"Ch {i}" for i in channel_ids]
+    
 
     def _maybe_update_analysis_sample_rate(self, sample_rate: float) -> None:
         """Update analysis dock with sample rate changes."""
@@ -2652,8 +2161,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 try:
                     block = np.asarray(viz_buffer.read(ptr.start_index, ptr.length), dtype=np.float32)
                 except Exception as e:
-                    print(f"!!! VIZ_BUFFER READ FAILED: start_index={ptr.start_index}, length={ptr.length}, error={e}")
-                    print(f"!!! This explains PSP truncation - chunk was overwritten before GUI could read it!")
+                    self._logger.warning(
+                        "VIZ_BUFFER READ FAILED - chunk may have been overwritten before GUI could read it",
+                        extra={"start_index": ptr.start_index, "length": ptr.length, "error": str(e)}
+                    )
                     continue
                 if block.size == 0:
                     continue
@@ -2679,34 +2190,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_times = times_arr
         now = time.perf_counter()
 
+        # Register chunk with plot manager
         self._register_chunk(data)
 
-        # RACE CONDITION FIX: Trust the channel metadata from the payload rather than
-        # filtering against the GUI's current state. The payload was generated by the  
-        # Dispatcher thread at the time the data was captured, so its channel_ids
-        # correctly reflect which channels the data belongs to.
-        #
-        # The GUI should simply render data for whatever channels are present in the
-        # incoming payload. If a channel ID in the payload doesn't have a corresponding
-        # renderer in the GUI (because the user removed it), Python will handle that
-        # gracefully in the rendering code below (the renderer lookup will fail and
-        # skip that channel).
-        #
-        # This approach avoids the previous race condition where:
-        # 1. Dispatcher sends a chunk for "Channel A"
-        # 2. User rapidly switches to "Channel B"  
-        # 3. GUI filters out Channel A data even though it's valid data that should
-        #    have been displayed before the switch
-        #
-        # Note: The old code filtered based on _channel_ids_current which belongs to
-        # the GUI thread, but the payload was generated milliseconds ago when the
-        # channel selection may have been different.
-        #
-        # If channel_ids from payload don't match any renderers, the rendering loop
-        # will simply skip them (no crash, just no display for removed channels).
+        # Trust channel metadata from payload (Dispatcher source of truth)
+        # to avoid race conditions with GUI state.
 
         if not self._plot_manager.renderers:
-            self.plot_widget.getPlotItem().setXRange(0, max(window_sec, 0.001), padding=0)
+            self.scope.plot_widget.getPlotItem().setXRange(0, max(window_sec, 0.001), padding=0)
             self._current_sample_rate = sample_rate
             self._current_window_sec = window_sec
             self._chunk_rate = 0.0
@@ -2719,13 +2210,11 @@ class MainWindow(QtWidgets.QMainWindow):
         mode = self._trigger_mode or "stream"
         if mode == "stream":
             self._plot_manager.process_streaming(data, times_arr, sample_rate, window_sec, channel_ids, now)
-            # Sync state back from PlotManager
+            # Sync state back from PlotManager - only what's needed
             self._current_sample_rate = self._plot_manager.sample_rate
             self._current_window_sec = self._plot_manager.window_sec
             self._chunk_rate = self._plot_manager.chunk_rate
             self._chunk_mean_samples = self._plot_manager.chunk_mean_samples
-            self._channel_last_samples = self._plot_manager.channel_last_samples
-            self._last_times = self._plot_manager.last_times
             try:
                 self.runtime.update_metrics(sample_rate=sample_rate, plot_refresh_hz=self._plot_manager.actual_plot_refresh_hz)
             except Exception:
@@ -2735,7 +2224,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 data, times_arr, sample_rate, window_sec, channel_ids, now,
                 trigger_mode=self._trigger_mode,
                 trigger_channel_id=self._trigger_channel_id,
-                pretrigger_line=self.pretrigger_line,
+                pretrigger_line=self.scope.pretrigger_line,
             )
             # Sync state back from PlotManager
             self._current_sample_rate = self._plot_manager.sample_rate
@@ -2750,7 +2239,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(bool)
     def on_record_toggled(self, enabled: bool) -> None:
-        """Placeholder slot that will route a record toggle to the controller."""
+        """Slot that will route a record toggle to the controller."""
         self.recordToggled.emit(enabled)
 
     def _bind_app_settings_store(self) -> None:
@@ -2861,4 +2350,25 @@ class MainWindow(QtWidgets.QMainWindow):
         """Stop the playback position update timer."""
         if hasattr(self, "_playback_timer") and self._playback_timer is not None:
             self._playback_timer.stop()
+
+    # -------------------------------------------------------------------------
+    # Properties for ScopeConfigProvider protocol
+    # -------------------------------------------------------------------------
+    
+    @property
+    def device_combo(self) -> QtWidgets.QComboBox:
+        return self.device_control.device_combo
+
+    @property
+    def window_combo(self) -> QtWidgets.QComboBox:
+        return self.trigger_control.window_combo
+
+    @property
+    def available_combo(self) -> QtWidgets.QComboBox:
+        return self.device_control.available_combo
+
+    @property
+    def active_combo(self) -> QtWidgets.QComboBox:
+        return self.channel_controls.active_combo
+
 

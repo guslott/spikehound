@@ -498,8 +498,10 @@ class BaseDevice(ABC):
             self.data_queue.put(ptr, block=True, timeout=10.0)
         except queue.Full:
             # This should NEVER happen with blocking mode - indicates deadlock or stuck consumer
-            print(f"\n!!! CRITICAL ERROR: Source data_queue BLOCKED for 10+ seconds !!!")
-            print(f"!!! Consumer (Dispatcher) is not keeping up - system deadlocked !!!")
+            logger.critical(
+                "Source data_queue BLOCKED for 10+ seconds - consumer (Dispatcher) not keeping up",
+                extra={"queue_maxsize": self.data_queue.maxsize, "timeout_sec": 10.0}
+            )
             raise RuntimeError("Source data_queue blocked - lossless constraint violated")
 
     def _assert_state(self, expected: Iterable[State]) -> None:

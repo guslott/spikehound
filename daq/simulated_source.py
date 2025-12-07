@@ -1,9 +1,12 @@
 # daq/simulated_source.py
+import logging
 import numpy as np
 import time
 import threading
 from dataclasses import dataclass
 from .base_device import BaseDevice, Chunk, DeviceInfo, ChannelInfo, Capabilities, ActualConfig
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -424,13 +427,22 @@ class SimulatedPhysiologySource(BaseDevice):
                             # Calculate how many samples to copy
                             overlap_len = min(chunk_end_sample - psp_start_global, len(psp.template)) - template_start_idx
                             
-                            # DIAGNOSTIC: Print if overlap_len is problematic
+                            # DIAGNOSTIC: Log if overlap_len is problematic
                             if overlap_len <= 0:
-                                print(f"!!! PSP RENDERING BUG in Chunk {counter}:")
-                                print(f"    PSP: start={psp_start_global}, end={psp_end_global}, len={len(psp.template)}")
-                                print(f"    Chunk: start={chunk_start_sample}, end={chunk_end_sample}")
-                                print(f"    Calculated: template_start_idx={template_start_idx}, chunk_start_idx={chunk_start_idx}, overlap_len={overlap_len}")
-                                print(f"    This PSP will be SKIPPED (zero or negative overlap)!")
+                                logger.warning(
+                                    "PSP rendering bug - overlap_len <= 0, PSP will be skipped",
+                                    extra={
+                                        "chunk": counter,
+                                        "psp_start": psp_start_global,
+                                        "psp_end": psp_end_global,
+                                        "psp_len": len(psp.template),
+                                        "chunk_start": chunk_start_sample,
+                                        "chunk_end": chunk_end_sample,
+                                        "template_start_idx": template_start_idx,
+                                        "chunk_start_idx": chunk_start_idx,
+                                        "overlap_len": overlap_len,
+                                    }
+                                )
                             
                             
                             if overlap_len > 0:

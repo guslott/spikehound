@@ -474,7 +474,10 @@ class Dispatcher:
                 target_queue.put(item, block=True, timeout=10.0)
             except queue.Full:
                 # This indicates disk I/O is too slow for too long
-                print(f"\n!!! CRITICAL ERROR: Dispatcher queue '{queue_name}' BLOCKED for 10+ seconds !!!")
+                logger.critical(
+                    "Dispatcher queue BLOCKED for 10+ seconds - disk I/O too slow",
+                    extra={"queue_name": queue_name, "timeout_sec": 10.0}
+                )
                 with self._stats_lock:
                     self._stats.evicted[queue_name] += 1
                 raise RuntimeError(f"Dispatcher queue '{queue_name}' blocked - lossless constraint violated")
@@ -770,9 +773,14 @@ class Dispatcher:
         # Detect gaps - STRICT MODE: This should NEVER happen in lossless mode
         if self._filled > 0 and start_sample != self._latest_sample_index + 1:
             gap_size = start_sample - (self._latest_sample_index + 1)
-            print(f"\n!!! SAMPLE GAP DETECTED !!!")
-            print(f"!!! Expected sample: {self._latest_sample_index + 1}, Got: {start_sample}, Gap: {gap_size} samples !!!")
-            print(f"!!! This indicates data loss or reordering - LOSSLESS CONSTRAINT VIOLATED !!!")
+            logger.critical(
+                "SAMPLE GAP DETECTED - lossless constraint violated",
+                extra={
+                    "expected_sample": self._latest_sample_index + 1,
+                    "received_sample": start_sample,
+                    "gap_size": gap_size,
+                }
+            )
             self._stats.sample_gaps += 1
             self._reset_viz_counters_locked()
             raise RuntimeError(f"Sample gap detected: expected {self._latest_sample_index + 1}, got {start_sample} (gap={gap_size})")
