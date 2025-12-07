@@ -137,9 +137,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(central_placeholder)
         self._analysis_dock = AnalysisDock(parent=self, controller=self.runtime)
         self._analysis_dock.set_scope_widget(scope_widget, "Scope")
+        
+        # Create and add permanent Settings tab
+        self._settings_tab = SettingsTab(self.runtime, self)
+        self._settings_tab.saveConfigRequested.connect(self._on_save_scope_config)
+        self._settings_tab.loadConfigRequested.connect(self._on_load_scope_config)
+        self._analysis_dock.set_settings_widget(self._settings_tab, "Settings")
+        
         self.addDockWidget(QtCore.Qt.TopDockWidgetArea, self._analysis_dock)
-        self._analysis_dock.settingsClosed.connect(self._on_settings_tab_closed)
         self._analysis_dock.select_scope()
+        
+        # Timer for updating file playback position
+        self._playback_timer = QtCore.QTimer(self)
+        self._playback_timer.setInterval(100)  # 10 Hz update rate
+        self._playback_timer.timeout.connect(self._update_playback_position)
         
         self._wire_placeholders()
         self._update_trigger_controls()
@@ -575,7 +586,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # self.scan_hardware_btn = self.device_control.scan_hardware_btn
         self.device_toggle_btn = self.device_control.device_toggle_btn
         self.sample_rate_combo = self.device_control.sample_rate_combo
-        self.settings_toggle_btn = self.device_control.settings_toggle_btn
         self.active_combo = self.channel_controls.active_combo
         self.add_channel_btn = self.device_control.add_channel_btn
         self.available_combo = self.device_control.available_combo
@@ -584,10 +594,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_control.deviceSelected.connect(self._on_device_selected)
         self.device_control.deviceConnectRequested.connect(self._on_device_connect_requested)
         self.device_control.deviceDisconnectRequested.connect(self._on_device_disconnect_requested)
-        # self.device_control.deviceScanRequested.connect(self._on_scan_hardware)
         self.device_control.channelAddRequested.connect(self._on_channel_add_requested)
         self.channel_controls.activeChannelSelected.connect(self._on_active_list_index_changed)
-        self.device_control.settingsToggled.connect(self._toggle_settings_tab)
+        
+        # Connect playback control signals (for file source)
+        self.device_control.playPauseToggled.connect(self._on_playback_toggled)
+        self.device_control.seekRequested.connect(self._on_seek_requested)
 
         grid.addWidget(side_panel, 0, 2)  # Trigger panel top right (col 2)
         grid.addWidget(self.device_control, 1, 0) # Device control bottom left (col 0)
@@ -1321,8 +1333,21 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_device_selected(self) -> None:
         key = self.device_combo.currentData()
         entry = self._device_map.get(key) if key else None
+        
+        # Detect if this is a file source device
+        is_file_source = False
+        if entry is not None:
+            driver_name = entry.get("driver_name", "")
+            # Check if this is the file source device
+            if "File" in driver_name or (key and "file" in key.lower()):
+                is_file_source = True
+        
+        # Update device control widget mode
+        self.device_control.set_file_source_mode(is_file_source)
+        
         self._populate_sample_rate_options(entry)
         self._update_sample_rate_enabled()
+
 
     def _populate_sample_rate_options(self, entry: Optional[dict]) -> None:
         self.sample_rate_combo.blockSignals(True)
@@ -1413,8 +1438,27 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_sample_rate_value(driver.config.sample_rate)
         elif self.runtime.sample_rate > 0:
             self._set_sample_rate_value(self.runtime.sample_rate)
+        
+        # For file source, populate sample rate dropdown with file's rate
+        file_source = self._get_file_source()
+        if file_source is not None:
+            # Populate sample rate dropdown with the file's sample rate
+            file_rate = file_source._sample_rate
+            if file_rate > 0:
+                self.device_control.populate_sample_rates([float(file_rate)])
+                self._set_sample_rate_value(float(file_rate))
+            
+            # Start playback timer
+            self._start_playback_timer()
+            # Set initial playback position
+            self._update_playback_position()
+            self.device_control.set_playing(True)  # Start in playing state
 
     def _on_device_disconnected(self) -> None:
+        # Stop playback timer
+        self._stop_playback_timer()
+        self.device_control.reset_playback_controls()
+        
         self._device_connected = False
         self._apply_device_state(False)
         self.stop_acquisition()
@@ -1435,6 +1479,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.set_trigger_channels([])
         self._update_channel_buttons()
         self._update_sample_rate_enabled()
+        
+        # Re-apply file source mode based on current device selection
+        # This ensures the button says "Browse..." instead of "Click to Connect"
+        self._on_device_selected()
+
 
     def _on_scan_hardware(self) -> None:
         dm = getattr(self.runtime, "device_manager", None)
@@ -2948,25 +2997,50 @@ class MainWindow(QtWidgets.QMainWindow):
             self.runtime.set_listen_output_device(normalized)
         except Exception:
             pass
-    def _toggle_settings_tab(self, checked: bool) -> None:
-        dock = getattr(self, "_analysis_dock", None)
-        controller = self._controller
-        if dock is None or controller is None:
-            self.settings_toggle_btn.blockSignals(True)
-            self.settings_toggle_btn.setChecked(False)
-            self.settings_toggle_btn.blockSignals(False)
-            return
-        if checked:
-            if self._settings_tab is None:
-                self._settings_tab = SettingsTab(self.runtime, self)
-                self._settings_tab.set_listen_device(self._listen_device_key)
-                self._settings_tab.saveConfigRequested.connect(self._on_save_scope_config)
-                self._settings_tab.loadConfigRequested.connect(self._on_load_scope_config)
-            dock.open_settings(self._settings_tab)
-        else:
-            dock.close_settings()
 
-    def _on_settings_tab_closed(self) -> None:
-        if hasattr(self, "settings_toggle_btn"):
-            self.settings_toggle_btn.setChecked(False)
-            self.settings_toggle_btn.blockSignals(False)
+    # -------------------------------------------------------------------------
+    # File Source Playback Controls
+    # -------------------------------------------------------------------------
+
+    def _get_file_source(self):
+        """Get the current device if it's a FileSource, otherwise None."""
+        from daq.file_source import FileSource
+        source = getattr(self.runtime, "daq_source", None)
+        if isinstance(source, FileSource):
+            return source
+        return None
+
+    def _on_playback_toggled(self, is_playing: bool) -> None:
+        """Handle play/pause toggle from device control widget."""
+        source = self._get_file_source()
+        if source is None:
+            return
+        source.set_paused(not is_playing)
+
+    def _on_seek_requested(self, position_secs: float) -> None:
+        """Handle seek request from device control widget."""
+        source = self._get_file_source()
+        if source is None:
+            return
+        source.seek_to_position(position_secs)
+
+    def _update_playback_position(self) -> None:
+        """Update playback position display (called by timer)."""
+        source = self._get_file_source()
+        if source is None:
+            return
+        pos = source.current_position_seconds
+        dur = source.total_duration_seconds
+        self.device_control.update_playback_position(pos, dur)
+        self.device_control.set_playing(not source.is_paused)
+
+    def _start_playback_timer(self) -> None:
+        """Start the playback position update timer."""
+        if hasattr(self, "_playback_timer") and self._playback_timer is not None:
+            self._playback_timer.start()
+
+    def _stop_playback_timer(self) -> None:
+        """Stop the playback position update timer."""
+        if hasattr(self, "_playback_timer") and self._playback_timer is not None:
+            self._playback_timer.stop()
+

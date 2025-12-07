@@ -11,6 +11,15 @@ from typing import Dict, List, Optional
 from PySide6 import QtCore, QtWidgets
 
 
+def _format_time(seconds: float) -> str:
+    """Format seconds as mm:ss.xx for time display."""
+    if seconds < 0:
+        seconds = 0
+    minutes = int(seconds // 60)
+    secs = seconds % 60
+    return f"{minutes}:{secs:05.2f}"
+
+
 class DeviceControlWidget(QtWidgets.QWidget):
     """Widget for device selection, connection, and channel management."""
 
@@ -18,12 +27,13 @@ class DeviceControlWidget(QtWidgets.QWidget):
     deviceSelected = QtCore.Signal(str)  # device_key
     deviceConnectRequested = QtCore.Signal(str, float)  # device_key, sample_rate
     deviceDisconnectRequested = QtCore.Signal()
-    deviceDisconnectRequested = QtCore.Signal()
     # deviceScanRequested = QtCore.Signal()  # Moved to SettingsTab
     channelAddRequested = QtCore.Signal(int)  # channel_id
-    channelAddRequested = QtCore.Signal(int)  # channel_id
     sampleRateChanged = QtCore.Signal(float)
-    settingsToggled = QtCore.Signal(bool)
+    
+    # Playback control signals (for file source)
+    playPauseToggled = QtCore.Signal(bool)  # is_playing (True = play, False = pause)
+    seekRequested = QtCore.Signal(float)  # position in seconds
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -33,6 +43,8 @@ class DeviceControlWidget(QtWidgets.QWidget):
         self._connected = False
         self._available_channels: List = []
         self._active_channel_infos: List = []
+        self._is_file_source_mode = False
+        self._total_duration_secs = 0.0
         
         self._build_ui()
 
@@ -49,12 +61,7 @@ class DeviceControlWidget(QtWidgets.QWidget):
         device_layout.setHorizontalSpacing(6)
         device_layout.setVerticalSpacing(6)
         device_layout.setColumnStretch(1, 1)
-        # self.device_group.setMaximumWidth(320)  # Removed to allow expansion
 
-        # device_layout.addWidget(self._label("Source"), 0, 0)
-        self.device_combo = QtWidgets.QComboBox()
-        self.device_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-        
         disabled_style = """
             QComboBox:disabled {
                 background-color: #e0e0e0;
@@ -65,9 +72,14 @@ class DeviceControlWidget(QtWidgets.QWidget):
                 color: #808080;
             }
         """
+        
+        # Row 0: Device combo
+        self.device_combo = QtWidgets.QComboBox()
+        self.device_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         self.device_combo.setStyleSheet(disabled_style)
         device_layout.addWidget(self.device_combo, 0, 0, 1, 2)
 
+        # Row 1: Sample rate + connect button
         self.sample_rate_label = self._label("Sample Rate (Hz)")
         self.sample_rate_label.setStyleSheet(disabled_style)
         device_layout.addWidget(self.sample_rate_label, 1, 0)
@@ -90,7 +102,7 @@ class DeviceControlWidget(QtWidgets.QWidget):
         
         device_layout.addLayout(sample_rate_row, 1, 1)
 
-        # Available Channels Row
+        # Row 2: Available Channels Row
         available_row = QtWidgets.QHBoxLayout()
         available_row.setSpacing(6)
         
@@ -108,24 +120,67 @@ class DeviceControlWidget(QtWidgets.QWidget):
         
         device_layout.addLayout(available_row, 2, 0, 1, 2)
 
-        controls_row = QtWidgets.QHBoxLayout()
-        controls_row.setSpacing(6)
-        self.settings_toggle_btn = QtWidgets.QPushButton("Settings")
-        self.settings_toggle_btn.setCheckable(True)
-        controls_row.addWidget(self.settings_toggle_btn)
-        controls_row.addStretch(1)
-        device_layout.addLayout(controls_row, 3, 0, 1, 2)
+        # Row 3: Playback controls (for file source only)
+        # Layout: [Play/Pause button] [Slider] [Time label]
+        playback_row = QtWidgets.QHBoxLayout()
+        playback_row.setSpacing(6)
+        
+        # Play/Pause button (square with standard icons)
+        self.play_pause_btn = QtWidgets.QPushButton("▶")
+        self.play_pause_btn.setCheckable(True)
+        self.play_pause_btn.setFixedSize(28, 28)
+        self.play_pause_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 14px;
+                font-weight: bold;
+                padding: 0px;
+                border: 1px solid #808080;
+                background-color: #e0e0e0;
+            }
+            QPushButton:checked {
+                background-color: #c0c0c0;
+            }
+            QPushButton:hover {
+                background-color: #d0d0d0;
+            }
+        """)
+        self.play_pause_btn.setToolTip("Play/Pause")
+        playback_row.addWidget(self.play_pause_btn)
+        
+        # Position slider (fills available space)
+        self.position_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.position_slider.setRange(0, 1000)  # Will be updated based on file duration
+        self.position_slider.setValue(0)
+        self.position_slider.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.position_slider.setTracking(True)  # Emit valueChanged while dragging
+        playback_row.addWidget(self.position_slider, stretch=1)
+        
+        # Time label: "0:00.00 / 0:00.00"
+        self.time_label = QtWidgets.QLabel("0:00.00 / 0:00.00")
+        self.time_label.setFixedWidth(120)
+        self.time_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.time_label.setStyleSheet("font-family: monospace; font-size: 11px;")
+        playback_row.addWidget(self.time_label)
+        
+        # Create a widget to contain the playback row so we can show/hide it
+        self.playback_widget = QtWidgets.QWidget()
+        self.playback_widget.setLayout(playback_row)
+        self.playback_widget.setVisible(False)  # Hidden by default
+        
+        device_layout.addWidget(self.playback_widget, 3, 0, 1, 2)
+
 
         layout.addWidget(self.device_group, 1)
 
-
         # Connect signals
         self.device_combo.currentIndexChanged.connect(self._on_device_selected)
-        # self.scan_hardware_btn.clicked.connect(self._on_scan_clicked)
         self.device_toggle_btn.clicked.connect(self._on_toggle_clicked)
         self.sample_rate_combo.currentIndexChanged.connect(self._on_sample_rate_changed)
-        self.settings_toggle_btn.toggled.connect(self._on_settings_toggled)
         self.add_channel_btn.clicked.connect(self._on_add_channel)
+        
+        # Playback control signals
+        self.play_pause_btn.toggled.connect(self._on_play_pause_toggled)
+        self.position_slider.sliderReleased.connect(self._on_slider_released)
 
     def _label(self, text: str) -> QtWidgets.QLabel:
         """Create a standard label."""
@@ -186,15 +241,46 @@ class DeviceControlWidget(QtWidgets.QWidget):
         self._connected = connected
         self.device_toggle_btn.blockSignals(True)
         self.device_toggle_btn.setChecked(connected)
-        self.device_toggle_btn.setText("Click to Disconnect" if connected else "Click to Connect")
+        
+        # Update button text based on mode
+        if connected:
+            self.device_toggle_btn.setText("Click to Disconnect")
+        else:
+            self.device_toggle_btn.setText("Browse..." if self._is_file_source_mode else "Click to Connect")
+        
         self.device_toggle_btn.blockSignals(False)
         
         self.device_combo.setEnabled(not connected)
-        # self.scan_hardware_btn.setEnabled(not connected)
         self.sample_rate_combo.setEnabled(not connected)
         
         self.available_combo.setVisible(connected)
         self.add_channel_btn.setVisible(connected)
+        
+        # Show playback controls only when file source is connected
+        self.playback_widget.setVisible(connected and self._is_file_source_mode)
+
+    def set_file_source_mode(self, enabled: bool) -> None:
+        """
+        Toggle file source mode which shows special UI elements.
+        
+        When enabled:
+        - Connect button says "Browse..."
+        - Playback controls become visible when connected
+        """
+        self._is_file_source_mode = enabled
+        
+        # Update button text if not connected
+        if not self._connected:
+            self.device_toggle_btn.setText("Browse..." if enabled else "Click to Connect")
+        
+        # Update playback widget visibility
+        self.playback_widget.setVisible(self._connected and enabled)
+        
+        # Clear sample rate when switching to file source (will be populated after file selection)
+        if enabled and not self._connected:
+            self.sample_rate_combo.blockSignals(True)
+            self.sample_rate_combo.clear()
+            self.sample_rate_combo.blockSignals(False)
 
     def get_selected_device_key(self) -> Optional[str]:
         """Return the currently selected device key."""
@@ -268,6 +354,37 @@ class DeviceControlWidget(QtWidgets.QWidget):
         if 0 <= index < self.active_combo.count():
             self.active_combo.setCurrentIndex(index)
 
+    # Public API - Playback Controls
+
+    def update_playback_position(self, position_secs: float, total_secs: float) -> None:
+        """Update the playback position display (for file source)."""
+        self._total_duration_secs = total_secs
+        
+        # Update time label
+        self.time_label.setText(f"{_format_time(position_secs)} / {_format_time(total_secs)}")
+        
+        # Update slider (only if not being dragged)
+        if not self.position_slider.isSliderDown():
+            if total_secs > 0:
+                slider_pos = int((position_secs / total_secs) * 1000)
+                self.position_slider.blockSignals(True)
+                self.position_slider.setValue(slider_pos)
+                self.position_slider.blockSignals(False)
+
+    def set_playing(self, is_playing: bool) -> None:
+        """Update the play/pause button state."""
+        self.play_pause_btn.blockSignals(True)
+        self.play_pause_btn.setChecked(is_playing)
+        self.play_pause_btn.setText("⏸" if is_playing else "▶")
+        self.play_pause_btn.blockSignals(False)
+
+    def reset_playback_controls(self) -> None:
+        """Reset playback controls to initial state."""
+        self._total_duration_secs = 0.0
+        self.time_label.setText("0:00.00 / 0:00.00")
+        self.position_slider.setValue(0)
+        self.set_playing(False)
+
     # Signal handlers
 
     def _on_device_selected(self) -> None:
@@ -276,17 +393,18 @@ class DeviceControlWidget(QtWidgets.QWidget):
         if device_key is not None:
             self.deviceSelected.emit(device_key)
 
-    # def _on_scan_clicked(self) -> None:
-    #     """Handle scan hardware button click."""
-    #     self.deviceScanRequested.emit()
-
     def _on_toggle_clicked(self, checked: bool) -> None:
         """Handle connect/disconnect button click."""
         if checked:
             device_key = self.get_selected_device_key()
             sample_rate = self.get_selected_sample_rate()
-            if device_key and sample_rate > 0:
-                self.deviceConnectRequested.emit(device_key, sample_rate)
+            # For file source, sample rate may be 0 (determined after file selection)
+            if device_key:
+                if self._is_file_source_mode or sample_rate > 0:
+                    self.deviceConnectRequested.emit(device_key, sample_rate)
+                else:
+                    # No sample rate selected
+                    self.device_toggle_btn.setChecked(False)
         else:
             self.deviceDisconnectRequested.emit()
 
@@ -296,10 +414,6 @@ class DeviceControlWidget(QtWidgets.QWidget):
         if rate > 0:
             self.sampleRateChanged.emit(rate)
 
-    def _on_settings_toggled(self, checked: bool) -> None:
-        """Handle settings button toggle."""
-        self.settingsToggled.emit(checked)
-
     def _on_add_channel(self) -> None:
         """Handle add channel button click."""
         ch_info = self.available_combo.currentData()
@@ -307,3 +421,18 @@ class DeviceControlWidget(QtWidgets.QWidget):
             ch_id = getattr(ch_info, "id", None)
             if ch_id is not None:
                 self.channelAddRequested.emit(ch_id)
+
+    def _on_play_pause_toggled(self, checked: bool) -> None:
+        """Handle play/pause button toggle."""
+        # checked = True means button is pressed (paused state visually), but we invert for playback
+        is_playing = checked
+        self.play_pause_btn.setText("⏸" if is_playing else "▶")
+        self.playPauseToggled.emit(is_playing)
+
+    def _on_slider_released(self) -> None:
+        """Handle slider release for seeking."""
+        if self._total_duration_secs <= 0:
+            return
+        slider_pos = self.position_slider.value()
+        position_secs = (slider_pos / 1000.0) * self._total_duration_secs
+        self.seekRequested.emit(position_secs)

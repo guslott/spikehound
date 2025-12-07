@@ -38,8 +38,15 @@ def list_output_devices(list_all: bool = False) -> List[Dict[str, object]]:
     try:
         playback_devices = miniaudio.Devices().get_playbacks()
         for idx, dev in enumerate(playback_devices):
-            label = dev.name
-            devices.append({"id": dev.id, "label": label, "name": dev.name})
+            # Handle both object attributes and dict access (miniaudio version differences)
+            if isinstance(dev, dict):
+                dev_id = dev.get("id", idx)
+                dev_name = dev.get("name", f"Device {idx}")
+            else:
+                dev_id = getattr(dev, "id", idx)
+                dev_name = getattr(dev, "name", f"Device {idx}")
+            
+            devices.append({"id": dev_id, "label": dev_name, "name": dev_name})
             
             if not list_all:
                 # Just return the first one (default)
@@ -48,6 +55,7 @@ def list_output_devices(list_all: bool = False) -> List[Dict[str, object]]:
         logger.warning("Failed to list output devices: %s", exc)
         return []
     return devices
+
 
 
 class AudioPlayer(threading.Thread):

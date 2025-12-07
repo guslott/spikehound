@@ -61,7 +61,27 @@ class AnalysisDock(QtWidgets.QDockWidget):
         tab_bar = self._tabs.tabBar()
         tab_bar.setTabButton(0, QtWidgets.QTabBar.RightSide, None)
 
+    def set_settings_widget(self, widget: QtWidgets.QWidget, title: str = "Settings") -> None:
+        """
+        Add a permanent Settings tab (non-closable) next to Scope.
+        
+        This replaces the toggle-based settings panel with a permanent tab.
+        """
+        if self._settings_widget is not None:
+            idx = self._tabs.indexOf(self._settings_widget)
+            if idx >= 0:
+                self._tabs.removeTab(idx)
+        self._settings_widget = widget
+        widget.setParent(self._tabs)
+        # Insert after Scope (index 1)
+        insert_index = 1 if self._scope_widget is not None else 0
+        self._tabs.insertTab(insert_index, widget, title)
+        # Remove close button from this tab
+        tab_bar = self._tabs.tabBar()
+        tab_bar.setTabButton(insert_index, QtWidgets.QTabBar.RightSide, None)
+
     def select_scope(self) -> None:
+
         if self._scope_widget is None:
             return
         idx = self._tabs.indexOf(self._scope_widget)
@@ -149,14 +169,15 @@ class AnalysisDock(QtWidgets.QDockWidget):
         widget = self._tabs.widget(index)
         if widget is None:
             return
+        # Don't allow closing the permanent Scope or Settings tabs
         if widget is self._scope_widget:
             self._tabs.setCurrentIndex(index)
             return
         if widget is self._settings_widget:
-            self.close_settings()
-            if not self._tab_info:
-                self.select_scope()
+            # Settings is now permanent; just switch to it
+            self._tabs.setCurrentIndex(index)
             return
+
         self._tabs.removeTab(index)
         info = self._tab_info.pop(widget, None)
         worker = None

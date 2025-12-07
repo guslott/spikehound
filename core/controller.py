@@ -160,8 +160,23 @@ class DeviceManager(QtCore.QObject):
         driver.open(target.id)
         channels = driver.list_available_channels(target.id)
 
+        # For devices that determine sample rate after opening (e.g., FileSource),
+        # get the sample rate from the driver's capabilities
+        effective_sample_rate = sample_rate
+        if effective_sample_rate <= 0:
+            try:
+                caps = driver.get_capabilities(target.id)
+                if caps.sample_rates and len(caps.sample_rates) > 0:
+                    effective_sample_rate = caps.sample_rates[0]
+            except Exception:
+                pass
+        
+        if effective_sample_rate <= 0:
+            driver.close()
+            raise RuntimeError("Could not determine sample rate for device")
+
         configure_kwargs = {
-            "sample_rate": int(sample_rate),
+            "sample_rate": int(effective_sample_rate),
             "channels": [ch.id for ch in channels] if channels else None,
             "chunk_size": chunk_size,
         }
@@ -180,6 +195,7 @@ class DeviceManager(QtCore.QObject):
         # NOTE: deviceConnected signal is now emitted from runtime.connect_device()
         # after attach_source() completes to ensure dispatcher is ready
         return driver
+
 
     def disconnect_device(self) -> None:
         if self._driver is None:
@@ -841,10 +857,13 @@ class PipelineController:
         except Exception as exc:
             logger.warning("Failed to start dispatcher: %s", exc)
         try:
-            self._source.start()
+            # Only start if not already running
+            if not self._source.running:
+                self._source.start()
         except Exception as exc:
             logger.warning("Failed to start source: %s", exc)
         self._streaming = True
+
 
     def _stop_streaming_locked(self) -> None:
         if not self._streaming:
