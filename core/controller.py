@@ -337,6 +337,13 @@ class PipelineController:
         """Return True if currently recording to a WAV file."""
         return self._wav_logger is not None
 
+    @property
+    def recording_duration_seconds(self) -> float:
+        """Return the actual duration of recorded audio based on frames written."""
+        if self._wav_logger is None:
+            return 0.0
+        return self._wav_logger.duration_seconds
+
     def active_channels(self) -> Sequence[ChannelInfo]:
         return [] if self._actual_config is None else list(self._actual_config.channels)
 

@@ -2150,10 +2150,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._recording_start_time = None
 
     def _update_recording_duration(self) -> None:
-        """Update the record button with elapsed time."""
-        if self._recording_start_time is None:
+        """Update the record button with elapsed time based on actual data logged."""
+        if self._controller is None:
             return
-        elapsed = time.perf_counter() - self._recording_start_time
+        
+        # Get actual duration from controller (based on frames written)
+        elapsed = self._controller.recording_duration_seconds
         minutes = int(elapsed // 60)
         seconds = int(elapsed % 60)
         self.record_toggle_btn.setText(f"Stop Recording ({minutes:02d}:{seconds:02d})")
