@@ -547,6 +547,11 @@ class Dispatcher:
             self._stop_event.wait(self._tick_interval)
 
     def _collect_window_payload(self) -> Optional[dict]:
+        # PERFORMANCE FIX: Minimize lock holding time to prevent blocking DAQ writes.
+        # Capture only the necessary state snapshot under the lock, then release it
+        # before doing expensive buffer reads and data copies.
+        
+        # Phase 1: Quick state snapshot under lock
         with self._ring_lock:
             status = {
                 "sample_rate": float(self._sample_rate or 0.0),
@@ -568,31 +573,57 @@ class Dispatcher:
             if window_samples <= 0:
                 return self._empty_payload(status)
 
+            # Capture just the read position - the actual read happens outside the lock
             start = (self._write_idx - window_samples) % capacity
-            data = np.array(self.viz_buffer.read(start, window_samples), copy=True, dtype=np.float32)
+            
+            # Snapshot state needed for post-processing
+            active_channel_ids = list(self._active_channel_ids)
+            channel_index_map = dict(self._channel_index_map)
+            channel_ids_tuple = self._channel_ids
+            channel_names_tuple = self._channel_names
+            
+            # Get reference to buffer (safe - buffer object is stable)
+            viz_buffer = self.viz_buffer
+        # Lock released here
+        
+        # Phase 2: Expensive operations outside the lock
+        # This allows DAQ thread to write new data while GUI processes
+        try:
+            data = np.array(viz_buffer.read(start, window_samples), copy=True, dtype=np.float32)
+        except Exception:
+            # Buffer may have been resized/replaced - return empty
+            return self._empty_payload(status)
+        
+        if data.size == 0:
+            return self._empty_payload(status)
 
-            if self._active_channel_ids:
-                indices = [self._channel_index_map[cid] for cid in self._active_channel_ids if cid in self._channel_index_map]
-            else:
-                indices = list(range(data.shape[0]))
-            if not indices:
-                return self._empty_payload(status)
+        # Compute channel indices
+        if active_channel_ids:
+            indices = [channel_index_map[cid] for cid in active_channel_ids if cid in channel_index_map]
+        else:
+            indices = list(range(data.shape[0]))
+        if not indices:
+            return self._empty_payload(status)
 
-            safe_indices = [idx for idx in indices if 0 <= idx < data.shape[0]]
-            if not safe_indices:
-                return self._empty_payload(status)
-            data = data[safe_indices, :]
-            channel_ids = [self._channel_ids[idx] if idx < len(self._channel_ids) else idx for idx in safe_indices]
-            channel_names = [self._channel_names[idx] if idx < len(self._channel_names) else str(channel_ids[i]) for i, idx in enumerate(safe_indices)]
-            actual_window_sec = window_samples / sample_rate if sample_rate else 0.0
-            times = np.linspace(0.0, actual_window_sec, window_samples, endpoint=False, dtype=np.float32)
-            return {
-                "channel_ids": channel_ids,
-                "channel_names": channel_names,
-                "samples": data,
-                "times": times,
-                "status": status,
-            }
+        safe_indices = [idx for idx in indices if 0 <= idx < data.shape[0]]
+        if not safe_indices:
+            return self._empty_payload(status)
+            
+        # Slice data to active channels only
+        data = data[safe_indices, :]
+        channel_ids = [channel_ids_tuple[idx] if idx < len(channel_ids_tuple) else idx for idx in safe_indices]
+        channel_names = [channel_names_tuple[idx] if idx < len(channel_names_tuple) else str(channel_ids[i]) for i, idx in enumerate(safe_indices)]
+        
+        actual_window_sec = window_samples / sample_rate if sample_rate else 0.0
+        times = np.linspace(0.0, actual_window_sec, window_samples, endpoint=False, dtype=np.float32)
+        
+        return {
+            "channel_ids": channel_ids,
+            "channel_names": channel_names,
+            "samples": data,
+            "times": times,
+            "status": status,
+        }
 
     def collect_window(
         self,
@@ -608,12 +639,18 @@ class Dispatcher:
         (samples, missing_prefix, missing_suffix) where the missing values
         indicate how many samples at the start/end were unavailable.
         """
+        # PERFORMANCE FIX: Minimize lock holding time to prevent blocking DAQ writes.
+        # Capture only the necessary state snapshot under the lock, then release it
+        # before doing expensive buffer reads and data assembly.
+        
         window_samples = int(window_samples)
         if window_samples <= 0:
             result = np.empty(0, dtype=np.float32)
             if return_info:
                 return result, 0, 0
             return result
+        
+        # Phase 1: Quick state snapshot under lock
         with self._ring_lock:
             if self._filled == 0 or self._latest_sample_index < 0 or self.viz_buffer.capacity <= 0:
                 zeros = np.zeros(window_samples, dtype=np.float32)
@@ -621,7 +658,8 @@ class Dispatcher:
                     return zeros, window_samples, window_samples
                 return zeros
             channel_idx = self._channel_index_map.get(int(channel_id))
-            if channel_idx is None or not (0 <= channel_idx < self.viz_buffer.shape[0]):
+            buffer_n_channels = self.viz_buffer.shape[0]
+            if channel_idx is None or not (0 <= channel_idx < buffer_n_channels):
                 zeros = np.zeros(window_samples, dtype=np.float32)
                 if return_info:
                     return zeros, window_samples, window_samples
@@ -637,52 +675,74 @@ class Dispatcher:
                 if return_info:
                     return zeros, window_samples, window_samples
                 return zeros
+            
+            # Capture state needed after lock release
             earliest = self._latest_sample_index - (self._filled - 1)
             latest = self._latest_sample_index + 1  # exclusive
-            desired_start = start_idx
-            desired_end = start_idx + window_samples
-            actual_start = max(desired_start, earliest)
-            actual_end = min(desired_end, latest)
-            if actual_start >= actual_end:
-                zeros = np.zeros(window_samples, dtype=np.float32)
-                if return_info:
-                    return zeros, window_samples, window_samples
-                return zeros
-            missing_prefix = max(0, earliest - desired_start)
-            missing_suffix = max(0, desired_end - latest)
-            available_count = window_samples - missing_prefix - missing_suffix
-            if available_count <= 0:
-                zeros = np.zeros(window_samples, dtype=np.float32)
-                if return_info:
-                    return zeros, window_samples, window_samples
-                return zeros
+            write_idx = self._write_idx
+            filled = self._filled
             buffer_len = self.viz_buffer.capacity
-            if buffer_len <= 0:
-                zeros = np.zeros(window_samples, dtype=np.float32)
-                if return_info:
-                    return zeros, window_samples, window_samples
-                return zeros
-            start_ptr = (self._write_idx - self._filled) % buffer_len
-            start_offset = actual_start - earliest
-            start_pos = (start_ptr + start_offset) % buffer_len
-            block = self.viz_buffer.read(start_pos, available_count)
-            channel_data = np.array(block[channel_idx], copy=True)
-            extracted: np.ndarray = channel_data
-            if extracted.size > available_count:
-                extracted = extracted[:available_count]
-            result = np.empty(window_samples, dtype=np.float32)
-            pos = 0
-            if missing_prefix > 0:
-                result[:missing_prefix] = 0.0
-                pos = missing_prefix
-            if extracted.size:
-                result[pos : pos + extracted.size] = extracted
-                pos += extracted.size
-            if pos < window_samples:
-                result[pos:] = 0.0
+            
+            # Get reference to buffer (safe - buffer object is stable)
+            viz_buffer = self.viz_buffer
+        # Lock released here
+        
+        # Phase 2: Compute positions (no lock needed, using snapshot values)
+        desired_start = start_idx
+        desired_end = start_idx + window_samples
+        actual_start = max(desired_start, earliest)
+        actual_end = min(desired_end, latest)
+        if actual_start >= actual_end:
+            zeros = np.zeros(window_samples, dtype=np.float32)
             if return_info:
-                return result, missing_prefix, missing_suffix
-            return result
+                return zeros, window_samples, window_samples
+            return zeros
+        missing_prefix = max(0, earliest - desired_start)
+        missing_suffix = max(0, desired_end - latest)
+        available_count = window_samples - missing_prefix - missing_suffix
+        if available_count <= 0:
+            zeros = np.zeros(window_samples, dtype=np.float32)
+            if return_info:
+                return zeros, window_samples, window_samples
+            return zeros
+        if buffer_len <= 0:
+            zeros = np.zeros(window_samples, dtype=np.float32)
+            if return_info:
+                return zeros, window_samples, window_samples
+            return zeros
+        start_ptr = (write_idx - filled) % buffer_len
+        start_offset = actual_start - earliest
+        start_pos = (start_ptr + start_offset) % buffer_len
+        
+        # Phase 3: Expensive buffer read outside the lock
+        # This allows DAQ thread to write new data while GUI processes
+        try:
+            block = viz_buffer.read(start_pos, available_count)
+            channel_data = np.array(block[channel_idx], copy=True)
+        except Exception:
+            # Buffer may have been resized/replaced - return zeros
+            zeros = np.zeros(window_samples, dtype=np.float32)
+            if return_info:
+                return zeros, window_samples, window_samples
+            return zeros
+        
+        # Phase 4: Assemble result (no lock needed)
+        extracted: np.ndarray = channel_data
+        if extracted.size > available_count:
+            extracted = extracted[:available_count]
+        result = np.empty(window_samples, dtype=np.float32)
+        pos = 0
+        if missing_prefix > 0:
+            result[:missing_prefix] = 0.0
+            pos = missing_prefix
+        if extracted.size:
+            result[pos : pos + extracted.size] = extracted
+            pos += extracted.size
+        if pos < window_samples:
+            result[pos:] = 0.0
+        if return_info:
+            return result, missing_prefix, missing_suffix
+        return result
 
     def _ensure_viz_buffer_locked(self, channels: int, *, min_capacity: int = 1) -> None:
         channels = max(1, int(channels))

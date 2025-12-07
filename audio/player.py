@@ -62,8 +62,10 @@ class AudioPlayer(threading.Thread):
     """
     Consumes Chunk/ChunkPointer-like objects from an audio_queue. Each item must
     resolve to samples shaped (frames, channels) at input_sr. We select one
-    channel, resample to out_sr (linear interpolation), and play via
-    miniaudio.PlaybackDevice.
+    channel and play via miniaudio.PlaybackDevice.
+    
+    OPTIMIZATION: miniaudio handles resampling from input_sr to the hardware
+    rate in C, which is significantly faster and lower latency than Python.
     """
 
     def __init__(
@@ -85,15 +87,14 @@ class AudioPlayer(threading.Thread):
         self._selected: Optional[int] = selected_channel
         self._ring_buffer = ring_buffer
 
-        # --- Output ring buffer (mono at out_sr) ---
-        ring_len = max(self.cfg.blocksize * 4, int(self.cfg.out_samplerate * self.cfg.ring_seconds))
+        # --- Output ring buffer (mono at INPUT rate - miniaudio handles resampling) ---
+        # OPTIMIZATION: Store data at input rate, not output rate.
+        # This uses less memory (e.g., 10kHz vs 44.1kHz) and reduces latency.
+        ring_len = max(self.cfg.blocksize * 4, int(self.in_sr * self.cfg.ring_seconds))
         self._ring = np.zeros(ring_len, dtype=np.float32)
         self._r_head = 0  # write index
         self._r_tail = 0  # read index
         self._r_lock = threading.Lock()
-
-        # For interpolation time tracking
-        self._t_in_cursor = 0.0  # seconds in input timebase
 
         self._stop_evt = threading.Event()
         self._device: Optional[miniaudio.PlaybackDevice] = None
@@ -212,41 +213,9 @@ class AudioPlayer(threading.Thread):
 
         return data
 
-    # ---- Resampling (linear interpolation) -----------------------------------
-
-    def _resample_block(self, mono_in: np.ndarray) -> np.ndarray:
-        """
-        Convert mono_in at in_sr -> out_sr using linear interpolation.
-        Keeps a rolling input-time cursor so blocks stitch together.
-        """
-        if mono_in.size == 0:
-            return mono_in.astype(np.float32)
-
-        # OPTIMIZATION: Zero-cost bypass if rates match
-        # This saves massive CPU cycles by skipping np.interp
-        if abs(self.in_sr - self.cfg.out_samplerate) < 1.0:
-            # Advance cursor to keep state consistent
-            dt_in = 1.0 / self.in_sr
-            self._t_in_cursor += mono_in.size * dt_in
-            return mono_in.astype(np.float32)
-
-        # Input times for this block (seconds)
-        N = mono_in.size
-        t0 = self._t_in_cursor
-        dt_in = 1.0 / self.in_sr
-        t = t0 + np.arange(N, dtype=np.float64) * dt_in
-        self._t_in_cursor = t[-1] + dt_in  # advance cursor to "just after" this block
-
-        # Output times covering [t[0], t[-1]] at out_sr
-        dt_out = 1.0 / self.cfg.out_samplerate
-        n_out = int(np.floor((t[-1] - t[0]) / dt_out)) + 1
-        if n_out <= 1:
-            return np.zeros(0, dtype=np.float32)
-        t_out = np.linspace(t[0], t[0] + (n_out - 1) * dt_out, num=n_out, dtype=np.float64)
-
-        # Interpolate
-        y = np.interp(t_out, t, mono_in.astype(np.float64, copy=False)).astype(np.float32, copy=False)
-        return y
+    # ---- Resampling removed ---------------------------------------------------
+    # OPTIMIZATION: miniaudio handles resampling from in_sr to hardware rate in C.
+    # This eliminates Python overhead from np.interp and reduces latency.
 
     # ---- Miniaudio generator -------------------------------------------------
 
@@ -274,15 +243,19 @@ class AudioPlayer(threading.Thread):
     # ---- Thread body ---------------------------------------------------------
 
     def run(self) -> None:
-        # Calculate buffer size in milliseconds
-        buf_msec = max(5, int(self.cfg.blocksize * 4 * 1000 / self.cfg.out_samplerate))
+        # OPTIMIZATION: Calculate buffer size based on INPUT rate.
+        # We target ~20-30ms latency. 4 blocks of 128 frames at 20kHz is ~25ms.
+        buf_msec = max(10, int(self.cfg.blocksize * 4 * 1000 / self.in_sr))
         
-        # Configure miniaudio device
+        # Configure miniaudio device with INPUT sample rate.
+        # miniaudio handles resampling to hardware rate (e.g., 44.1kHz) in C,
+        # which is significantly faster and lower latency than Python.
         try:
             self._device = miniaudio.PlaybackDevice(
                 device_id=self.cfg.device,
                 nchannels=self.cfg.out_channels,
-                sample_rate=self.cfg.out_samplerate,
+                # OPTIMIZATION: Use input rate. Miniaudio handles resampling to hardware rate.
+                sample_rate=self.in_sr,
                 output_format=miniaudio.SampleFormat.FLOAT32,
                 buffersize_msec=buf_msec,
             )
@@ -294,7 +267,7 @@ class AudioPlayer(threading.Thread):
             self._device.start(gen)
             
         except Exception as e:
-            print(f"Error starting miniaudio device: {e}")
+            logger.error(f"Error starting miniaudio device: {e}")
             return
 
         try:
@@ -307,20 +280,24 @@ class AudioPlayer(threading.Thread):
 
                 data = self._extract_frames(ch)
                 if data is None:
-                    #Unknown message type - ignore but keep draining.
+                    # Unknown message type - ignore but keep draining.
                     continue
                 if self._selected is None or self._selected >= data.shape[1]:
-                    #muted or invalid selection
+                    # Muted or invalid selection
                     continue
+                
+                # Extract mono channel
                 mono_in = data[:, self._selected]
-                mono_out = self._resample_block(mono_in)
-
-                if mono_out.size:
-                    # very soft limiter to avoid clipping if spikes are tall
-                    peak = float(np.max(np.abs(mono_out)))
+                
+                # OPTIMIZATION: Removed _resample_block() call.
+                # Write raw input samples directly to ring buffer.
+                # miniaudio handles resampling to hardware rate in C.
+                if mono_in.size:
+                    # Very soft limiter to avoid clipping if spikes are tall
+                    peak = float(np.max(np.abs(mono_in)))
                     if peak > 1.5:
-                        mono_out = mono_out / peak
-                    self._ring_write(mono_out)
+                        mono_in = mono_in / peak
+                    self._ring_write(mono_in)
         finally:
             if self._device and self._device.running:
                 self._device.stop()
