@@ -34,6 +34,7 @@ from .device_manager import DeviceManager
 from .recording_control_widget import RecordingControlWidget
 from .scope_config_manager import ScopeConfigManager, ScopeConfigProvider
 from .trigger_control_widget import TriggerControlWidget
+from .channel_manager import ChannelManager
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -84,15 +85,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._channel_last_samples: Dict[int, np.ndarray] = {}
         self._channel_display_buffers: Dict[int, np.ndarray] = {}
         self._last_times: np.ndarray = np.zeros(0, dtype=np.float32)
-        self._channel_color_cycle: List[QtGui.QColor] = [
-            QtGui.QColor(0, 0, 139),
-            QtGui.QColor(178, 34, 34),
-            QtGui.QColor(0, 105, 148),
-            QtGui.QColor(34, 139, 34),
-            QtGui.QColor(128, 0, 128),
-            QtGui.QColor(255, 140, 0),
-        ]
-        self._next_color_index = 0
+        # Color cycle now managed by ChannelManager
         self._current_sample_rate: float = 0.0
         self._analysis_sample_rate: float = 0.0
         self._current_window_sec: float = 1.0
@@ -194,10 +187,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._analysis_dock.select_scope()
 
     def _reset_color_cycle(self) -> None:
-        """Reset channel color selection to the initial palette order."""
-        self._next_color_index = 0
+        """Delegate to ChannelManager."""
+        self._channel_manager.reset_color_cycle()
 
-        # Global shortcuts for quitting/closing
+    def _setup_quit_shortcut(self) -> None:
+        """Set up global shortcuts for quitting/closing."""
         quit_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Quit), self)
         quit_shortcut.activated.connect(self._quit_application)
 
@@ -346,14 +340,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_control = DeviceControlWidget(self)
         self.channel_controls = ChannelControlsWidget(self)
         
-
+        # Create ChannelManager to centralize channel state management
+        self._channel_manager = ChannelManager(
+            channel_controls=self.channel_controls,
+            device_control=self.device_control,
+            parent=self,
+        )
+        # Wire ChannelManager signals
+        self._channel_manager.channelConfigChanged.connect(self._on_channel_manager_config_changed)
+        self._channel_manager.activeChannelChanged.connect(self._on_channel_manager_active_changed)
+        self._channel_manager.channelsUpdated.connect(self._on_channel_manager_channels_updated)
+        self._channel_manager.listenChannelRequested.connect(self._handle_listen_change)
+        self._channel_manager.analysisRequested.connect(self._open_analysis_for_channel)
+        self._channel_manager.filterSettingsChanged.connect(self._sync_filter_settings)
         
         # Connect DeviceControlWidget signals
         self.device_control.deviceSelected.connect(self._on_device_selected)
         self.device_control.deviceConnectRequested.connect(self._on_device_connect_requested)
         self.device_control.deviceDisconnectRequested.connect(self._on_device_disconnect_requested)
         self.device_control.channelAddRequested.connect(self._on_channel_add_requested)
-        self.channel_controls.activeChannelSelected.connect(self._on_active_list_index_changed)
+        # Note: activeChannelSelected is now handled by ChannelManager
         
         # Connect playback control signals (for file source)
         self.device_control.playPauseToggled.connect(self._on_playback_toggled)
@@ -795,14 +801,55 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_channel_add_requested(self, channel_id: int) -> None:
         """Handle add channel request from DeviceControlWidget."""
-        self._on_add_channel()
+        added_id = self._channel_manager.on_add_channel()
+        if added_id is not None:
+            self._update_channel_buttons()
+            self._publish_active_channels()
+            self._set_active_channel_focus(added_id)
 
+    # -------------------------------------------------------------------------
+    # ChannelManager Signal Handlers
+    # -------------------------------------------------------------------------
 
-    def _on_active_list_index_changed(self, index: int) -> None:
-        """Handle active channel selection change by index."""
-        if 0 <= index < self.channel_controls.active_combo.count():
-            info = self.channel_controls.active_combo.itemData(index)
-            self._on_active_channel_selected(info)
+    @QtCore.Slot(int, ChannelConfig)
+    def _on_channel_manager_config_changed(self, channel_id: int, config: ChannelConfig) -> None:
+        """Handle channel config changes from ChannelManager."""
+        # Update local cached state
+        self._channel_configs[channel_id] = config
+        
+        # Update trigger visuals if this is the trigger channel
+        if self._trigger_controller.channel_id is not None and channel_id == self._trigger_controller.channel_id:
+            cfg = {
+                "mode": self._trigger_controller.mode,
+                "threshold": self._trigger_controller.threshold,
+                "channel_index": self._trigger_controller.channel_id,
+                "pretrigger_frac": self._trigger_controller.pre_seconds
+            }
+            self._update_trigger_visuals(cfg)
+        
+        # Update channel display
+        self._update_channel_display(channel_id)
+        self._refresh_channel_layout()
+        
+        if self._active_channel_id == channel_id:
+            self._update_axis_label()
+
+    @QtCore.Slot(object)
+    def _on_channel_manager_active_changed(self, channel_id: object) -> None:
+        """Handle active channel changes from ChannelManager."""
+        self._active_channel_id = channel_id
+        self._apply_active_channel_style()
+        self._update_plot_y_range()
+
+    @QtCore.Slot(list, list)
+    def _on_channel_manager_channels_updated(self, channel_ids: List[int], channel_names: List[str]) -> None:
+        """Handle channel list updates from ChannelManager."""
+        # Sync local state
+        self._channel_ids_current = list(channel_ids)
+        self._channel_names = list(channel_names)
+        
+        # This is handled by _publish_active_channels for now, 
+        # but will eventually be fully managed by ChannelManager
 
 
     def _on_devices_changed(self, entries: List[dict]) -> None:
@@ -1043,56 +1090,49 @@ class MainWindow(QtWidgets.QMainWindow):
         self._publish_active_channels()
         self._update_sample_rate_enabled()
 
-    def _on_add_channel(self) -> None:
-        idx = self.device_control.available_combo.currentIndex()
-        if idx < 0:
-            return
-        info = self.device_control.available_combo.itemData(idx)
-        text = self.device_control.available_combo.currentText()
-        
-        self.channel_controls.active_combo.addItem(text, info)
-        self.device_control.available_combo.removeItem(idx)
-        
-        if self.device_control.available_combo.count():
-            self.device_control.available_combo.setCurrentIndex(min(idx, self.device_control.available_combo.count() - 1))
-            
-        # Activate and focus the newly added channel without extra signal chatter.
-        self.channel_controls.active_combo.blockSignals(True)
-        self.channel_controls.active_combo.setCurrentIndex(self.channel_controls.active_combo.count() - 1)
-        self.channel_controls.active_combo.blockSignals(False)
-        
-        self._update_channel_buttons()
-        self._publish_active_channels()
-        self._set_active_channel_focus(getattr(info, "id", None))
-        pass # _emit_trigger_config removed
-
 
     def _publish_active_channels(self) -> None:
-        infos = []
-        for index in range(self.channel_controls.active_combo.count()):
-            info = self.channel_controls.active_combo.itemData(index)
-            if info is not None:
-                infos.append(info)
-        self._active_channel_infos = infos
+        # Delegate channel collection to ChannelManager
+        ids, names = self._channel_manager.publish_active_channels()
+        
+        # Sync local state from ChannelManager
+        self._active_channel_infos = self._channel_manager.active_channel_infos
+        self._channel_ids_current = list(ids)
+        self._channel_names = list(names)
+        
         self._update_channel_buttons()
-        ids = [getattr(info, "id", None) for info in infos]
-        ids = [cid for cid in ids if cid is not None]
-        names = [getattr(info, "name", str(info)) for info in infos]
+        
+        # Check if channels changed for trigger reset
         if list(ids) != self._channel_ids_current:
             self._reset_trigger_state()
-        self._sync_channel_panels(ids, names)
+        
+        # Sync panels via ChannelManager
+        self._channel_manager.sync_channel_panels(
+            ids, names,
+            analysis_dock=getattr(self, "_analysis_dock", None),
+        )
+        # CRITICAL: Sync configs and panels back to MainWindow BEFORE resetting scope
+        # This ensures PlotManager gets the correct configs for creating renderers
+        self._channel_panels = self._channel_manager.channel_panels
+        self._channel_configs = self._channel_manager.channel_configs
+        
         self._reset_scope_for_channels(ids, names)
         self._sync_filter_settings()
-        self._ensure_active_channel_focus()
+        
+        # Sync active channel focus via ChannelManager
+        self._channel_manager.ensure_active_channel_focus()
+        self._active_channel_id = self._channel_manager.active_channel_id
+        
         self._channel_last_samples = {cid: self._channel_last_samples[cid] for cid in ids if cid in self._channel_last_samples}
         self._channel_display_buffers = {cid: self._channel_display_buffers[cid] for cid in ids if cid in self._channel_display_buffers}
+        
         if self._listen_channel_id is not None and self._listen_channel_id not in ids:
             self._clear_listen_channel()
+        
+        infos = self._active_channel_infos
         if infos:
             self.set_trigger_channels(infos)
-            # Ensure trigger control updates its state
         else:
-            # Clear trigger channels via API if needed, but set_trigger_channels([]) does it
             self.set_trigger_channels([])
 
         if ids:
@@ -1116,129 +1156,39 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._controller and hasattr(self._controller, '_audio_manager') and self._controller._audio_manager:
             self._controller._audio_manager.update_active_channels(ids)
 
-    def _next_channel_color(self) -> QtGui.QColor:
-        color = self._channel_color_cycle[self._next_color_index % len(self._channel_color_cycle)]
-        self._next_color_index += 1
-        return QtGui.QColor(color)
-
-    def _initial_screen_offset(self) -> float:
-        """Pick a starting offset; default all new channels to center."""
-        return 0.5
 
     def _ensure_channel_config(self, channel_id: int, channel_name: str) -> ChannelConfig:
-        config = self._channel_configs.get(channel_id)
-        if config is None:
-            color = self._next_channel_color()
-            # print(f"Creating NEW config for ch{channel_id}, color={color}")
-            config = ChannelConfig(
-                color=color,
-                channel_name=channel_name,
-                screen_offset=self._initial_screen_offset(),
-            )
-            self._channel_configs[channel_id] = config
-        else:
-            # print(f"Reusing config for ch{channel_id}, existing color={config.color}")
-            config.channel_name = channel_name
-        return config
+        """Delegate to ChannelManager."""
+        return self._channel_manager.ensure_channel_config(channel_id, channel_name)
 
     def _sync_channel_panels(self, channel_ids: Sequence[int], channel_names: Sequence[str]) -> None:
-        desired = {cid: name for cid, name in zip(channel_ids, channel_names)}
-        for cid, panel in list(self._channel_panels.items()):
-            if cid not in desired:
-                config = self._channel_configs.get(cid)
-                if config is not None and hasattr(self, "_analysis_dock"):
-                    channel_name = config.channel_name or f"Channel {cid}"
-                    self._analysis_dock.close_tab(channel_name)
-                self.channel_controls.remove_panel(cid)
-                del self._channel_panels[cid]
-                self._channel_configs.pop(cid, None)
-        if not channel_ids:
-            self._show_channel_panel(None)
-            return
-        for cid, name in desired.items():
-            config = self._ensure_channel_config(cid, name)
-            panel = self._channel_panels.get(cid)
-            if panel is None:
-                panel = ChannelDetailPanel(cid, name, self.channel_controls.stack)
-                panel.configChanged.connect(lambda cfg, cid=cid: self._on_channel_config_changed(cid, cfg))
-                panel.analysisRequested.connect(lambda cid=cid: self._open_analysis_for_channel(cid))
-                self.channel_controls.add_panel(cid, panel)
-                self._channel_panels[cid] = panel
-            panel.set_config(config)
-        idx = self.channel_controls.active_combo.currentIndex()
-        if idx >= 0:
-            info = self.channel_controls.active_combo.itemData(idx)
-            cid = getattr(info, "id", None)
-            self._show_channel_panel(cid)
-        else:
-            self._show_channel_panel(channel_ids[0] if channel_ids else None)
-            if channel_ids:
-                self._set_active_channel_focus(channel_ids[0])
+        """Delegate to ChannelManager."""
+        self._channel_manager.sync_channel_panels(
+            channel_ids, channel_names,
+            analysis_dock=getattr(self, "_analysis_dock", None),
+        )
+        # Sync local state
+        self._channel_panels = self._channel_manager.channel_panels
+        self._channel_configs = self._channel_manager.channel_configs
 
     def _clear_channel_panels(self) -> None:
-        self.channel_controls.clear_panels()
-        self._channel_panels.clear()
-        # Don't clear _channel_configs - configs should persist so channels maintain
-        # their color/settings when re-added. Configs are cleared on device disconnect.
+        """Delegate to ChannelManager."""
+        self._channel_manager.clear_channel_panels()
+        # Clear local display buffers
         self._channel_last_samples.clear()
         self._channel_display_buffers.clear()
-        self._show_channel_panel(None)
 
     def _show_channel_panel(self, channel_id: Optional[int]) -> None:
         self.channel_controls.show_panel(channel_id)
 
-    def _on_active_channel_selected(self, info: Optional[object]) -> None:
-        if info is None:
-            self._show_channel_panel(None)
-            return
-        channel_id = getattr(info, "id", None)
-        name = getattr(info, "name", str(info))
-        if channel_id is None:
-            self._show_channel_panel(None)
-            return
-        config = self._ensure_channel_config(channel_id, name)
-        panel = self._channel_panels.get(channel_id)
-        if panel is None:
-            panel = ChannelDetailPanel(channel_id, name, self.channel_controls.stack)
-            panel.configChanged.connect(lambda cfg, cid=channel_id: self._on_channel_config_changed(cid, cfg))
-            panel.analysisRequested.connect(lambda cid=channel_id: self._open_analysis_for_channel(cid))
-            self.channel_controls.add_panel(channel_id, panel)
-            self._channel_panels[channel_id] = panel
-        panel.set_config(config)
-        self._set_active_channel_focus(channel_id)
-        self._show_channel_panel(channel_id)
-
     def _select_active_channel_by_id(self, channel_id: int) -> None:
-        target_idx = None
-        for idx in range(self.channel_controls.active_combo.count()):
-            info = self.channel_controls.active_combo.itemData(idx)
-            if getattr(info, "id", None) == channel_id:
-                target_idx = idx
-                break
-        if target_idx is None:
-            return
-        if self.channel_controls.active_combo.currentIndex() != target_idx:
-            self.channel_controls.active_combo.setCurrentIndex(target_idx)
-        else:
-            self._set_active_channel_focus(channel_id)
-            self._show_channel_panel(channel_id)
+        """Delegate to ChannelManager."""
+        self._channel_manager.select_active_channel_by_id(channel_id)
+        self._active_channel_id = self._channel_manager.active_channel_id
 
     def _nearest_channel_at_y(self, y: float) -> Optional[int]:
-        """Return the channel whose configured offset is closest to the given y view coordinate."""
-        candidates: list[tuple[float, int]] = []
-        for cid in self._channel_ids_current:
-            config = self._channel_configs.get(cid)
-            if config is None:
-                continue
-            center = config.screen_offset
-            candidates.append((abs(float(y) - center), cid))
-        if not candidates:
-            return None
-        candidates.sort(key=lambda item: item[0])
-        distance, cid = candidates[0]
-        if distance > 0.05:
-            return None
-        return cid
+        """Delegate to ChannelManager."""
+        return self._channel_manager.get_nearest_channel_at_y(y)
 
     def _on_plot_channel_clicked(self, y: float, button: QtCore.Qt.MouseButton) -> None:
         if button != QtCore.Qt.MouseButton.LeftButton:
@@ -1430,20 +1380,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self._controller.set_audio_monitoring(None)
 
     def _ensure_active_channel_focus(self) -> None:
-        if self._channel_ids_current:
-            if self._active_channel_id not in self._channel_ids_current:
-                self._active_channel_id = self._channel_ids_current[0]
-        else:
-            self._active_channel_id = None
+        """Delegate to ChannelManager."""
+        self._channel_manager.ensure_active_channel_focus()
+        self._active_channel_id = self._channel_manager.active_channel_id
         self._apply_active_channel_style()
 
     def _set_active_channel_focus(self, channel_id: Optional[int]) -> None:
-        if channel_id is not None and channel_id not in self._channel_ids_current:
+        """Delegate to ChannelManager."""
+        if channel_id is not None and channel_id not in self._channel_manager.channel_ids_current:
             return
         if self._active_channel_id == channel_id:
             self._update_axis_label()
             return
-        self._active_channel_id = channel_id
+        self._channel_manager.set_active_channel_focus(channel_id)
+        self._active_channel_id = self._channel_manager.active_channel_id
         self._apply_active_channel_style()
         self._update_plot_y_range()
 
