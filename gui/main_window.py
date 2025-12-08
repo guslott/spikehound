@@ -80,13 +80,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._device_connected = False
         self._active_channel_infos: List[object] = []
         self._channel_ids_current: List[int] = []
-        # self._curve_map removed in favor of self._renderers
         self._channel_configs: Dict[int, ChannelConfig] = {}
         self._channel_panels: Dict[int, ChannelDetailPanel] = {}
         self._channel_last_samples: Dict[int, np.ndarray] = {}
         self._channel_display_buffers: Dict[int, np.ndarray] = {}
         self._last_times: np.ndarray = np.zeros(0, dtype=np.float32)
-        # Color cycle now managed by ChannelManager
+        # Color cycle managed by ChannelManager
         self._current_sample_rate: float = 0.0
         self._analysis_sample_rate: float = 0.0
         self._current_window_sec: float = 1.0
@@ -99,14 +98,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # TriggerController manages all trigger state and detection logic
         self._trigger_controller = TriggerController(parent=self)
         self._trigger_controller.configChanged.connect(self._on_trigger_config_changed)
-        self._trigger_controller.captureReady.connect(self._on_trigger_capture_ready)
+        # captureReady signal available for future use if needed
         self._plot_refresh_hz = 40.0
         self._plot_interval = 1.0 / self._plot_refresh_hz
         self._last_plot_refresh = 0.0
-        # Actual measured plot refresh rate tracking
-        self._actual_plot_refresh_hz = 0.0
-        self._plot_refresh_count = 0
-        self._plot_refresh_last_calc = time.perf_counter()
         self._chunk_mean_samples: float = 0.0
         self._chunk_accum_count: int = 0
         self._chunk_accum_samples: int = 0
@@ -187,9 +182,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addDockWidget(QtCore.Qt.TopDockWidgetArea, self._analysis_dock)
         self._analysis_dock.select_scope()
 
-    def _reset_color_cycle(self) -> None:
-        """Delegate to ChannelManager."""
-        self._channel_manager.reset_color_cycle()
+
 
     def _setup_quit_shortcut(self) -> None:
         """Set up global shortcuts for quitting/closing."""
@@ -198,13 +191,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @property
     def chunk_rate(self) -> float:
-        return float(getattr(self, "_chunk_rate", 0.0))
+        return float(self._chunk_rate)
 
     @property
     def plot_refresh_hz(self) -> float:
-        return float(getattr(self, "_plot_refresh_hz", 0.0))
+        return float(self._plot_refresh_hz)
 
-    # -------------------------------------------------------------------------
     def set_plot_refresh_hz(self, hz: float) -> None:
         hz = max(1.0, float(hz))
         self._plot_refresh_hz = hz
@@ -658,12 +650,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Delegate to config manager."""
         self._config_manager.apply_config_data(data, source, show_dialogs=show_dialogs)
 
-    @QtCore.Slot()
-    def _on_trigger_capture_ready(self) -> None:
-        """Handle trigger capture completion event."""
-        # Typically the visualization timer handles data retrieval, but we can hook here
-        # if we need immediate UI updates (e.g. status bar).
-        pass
+
 
     @QtCore.Slot(dict)
     def _on_trigger_config_changed(self, config: dict) -> None:
@@ -843,7 +830,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Update channel display
         self._update_channel_display(channel_id)
-        self._refresh_channel_layout()
+
         
         if self._active_channel_id == channel_id:
             self._update_axis_label()
@@ -1291,7 +1278,7 @@ class MainWindow(QtWidgets.QMainWindow):
              }
              self._update_trigger_visuals(cfg)
         self._update_channel_display(channel_id)
-        self._refresh_channel_layout()
+
         if filters_changed:
             self._sync_filter_settings()
         if self._active_channel_id == channel_id:
@@ -1357,9 +1344,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_active_channel_style()
         self._update_plot_y_range()
 
-    def _refresh_channel_layout(self) -> None:
-        """No-op stub: channel layout is now managed by PlotManager."""
-        pass
+
 
     def _register_chunk(self, data: np.ndarray) -> None:
         self._plot_manager.register_chunk(data)
@@ -1688,11 +1673,12 @@ class MainWindow(QtWidgets.QMainWindow):
             stats = controller.dispatcher_stats()
             queue_depths = controller.queue_depths()
 
-        sr = getattr(self, "_current_sample_rate", 0.0)
+        sr = self._current_sample_rate
 
         drops = stats.get("dropped", {}) if isinstance(stats, dict) else {}
         evicted = stats.get("evicted", {}) if isinstance(stats, dict) else {}
 
+        # Clear stale chunk rate
         now = time.perf_counter()
         if self._chunk_accum_count == 0 and (now - self._chunk_last_rate_update) > (self._chunk_rate_window * 2.0):
             self._chunk_rate = 0.0
@@ -1934,7 +1920,7 @@ class MainWindow(QtWidgets.QMainWindow):
         mode = self._trigger_controller.mode or "stream"
         if mode == "stream":
             self._plot_manager.process_streaming(data, times_arr, sample_rate, window_sec, channel_ids, now)
-            # Sync state back from PlotManager - only what's needed
+            # Sync state back from PlotManager
             self._current_sample_rate = self._plot_manager.sample_rate
             self._current_window_sec = self._plot_manager.window_sec
             self._chunk_rate = self._plot_manager.chunk_rate
