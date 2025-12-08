@@ -243,9 +243,11 @@ class AudioPlayer(threading.Thread):
     # ---- Thread body ---------------------------------------------------------
 
     def run(self) -> None:
-        # OPTIMIZATION: Calculate buffer size based on INPUT rate.
-        # We target ~20-30ms latency. 4 blocks of 128 frames at 20kHz is ~25ms.
-        buf_msec = max(10, int(self.cfg.blocksize * 4 * 1000 / self.in_sr))
+        # OPTIMIZATION: Use a strict 20ms hardware buffer for low latency.
+        # Miniaudio handles resampling, so we don't need to bloat the buffer 
+        # based on input rate (which was punishing low-sr devices).
+        # We ensure at least 5ms to avoid underruns on busy systems.
+        buf_msec = 20
         
         # Configure miniaudio device with INPUT sample rate.
         # miniaudio handles resampling to hardware rate (e.g., 44.1kHz) in C,

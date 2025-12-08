@@ -146,7 +146,7 @@ class SettingsTab(QtWidgets.QWidget):
         box = QtWidgets.QGroupBox("About")
         layout = QtWidgets.QVBoxLayout(box)
         layout.setContentsMargins(12, 10, 12, 10)
-        layout.addWidget(QtWidgets.QLabel("SpikeHound"))
+        layout.addWidget(QtWidgets.QLabel("SpikeHound 2.0"))
         layout.addWidget(QtWidgets.QLabel("Dr. Gus Lott & Taylor Mangoba"))
         layout.addWidget(QtWidgets.QLabel("License: 0BSD"))
         link = QtWidgets.QLabel(

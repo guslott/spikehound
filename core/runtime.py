@@ -103,6 +103,15 @@ class SpikeHoundRuntime:
 
     def connect_device(self, device_key: str, sample_rate: float, chunk_size: int = 1024) -> None:
         """Connect a device via the DeviceManager and wire it into the pipeline."""
+        # OPTIMIZATION: Calculate chunk size for ~20ms latency if not explicitly overridden
+        # default was 1024, which is >100ms at 10kHz.
+        # We target 20ms (0.02s) with a minimum of 32 samples for safety.
+        if chunk_size == 1024:  # Only override if it's the default
+            target_latency = 0.02  # 20ms
+            chunk_size = max(32, int(sample_rate * target_latency))
+            # Align to 2/4 for cleanliness? Not strictly necessary but 128/256 are nice.
+            # actually strict 20ms is better for time alignment.
+            
         driver = self.device_manager.connect_device(device_key, sample_rate, chunk_size=chunk_size)
         channels = self.device_manager.get_available_channels()
         self.attach_source(driver, sample_rate, channels)
