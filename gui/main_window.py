@@ -138,6 +138,36 @@ class MainWindow(QtWidgets.QMainWindow):
         # Config manager for save/load operations
         self._config_manager = ScopeConfigManager(self)
 
+        self._init_ui()
+        
+        # Timer for updating file playback position
+        self._playback_timer = QtCore.QTimer(self)
+        self._playback_timer.setInterval(100)  # 10 Hz update rate
+        self._playback_timer.timeout.connect(self._update_playback_position)
+        
+        self.attach_controller(controller)
+        self.runtime.device_manager.devicesChanged.connect(self._on_devices_changed)
+        self.runtime.device_manager.deviceConnected.connect(self._on_device_connected)
+        self.runtime.device_manager.deviceDisconnected.connect(self._on_device_disconnected)
+        self.runtime.device_manager.availableChannelsChanged.connect(self._on_available_channels)
+        self._apply_device_state(False)
+        self.runtime.device_manager.refresh_devices()
+        app_settings = controller.app_settings if controller is not None else None
+        if app_settings is not None:
+            self.set_plot_refresh_hz(float(app_settings.plot_refresh_hz))
+            if not self._window_combo_user_set:
+                self._set_window_combo_value(float(app_settings.default_window_sec))
+            self._apply_listen_output_preference(app_settings.listen_output_key)
+        # Standard close shortcut (Cmd+W on macOS, Ctrl+W on Windows/Linux)
+        self._close_shortcut = QtGui.QShortcut(QtGui.QKeySequence.StandardKey.Close, self)
+        self._close_shortcut.setContext(QtCore.Qt.ApplicationShortcut)
+        self._close_shortcut.activated.connect(self.close)
+        self._bind_app_settings_store()
+        pass # _emit_trigger_config removed
+        QtCore.QTimer.singleShot(0, self._update_splash_pixmap)
+        QtCore.QTimer.singleShot(0, self._try_load_default_config)
+
+    def _init_ui(self) -> None:
         self._settings_tab: Optional[SettingsTab] = None
         self._apply_palette()
         self._style_plot()
@@ -172,33 +202,6 @@ class MainWindow(QtWidgets.QMainWindow):
         
         self.addDockWidget(QtCore.Qt.TopDockWidgetArea, self._analysis_dock)
         self._analysis_dock.select_scope()
-        
-        # Timer for updating file playback position
-        self._playback_timer = QtCore.QTimer(self)
-        self._playback_timer.setInterval(100)  # 10 Hz update rate
-        self._playback_timer.timeout.connect(self._update_playback_position)
-        
-        self.attach_controller(controller)
-        self.runtime.device_manager.devicesChanged.connect(self._on_devices_changed)
-        self.runtime.device_manager.deviceConnected.connect(self._on_device_connected)
-        self.runtime.device_manager.deviceDisconnected.connect(self._on_device_disconnected)
-        self.runtime.device_manager.availableChannelsChanged.connect(self._on_available_channels)
-        self._apply_device_state(False)
-        self.runtime.device_manager.refresh_devices()
-        app_settings = controller.app_settings if controller is not None else None
-        if app_settings is not None:
-            self.set_plot_refresh_hz(float(app_settings.plot_refresh_hz))
-            if not self._window_combo_user_set:
-                self._set_window_combo_value(float(app_settings.default_window_sec))
-            self._apply_listen_output_preference(app_settings.listen_output_key)
-        # Standard close shortcut (Cmd+W on macOS, Ctrl+W on Windows/Linux)
-        self._close_shortcut = QtGui.QShortcut(QtGui.QKeySequence.StandardKey.Close, self)
-        self._close_shortcut.setContext(QtCore.Qt.ApplicationShortcut)
-        self._close_shortcut.activated.connect(self.close)
-        self._bind_app_settings_store()
-        pass # _emit_trigger_config removed
-        QtCore.QTimer.singleShot(0, self._update_splash_pixmap)
-        QtCore.QTimer.singleShot(0, self._try_load_default_config)
 
     def _reset_color_cycle(self) -> None:
         """Reset channel color selection to the initial palette order."""
@@ -217,157 +220,6 @@ class MainWindow(QtWidgets.QMainWindow):
         return float(getattr(self, "_plot_refresh_hz", 0.0))
 
     # -------------------------------------------------------------------------
-    # Trigger state properties (delegate to TriggerController)
-    # -------------------------------------------------------------------------
-    
-    @property
-    def _trigger_mode(self) -> str:
-        return self._trigger_controller._mode
-    
-    @_trigger_mode.setter
-    def _trigger_mode(self, value: str) -> None:
-        self._trigger_controller._mode = value
-    
-    @property
-    def _trigger_channel_id(self) -> Optional[int]:
-        return self._trigger_controller._channel_id
-    
-    @_trigger_channel_id.setter
-    def _trigger_channel_id(self, value: Optional[int]) -> None:
-        self._trigger_controller._channel_id = value
-    
-    @property
-    def _trigger_threshold(self) -> float:
-        return self._trigger_controller._threshold
-    
-    @_trigger_threshold.setter
-    def _trigger_threshold(self, value: float) -> None:
-        self._trigger_controller._threshold = value
-    
-    @property
-    def _trigger_pre_seconds(self) -> float:
-        return self._trigger_controller._pre_seconds
-    
-    @_trigger_pre_seconds.setter
-    def _trigger_pre_seconds(self, value: float) -> None:
-        self._trigger_controller._pre_seconds = value
-    
-    @property
-    def _trigger_pre_samples(self) -> int:
-        return self._trigger_controller._pre_samples
-    
-    @_trigger_pre_samples.setter
-    def _trigger_pre_samples(self, value: int) -> None:
-        self._trigger_controller._pre_samples = value
-    
-    @property
-    def _trigger_window_samples(self) -> int:
-        return self._trigger_controller._window_samples
-    
-    @_trigger_window_samples.setter
-    def _trigger_window_samples(self, value: int) -> None:
-        self._trigger_controller._window_samples = value
-    
-    @property
-    def _trigger_last_sample_rate(self) -> float:
-        return self._trigger_controller._last_sample_rate
-    
-    @_trigger_last_sample_rate.setter
-    def _trigger_last_sample_rate(self, value: float) -> None:
-        self._trigger_controller._last_sample_rate = value
-    
-    @property
-    def _trigger_history(self) -> deque:
-        return self._trigger_controller._history
-    
-    @property
-    def _trigger_history_length(self) -> int:
-        return self._trigger_controller._history_length
-    
-    @_trigger_history_length.setter
-    def _trigger_history_length(self, value: int) -> None:
-        self._trigger_controller._history_length = value
-    
-    @property
-    def _trigger_history_total(self) -> int:
-        return self._trigger_controller._history_total
-    
-    @_trigger_history_total.setter
-    def _trigger_history_total(self, value: int) -> None:
-        self._trigger_controller._history_total = value
-    
-    @property
-    def _trigger_max_chunk(self) -> int:
-        return self._trigger_controller._max_chunk
-    
-    @_trigger_max_chunk.setter
-    def _trigger_max_chunk(self, value: int) -> None:
-        self._trigger_controller._max_chunk = value
-    
-    @property
-    def _trigger_prev_value(self) -> float:
-        return self._trigger_controller._prev_value
-    
-    @_trigger_prev_value.setter
-    def _trigger_prev_value(self, value: float) -> None:
-        self._trigger_controller._prev_value = value
-    
-    @property
-    def _trigger_capture_start_abs(self) -> Optional[int]:
-        return self._trigger_controller._capture_start_abs
-    
-    @_trigger_capture_start_abs.setter
-    def _trigger_capture_start_abs(self, value: Optional[int]) -> None:
-        self._trigger_controller._capture_start_abs = value
-    
-    @property
-    def _trigger_capture_end_abs(self) -> Optional[int]:
-        return self._trigger_controller._capture_end_abs
-    
-    @_trigger_capture_end_abs.setter
-    def _trigger_capture_end_abs(self, value: Optional[int]) -> None:
-        self._trigger_controller._capture_end_abs = value
-    
-    @property
-    def _trigger_display(self) -> Optional[np.ndarray]:
-        return self._trigger_controller._display
-    
-    @_trigger_display.setter
-    def _trigger_display(self, value: Optional[np.ndarray]) -> None:
-        self._trigger_controller._display = value
-    
-    @property
-    def _trigger_display_times(self) -> Optional[np.ndarray]:
-        return self._trigger_controller._display_times
-    
-    @_trigger_display_times.setter
-    def _trigger_display_times(self, value: Optional[np.ndarray]) -> None:
-        self._trigger_controller._display_times = value
-    
-    @property
-    def _trigger_hold_until(self) -> float:
-        return self._trigger_controller._hold_until
-    
-    @_trigger_hold_until.setter
-    def _trigger_hold_until(self, value: float) -> None:
-        self._trigger_controller._hold_until = value
-    
-    @property
-    def _trigger_single_armed(self) -> bool:
-        return self._trigger_controller._single_armed
-    
-    @_trigger_single_armed.setter
-    def _trigger_single_armed(self, value: bool) -> None:
-        self._trigger_controller._single_armed = value
-    
-    @property
-    def _trigger_display_pre_samples(self) -> int:
-        return self._trigger_controller._display_pre_samples
-    
-    @_trigger_display_pre_samples.setter
-    def _trigger_display_pre_samples(self, value: int) -> None:
-        self._trigger_controller._display_pre_samples = value
-
     def set_plot_refresh_hz(self, hz: float) -> None:
         hz = max(1.0, float(hz))
         self._plot_refresh_hz = hz
@@ -806,10 +658,10 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot(dict)
     def _on_trigger_config_changed(self, config: dict) -> None:
         """Handle trigger configuration changes from controller."""
-        self._trigger_mode = config.get("mode", "stream")
+        # self._trigger_mode cache removed - use controller or config directly
         
         # Determine if we should clear existing plots
-        is_triggered = (ball := self._trigger_mode) != "stream"
+        is_triggered = config.get("mode", "stream") != "stream"
         if not is_triggered:
             # Stream mode
             self.scope.set_pretrigger_position(0.0, visible=False)
@@ -831,7 +683,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_scope_threshold_changed(self, value: float) -> None:
         """Handle threshold line moved by user."""
         # value is in normalized 0-1 screen coordinates, convert to volts
-        cfg = self._channel_configs.get(self._trigger_channel_id) or self._channel_configs.get(self._active_channel_id)
+        cfg = self._channel_configs.get(self._trigger_controller.channel_id) or self._channel_configs.get(self._active_channel_id)
         if cfg is not None:
             span = cfg.vertical_span_v
             offset = cfg.screen_offset
@@ -863,7 +715,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Calculate threshold position in screen coordinates
         threshold_value = config.get("threshold", 0.0)
-        cfg = self._channel_configs.get(self._trigger_channel_id) or self._channel_configs.get(self._active_channel_id)
+        cfg = self._channel_configs.get(self._trigger_controller.channel_id) or self._channel_configs.get(self._active_channel_id)
         if cfg is not None:
             span = cfg.vertical_span_v
             offset = cfg.screen_offset
@@ -1465,16 +1317,16 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # If this channel is the current trigger source, update trigger visuals
         # to reflect potential changes in vertical span or offset.
-        if self._trigger_channel_id is not None and channel_id == self._trigger_channel_id:
+        if self._trigger_controller.channel_id is not None and channel_id == self._trigger_controller.channel_id:
              # Refresh visuals using current controller state
              # We rely on cached _trigger_threshold etc? 
              # Or better, construct a config dict from current simple state?
              # _update_trigger_visuals needs a dict.
              cfg = {
-                 "mode": self._trigger_mode,
-                 "threshold": getattr(self, "_trigger_threshold", 0.0),
-                 "channel_index": self._trigger_channel_id,
-                 "pretrigger_frac": getattr(self, "_trigger_pre_seconds", 0.01)
+                 "mode": self._trigger_controller.mode,
+                 "threshold": self._trigger_controller.threshold,
+                 "channel_index": self._trigger_controller.channel_id,
+                 "pretrigger_frac": self._trigger_controller.pre_seconds
              }
              self._update_trigger_visuals(cfg)
         self._update_channel_display(channel_id)
@@ -1832,8 +1684,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._controller is not None:
             self._controller.update_window_span(self._current_window_sec)
         self._update_status(viz_depth=0)
-        if self._trigger_last_sample_rate > 0:
-            self._update_trigger_sample_parameters(self._trigger_last_sample_rate)
+        if self._trigger_controller.sample_rate > 0:
+            self._update_trigger_sample_parameters(self._trigger_controller.sample_rate)
 
     def _on_window_changed(self) -> None:
         value = float(self.trigger_control.window_combo.currentData() or 0.0)
@@ -1845,7 +1697,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_threshold_line_changed(self) -> None:
         y_norm = float(self.scope.threshold_line.value())
-        cfg = self._channel_configs.get(self._trigger_channel_id) or self._channel_configs.get(self._active_channel_id)
+        cfg = self._channel_configs.get(self._trigger_controller.channel_id) or self._channel_configs.get(self._active_channel_id)
         span = cfg.vertical_span_v if cfg is not None else 1.0
         offset = cfg.screen_offset if cfg is not None else 0.0
         value = (y_norm - offset) * span
@@ -1898,10 +1750,10 @@ class MainWindow(QtWidgets.QMainWindow):
              panel.set_config(config)
 
         # Triggers
-        if self._trigger_channel_id is not None and cid == self._trigger_channel_id:
+        if self._trigger_controller.channel_id is not None and cid == self._trigger_controller.channel_id:
              self._on_trigger_config_changed({
                  "channel_index": cid,
-                 "mode": self._trigger_mode,
+                 "mode": self._trigger_controller.mode,
                  # Trigger widget handles others, but we need to refresh potentially
              })
              # Actually TriggerControlWidget usually updates on its own, but dragging offset
@@ -2134,7 +1986,7 @@ class MainWindow(QtWidgets.QMainWindow):
         #    overlaps, duplicates, and channel count mismatches (oscillation).
         # 2. If in Stream Mode, we prefer the payload (window) for smooth display, unless it's missing.
         use_pointers = False
-        if self._trigger_mode != "stream":
+        if self._trigger_controller.mode != "stream":
             # STRICT: Only use pointers. If no pointers, we have no new stream data.
             # Do NOT fall back to samples.
             use_pointers = True
@@ -2207,7 +2059,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._chunk_last_rate_update = time.perf_counter()
             self._update_status(viz_depth=0)
             return
-        mode = self._trigger_mode or "stream"
+        mode = self._trigger_controller.mode or "stream"
         if mode == "stream":
             self._plot_manager.process_streaming(data, times_arr, sample_rate, window_sec, channel_ids, now)
             # Sync state back from PlotManager - only what's needed
@@ -2222,8 +2074,8 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._plot_manager.process_trigger_mode(
                 data, times_arr, sample_rate, window_sec, channel_ids, now,
-                trigger_mode=self._trigger_mode,
-                trigger_channel_id=self._trigger_channel_id,
+                trigger_mode=self._trigger_controller.mode,
+                trigger_channel_id=self._trigger_controller.channel_id,
                 pretrigger_line=self.scope.pretrigger_line,
             )
             # Sync state back from PlotManager
