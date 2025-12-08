@@ -10,7 +10,7 @@ SpikeHound 2.0 is a free, open-source desktop application for real-time bioelect
 
 | Audience | Use Case |
 |----------|----------|
-| **High School Biology** | Demonstrate action potentials with Backyard Brains SpikerBoxes |
+| **High School Biology** | Demonstrate action potentials with accessible bioamplifiers |
 | **Undergraduate Labs** | Replace expensive LabVIEW/MATLAB setups in neurophysiology courses |
 | **Graduate Research** | Rapid prototyping for behavioral/neural recordings |
 | **Citizen Scientists** | Explore electrophysiology with low-cost hardware |
@@ -29,7 +29,7 @@ SpikeHound **democratizes neurophysiology** by removing financial and technical 
 
 | Barrier | SpikeHound Solution |
 |---------|---------------------|
-| Expensive hardware | Works with $100 SpikerBoxes or free sound cards |
+| Expensive hardware | Works with low-cost hardware or free sound cards |
 | MATLAB licenses ($$$) | No licenses required—100% free |
 | Windows-only software | Runs on Windows, macOS, and Linux |
 | Complex setup | Single Python script, simple installation |
@@ -55,7 +55,7 @@ SpikeHound **democratizes neurophysiology** by removing financial and technical 
 | Device | Status | Notes |
 |--------|--------|-------|
 | **Sound Card** | ✅ Supported | Any USB/built-in audio input |
-| **Backyard Brains** | ✅ Supported | SpikerBox Pro, Neuron, Muscle |
+| **Neuron SpikerBox** | ✅ Supported | Supports Muscle/Neuron/Pro models |
 | **Simulation** | ✅ Supported | Neural simulator for testing |
 | **WAV Files** | ✅ Supported | Replay recorded data |
 | **NI-DAQmx** | 🔄 Planned | National Instruments boards |
@@ -198,7 +198,7 @@ spikehound/
 │   ├── daq_readme.md       # 📖 Driver development guide
 │   ├── base_device.py      # Abstract device interface
 │   ├── soundcard_source.py # Audio input driver
-│   └── backyard_brains.py  # SpikerBox driver
+│   └── backyard_brains.py  # Serial hardware driver
 │
 ├── analysis/               # Spike detection & metrics
 │   ├── analysis_readme.md  # 📖 Metric development guide
@@ -230,7 +230,7 @@ spikehound/
 ### Classroom Setup
 1. Install Python 3.12+ on lab computers
 2. Clone SpikeHound and install dependencies
-3. Connect SpikerBox devices (or use simulation mode)
+3. Connect acquisition hardware (or use simulation mode)
 4. Launch with `python main.py`
 
 ### Lab Exercise Ideas
@@ -253,6 +253,8 @@ Use the built-in **Simulated Source** to demonstrate concepts without any physic
 
 **SpikeHound** (formerly **g-PRIME**) was created by **Dr. Gus K. Lott III** as a doctoral student at **Cornell University** in **Dr. Ronald R. Hoy's** laboratory. It became a cornerstone of the *BioNB 491: Principles of Neurophysiology* course.
 
+**SpikeHound 1.0** was developed under funding from **HHMI** while **Gus Lott** worked as an instrumentation engineer at the **Janelia Farm Research Campus** and supported frontier neuroscience research.
+
 **SpikeHound 2.0** is a complete rewrite, developed with support from **Manlius Pebble Hill School (MPHS)** and continued mentorship from Cornell.
 
 ### Contributors
@@ -274,4 +276,3 @@ This software is open-source under the MIT License. See `LICENSE` for details.
 
 - **Repository:** [github.com/guslott/spikehound](https://github.com/guslott/spikehound)
 - **Issues:** [Report bugs or request features](https://github.com/guslott/spikehound/issues)
-- **Backyard Brains:** [backyardbrains.com](https://backyardbrains.com)
