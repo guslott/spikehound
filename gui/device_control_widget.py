@@ -124,6 +124,7 @@ class DeviceControlWidget(QtWidgets.QWidget):
         # Layout: [Play/Pause button] [Slider] [Time label]
         playback_row = QtWidgets.QHBoxLayout()
         playback_row.setSpacing(6)
+        playback_row.setContentsMargins(0, 0, 0, 0)  # No extra margins
         
         # Play/Pause button (square with standard icons)
         self.play_pause_btn = QtWidgets.QPushButton("▶")
@@ -167,6 +168,7 @@ class DeviceControlWidget(QtWidgets.QWidget):
         
         # Create a widget to contain the playback row so we can show/hide it
         self.playback_widget = QtWidgets.QWidget()
+        self.playback_widget.setContentsMargins(0, 0, 0, 0)  # No extra margins
         self.playback_widget.setLayout(playback_row)
         self.playback_widget.setVisible(False)  # Hidden by default
         

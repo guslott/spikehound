@@ -78,6 +78,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chunk_rate: float = 0.0
         self._device_map: Dict[str, dict] = {}
         self._device_connected = False
+        self._is_recording = False  # Track recording state to disable channel changes
         self._active_channel_infos: List[object] = []
         self._channel_ids_current: List[int] = []
         self._channel_configs: Dict[int, ChannelConfig] = {}
@@ -1483,8 +1484,16 @@ class MainWindow(QtWidgets.QMainWindow):
         return pointers
 
     def _update_channel_buttons(self) -> None:
+        """Update enabled state of channel add/remove controls.
+        
+        Respects both connection state and recording state.
+        """
         connected = self._device_connected
-        self.device_control.add_channel_btn.setEnabled(connected and self.device_control.available_combo.count() > 0)
+        not_recording = not self._is_recording
+        # Only enable add channel if connected AND not recording AND channels available
+        can_add = connected and not_recording and self.device_control.available_combo.count() > 0
+        self.device_control.add_channel_btn.setEnabled(can_add)
+        self.device_control.available_combo.setEnabled(connected and not_recording)
         # Delegate to trigger control
         if hasattr(self, "trigger_control"):
             self.trigger_control.set_enabled_for_scanning(connected)
@@ -1495,18 +1504,38 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_recording_started(self, path: str, rollover: bool) -> None:
         """Handle recording started signal from RecordingControlWidget."""
+        self._is_recording = True
         self._set_panels_enabled(False)
         self.startRecording.emit(path, rollover)
 
     def _on_recording_stopped(self) -> None:
         """Handle recording stopped signal from RecordingControlWidget."""
+        self._is_recording = False
         self._set_panels_enabled(True)
         self.stopRecording.emit()
 
     def _set_panels_enabled(self, enabled: bool) -> None:
-        # Safely enable/disable panels that may or may not exist
+        """Enable or disable UI panels when recording starts/stops.
+        
+        Disables channel add/remove controls during recording to prevent
+        ring buffer dimension mismatches. Active channel selection and
+        cosmetic controls (window width, etc.) remain enabled.
+        """
+        # Trigger control: disable data-affecting controls, keep cosmetic ones
         if hasattr(self, "trigger_control"):
-            self.trigger_control.setEnabled(enabled)
+            tc = self.trigger_control
+            # Window combo is purely cosmetic - keep it enabled
+            if hasattr(tc, "window_combo"):
+                tc.window_combo.setEnabled(True)  # Always enabled
+            # Trigger mode affects which data is captured - disable during recording
+            if hasattr(tc, "trigger_mode_combo"):
+                tc.trigger_mode_combo.setEnabled(enabled)
+            if hasattr(tc, "threshold_spin"):
+                tc.threshold_spin.setEnabled(enabled)
+            if hasattr(tc, "channel_combo"):
+                tc.channel_combo.setEnabled(enabled)
+            if hasattr(tc, "rearm_btn"):
+                tc.rearm_btn.setEnabled(enabled)
             
         for attr_name in ("device_group", "channels_group", "channel_opts_group"):
             panel = getattr(self, attr_name, None)
@@ -1517,20 +1546,27 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "record_group") and hasattr(self.record_group, "set_enabled_for_recording"):
             self.record_group.set_enabled_for_recording(enabled)
         
-        if hasattr(self, "device_combo"):
-            self.device_control.device_combo.setEnabled(not self._device_connected)
-        if hasattr(self, "sample_rate_combo"):
-            self.device_control.sample_rate_combo.setEnabled(not self._device_connected)
-        if hasattr(self, "available_combo"):
-            self.device_control.available_combo.setEnabled(enabled and self._device_connected)
-        if hasattr(self, "active_combo"):
-            self.channel_controls.active_combo.setEnabled(enabled and self._device_connected)
-        if hasattr(self, "add_channel_btn"):
-            self.device_control.add_channel_btn.setEnabled(enabled and self._device_connected)
+        # Device controls - disable channel add/modification during recording
+        if hasattr(self, "device_control"):
+            dc = self.device_control
+            if hasattr(dc, "device_combo"):
+                dc.device_combo.setEnabled(not self._device_connected)
+            if hasattr(dc, "sample_rate_combo"):
+                dc.sample_rate_combo.setEnabled(not self._device_connected)
+            # Disable adding new channels during recording
+            if hasattr(dc, "available_combo"):
+                dc.available_combo.setEnabled(enabled and self._device_connected)
+            if hasattr(dc, "add_channel_btn"):
+                dc.add_channel_btn.setEnabled(enabled and self._device_connected)
+        
+        # Note: active_combo intentionally NOT disabled so users can still
+        # switch channels and adjust filters/visualization during recording
         
         # If disabling, ensure we don't leave stale state
         if not enabled and hasattr(self, "_update_channel_buttons"):
             self._update_channel_buttons()
+
+
 
     def _apply_device_state(self, connected: bool) -> None:
         has_entries = bool(self._device_map)
@@ -1733,10 +1769,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def set_active_channels(self, channels: Sequence[str]) -> None:
         """Display the channels currently routed to the plot."""
         names = [getattr(ch, "name", str(ch)) for ch in channels]
-        self._ensure_renderers_for_ids(self._channel_ids_current, names) # Changed from _ensure_curves
+        self._ensure_renderers_for_ids(self._channel_ids_current, names)
+        
         # Trigger widget handles its own channel logic
         if hasattr(self, "trigger_control"):
-            self.trigger_control.update_channels(names)
+            # Must pass list of (name, id) tuples
+            # We assume self._channel_ids_current aligns with channels/names
+            # If lengths mismatch, zip will truncate safe-ly
+            trigger_channels = list(zip(names, self._channel_ids_current))
+            self.trigger_control.update_channels(trigger_channels)
 
     def set_trigger_channels(self, channels: Sequence[object], *, current: Optional[int] = None) -> None:
         """Update trigger channel choices presented to the user."""
