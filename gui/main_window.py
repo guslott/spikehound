@@ -141,7 +141,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._close_shortcut.setContext(QtCore.Qt.ApplicationShortcut)
         self._close_shortcut.activated.connect(self.close)
         self._bind_app_settings_store()
-        pass # _emit_trigger_config removed
+        
         QtCore.QTimer.singleShot(0, self._update_splash_pixmap)
         QtCore.QTimer.singleShot(0, self._try_load_default_config)
 
@@ -1576,7 +1576,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.trigger_control.threshold_spin.blockSignals(True)
             self.trigger_control.threshold_spin.setValue(value)
             self.trigger_control.threshold_spin.blockSignals(False)
-        pass # _emit_trigger_config removed
 
     # ScopeWidget signal handlers
     # ScopeWidget signal handlers

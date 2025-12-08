@@ -127,8 +127,18 @@ class SpikeHoundRuntime:
         filter_settings: Optional[FilterSettings] = None,
         trigger_cfg: Optional[TriggerConfig] = None,
     ) -> None:
-        """
-        Placeholder: configure the acquisition pipeline (filters, triggers, buffering).
+        """Configure the acquisition pipeline with updated settings.
+        
+        Updates filter settings, trigger configuration, and active channel list
+        on the underlying pipeline controller. All parameters are optional;
+        only provided values are applied.
+        
+        Args:
+            sample_rate: Target sample rate in Hz (currently unused, set at device level).
+            channels: List of channel IDs to enable. Empty list clears all channels.
+            chunk_size: Samples per chunk (currently unused, set at device level).
+            filter_settings: Signal conditioning parameters (high-pass, low-pass, notch).
+            trigger_cfg: Trigger configuration (threshold, mode, pretrigger, window).
         """
         controller = self._pipeline
         if controller is None:
@@ -156,7 +166,12 @@ class SpikeHoundRuntime:
                     self.logger.warning("Failed to clear active channels: %s", exc)
 
     def start_acquisition(self) -> None:
-        """Placeholder: start streaming from the current DAQ source into the pipeline."""
+        """Start streaming data from the DAQ source into the pipeline.
+        
+        Starts the dispatcher thread which pulls data from the source and
+        fans it out to visualization, audio, logging, and analysis queues.
+        Also begins uptime tracking for health metrics.
+        """
         controller = self._pipeline
         if controller is None:
             return
@@ -168,7 +183,12 @@ class SpikeHoundRuntime:
             return
 
     def stop_acquisition(self) -> None:
-        """Placeholder: stop streaming and tear down active threads/queues."""
+        """Stop streaming and wait for pipeline threads to exit.
+        
+        Stops the dispatcher thread and blocks until it exits. Resets uptime
+        tracking. Note: Does NOT disconnect the device, allowing acquisition
+        to be resumed later without reconnecting.
+        """
         controller = self._pipeline
         if controller is None:
             return
