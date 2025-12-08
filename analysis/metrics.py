@@ -1,3 +1,13 @@
+"""Centralized metric computation functions for event analysis.
+
+This module provides signal processing utilities for computing metrics on
+detected events, including:
+- baseline: Median-based baseline estimation from pre-event samples
+- energy_density: Windowed energy density computation
+- min_max: Peak amplitude extraction
+- peak_frequency_sinc: High-resolution frequency estimation with FFT and sinc interpolation
+- autocorr_frequency: Autocorrelation-based frequency estimation fallback
+"""
 import math
 from typing import Optional, Tuple
 import numpy as np

@@ -1,3 +1,13 @@
+"""Analysis-layer event types for GUI and worker communication.
+
+This module defines the detailed Event type used by the analysis worker and GUI.
+Unlike `shared.models.Event` (which is a simpler detection-layer type), this
+Event includes detailed timing metadata for UI display and metric computation.
+
+When to use which Event type:
+- `shared.models.Event`: Use in detection/dispatcher layer for lightweight event passing
+- `shared.types.Event`: Use in analysis worker and GUI for detailed event display
+"""
 from __future__ import annotations
 
 import math
@@ -9,9 +19,31 @@ import numpy as np
 
 @dataclass(frozen=True)
 class Event:
-    """
-    Lightweight description of a single threshold crossing that both the
-    analysis worker and GUI can exchange without additional translation.
+    """Detailed threshold crossing event for analysis and GUI display.
+    
+    This Event type contains comprehensive timing and sampling metadata needed
+    for accurate event visualization and metric computation. It is exchanged
+    between the analysis worker and GUI without additional translation.
+    
+    For the simpler detection-layer Event, see `shared.models.Event`.
+    
+    Attributes:
+        id: Unique event identifier
+        channelId: Channel where the crossing occurred
+        thresholdValue: Threshold value that was crossed
+        crossingIndex: Absolute sample index of the crossing
+        crossingTimeSec: Timestamp of the crossing (seconds)
+        firstSampleTimeSec: Timestamp of the first sample in the window
+        sampleRateHz: Sample rate for time conversions
+        windowMs: Total event window duration in milliseconds
+        preMs: Pre-crossing window duration in milliseconds
+        postMs: Post-crossing window duration in milliseconds
+        samples: Waveform samples around the crossing
+        properties: Computed metrics (e.g., energy, frequency)
+        intervalSinceLastSec: Time since previous event on this channel
+    
+    See Also:
+        shared.models.Event: Simpler detection-layer Event type
     """
 
     id: int

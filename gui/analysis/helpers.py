@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from shared.types import Event
@@ -50,17 +53,17 @@ class _MeasureLine:
     def remove(self) -> None:
         try:
             self._plot.removeItem(self.roi)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to remove ROI: %s", e)
         try:
             self._plot.removeItem(self.label)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to remove label: %s", e)
         for ep in self._endpoints:
             try:
                 self._plot.removeItem(ep)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to remove endpoint: %s", e)
 
     def set_points(self, p1: QtCore.QPointF, p2: QtCore.QPointF) -> None:
         self._set_handle_positions(pg.Point(p1), pg.Point(p2))
@@ -75,13 +78,13 @@ class _MeasureLine:
         if h0 is not None:
             try:
                 self.roi.movePoint(h0, p1)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to move ROI point h0: %s", e)
         if h1 is not None:
             try:
                 self.roi.movePoint(h1, p2)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to move ROI point h1: %s", e)
         if self._endpoints and len(self._endpoints) >= 2:
             self._endpoints[0].setData([p1.x()], [p1.y()])
             self._endpoints[1].setData([p2.x()], [p2.y()])

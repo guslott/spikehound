@@ -162,8 +162,8 @@ class FileSource(BaseDevice):
         if self._wav_file is not None:
             try:
                 self._wav_file.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to close WAV file: %s", e)
             self._wav_file = None
         
         self._file_path = None

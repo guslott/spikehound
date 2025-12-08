@@ -249,8 +249,8 @@ class PlotManager(QtCore.QObject):
         plot_item = self._plot_widget.getPlotItem()
         try:
             plot_item.clear()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to clear plot item: %s", e)
         
         # Clear renderers
         for renderer in self._renderers.values():

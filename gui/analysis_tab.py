@@ -13,6 +13,8 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets, QtGui
 
+logger = logging.getLogger(__name__)
+
 
 from analysis.models import AnalysisBatch
 from shared.models import Chunk, EndOfStream
@@ -132,8 +134,8 @@ class AnalysisTab(QtWidgets.QWidget):
         self.plot_widget = pg.PlotWidget(enableMenu=False)
         try:
             self.plot_widget.hideButtons()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to hide plot buttons: %s", e)
         self.plot_widget.setBackground(SCOPE_BACKGROUND_COLOR)
         self.plot_widget.setAntialiasing(False)
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
@@ -164,8 +166,8 @@ class AnalysisTab(QtWidgets.QWidget):
         self.sta_plot = pg.PlotWidget(enableMenu=False)
         try:
             self.sta_plot.hideButtons()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to hide STA plot buttons: %s", e)
         self.sta_plot.setBackground(SCOPE_BACKGROUND_COLOR)
         self.sta_plot.showGrid(x=True, y=True, alpha=0.25)
         self.sta_plot.setLabel("bottom", "Lag", units="ms")
@@ -185,8 +187,8 @@ class AnalysisTab(QtWidgets.QWidget):
         self.metrics_plot = pg.PlotWidget(enableMenu=False)
         try:
             self.metrics_plot.hideButtons()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to hide metrics plot buttons: %s", e)
         self.metrics_plot.setBackground(SCOPE_BACKGROUND_COLOR)
         self.metrics_plot.setLabel("bottom", "Time (s)")
         self.metrics_plot.setLabel("left", "Max Amplitude (V)")
@@ -499,8 +501,8 @@ class AnalysisTab(QtWidgets.QWidget):
                 for fut in list(self._analysis_futures):
                     fut.cancel()
                 executor.shutdown(wait=False)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Exception shutting down analysis executor: %s", e)
             self._analysis_executor = None
         super().closeEvent(event)
 
@@ -703,7 +705,8 @@ class AnalysisTab(QtWidgets.QWidget):
             return 5.0
         try:
             return float(self._analysis_settings.get().event_window_ms)
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to get event_window_ms from settings: %s", e)
             return 5.0
 
     def _set_event_window_selection(self, value_ms: float) -> None:
@@ -770,14 +773,15 @@ class AnalysisTab(QtWidgets.QWidget):
                 secondary_value=secondary_value,
                 auto_detect=self.auto_detect_check.isChecked(),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to configure worker threshold: %s", e)
 
     def _render_batch(self, batch: AnalysisBatch) -> None:
         chunk = batch.chunk
         try:
             data = np.array(chunk.samples, dtype=np.float32)
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to convert chunk samples: %s", e)
             return
         if data.size == 0 or data.ndim != 2:
             self.raw_curve.clear()
@@ -811,7 +815,8 @@ class AnalysisTab(QtWidgets.QWidget):
             start_sample = self._fallback_start_sample
         try:
             chunk_dt = float(chunk.dt)
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to get chunk.dt: %s", e)
             chunk_dt = self._dt
         self._latest_sample_time = float(chunk.start_time) + frames * chunk_dt
 
@@ -911,12 +916,14 @@ class AnalysisTab(QtWidgets.QWidget):
             if callable(width_attr):
                 try:
                     width = float(width_attr())
-                except Exception:
+                except Exception as e:
+                    logger.debug("Failed to get pen width: %s", e)
                     width = 2.0
             else:
                 try:
                     width = float(base_pen.width())
-                except Exception:
+                except Exception as e:
+                    logger.debug("Failed to get pen width fallback: %s", e)
                     width = 2.0
         item.setPen(pg.mkPen(color, width=width))
 
@@ -1632,8 +1639,8 @@ class AnalysisTab(QtWidgets.QWidget):
         if cluster is not None and cluster.roi is not None:
             try:
                 self.metrics_plot.removeItem(cluster.roi)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to remove cluster ROI: %s", e)
         self._clusters = [c for c in self._clusters if c.id != cluster_id]
         row = self.class_list.row(current_item)
         if row >= 0:
@@ -2492,13 +2499,13 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
             try:
                 if isinstance(item, pg.ScatterPlotItem):
                     self.plot_widget.removeItem(item)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to remove scatter item: %s", e)
             try:
                 if isinstance(label, pg.TextItem):
                     self.plot_widget.removeItem(label)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to remove text label: %s", e)
         self._measure_points.clear()
         for line in self._measure_lines:
             line.remove()
@@ -2532,7 +2539,8 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
     def _handle_pinch_gesture(self, pinch: QtGui.QPinchGesture) -> None:
         try:
             factor = float(pinch.scaleFactor())
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to get pinch scale factor: %s", e)
             return
         if not np.isfinite(factor) or factor <= 0.0:
             return

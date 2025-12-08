@@ -90,7 +90,8 @@ class ScopeConfigManager:
         try:
             r, g, b, a = (int(x) for x in data)
             return QtGui.QColor(r, g, b, a)
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to parse color tuple: %s", e)
             return QtGui.QColor(0, 0, 139)
 
     # -------------------------------------------------------------------------

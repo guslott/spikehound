@@ -151,7 +151,22 @@ class ChunkPointer:
 
 @dataclass(frozen=True)
 class Event:
-    """Detected feature emitted by the analyzer."""
+    """Detected feature emitted by the dispatcher/detection layer.
+    
+    This is the simpler, lower-level Event type used by the detection pipeline.
+    For the more detailed analysis-layer Event with timing metadata, see
+    `shared.types.Event`.
+    
+    Attributes:
+        t: Timestamp of the event (seconds since stream start)
+        chan: Channel index where the event was detected
+        window: Waveform samples around the detection point
+        properties: Computed metrics (e.g., amplitude, energy)
+        params: Detection parameters used (e.g., threshold value)
+    
+    See Also:
+        shared.types.Event: Analysis-layer Event with detailed timing info
+    """
 
     t: float
     chan: int

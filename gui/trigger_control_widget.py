@@ -1,4 +1,15 @@
-"""TriggerControlWidget - Wrapper for trigger settings UI."""
+"""TriggerControlWidget - UI wrapper for oscilloscope trigger settings.
+
+This widget provides controls for configuring the trigger subsystem:
+- Mode selection: Stream (no trigger), Single, or Continuous Trigger
+- Channel selection: Which channel to monitor for trigger events
+- Threshold: Voltage level that initiates a capture
+- Pre-trigger: Amount of data to capture before the trigger event
+- Window width: Total capture duration
+
+The widget syncs its state with a TriggerController instance and forwards
+all configuration changes to the controller.
+"""
 from __future__ import annotations
 
 import logging

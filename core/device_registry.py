@@ -132,8 +132,8 @@ class DeviceRegistry:
         try:
             from daq.soundcard_source import SoundCardSource
             SoundCardSource.set_list_all_devices(self._list_all_audio_devices)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to configure SoundCardSource device listing: %s", e)
         
         self._descriptors = {d.key: d for d in descriptors}
         self._device_entries = {}
@@ -142,7 +142,8 @@ class DeviceRegistry:
         for descriptor in descriptors:
             try:
                 available = descriptor.cls.list_available_devices()
-            except Exception:
+            except Exception as e:
+                logger.debug("Failed to list devices for %s: %s", descriptor.key, e)
                 continue
 
             if not available:
@@ -158,8 +159,8 @@ class DeviceRegistry:
                 try:
                     drv = reg.create_device(descriptor.key)
                     capabilities = drv.get_capabilities(device.id)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to get capabilities for %s: %s", entry_key, e)
                     
                 entry: Dict[str, object] = {
                     "key": entry_key,
@@ -268,8 +269,8 @@ class DeviceRegistry:
                 caps = driver.get_capabilities(target.id)
                 if caps.sample_rates and len(caps.sample_rates) > 0:
                     effective_sample_rate = caps.sample_rates[0]
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to get capabilities for sample rate: %s", e)
         
         if effective_sample_rate <= 0:
             driver.close()
@@ -303,12 +304,12 @@ class DeviceRegistry:
             if getattr(self._driver, "running", False):
                 try:
                     self._driver.stop()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to stop driver during disconnect: %s", e)
             try:
                 self._driver.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to close driver during disconnect: %s", e)
         finally:
             self._driver = None
             self._active_key = None

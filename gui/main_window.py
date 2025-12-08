@@ -36,16 +36,6 @@ from .scope_config_manager import ScopeConfigManager, ScopeConfigProvider
 from .trigger_control_widget import TriggerControlWidget
 
 
-
-
-
-
-
-
-
-
-
-
 class MainWindow(QtWidgets.QMainWindow):
     """Main application window orchestrating plotting, device control, and audio monitoring."""
 
@@ -688,7 +678,8 @@ class MainWindow(QtWidgets.QMainWindow):
             span = cfg.vertical_span_v
             offset = cfg.screen_offset
             # Convert from normalized screen coords to volts
-            voltage = (value - offset) * span
+            # Must match trace_renderer.py: voltage = (y_norm - offset) * (2 * span)
+            voltage = (value - offset) * (2.0 * span)
         else:
             # No channel config, can't convert properly
             voltage = 0.0
@@ -720,7 +711,8 @@ class MainWindow(QtWidgets.QMainWindow):
             span = cfg.vertical_span_v
             offset = cfg.screen_offset
             # Transform threshold from volts to normalized 0-1 screen coords
-            normalized_value = (threshold_value / span) + offset
+            # Must match trace_renderer.py: y = (voltage / (2 * span)) + offset
+            normalized_value = (threshold_value / (2.0 * span)) + offset
         else:
             normalized_value = 0.5
         
@@ -989,6 +981,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # Stop playback timer
         self._stop_playback_timer()
         self.device_control.reset_playback_controls()
+        # Update widget connected state - this hides playback controls
+        self.device_control.set_connected(False)
         
         self._device_connected = False
         self._apply_device_state(False)
@@ -1287,12 +1281,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if not hasattr(config, "vertical_span_v"):
             try:
                 config.vertical_span_v = float(getattr(config, "range_v", 1.0))
-            except Exception:
+            except Exception as e:
+                self._logger.debug("Failed to get vertical_span_v: %s", e)
                 config.vertical_span_v = 1.0
         if not hasattr(config, "screen_offset"):
             try:
                 config.screen_offset = float(getattr(config, "offset_v", 0.5))
-            except Exception:
+            except Exception as e:
+                self._logger.debug("Failed to get screen_offset: %s", e)
                 config.screen_offset = 0.5
         existing = self._channel_configs.get(channel_id)
         if existing is not None:
@@ -1452,8 +1448,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_plot_y_range()
 
     def _refresh_channel_layout(self) -> None:
-       """Deprecated: Delegates to plot manager if needed, but ensure_renderers handles it."""
-       pass
+        """No-op stub: channel layout is now managed by PlotManager."""
+        pass
 
     def _register_chunk(self, data: np.ndarray) -> None:
         self._plot_manager.register_chunk(data)
@@ -1462,8 +1458,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chunk_mean_samples = self._plot_manager.chunk_mean_samples
         try:
             self.runtime.update_metrics(chunk_rate=self._chunk_rate, sample_rate=self._current_sample_rate)
-        except Exception:
-            pass
+        except Exception as e:
+            self._logger.debug("Failed to update runtime metrics: %s", e)
 
     def _transform_to_screen(self, raw_data: np.ndarray, span_v: float, offset_pct: float) -> np.ndarray:
         span = max(float(span_v), 1e-9)
@@ -1649,8 +1645,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if dm is not None:
             try:
                 dm.disconnect_device()
-            except Exception:
-                pass
+            except Exception as e:
+                self._logger.debug("Exception during device disconnect on close: %s", e)
         self._clear_listen_channel()
         if hasattr(self, "_analysis_dock") and self._analysis_dock is not None:
             self._analysis_dock.shutdown()
@@ -1700,7 +1696,8 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg = self._channel_configs.get(self._trigger_controller.channel_id) or self._channel_configs.get(self._active_channel_id)
         span = cfg.vertical_span_v if cfg is not None else 1.0
         offset = cfg.screen_offset if cfg is not None else 0.0
-        value = (y_norm - offset) * span
+        # Reverse transform: must match trace_renderer.py: voltage = (y_norm - offset) * (2 * span)
+        value = (y_norm - offset) * (2.0 * span)
         if abs(self.trigger_control.threshold_spin.value() - value) > 1e-6:
             self.trigger_control.threshold_spin.blockSignals(True)
             self.trigger_control.threshold_spin.setValue(value)
@@ -1816,41 +1813,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def health_snapshot(self) -> dict:
         return self.runtime.health_snapshot()
-
-        _set_status_text(
-            "sr",
-            f"SR: {sr:,.0f} Hz\n"
-            f"Drops V:{drops.get('visualization', 0)} "
-            f"L:{drops.get('logging', 0)} Evict:{evicted.get('visualization', 0)}",
-        )
-
-        chunk_line = f"Chunks/s: {self._chunk_rate:5.1f}"
-        if chunk_suffix:
-            chunk_line = f"{chunk_line}\n{chunk_suffix}"
-        else:
-            chunk_line = f"{chunk_line}\n"
-        _set_status_text("chunk", chunk_line)
-
-        viz_queue_text = _format_queue(queue_depths.get("visualization"), "V")
-
-        ring_info = queue_depths.get("viz_buffer", {})
-        if isinstance(ring_info, dict):
-            ring_seconds = float(ring_info.get("seconds", 0.0))
-            ring_capacity_seconds = float(ring_info.get("capacity_seconds", 0.0))
-            ring_ms = ring_seconds * 1_000.0
-            ring_cap_ms = ring_capacity_seconds * 1_000.0
-            if ring_capacity_seconds > 0:
-                ring_text = f"History {ring_ms:5.0f}/{ring_cap_ms:5.0f} ms"
-            else:
-                ring_text = "History 0 ms"
-        else:
-            ring_text = "History 0 ms"
-
-        audio_text = _format_queue(queue_depths.get("audio"), "Au")
-        logging_text = _format_queue(queue_depths.get("logging"), "L")
-
-        _set_status_text("queues", f"Queues {viz_queue_text} {audio_text} {logging_text}\n{ring_text}")
-        _set_status_text("drops", "")
 
     # ------------------------------------------------------------------
 

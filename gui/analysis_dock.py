@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from typing import Dict, Optional, Sequence, TYPE_CHECKING
 
 from PySide6 import QtCore, QtWidgets
 
 from .analysis_tab import AnalysisTab
 from analysis.analysis_worker import AnalysisWorker
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from daq.base_device import ChannelInfo
@@ -98,7 +101,8 @@ class AnalysisDock(QtWidgets.QDockWidget):
         if self._controller is not None:
             try:
                 output_queue, worker = self._controller.open_analysis_stream(channel_name, sample_rate)
-            except Exception:
+            except Exception as e:
+                logger.debug("Failed to open analysis stream: %s", e)
                 output_queue = None
                 worker = None
         count = self._analysis_count.get(channel_name, 0) + 1
@@ -209,8 +213,8 @@ class AnalysisDock(QtWidgets.QDockWidget):
             if hasattr(widget, "_release_metrics"):
                 try:
                     widget._release_metrics()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to release metrics during shutdown: %s", e)
             if self._tabs.indexOf(widget) >= 0:
                 self._tabs.removeTab(self._tabs.indexOf(widget))
             widget.deleteLater()

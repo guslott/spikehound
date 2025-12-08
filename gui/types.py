@@ -1,3 +1,8 @@
+"""GUI type definitions for channel configuration and display settings.
+
+This module defines data classes used to configure per-channel display properties
+including colors, vertical scaling, filter settings, and feature toggles.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field

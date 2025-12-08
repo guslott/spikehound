@@ -1,7 +1,14 @@
-numpy
-scipy
-PySide6
-pyqtgraph
-miniaudio
-pyserial
-pytest
+# Core dependencies
+numpy>=1.26.0,<2.0
+scipy>=1.11.0
+PySide6>=6.6.0
+pyqtgraph>=0.13.0
+
+# Audio support
+miniaudio>=1.60
+
+# Serial communication (BYB devices)
+pyserial>=3.5
+
+# Testing
+pytest>=8.0.0

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 import threading
 from typing import Callable, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -34,8 +37,9 @@ class AnalysisSettingsStore:
         for callback in callbacks:
             try:
                 callback(new_settings)
-            except Exception:
+            except Exception as e:
                 # Best-effort notifications; a bad subscriber should not break updates.
+                logger.debug("Subscriber callback failed: %s", e)
                 continue
         return new_settings
 

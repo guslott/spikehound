@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 import math
 import queue
 import threading
 from typing import Callable, Optional
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from shared.models import Chunk, EndOfStream
 from shared.event_buffer import EventRingBuffer
@@ -74,7 +77,8 @@ class AnalysisWorker(threading.Thread):
             return
         try:
             samples = np.array(chunk.samples[idx : idx + 1], dtype=np.float32)
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to slice chunk samples: %s", e)
             return
         if samples.size == 0:
             return
@@ -107,7 +111,8 @@ class AnalysisWorker(threading.Thread):
                 units=chunk.units,
                 meta=meta,
             )
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to create routed chunk: %s", e)
             return
         events = self._detect_events(routed_chunk)
         events_tuple = tuple(events)
@@ -124,8 +129,8 @@ class AnalysisWorker(threading.Thread):
                     units=routed_chunk.units,
                     meta=meta_with_events,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to add events meta to chunk: %s", e)
         batch = AnalysisBatch(chunk=routed_chunk, events=events_tuple)
         try:
             self.output_queue.put_nowait(batch)
@@ -184,8 +189,8 @@ class AnalysisWorker(threading.Thread):
         if self._registration_token is not None:
             try:
                 self._controller.unregister_analysis_queue(self._registration_token)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to unregister analysis queue: %s", e)
             self._registration_token = None
         if self._settings_unsub:
             self._settings_unsub()
@@ -200,7 +205,8 @@ class AnalysisWorker(threading.Thread):
             return
         try:
             infos = self._controller.active_channels()
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to get active channels: %s", e)
             return
         for info in infos or []:
             name = getattr(info, "name", None)
@@ -221,7 +227,8 @@ class AnalysisWorker(threading.Thread):
                 int(self._channel_id),
                 return_info=True,
             )
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to collect waveform window: %s", e)
             return np.empty(0, dtype=np.float32)
         if miss_pre > 0 or miss_post > 0:
             # Avoid splicing truncated windows; fall back to the local chunk data.
@@ -591,5 +598,3 @@ class AnalysisWorker(threading.Thread):
         if threshold >= 0:
             return bool(np.nanmax(waveform) >= threshold)
         return bool(np.nanmin(waveform) <= threshold)
-
-from .metrics import peak_frequency_sinc

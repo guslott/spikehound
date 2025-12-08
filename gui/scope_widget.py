@@ -41,7 +41,9 @@ class VoltageAxis(pg.AxisItem):
 
     def tickStrings(self, values, scale, spacing):
         try:
-            return [f"{(float(v) - self._offset) * self._span:.3g}" for v in values]
+            # Must match trace_renderer.py: y_norm = voltage/(2*span) + offset
+            # So: voltage = (y_norm - offset) * (2 * span)
+            return [f"{(float(v) - self._offset) * (2.0 * self._span):.3g}" for v in values]
         except Exception as exc:
             logger.debug("VoltageAxis tickStrings failed: %s", exc)
             return super().tickStrings(values, scale, spacing)

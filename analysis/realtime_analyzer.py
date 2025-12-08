@@ -1,6 +1,7 @@
 # analysis/realtime_analyzer.py
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -8,6 +9,8 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from shared.event_buffer import EventRingBuffer
 from shared.types import Event
@@ -61,10 +64,10 @@ class RealTimeAnalyzer:
         analysis_queue: "queue.Queue",
         event_queue: "queue.Queue",
         logging_queue: "queue.Queue",
-        event_buffer: Optional[EventRingBuffer] = None,
         sample_rate: float,
         n_channels: int,
         config: ThresholdConfig,
+        event_buffer: Optional[EventRingBuffer] = None,
     ) -> None:
         self.analysis_queue = analysis_queue
         self.event_queue = event_queue
@@ -260,6 +263,7 @@ class RealTimeAnalyzer:
 
             try:
                 self._detect_in_chunk(view)
-            except Exception:
+            except Exception as e:
                 # Keep going even if one chunk is problematic.
+                logger.debug("Failed to detect in chunk: %s", e)
                 continue
