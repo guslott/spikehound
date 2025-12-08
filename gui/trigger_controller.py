@@ -15,18 +15,10 @@ from typing import Deque, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from PySide6 import QtCore
 
+from shared.models import TriggerConfig
+
 logger = logging.getLogger(__name__)
 
-
-@dataclass
-class TriggerConfig:
-    """Immutable snapshot of trigger configuration."""
-    mode: str = "stream"  # "stream", "single", "continuous"
-    channel_id: Optional[int] = None
-    threshold: float = 0.0
-    pre_seconds: float = 0.01
-    hysteresis: float = 0.0
-    window_sec: float = 1.0
 
 
 class TriggerController(QtCore.QObject):
@@ -44,7 +36,7 @@ class TriggerController(QtCore.QObject):
     """
 
     # Emitted when trigger configuration changes
-    configChanged = QtCore.Signal(dict)
+    configChanged = QtCore.Signal(object)  # TriggerConfig
     
     # Emitted when a triggered capture is ready for display
     captureReady = QtCore.Signal()
@@ -161,15 +153,15 @@ class TriggerController(QtCore.QObject):
         if reset_state:
             self.reset_state()
         
-        config_dict = {
-            "mode": mode,
-            "channel_index": channel_id if channel_id is not None else -1,
-            "threshold": threshold,
-            "hysteresis": 0.0,
-            "pretrigger_frac": pre_seconds,
-            "window_sec": window_sec,
-        }
-        self.configChanged.emit(config_dict)
+        config = TriggerConfig(
+            channel_index=channel_id if channel_id is not None else -1,
+            threshold=threshold,
+            hysteresis=0.0,
+            pretrigger_frac=pre_seconds,
+            window_sec=window_sec,
+            mode=mode,
+        )
+        self.configChanged.emit(config)
 
     def arm_single(self) -> None:
         """Arm single-shot trigger mode."""

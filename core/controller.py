@@ -319,26 +319,16 @@ class PipelineController:
 
     # Trigger configuration placeholder ---------------------------------
 
-    def update_trigger_config(self, config: Dict[str, Any]) -> None:
+    def update_trigger_config(self, config: TriggerConfig) -> None:
         """Receive trigger configuration updates from the GUI and forward them."""
         with self._lock:
             if self._dispatcher is None:
                 return
 
-            channel_index = int(config.get("channel_index", -1))
-            trigger_conf = TriggerConfig(
-                channel_index=channel_index,
-                threshold=float(config.get("threshold", 0.0)),
-                hysteresis=float(config.get("hysteresis", 0.0)),
-                pretrigger_frac=float(config.get("pretrigger_frac", 0.0)),
-                window_sec=float(config.get("window_sec", 0.0)),
-                mode=str(config.get("mode", "continuous")),
-            )
-
-            self._window_sec = trigger_conf.window_sec or self._window_sec
+            self._window_sec = config.window_sec or self._window_sec
             sample_rate = self.sample_rate or 0.0
-            self._dispatcher.set_trigger_config(trigger_conf, sample_rate)
-            self._dispatcher.set_window_duration(trigger_conf.window_sec)
+            self._dispatcher.set_trigger_config(config, sample_rate)
+            self._dispatcher.set_window_duration(config.window_sec)
 
     def attach_source(self, driver: BaseDevice, sample_rate: float, channels: Sequence[ChannelInfo]) -> None:
         with self._lock:

@@ -19,7 +19,7 @@ from core import PipelineController
 from core.runtime import SpikeHoundRuntime
 from shared.app_settings import AppSettings
 from core.conditioning import ChannelFilterSettings, FilterSettings
-from shared.models import ChunkPointer, EndOfStream
+from shared.models import ChunkPointer, EndOfStream, TriggerConfig
 from shared.ring_buffer import SharedRingBuffer
 from .analysis_dock import AnalysisDock
 from .settings_tab import SettingsTab
@@ -226,7 +226,7 @@ class MainWindow(QtWidgets.QMainWindow):
         channels: Optional[list[int]] = None,
         chunk_size: Optional[int] = None,
         filter_settings: Optional[FilterSettings] = None,
-        trigger_cfg: Optional[dict] = None,
+        trigger_cfg: Optional[TriggerConfig] = None,
     ) -> None:
         cfg_trigger = trigger_cfg
         try:
@@ -648,17 +648,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._config_manager.apply_config_data(data, source, show_dialogs=show_dialogs)
 
 
-    @QtCore.Slot(dict)
-    def _on_trigger_config_changed(self, config: dict) -> None:
+    @QtCore.Slot(object)
+    def _on_trigger_config_changed(self, config: TriggerConfig) -> None:
         """Handle trigger configuration changes from controller."""
-        is_triggered = config.get("mode", "stream") != "stream"
+        is_triggered = config.mode != "stream"
         if not is_triggered:
             # Stream mode
             self.scope.set_pretrigger_position(0.0, visible=False)
             self.scope.set_threshold(visible=False)
         else:
             # Trigger mode
-            pre = float(config.get("pre_seconds", 0.01))
+            pre = float(config.pretrigger_frac)
             self.scope.set_pretrigger_position(pre, visible=True)
         
         if self._device_connected:
@@ -676,14 +676,19 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             voltage = 0.0
         
+        # Update spinbox value (blocked to prevent loop)
         self.trigger_control.threshold_spin.blockSignals(True)
         self.trigger_control.threshold_spin.setValue(voltage)
         self.trigger_control.threshold_spin.blockSignals(False)
+        
+        # Manually trigger config update to propagate to dispatcher
+        # (since blockSignals prevented the automatic valueChanged signal)
+        self.trigger_control._on_config_changed()
 
-    def _update_trigger_visuals(self, config: dict, update_line: bool = True) -> None:
+    def _update_trigger_visuals(self, config: TriggerConfig, update_line: bool = True) -> None:
         """Update trigger visual elements on the scope."""
-        mode = config.get("mode", "stream")
-        channel_valid = config.get("channel_index", -1) != -1
+        mode = config.mode
+        channel_valid = config.channel_index != -1
         
         if mode == "stream" or not channel_valid:
             self.scope.set_threshold(visible=False)
@@ -691,7 +696,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         
         # Calculate threshold position in screen coordinates
-        threshold_value = config.get("threshold", 0.0)
+        threshold_value = config.threshold
         cfg = self._channel_configs.get(self._trigger_controller.channel_id) or self._channel_configs.get(self._active_channel_id)
         if cfg is not None:
             span = cfg.vertical_span_v
@@ -714,7 +719,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         
         # Pretrigger line
-        pre_value = float(config.get("pretrigger_frac", 0.0) or 0.0)
+        pre_value = float(config.pretrigger_frac)
         if pre_value > 0.0:
             self.scope.pretrigger_line.setVisible(True)
             self.scope.pretrigger_line.setValue(0.0)
@@ -799,13 +804,15 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Update trigger visuals if this is the trigger channel
         if self._trigger_controller.channel_id is not None and channel_id == self._trigger_controller.channel_id:
-            cfg = {
-                "mode": self._trigger_controller.mode,
-                "threshold": self._trigger_controller.threshold,
-                "channel_index": self._trigger_controller.channel_id,
-                "pretrigger_frac": self._trigger_controller.pre_seconds
-            }
-            self._update_trigger_visuals(cfg)
+            trigger_cfg = TriggerConfig(
+                channel_index=self._trigger_controller.channel_id,
+                threshold=self._trigger_controller.threshold,
+                hysteresis=0.0,
+                pretrigger_frac=self._trigger_controller.pre_seconds,
+                window_sec=self._trigger_controller.window_sec,
+                mode=self._trigger_controller.mode,
+            )
+            self._update_trigger_visuals(trigger_cfg)
         
         # Update channel display
         self._update_channel_display(channel_id)
@@ -1245,17 +1252,16 @@ class MainWindow(QtWidgets.QMainWindow):
         # If this channel is the current trigger source, update trigger visuals
         # to reflect potential changes in vertical span or offset.
         if self._trigger_controller.channel_id is not None and channel_id == self._trigger_controller.channel_id:
-             # Refresh visuals using current controller state
-             # We rely on cached _trigger_threshold etc? 
-             # Or better, construct a config dict from current simple state?
-             # _update_trigger_visuals needs a dict.
-             cfg = {
-                 "mode": self._trigger_controller.mode,
-                 "threshold": self._trigger_controller.threshold,
-                 "channel_index": self._trigger_controller.channel_id,
-                 "pretrigger_frac": self._trigger_controller.pre_seconds
-             }
-             self._update_trigger_visuals(cfg)
+            # Refresh visuals using current controller state
+            trigger_cfg = TriggerConfig(
+                channel_index=self._trigger_controller.channel_id,
+                threshold=self._trigger_controller.threshold,
+                hysteresis=0.0,
+                pretrigger_frac=self._trigger_controller.pre_seconds,
+                window_sec=self._trigger_controller.window_sec,
+                mode=self._trigger_controller.mode,
+            )
+            self._update_trigger_visuals(trigger_cfg)
         self._update_channel_display(channel_id)
 
         if filters_changed:
@@ -1621,16 +1627,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Triggers
         if self._trigger_controller.channel_id is not None and cid == self._trigger_controller.channel_id:
-             self._on_trigger_config_changed({
-                 "channel_index": cid,
-                 "mode": self._trigger_controller.mode,
-                 # Trigger widget handles others, but we need to refresh potentially
-             })
-             # Actually TriggerControlWidget usually updates on its own, but dragging offset
-             # doesn't change trigger LEVEL, only visualization of it relative to trace?
-             # No, offset changes where the trace is, so threshold might need visual update?
-             # ScopeWidget handles threshold line.
-             pass
+            # Create TriggerConfig for visual update
+            config_update = TriggerConfig(
+                channel_index=cid,
+                threshold=self._trigger_controller.threshold,
+                hysteresis=0.0,
+                pretrigger_frac=self._trigger_controller.pre_seconds,
+                window_sec=self._trigger_controller.window_sec,
+                mode=self._trigger_controller.mode,
+            )
+            self._update_trigger_visuals(config_update)
 
     def _on_scope_drag_finished(self) -> None:
         """Handle end of channel drag operation."""

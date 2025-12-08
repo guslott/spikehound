@@ -14,7 +14,3 @@ def main() -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 
-
-#TODO Notes:
-# - (Taylor) Add spectrogram view in separate tab, also, simply fft amplitudes view
-# - Add analog output to DAQ devices to support input and output/stimulation

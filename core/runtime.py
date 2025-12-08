@@ -150,7 +150,7 @@ class SpikeHoundRuntime:
                 self.logger.warning("Failed to update filter settings: %s", exc)
         if trigger_cfg is not None:
             try:
-                controller.update_trigger_config(trigger_cfg.__dict__ if hasattr(trigger_cfg, "__dict__") else trigger_cfg)
+                controller.update_trigger_config(trigger_cfg)
             except Exception as exc:
                 self.logger.warning("Failed to update trigger config: %s", exc)
         if channels is not None:

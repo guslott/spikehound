@@ -386,8 +386,7 @@ class BackyardBrainsSource(BaseDevice):
                             msg_bytes = raw_buffer[start_idx + len(_MSG_START) : end_idx]
                             try:
                                 msg_str = msg_bytes.decode("ascii", errors="ignore")
-                                # TODO: emit event or log message
-                                # e.g. "EVNT: 4;"
+                            # Handle embedded ASCII messages (e.g. "EVNT: 4;")
                                 if msg_str:
                                     _LOGGER.info("SpikerBox Message: %s", msg_str)
                             except Exception as exc:
