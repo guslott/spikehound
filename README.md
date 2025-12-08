@@ -260,7 +260,7 @@ Use the built-in **Simulated Source** to demonstrate concepts without any physic
 ### Contributors
 - **Author:** Gus K. Lott III, PhD
 - **Student Contributor:** Taylor Mangoba (MPHS)
-- **Special Thanks:** Dr. Ronald Hoy, Audrey Yeager, and the Grass Foundation
+- **Special Thanks:** Dr. Ronald Hoy, Audrey Yeager
 
 ---
 
