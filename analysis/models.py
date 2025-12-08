@@ -6,7 +6,7 @@ from typing import Optional, Sequence
 import numpy as np
 
 from shared.models import Chunk
-from shared.types import Event
+from shared.types import AnalysisEvent
 
 
 @dataclass
@@ -27,7 +27,7 @@ class AnalysisBatch:
     """Chunk routed to a single channel plus the events detected within that chunk."""
 
     chunk: Chunk
-    events: Sequence[Event]
+    events: Sequence[AnalysisEvent]
 
 
-__all__ = ["Event", "ThresholdConfig", "AnalysisBatch"]
+__all__ = ["AnalysisEvent", "ThresholdConfig", "AnalysisBatch"]

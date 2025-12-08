@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 from shared.models import Chunk, EndOfStream
 from shared.event_buffer import EventRingBuffer
-from shared.types import Event
+from shared.types import AnalysisEvent
 
 from .models import AnalysisBatch
 from .settings import AnalysisSettings, AnalysisSettingsStore
@@ -196,7 +196,7 @@ class AnalysisWorker(threading.Thread):
             self._settings_unsub()
             self._settings_unsub = None
 
-    def publish_event(self, event: Event) -> None:
+    def publish_event(self, event: AnalysisEvent) -> None:
         if self._event_buffer is not None:
             self._event_buffer.push(event)
 
@@ -294,7 +294,7 @@ class AnalysisWorker(threading.Thread):
         self._event_id += 1
         return self._event_id
 
-    def _detect_events(self, chunk: Chunk) -> list[Event]:
+    def _detect_events(self, chunk: Chunk) -> list[AnalysisEvent]:
         with self._state_lock:
             event_window_ms = float(self._event_window_ms)
             threshold_enabled = bool(self._threshold_enabled)
@@ -325,15 +325,15 @@ class AnalysisWorker(threading.Thread):
             if not detected_events:
                 return []
             
-            events: list[tuple[Event, int, float]] = []
+            events: list[tuple[AnalysisEvent, int, float]] = []
             
             # We need to calculate metrics for these events
             dt = float(chunk.dt)
             sr = (1.0 / dt) if dt > 0 else self.sample_rate
             
             for de in detected_events:
-                # de is shared.models.Event
-                # We need to create shared.types.Event (which is the same class)
+                # de is shared.models.DetectionEvent
+                # We need to create shared.types.AnalysisEvent (which is the same class)
                 # But AnalysisWorker adds extra properties.
                 
                 wf = de.window
@@ -392,7 +392,7 @@ class AnalysisWorker(threading.Thread):
                 
                 first_time_sec = de.t - (pre_samples * dt)
                 
-                event = Event(
+                event = AnalysisEvent(
                     id=self._next_event_id(),
                     channelId=de.chan, # This might need mapping if we have multiple channels
                     thresholdValue=de.params.get("threshold", 0.0),
@@ -428,7 +428,7 @@ class AnalysisWorker(threading.Thread):
                 self._last_crossing_time_sec = crossing_time
             
             # Return collected events
-            collected: list[Event] = []
+            collected: list[AnalysisEvent] = []
             for event, new_last_end, crossing_time in events:
                 self.publish_event(event)
                 with self._state_lock:
@@ -481,7 +481,7 @@ class AnalysisWorker(threading.Thread):
 
         use_secondary = threshold_enabled and secondary_enabled
 
-        events: list[tuple[Event, int, float]] = []
+        events: list[tuple[AnalysisEvent, int, float]] = []
         last_end = last_window_end
         prev_crossing_time = last_crossing_time
         target_len = window_samples
@@ -551,7 +551,7 @@ class AnalysisWorker(threading.Thread):
             energy_density = float(np.sqrt(energy / window_sec))
             peak_freq = peak_frequency_sinc(centered_wf, sr, center_index=peak_idx)
             peak_wavelength = 1.0 / peak_freq if peak_freq > 1e-9 else 0.0
-            event = Event(
+            event = AnalysisEvent(
                 id=self._next_event_id(),
                 channelId=int(channel_id) if channel_id is not None else 0,
                 thresholdValue=threshold_value,
@@ -581,7 +581,7 @@ class AnalysisWorker(threading.Thread):
         if not events:
             return []
 
-        collected: list[Event] = []
+        collected: list[AnalysisEvent] = []
         for event, new_last_end, crossing_time in events:
             self.publish_event(event)
             with self._state_lock:

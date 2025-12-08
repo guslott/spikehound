@@ -24,7 +24,7 @@ from shared.ring_buffer import SharedRingBuffer
 from analysis.settings import AnalysisSettingsStore
 from shared.app_settings import AppSettings, AppSettingsStore
 from shared.event_buffer import AnalysisEvents, EventRingBuffer
-from shared.types import Event as SharedEvent
+from shared.types import AnalysisEvent
 
 
 def _registry():
@@ -545,7 +545,7 @@ class PipelineController:
 
     def collect_trigger_window(
         self,
-        event: SharedEvent,
+        event: AnalysisEvent,
         target_channel_id: int,
         window_ms: float,
     ) -> tuple[np.ndarray, int, int]:

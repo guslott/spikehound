@@ -7,13 +7,13 @@ from shared.models import (
     Chunk,
     DeviceInfo,
     EndOfStream,
-    Event,
+    DetectionEvent,
     TriggerConfig,
 )
 
 __all__ = [
     "Chunk",
-    "Event",
+    "DetectionEvent",
     "EndOfStream",
     "TriggerConfig",
     "ChannelInfo",

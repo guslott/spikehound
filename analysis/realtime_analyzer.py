@@ -13,7 +13,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 from shared.event_buffer import EventRingBuffer
-from shared.types import Event
+from shared.types import AnalysisEvent
 
 from .models import ThresholdConfig
 
@@ -55,7 +55,7 @@ def _as_chunk_view(obj) -> Optional[_ChunkView]:
 class RealTimeAnalyzer:
     """
     Consumes filtered chunks from `analysis_queue`, runs a simple threshold detector,
-    and emits Event objects to `event_queue` (for GUI markers) and `logging_queue`
+    and emits AnalysisEvent objects to `event_queue` (for GUI markers) and `logging_queue`
     (for persistence by the writer thread later).
     """
 
@@ -215,7 +215,7 @@ class RealTimeAnalyzer:
                 post_ms = 1000.0 * (self._post / sr)
                 crossing_value = float(sig[idx])
                 threshold_value = -float(th[c]) if crossing_value < 0 else float(th[c])
-                ev = Event(
+                ev = AnalysisEvent(
                     id=self._next_event_id(),
                     channelId=int(c),
                     thresholdValue=threshold_value,

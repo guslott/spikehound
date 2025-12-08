@@ -135,18 +135,15 @@ config = TriggerConfig(
 
 ## Backward Compatibility
 
-Both Event types have aliases for backward compatibility:
+## Backward Compatibility
+
+The generic `Event` alias has been removed to avoid ambiguity. Code must use `DetectionEvent` or `AnalysisEvent` explicitly.
 
 ```python
-# These are equivalent:
-from shared.models import Event, DetectionEvent
-# Event is DetectionEvent
-
-from shared.types import Event, AnalysisEvent
-# Event is AnalysisEvent
+# Use explicit imports:
+from shared.models import DetectionEvent
+from shared.types import AnalysisEvent
 ```
-
-> **For new code**, prefer the explicit names `DetectionEvent` and `AnalysisEvent`.
 
 ---
 

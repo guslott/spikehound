@@ -6,7 +6,7 @@ from analysis.metrics import peak_frequency_sinc as _peak_frequency_sinc
 from analysis.settings import AnalysisSettingsStore
 from shared.models import Chunk
 from shared.event_buffer import AnalysisEvents, EventRingBuffer
-from shared.types import Event
+from shared.types import AnalysisEvent
 
 
 class _DummyController:
@@ -21,8 +21,8 @@ class _DummyController:
         return None
 
 
-def _stub_event(event_id: int) -> Event:
-    return Event(
+def _stub_event(event_id: int) -> AnalysisEvent:
+    return AnalysisEvent(
         id=event_id,
         channelId=0,
         thresholdValue=0.5,

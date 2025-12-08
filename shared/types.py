@@ -83,6 +83,5 @@ class AnalysisEvent:
         object.__setattr__(self, "intervalSinceLastSec", interval)
 
 
-# Backward compatibility alias
-Event = AnalysisEvent
+
 

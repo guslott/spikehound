@@ -1591,6 +1591,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 dm.disconnect_device()
             except Exception as e:
                 self._logger.debug("Exception during device disconnect on close: %s", e)
+            try:
+                dm.cleanup()
+            except Exception as e:
+                self._logger.debug("Exception during device manager cleanup: %s", e)
         self._clear_listen_channel()
         if hasattr(self, "_analysis_dock") and self._analysis_dock is not None:
             self._analysis_dock.shutdown()

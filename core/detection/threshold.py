@@ -1,7 +1,7 @@
 import numpy as np
 from typing import Iterable, Mapping, Dict, Optional
 
-from shared.models import Event, Chunk
+from shared.models import DetectionEvent, Chunk
 from .base import EventDetector, DetectorParameter, register_detector
 
 
@@ -83,7 +83,7 @@ class AmpThresholdDetector:
         self._last_event_time = np.zeros(n_channels, dtype=np.float64) - 1000.0 # Initialize far in the past
         self._residue = None # Reset residue buffer
 
-    def process_chunk(self, chunk: Chunk) -> Iterable[Event]:
+    def process_chunk(self, chunk: Chunk) -> Iterable[DetectionEvent]:
         if self._sample_rate <= 0:
             return []
         
@@ -203,7 +203,7 @@ class AmpThresholdDetector:
                 waveform = ch_data[w_start:w_end]
                 
                 # Create event
-                event = Event(
+                event = DetectionEvent(
                     t=real_t,
                     chan=ch,
                     window=waveform,
@@ -226,6 +226,6 @@ class AmpThresholdDetector:
             
         return events
 
-    def finalize(self) -> Iterable[Event]:
+    def finalize(self) -> Iterable[DetectionEvent]:
         return []
 

@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 from analysis.models import AnalysisBatch
 from shared.models import Chunk, EndOfStream
 from shared.event_buffer import AnalysisEvents
-from shared.types import Event
+from shared.types import AnalysisEvent
 
 
 from gui.analysis.helpers import (
@@ -114,7 +114,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._sta_window_ms: float = 50.0
         self._sta_source_cluster_id: int | None = None
         self._sta_target_channel_id: int | None = None
-        self._sta_pending_events: dict[int, tuple[Event, int]] = {}
+        self._sta_pending_events: dict[int, tuple[AnalysisEvent, int]] = {}
         self._sta_retry_limit: int = 10
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -611,13 +611,13 @@ class AnalysisTab(QtWidgets.QWidget):
         """Update the list of available STA signal channels."""
         self._refresh_sta_channel_options(channels)
 
-    def peek_all_events(self) -> list[Event]:
+    def peek_all_events(self) -> list[AnalysisEvent]:
         """Return all events in the buffer without removing them."""
         if self._event_buffer is None:
             return []
         return self._event_buffer.peek_all()
 
-    def drain_events(self) -> list[Event]:
+    def drain_events(self) -> list[AnalysisEvent]:
         """Remove and return all events from the buffer."""
         if self._event_buffer is None:
             return []
@@ -969,7 +969,7 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def _handle_batch_events(
         self,
-        events: Sequence[Event],
+        events: Sequence[AnalysisEvent],
         window_start: float,
         width: float,
         window_start_idx: Optional[int],
@@ -985,7 +985,7 @@ class AnalysisTab(QtWidgets.QWidget):
         if not self._viz_paused:
             self._refresh_overlay_positions(window_start, width, window_start_idx)
 
-    def _build_sta_task(self, events: Sequence[Event]) -> StaTask | None:
+    def _build_sta_task(self, events: Sequence[AnalysisEvent]) -> StaTask | None:
         """Create an STA task for the given events if STA is enabled."""
         if not self._sta_enabled:
             return None
@@ -1002,7 +1002,7 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def _submit_analysis_job(
         self,
-        events: tuple[Event, ...],
+        events: tuple[AnalysisEvent, ...],
         window_start: float,
         width: float,
         window_start_idx: Optional[int],
@@ -1055,7 +1055,7 @@ class AnalysisTab(QtWidgets.QWidget):
             return
         self._apply_analysis_update(update, window_start, width, window_start_idx)
 
-    def _build_analysis_update(self, events: tuple[Event, ...]) -> AnalysisUpdate:
+    def _build_analysis_update(self, events: tuple[AnalysisEvent, ...]) -> AnalysisUpdate:
         """Build overlay payloads and STA task for a batch of events."""
         overlays: list[OverlayPayload] = []
         last_event_id: int | None = None
@@ -1496,7 +1496,7 @@ class AnalysisTab(QtWidgets.QWidget):
         channel_info = task.channel_index
         pending_items = list(self._sta_pending_events.values())
         self._sta_pending_events.clear()
-        queue: list[tuple[Event, int]] = [(event, 0) for event in task.events]
+        queue: list[tuple[AnalysisEvent, int]] = [(event, 0) for event in task.events]
         queue.extend(pending_items)
         updated = False
         for event, attempts in queue:
@@ -1524,7 +1524,7 @@ class AnalysisTab(QtWidgets.QWidget):
         controller: "PipelineController",
         target_channel_id: int,
         channel_info: Optional[int],
-        event: Event,
+        event: AnalysisEvent,
         window_ms: float,
     ) -> str:
         """Collect trigger window for a single event and add to STA."""
@@ -2005,7 +2005,7 @@ class AnalysisTab(QtWidgets.QWidget):
             self._refresh_overlay_colors()
         # Flag metrics for refresh; UI updates happen in the timer to avoid per-event churn.
 
-    def _build_overlay_payload(self, event: Event) -> Optional[OverlayPayload]:
+    def _build_overlay_payload(self, event: AnalysisEvent) -> Optional[OverlayPayload]:
         """Build overlay data from a detected event for visualization."""
         samples = np.asarray(event.samples, dtype=np.float32)
         if samples.size < 8:

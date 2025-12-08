@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 from core import Dispatcher, FilterSettings, Chunk, EndOfStream
 from core.detection import AmpThresholdDetector, DETECTOR_REGISTRY
-from shared.models import Event
+from shared.models import DetectionEvent
 
 def _make_chunk(samples: np.ndarray, *, start_time: float, dt: float, seq: int) -> Chunk:
     return Chunk(

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Mapping, Optional, Protocol, Type
 
-from shared.models import Event
+from shared.models import DetectionEvent
 
 
 @dataclass
@@ -30,11 +30,11 @@ class EventDetector(Protocol):
         """Called when acquisition (re)starts."""
         ...
 
-    def process_chunk(self, chunk) -> Iterable[Event]:
+    def process_chunk(self, chunk) -> Iterable[DetectionEvent]:
         """Return any new events detected in this chunk."""
         ...
 
-    def finalize(self) -> Iterable[Event]:
+    def finalize(self) -> Iterable[DetectionEvent]:
         """Flush any trailing events at stop (optional)."""
         ...
 

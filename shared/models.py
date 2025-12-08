@@ -228,8 +228,7 @@ class TriggerConfig:
     mode: str
 
 
-# Backward compatibility alias
-Event = DetectionEvent
+
 
 __all__ = [
     "DeviceInfo",
@@ -239,7 +238,7 @@ __all__ = [
     "Chunk",
     "ChunkPointer",
     "DetectionEvent",
-    "Event",  # Alias for DetectionEvent
+
     "EndOfStream",
     "TriggerConfig",
 ]

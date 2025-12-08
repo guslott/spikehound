@@ -5,12 +5,11 @@ from .controller import PipelineController
 from .device_registry import DeviceRegistry
 from .dispatcher import Dispatcher, DispatcherStats
 from .runtime import SpikeHoundRuntime
-from shared.models import Chunk, EndOfStream, Event, DetectionEvent, TriggerConfig, ChannelInfo, DeviceInfo, Capabilities, ActualConfig
+from shared.models import Chunk, EndOfStream, DetectionEvent, TriggerConfig, ChannelInfo, DeviceInfo, Capabilities, ActualConfig
 
 __all__ = [
     "Chunk",
     "DetectionEvent",
-    "Event",  # Alias for DetectionEvent
     "EndOfStream",
     "TriggerConfig",
     "ChannelInfo",

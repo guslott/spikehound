@@ -11,7 +11,7 @@ from PySide6 import QtCore, QtGui
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from shared.types import Event
+    from shared.types import AnalysisEvent
 
 # Constants moved from analysis_tab.py
 CLUSTER_COLORS: list[QtGui.QColor] = [
@@ -197,7 +197,7 @@ class OverlayPayload:
 class StaTask:
     """Data packet describing which events to use for STA processing."""
 
-    events: tuple[Event, ...]
+    events: tuple[AnalysisEvent, ...]
     target_channel_id: int
     channel_index: int | None
     window_ms: float

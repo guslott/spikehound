@@ -12,7 +12,7 @@ from .conditioning import FilterSettings, SignalConditioner
 from .device_registry import DeviceRegistry
 from shared.app_settings import AppSettingsStore
 from shared.models import TriggerConfig
-from shared.types import Event
+from shared.types import AnalysisEvent
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .controller import PipelineController

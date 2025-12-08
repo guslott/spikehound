@@ -3,7 +3,7 @@ import pickle
 import numpy as np
 import pytest
 
-from core import Chunk, Event
+from core import Chunk, DetectionEvent
 from daq.simulated_source import SimulatedPhysiologySource
 
 
@@ -100,7 +100,7 @@ def test_chunk_and_event_pickle_roundtrip():
     assert not restored_chunk.samples.flags.writeable
 
     window = rng.standard_normal(64).astype(np.float32)
-    event = Event(
+    event = DetectionEvent(
         t=3.5,
         chan=1,
         window=window,

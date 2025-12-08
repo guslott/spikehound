@@ -108,4 +108,15 @@ class DeviceManager(QtCore.QObject):
             self._listener_token = None
 
 
+    def __del__(self) -> None:
+        """Ensure local listener is removed if the object is garbage collected."""
+        try:
+            self.cleanup()
+        except ImportError:
+            # Can happen during interpreter shutdown
+            pass
+        except Exception:
+            pass
+
+
 __all__ = ["DeviceManager"]

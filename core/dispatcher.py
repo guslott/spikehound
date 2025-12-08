@@ -12,7 +12,7 @@ from PySide6 import QtCore
 
 from .conditioning import FilterSettings, SignalConditioner
 from .detection import DETECTOR_REGISTRY, EventDetector
-from shared.models import Chunk, ChunkPointer, EndOfStream, TriggerConfig, Event
+from shared.models import Chunk, ChunkPointer, EndOfStream, TriggerConfig, DetectionEvent
 from shared.ring_buffer import SharedRingBuffer
 
 logger = logging.getLogger(__name__)
