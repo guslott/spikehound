@@ -1,7 +1,7 @@
 """ChannelManager - Manages channel configurations, active channel tracking, and panel lifecycle.
 
-Extracted from MainWindow to provide a focused component for channel state management,
-including channel configs, panels, color cycling, and active channel selection.
+Provides a focused component for channel state management, including channel
+configs, panels, color cycling, and active channel selection.
 """
 
 from __future__ import annotations
@@ -24,8 +24,7 @@ logger = logging.getLogger(__name__)
 class ChannelManager(QtCore.QObject):
     """Manages channel configurations, active channel tracking, and panel lifecycle.
     
-    This component centralizes channel state management that was previously spread
-    across MainWindow. It handles:
+    Responsibilities:
     - Channel configuration storage and lifecycle
     - Channel panel creation and removal
     - Active channel tracking and selection

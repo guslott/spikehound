@@ -35,6 +35,7 @@ from .recording_control_widget import RecordingControlWidget
 from .scope_config_manager import ScopeConfigManager, ScopeConfigProvider
 from .trigger_control_widget import TriggerControlWidget
 from .channel_manager import ChannelManager
+from .audio_listen_manager import AudioListenManager
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -346,11 +347,22 @@ class MainWindow(QtWidgets.QMainWindow):
             device_control=self.device_control,
             parent=self,
         )
+        
+        # Create AudioListenManager to centralize audio monitoring
+        self._audio_listen_manager = AudioListenManager(parent=self)
+        self._audio_listen_manager.set_callbacks(
+            get_channel_configs=lambda: self._channel_configs,
+            get_channel_panels=lambda: self._channel_panels,
+            get_sample_rate=lambda: self._current_sample_rate,
+            get_active_channel_ids=lambda: self._channel_ids_current,
+            show_message=lambda title, msg: QtWidgets.QMessageBox.information(self, title, msg),
+        )
+        
         # Wire ChannelManager signals
         self._channel_manager.channelConfigChanged.connect(self._on_channel_manager_config_changed)
         self._channel_manager.activeChannelChanged.connect(self._on_channel_manager_active_changed)
         self._channel_manager.channelsUpdated.connect(self._on_channel_manager_channels_updated)
-        self._channel_manager.listenChannelRequested.connect(self._handle_listen_change)
+        self._channel_manager.listenChannelRequested.connect(self._audio_listen_manager.handle_listen_change)
         self._channel_manager.analysisRequested.connect(self._open_analysis_for_channel)
         self._channel_manager.filterSettingsChanged.connect(self._sync_filter_settings)
         
@@ -414,6 +426,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._logger.debug("Failed to set pipeline on runtime: %s", exc)
 
         self._controller = controller
+        if hasattr(self, "_audio_listen_manager"):
+            self._audio_listen_manager.set_controller(controller)
         if hasattr(self, "_analysis_dock") and self._analysis_dock is not None:
             self._analysis_dock._controller = self.runtime
 
@@ -1126,8 +1140,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._channel_last_samples = {cid: self._channel_last_samples[cid] for cid in ids if cid in self._channel_last_samples}
         self._channel_display_buffers = {cid: self._channel_display_buffers[cid] for cid in ids if cid in self._channel_display_buffers}
         
-        if self._listen_channel_id is not None and self._listen_channel_id not in ids:
-            self._clear_listen_channel()
+        # Clear listen channel if no longer in active list
+        self._audio_listen_manager.clear_if_channel_removed(ids)
+        self._listen_channel_id = self._audio_listen_manager.listen_channel_id
         
         infos = self._active_channel_infos
         if infos:
@@ -1294,12 +1309,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_axis_label()
 
     def _handle_listen_change(self, channel_id: int, enabled: bool) -> None:
-        """Apply listen toggle semantics (single selection) and spin up/tear down audio plumbing."""
-        if enabled:
-            self._set_listen_channel(channel_id)
-        else:
-            if self._listen_channel_id == channel_id:
-                self._clear_listen_channel(channel_id)
+        """Delegate to AudioListenManager."""
+        self._audio_listen_manager.handle_listen_change(channel_id, enabled)
+        # Sync local state
+        self._listen_channel_id = self._audio_listen_manager.listen_channel_id
 
     def _open_analysis_for_channel(self, channel_id: int) -> None:
         dock = getattr(self, "_analysis_dock", None)
@@ -1317,67 +1330,14 @@ class MainWindow(QtWidgets.QMainWindow):
         dock.open_analysis(channel_name, sample_rate)
 
     def _set_listen_channel(self, channel_id: int) -> None:
-        """Activate audio monitoring for the requested channel, disabling other listen toggles."""
-        cfg = self._channel_configs.get(channel_id)
-        if cfg is None:
-            return
-        if self._current_sample_rate <= 0:
-            QtWidgets.QMessageBox.information(
-                self,
-                "Audio Output",
-                "Audio output becomes available after streaming starts.",
-            )
-            cfg.listen_enabled = False
-            panel = self._channel_panels.get(channel_id)
-            if panel is not None:
-                panel.set_config(cfg)
-            return
-
-        for cid, other_cfg in self._channel_configs.items():
-            if cid == channel_id:
-                continue
-            if other_cfg.listen_enabled:
-                other_cfg.listen_enabled = False
-                panel = self._channel_panels.get(cid)
-                if panel is not None:
-                    panel.set_config(other_cfg)
-
-        cfg.listen_enabled = True
-        panel = self._channel_panels.get(channel_id)
-        if panel is not None:
-            panel.set_config(cfg)
-
-        # Track for UI state
-        self._listen_channel_id = channel_id
-
-        #Use controller API to start audio monitoring
-        if self._controller:
-            self._controller.set_audio_monitoring(channel_id)
-            # Update active channels so AudioManager knows about them
-            if hasattr(self._controller, '_audio_manager') and self._controller._audio_manager:
-                self._controller._audio_manager.update_active_channels(self._channel_ids_current)
+        """Delegate to AudioListenManager."""
+        self._audio_listen_manager.set_listen_channel(channel_id)
+        self._listen_channel_id = self._audio_listen_manager.listen_channel_id
 
     def _clear_listen_channel(self, channel_id: Optional[int] = None) -> None:
-        """Disable audio monitoring, optionally for a specific channel."""
-        target = channel_id if channel_id is not None else self._listen_channel_id
-        if target is None:
-            return
-        
-        # Update UI state
-        cfg = self._channel_configs.get(target)
-        if cfg is not None and cfg.listen_enabled:
-            cfg.listen_enabled = False
-            panel = self._channel_panels.get(target)
-            if panel is not None:
-                panel.set_config(cfg)
-        
-        # Clear UI state tracking
-        if self._listen_channel_id == target:
-            self._listen_channel_id = None
-        
-        # Use controller API to stop audio monitoring
-        if self._controller:
-            self._controller.set_audio_monitoring(None)
+        """Delegate to AudioListenManager."""
+        self._audio_listen_manager.clear_listen_channel(channel_id)
+        self._listen_channel_id = self._audio_listen_manager.listen_channel_id
 
     def _ensure_active_channel_focus(self) -> None:
         """Delegate to ChannelManager."""
@@ -2038,22 +1998,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._app_settings_unsub = store.subscribe(_apply)
 
     def _apply_listen_output_preference(self, key: Optional[str]) -> None:
-        prev = getattr(self, "_listen_device_key", None)
-        self._listen_device_key = key
+        """Apply audio output device preference."""
+        prev = self._audio_listen_manager.listen_device_key if hasattr(self, "_audio_listen_manager") else None
+        self._audio_listen_manager.set_listen_device(key)
+        self._listen_device_key = self._audio_listen_manager.listen_device_key
         if self._settings_tab is not None:
             self._settings_tab.set_listen_device(key)
         if prev == key:
             return
-        if self._listen_channel_id is None:
-            return
-        self._stop_audio_player()
-        current = self._listen_channel_id
-        if current is None:
-            return
-        if not self._ensure_audio_player(show_error=False):
+        # If listen channel is active and device changed, restart monitoring
+        if self._audio_listen_manager.listen_channel_id is not None:
+            current = self._audio_listen_manager.listen_channel_id
             self._clear_listen_channel(current)
-        else:
-            self._flush_audio_player_queue()
+            self._set_listen_channel(current)
 
     def set_listen_output_device(self, device_key: Optional[str]) -> None:
         normalized = None if device_key in (None, "") else str(device_key)
