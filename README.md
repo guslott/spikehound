@@ -1,82 +1,277 @@
 # SpikeHound 2.0
-**Scientific Data Acquisition for Physiology and Neuroscience**
 
-SpikeHound 2.0 is a modern, open-source desktop application designed for real-time bioelectric data acquisition, visualization, and analysis. A complete rewrite of the legacy **g-PRIME** software, SpikeHound 2.0 leverages Python and hardware acceleration to turn standard laptops into research-grade oscilloscopes for neurophysiology education and research.
+**Real-Time Neurophysiology Software for Education and Research**
 
-## 🧪 Project Mission
-SpikeHound democratizes access to neuroscience by removing financial and technical barriers. It provides a free, cross-platform "Lab on a Chip" solution that replaces expensive proprietary hardware and software with:
-* **Hardware Agnosticism:** Works with standard sound cards, low-cost hobbyist kits (e.g., Backyard Brains), and professional DAQ boards.
-* **Cross-Platform Support:** Runs natively on Windows, macOS, and Linux.
-* **Zero Cost:** Open-source (MIT/BSD-style license) with no MATLAB license required.
-
-## 🚀 Key Features
-
-### 1. Real-Time Oscilloscope
-* **Multi-Channel Visualization:** Stream data from multiple sources simultaneously with independent scaling, offset, and color controls.
-* **Live Conditioning:** Apply software-based filters in real-time:
-    * **Notch Filter:** Remove 50/60Hz mains hum.
-    * **High-Pass:** Eliminate DC offset and drift (AC coupling).
-    * **Low-Pass:** Reduce high-frequency noise.
-* **Audio Monitoring:** "Hear the neuron"—route any channel to your system speakers for real-time audio feedback of spike events.
-
-### 2. Advanced Analysis
-* **Threshold Detection:** Configure primary and secondary voltage thresholds to detect and capture spike events live.
-* **Live Metrics:** Visualize event statistics in real-time, including:
-    * Energy Density
-    * Peak Frequency
-    * Inter-Spike Interval (ISI) & Rate
-* **Spike-Triggered Averaging (STA):** Correlate events across channels to visualize synaptic potentials or conduction delays in real-time.
-
-### 3. Flexible Hardware Support
-SpikeHound uses a plugin-based architecture to support various input sources:
-* **Sound Card:** Uses the system's default audio input.
-* **Backyard Brains:** Direct serial support for SpikerBox devices.
-* **Simulation:** Built-in neural simulator (Poisson spike trains, noise, and mains hum) for testing and education without hardware.
-* *(Planned)* **NI-DAQmx:** Support for National Instruments research boards.
+SpikeHound 2.0 is a free, open-source desktop application for real-time bioelectric data acquisition, visualization, and analysis. Built for educators, students, and researchers from high school biology classes to graduate neuroscience programs.
 
 ---
 
-## 📦 Installation & Usage
+## 🎯 Who Is This For?
+
+| Audience | Use Case |
+|----------|----------|
+| **High School Biology** | Demonstrate action potentials with Backyard Brains SpikerBoxes |
+| **Undergraduate Labs** | Replace expensive LabVIEW/MATLAB setups in neurophysiology courses |
+| **Graduate Research** | Rapid prototyping for behavioral/neural recordings |
+| **Citizen Scientists** | Explore electrophysiology with low-cost hardware |
+
+### Educational Applications
+- **BioNB 491** (Cornell): Principles of Neurophysiology lab exercises
+- **AP Biology**: Neuroscience and action potential demonstrations
+- **Science Fairs**: Student-driven neurophysiology projects
+- **Outreach**: Public demonstrations at science museums and events
+
+---
+
+## 🧪 Project Mission
+
+SpikeHound **democratizes neurophysiology** by removing financial and technical barriers:
+
+| Barrier | SpikeHound Solution |
+|---------|---------------------|
+| Expensive hardware | Works with $100 SpikerBoxes or free sound cards |
+| MATLAB licenses ($$$) | No licenses required—100% free |
+| Windows-only software | Runs on Windows, macOS, and Linux |
+| Complex setup | Single Python script, simple installation |
+| Proprietary formats | Open data formats (WAV, CSV) |
+
+---
+
+## 🚀 Key Features
+
+### Real-Time Oscilloscope
+- **Multi-channel visualization** with independent color, scaling, and offset
+- **Live signal conditioning**: Notch (50/60Hz), high-pass, and low-pass filters
+- **Audio monitoring**: "Hear the neuron"—route any channel to speakers
+- **Triggered capture**: Single-shot or continuous threshold triggering
+
+### Spike Detection & Analysis
+- **Threshold detection** with configurable polarity and refractory period
+- **Live metrics**: Energy density, peak frequency, inter-spike interval
+- **Spike-triggered averaging**: Correlate events across channels
+- **Event capture**: Extract waveforms around detected spikes
+
+### Hardware Support
+| Device | Status | Notes |
+|--------|--------|-------|
+| **Sound Card** | ✅ Supported | Any USB/built-in audio input |
+| **Backyard Brains** | ✅ Supported | SpikerBox Pro, Neuron, Muscle |
+| **Simulation** | ✅ Supported | Neural simulator for testing |
+| **WAV Files** | ✅ Supported | Replay recorded data |
+| **NI-DAQmx** | 🔄 Planned | National Instruments boards |
+| **LabJack** | 🔄 Planned | T-series DAQ devices |
+
+---
+
+## 📦 Installation
 
 ### Requirements
-* **Python 3.12+**
+- **Python 3.12+**
+- Any supported operating system (Windows, macOS, Linux)
 
-### Dependencies
-SpikeHound relies on the scientific Python stack and Qt for its GUI:
+### Quick Start
 ```bash
+# Clone the repository
+git clone https://github.com/guslott/spikehound.git
+cd spikehound
+
+# Install dependencies
 pip install numpy scipy PySide6 pyqtgraph miniaudio pyserial
-```
 
-### Running the Application
-Launch the main entry point from the project root:
-```bash
+# Run the application
 python main.py
 ```
-## 🛠️ Architecture for Developers
 
-SpikeHound 2.0 moves away from the monolithic callback structure of its MATLAB predecessor to a modern, concurrent pipeline:
+### Building a Standalone App
+```bash
+pip install pyinstaller
+pyinstaller SpikeHound.spec
+# Output: dist/SpikeHound.app (macOS) or dist/SpikeHound.exe (Windows)
+```
 
-### Core Components
-* **DAQ Layer (`daq/`):** A unified abstraction (`BaseDevice`) that normalizes disparate hardware inputs into a consistent stream of float32 buffers.
-* **Ring Buffer (`shared/ring_buffer.py`):** A zero-copy, lock-free-read shared memory structure that decouples high-speed acquisition from visualization.
-* **Dispatcher (`core/dispatcher.py`):** The central router that pulls data from the DAQ source and fans it out to Visualization, Analysis, Audio, and Logging queues. This ensures that a slow UI never blocks data acquisition.
-* **Analysis Engine (`analysis/`):** Background workers that perform CPU-intensive tasks (filtering, FFTs, thresholding) independent of the GUI thread.
+---
 
-### "Vibe Coding" & AI Development
-This project utilizes an AI-assisted workflow. Core architecture and logic are human-designed, while implementation details are often accelerated using AI coding assistants. We encourage students and educators to contribute using similar tools!
+## 🤖 AI-Aided Development for Non-Programmers
+
+> **SpikeHound is designed to be extended by anyone**, even without programming experience. The codebase is structured specifically for AI coding assistants to understand and modify.
+
+### How It Works
+
+1. **You describe what you want** in plain English
+2. **AI reads the documentation** and understands the patterns
+3. **AI implements the feature** following established conventions
+4. **You test and verify** using the provided checklists
+
+### What You Can Add (Without Being a Programmer)
+
+| Feature Type | Difficulty | Example Request |
+|-------------|------------|-----------------|
+| **New metric** | Easy | "Add a spike width measurement" |
+| **New filter** | Easy | "Add a bandpass filter option" |
+| **New device** | Medium | "Add support for LabJack T7" |
+| **New tab** | Medium | "Add a spectrogram view" |
+| **New analysis** | Medium | "Add burst detection" |
+
+### Getting Started with AI Development
+
+1. **Open an AI coding assistant** (Claude, Cursor, GitHub Copilot, etc.)
+2. **Describe your feature request** clearly
+3. **Point the AI to the relevant workflow**:
+   - `/add-daq-driver` - For new hardware support
+   - `/add-analysis-metric` - For new measurements
+   - `/add-gui-tab` - For new interface tabs
+   - `/add-filter-type` - For new signal filters
+4. **Review the AI's implementation** and test
+
+### Documentation for AI Assistants
+
+The codebase includes extensive documentation specifically designed for AI:
+
+| Document | Location | Purpose |
+|----------|----------|---------|
+| DAQ Driver Guide | `daq/daq_readme.md` | Adding hardware support |
+| GUI Widget Guide | `gui/gui_readme.md` | Adding UI components |
+| Analysis Guide | `analysis/analysis_readme.md` | Adding metrics/detection |
+| Dispatcher Guide | `doc/dispatcher_readme.md` | Understanding data flow |
+
+### Example: Adding a New Metric
+
+**Your request to AI:**
+> "I want to add a 'spike width at half maximum' metric that measures how wide each spike is in milliseconds."
+
+**What happens:**
+1. AI reads `analysis/analysis_readme.md`
+2. AI adds a function to `analysis/metrics.py`
+3. AI integrates it into the analysis worker
+4. AI optionally adds display to the GUI
+5. You test with real or simulated data
+
+---
+
+## 🏗️ Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    User Interface                        │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐     │
+│  │ Oscilloscope│  │  Analysis   │  │  Settings   │     │
+│  │   (Scope)   │  │    Tab      │  │    Tab      │     │
+│  └─────────────┘  └─────────────┘  └─────────────┘     │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│                   Core Pipeline                          │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐     │
+│  │  Dispatcher │→ │ Conditioning│→ │  Analysis   │     │
+│  │  (Router)   │  │  (Filters)  │  │  (Metrics)  │     │
+│  └─────────────┘  └─────────────┘  └─────────────┘     │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│                 Hardware Abstraction                     │
+│  ┌───────────┐ ┌───────────┐ ┌───────────┐ ┌─────────┐ │
+│  │ SoundCard │ │ SpikerBox │ │ Simulator │ │WAV File │ │
+│  └───────────┘ └───────────┘ └───────────┘ └─────────┘ │
+└─────────────────────────────────────────────────────────┘
+```
+
+Each layer has its own documentation and follows consistent patterns that AI can understand and replicate.
+
+---
+
+## 📁 Project Structure
+
+```
+spikehound/
+├── main.py                 # Application entry point
+├── README.md               # This file
+│
+├── gui/                    # User interface components
+│   ├── gui_readme.md       # 📖 Widget development guide
+│   ├── main_window.py      # Central orchestrator
+│   ├── scope_widget.py     # Oscilloscope display
+│   └── analysis_tab.py     # Spike analysis view
+│
+├── daq/                    # Hardware drivers
+│   ├── daq_readme.md       # 📖 Driver development guide
+│   ├── base_device.py      # Abstract device interface
+│   ├── soundcard_source.py # Audio input driver
+│   └── backyard_brains.py  # SpikerBox driver
+│
+├── analysis/               # Spike detection & metrics
+│   ├── analysis_readme.md  # 📖 Metric development guide
+│   ├── metrics.py          # Metric functions
+│   └── analysis_worker.py  # Background processor
+│
+├── core/                   # Pipeline orchestration
+│   ├── dispatcher.py       # Data routing
+│   ├── conditioning.py     # Signal filters
+│   └── controller.py       # Pipeline lifecycle
+│
+├── shared/                 # Common data types
+│   ├── models.py           # DetectionEvent, Chunk, etc.
+│   └── types.py            # AnalysisEvent
+│
+├── .agent/workflows/       # AI development workflows
+│   ├── add-daq-driver.md
+│   ├── add-analysis-metric.md
+│   ├── add-gui-tab.md
+│   └── add-filter-type.md
+│
+└── test/                   # Unit tests (28 tests)
+```
+
+---
+
+## 🧑‍🔬 For Educators
+
+### Classroom Setup
+1. Install Python 3.12+ on lab computers
+2. Clone SpikeHound and install dependencies
+3. Connect SpikerBox devices (or use simulation mode)
+4. Launch with `python main.py`
+
+### Lab Exercise Ideas
+- **Action Potential Recording**: Record from earthworm giant fibers
+- **EMG Analysis**: Measure muscle activity with surface electrodes
+- **ECG Demonstration**: Record heartbeat with simple electrodes
+- **Neural Conduction Velocity**: Measure spike propagation speed
+- **Filter Effects**: Demonstrate signal conditioning in real-time
+
+### No Hardware? No Problem!
+Use the built-in **Simulated Source** to demonstrate concepts without any physical equipment. The simulator generates realistic:
+- Poisson spike trains
+- Action potential waveforms
+- Background noise
+- 60Hz mains hum
 
 ---
 
 ## 📚 History & Acknowledgments
 
-**SpikeHound** (formerly **g-PRIME**) was originally authored by **Dr. Gus K. Lott III** as a doctoral student at **Cornell University** in the laboratory of **Dr. Ronald R. Hoy**. It became a staple in the *BioNB 491: Principles of Neurophysiology* course.
+**SpikeHound** (formerly **g-PRIME**) was created by **Dr. Gus K. Lott III** as a doctoral student at **Cornell University** in **Dr. Ronald R. Hoy's** laboratory. It became a cornerstone of the *BioNB 491: Principles of Neurophysiology* course.
 
-**SpikeHound 2.0** is a revival of this project, developed with institutional support from **Manlius Pebble Hill School (MPHS)** and mentorship from Cornell.
+**SpikeHound 2.0** is a complete rewrite, developed with support from **Manlius Pebble Hill School (MPHS)** and continued mentorship from Cornell.
 
-* **Author:** Gus K. Lott III, PhD
-* **Contributors:** Taylor Mangoba (MPHS Student Contributor)
-* **Special Thanks:** Dr. Ronald Hoy, Audrey Yeager, and the Grass Foundation.
+### Contributors
+- **Author:** Gus K. Lott III, PhD
+- **Student Contributor:** Taylor Mangoba (MPHS)
+- **Special Thanks:** Dr. Ronald Hoy, Audrey Yeager, and the Grass Foundation
+
+---
 
 ## 📄 License
-Copyright (C) 2025 Gus Lott.
-This software is open-source. See the `LICENSE` file for details.
+
+Copyright © 2025 Gus K. Lott III
+
+This software is open-source under the MIT License. See `LICENSE` for details.
+
+---
+
+## 🔗 Links
+
+- **Repository:** [github.com/guslott/spikehound](https://github.com/guslott/spikehound)
+- **Issues:** [Report bugs or request features](https://github.com/guslott/spikehound/issues)
+- **Backyard Brains:** [backyardbrains.com](https://backyardbrains.com)
