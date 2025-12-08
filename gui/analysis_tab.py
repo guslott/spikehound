@@ -495,6 +495,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._update_cluster_button_states()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        """Clean up analysis executor threads on window close."""
         executor = getattr(self, "_analysis_executor", None)
         if executor is not None:
             try:
@@ -511,12 +512,14 @@ class AnalysisTab(QtWidgets.QWidget):
     # ------------------------------------------------------------------
 
     def _init_buffer(self) -> None:
+        """Initialize the circular sample buffer based on current sample rate."""
         samples = max(1, int(round(self.sample_rate * self._buffer_span_sec))) if self.sample_rate > 0 else 1
         self._buffer = np.zeros(samples, dtype=np.float32)
         self._buffer_pos = 0
         self._buffer_filled = 0
 
     def _ensure_buffer_capacity(self, required_sec: float) -> None:
+        """Expand the circular buffer if needed to hold required_sec of data."""
         if self.sample_rate <= 0:
             return
         required_sec = max(required_sec, 0.1)
@@ -532,6 +535,7 @@ class AnalysisTab(QtWidgets.QWidget):
             self._append_to_buffer(recent)
 
     def _append_to_buffer(self, data: np.ndarray) -> None:
+        """Append samples to the circular buffer, wrapping at capacity."""
         if data.size == 0:
             return
         if data.size >= self._buffer.size:
@@ -550,6 +554,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._buffer_filled = min(self._buffer_filled + data.size, self._buffer.size)
 
     def _recent_data(self, count: int) -> np.ndarray:
+        """Return the most recent 'count' samples from the circular buffer."""
         if self._buffer_filled == 0 or count <= 0:
             return np.empty(0, dtype=np.float32)
         count = min(count, self._buffer_filled)
@@ -560,6 +565,7 @@ class AnalysisTab(QtWidgets.QWidget):
         return np.concatenate((self._buffer[start:], self._buffer[:count - first]))
 
     def _extract_recent(self, count: int) -> np.ndarray:
+        """Extract recent samples, padding with NaN if buffer has fewer than 'count'."""
         if count <= 0:
             return np.empty(0, dtype=np.float32)
         data = self._recent_data(count)
@@ -571,9 +577,11 @@ class AnalysisTab(QtWidgets.QWidget):
         return out
 
     def _title_text(self) -> str:
+        """Generate the window title from channel name and sample rate."""
         return f"{self.channel_name} \u2013 {self.sample_rate:,.0f} Hz"
 
     def set_channel_info(self, channel_name: str, sample_rate: float) -> None:
+        """Update channel name and sample rate, reinitializing buffers."""
         self.channel_name = channel_name
         self.sample_rate = float(sample_rate)
         self.title_label.setText(self._title_text())
@@ -586,9 +594,11 @@ class AnalysisTab(QtWidgets.QWidget):
         self._clear_event_overlays()
 
     def set_analysis_queue(self, q: "queue.Queue") -> None:
+        """Set the queue from which analysis batches are consumed."""
         self._analysis_queue = q
 
     def set_worker(self, worker: "AnalysisWorker") -> None:
+        """Bind the analysis worker for threshold configuration."""
         self._worker = worker
         if self._worker is not None and self.sample_rate > 0:
             try:
@@ -598,19 +608,23 @@ class AnalysisTab(QtWidgets.QWidget):
         self._notify_threshold_change()
 
     def set_sta_channels(self, channels: Sequence["ChannelInfo"]) -> None:
+        """Update the list of available STA signal channels."""
         self._refresh_sta_channel_options(channels)
 
     def peek_all_events(self) -> list[Event]:
+        """Return all events in the buffer without removing them."""
         if self._event_buffer is None:
             return []
         return self._event_buffer.peek_all()
 
     def drain_events(self) -> list[Event]:
+        """Remove and return all events from the buffer."""
         if self._event_buffer is None:
             return []
         return self._event_buffer.drain()
 
     def _toggle_threshold(self, line: pg.InfiniteLine, spin: QtWidgets.QDoubleSpinBox, checked: bool) -> None:
+        """Show/hide a threshold line and sync it with the spinbox value."""
         line.setVisible(checked)
         if checked:
             self._in_threshold_update = True
@@ -619,6 +633,7 @@ class AnalysisTab(QtWidgets.QWidget):
             line.setZValue(20)
 
     def _update_threshold_from_spin(self, line: pg.InfiniteLine, value: float) -> None:
+        """Update threshold line position when spinbox value changes."""
         if not line.isVisible() or self._in_threshold_update:
             return
         self._in_threshold_update = True
@@ -626,6 +641,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._in_threshold_update = False
 
     def _update_spin_from_line(self, line: pg.InfiniteLine, spin: QtWidgets.QDoubleSpinBox) -> None:
+        """Update spinbox value when threshold line is dragged."""
         if not line.isVisible() or self._in_threshold_update:
             return
         self._in_threshold_update = True
@@ -639,6 +655,7 @@ class AnalysisTab(QtWidgets.QWidget):
             self._notify_threshold_change()
 
     def _on_timer(self) -> None:
+        """Timer callback: drain analysis queue and render batches."""
         if self._analysis_queue is None:
             return
         max_batches = 3
@@ -671,17 +688,20 @@ class AnalysisTab(QtWidgets.QWidget):
                 self._last_event_id = new_last_id
 
     def _on_metrics_timer(self) -> None:
+        """Timer callback: refresh metric scatter plots if dirty."""
         if not self._metrics_dirty:
             return
         self._update_metric_points()
         self._metrics_dirty = False
     def _on_sta_timer(self) -> None:
+        """Timer callback: refresh STA plot if enabled and dirty."""
         if not self._sta_enabled or not self._sta_dirty:
             return
         self._refresh_sta_plot()
         self._sta_dirty = False
 
     def _apply_ranges(self) -> None:
+        """Apply width/height settings to the plot axes."""
         width = float(self.width_combo.currentData() or 0.5)
         plot_item = self.plot_widget.getPlotItem()
         plot_item.setXRange(0.0, width, padding=0.0)
@@ -701,6 +721,7 @@ class AnalysisTab(QtWidgets.QWidget):
             self._refresh_overlay_positions(self._last_window_start, self._last_window_width, self._window_start_index)
 
     def _initial_event_window_ms(self) -> float:
+        """Get initial event window duration from settings or default to 5ms."""
         if self._analysis_settings is None:
             return 5.0
         try:
@@ -710,6 +731,7 @@ class AnalysisTab(QtWidgets.QWidget):
             return 5.0
 
     def _set_event_window_selection(self, value_ms: float) -> None:
+        """Set the event window combo to match value_ms."""
         target = float(value_ms)
         for idx in range(self.event_window_combo.count()):
             item_value = self.event_window_combo.itemData(idx)
@@ -724,6 +746,7 @@ class AnalysisTab(QtWidgets.QWidget):
                 return
 
     def _on_event_window_changed(self, index: int) -> None:
+        """Handle event window combo selection change."""
         value = self.event_window_combo.itemData(index)
         if value is None:
             return
@@ -737,6 +760,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._notify_threshold_change()
 
     def _on_threshold1_toggled(self, checked: bool) -> None:
+        """Handle threshold 1 checkbox toggle, update dependent controls."""
         self.threshold2_check.setEnabled(checked)
         self.threshold2_spin.setEnabled(checked and self.threshold2_check.isChecked())
         if not checked:
@@ -744,10 +768,12 @@ class AnalysisTab(QtWidgets.QWidget):
         self._notify_threshold_change()
 
     def _on_threshold2_toggled(self, checked: bool) -> None:
+        """Handle threshold 2 checkbox toggle."""
         self.threshold2_spin.setEnabled(checked)
         self._notify_threshold_change()
 
     def _on_auto_detect_toggled(self, checked: bool) -> None:
+        """Handle auto-detect checkbox toggle, disable manual thresholds."""
         # Disable manual thresholds if auto-detect is on?
         # User said "add a third checkbox above...".
         # Let's disable manual controls to avoid confusion.
@@ -758,6 +784,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._notify_threshold_change()
 
     def _notify_threshold_change(self) -> None:
+        """Push current threshold settings to the analysis worker."""
         if self._worker is None:
             return
         self._clear_metrics()
@@ -777,6 +804,7 @@ class AnalysisTab(QtWidgets.QWidget):
             logger.debug("Failed to configure worker threshold: %s", e)
 
     def _render_batch(self, batch: AnalysisBatch) -> None:
+        """Process an analysis batch: update plots, overlays, and events."""
         chunk = batch.chunk
         try:
             data = np.array(chunk.samples, dtype=np.float32)
@@ -870,12 +898,14 @@ class AnalysisTab(QtWidgets.QWidget):
         self._handle_batch_events(events, window_start, width_in_use, self._window_start_index)
 
     def _on_pause_viz_toggled(self, checked: bool) -> None:
+        """Handle visualization pause checkbox toggle."""
         self._viz_paused = bool(checked)
         if not self._viz_paused:
             self._refresh_raw_plot()
             self._refresh_overlay_positions(self._last_window_start, self._last_window_width, self._window_start_index)
 
     def _refresh_raw_plot(self) -> None:
+        """Redraw the raw signal curve from cached data."""
         if self._viz_paused:
             return
         if self._cached_raw_times is None or self._cached_raw_samples is None:
@@ -884,6 +914,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self.event_curve.clear()
 
     def _acquire_overlay_item(self) -> pg.PlotCurveItem:
+        """Get a PlotCurveItem from the pool or create a new one."""
         if self._overlay_pool:
             item = self._overlay_pool.pop()
         else:
@@ -894,6 +925,7 @@ class AnalysisTab(QtWidgets.QWidget):
         return item
 
     def _release_overlay_item(self, item: Optional[pg.PlotCurveItem]) -> None:
+        """Return an overlay item to the pool for reuse."""
         if item is None:
             return
         item.hide()
@@ -901,6 +933,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._overlay_pool.append(item)
 
     def _apply_overlay_color(self, overlay: dict[str, object]) -> None:
+        """Set overlay curve color based on event cluster membership."""
         item = overlay.get("item") or overlay.get("curve")
         if not isinstance(item, pg.PlotCurveItem):
             return
@@ -941,6 +974,7 @@ class AnalysisTab(QtWidgets.QWidget):
         width: float,
         window_start_idx: Optional[int],
     ) -> None:
+        """Process detected events: submit for analysis and update overlays."""
         pending_sta = bool(getattr(self, "_sta_pending_events", None))
         if events:
             self._submit_analysis_job(tuple(events), window_start, width, window_start_idx)
@@ -952,6 +986,7 @@ class AnalysisTab(QtWidgets.QWidget):
             self._refresh_overlay_positions(window_start, width, window_start_idx)
 
     def _build_sta_task(self, events: Sequence[Event]) -> StaTask | None:
+        """Create an STA task for the given events if STA is enabled."""
         if not self._sta_enabled:
             return None
         target_channel_id = self._sta_target_channel_id
@@ -972,6 +1007,7 @@ class AnalysisTab(QtWidgets.QWidget):
         width: float,
         window_start_idx: Optional[int],
     ) -> None:
+        """Submit events to background executor or process inline."""
         if not events:
             return
         executor = self._analysis_executor
@@ -1010,6 +1046,7 @@ class AnalysisTab(QtWidgets.QWidget):
         width: float,
         window_start_idx: Optional[int],
     ) -> None:
+        """Callback when background analysis completes."""
         self._analysis_futures.discard(future)
         try:
             update = future.result()
@@ -1019,6 +1056,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._apply_analysis_update(update, window_start, width, window_start_idx)
 
     def _build_analysis_update(self, events: tuple[Event, ...]) -> AnalysisUpdate:
+        """Build overlay payloads and STA task for a batch of events."""
         overlays: list[OverlayPayload] = []
         last_event_id: int | None = None
         for event in events:
@@ -1039,6 +1077,7 @@ class AnalysisTab(QtWidgets.QWidget):
         width: float,
         window_start_idx: Optional[int],
     ) -> None:
+        """Apply analysis results: materialize overlays and update metrics."""
         payloads = update.overlays or []
         for payload in payloads:
             reuse_overlay: dict[str, object] | None = None
@@ -1070,6 +1109,7 @@ class AnalysisTab(QtWidgets.QWidget):
             self._refresh_overlay_positions(window_start, width, window_start_idx)
 
     def _refresh_overlay_positions(self, window_start: float, width: float, window_start_idx: Optional[int]) -> None:
+        """Update overlay positions and remove expired ones outside the window."""
         if self._viz_paused:
             return
         if not self._event_overlays:
@@ -1089,6 +1129,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._event_overlays = kept
 
     def _clear_event_overlays(self) -> None:
+        """Remove and recycle all event overlay items."""
         if not self._event_overlays:
             return
         for overlay in self._event_overlays:
@@ -1096,6 +1137,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._event_overlays.clear()
 
     def _ensure_sta_trace_capacity(self, capacity: int) -> None:
+        """Ensure enough STA trace items exist for the given capacity."""
         current = len(self._sta_trace_items)
         if current >= capacity:
             return
@@ -1106,11 +1148,13 @@ class AnalysisTab(QtWidgets.QWidget):
             self._sta_trace_items.append(item)
 
     def _clear_sta_traces(self) -> None:
+        """Hide and clear all STA trace plot items."""
         for item in self._sta_trace_items:
             item.hide()
             item.setData([], [])
 
     def _clear_metrics(self) -> None:
+        """Reset all metric data, scatter plots, and cluster counts."""
         self._metric_events.clear()
         self._event_details.clear()
         self._event_cluster_labels.clear()
@@ -1129,6 +1173,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self.metrics_clear_btn.setText("Clear metrics (0)")
 
     def get_energy_density_points(self) -> list[tuple[float, float]]:
+        """Return (time, energy_density) pairs for all recorded events."""
         return [
             (event["time"], event["ed"])
             for event in self._metric_events
@@ -1136,6 +1181,7 @@ class AnalysisTab(QtWidgets.QWidget):
         ]
 
     def _set_metrics_range(self, plot_item: pg.PlotItem, min_x: float, max_x: float, min_y: float, max_y: float) -> None:
+        """Set the X and Y ranges for the metrics scatter plot with padding."""
         if max_x < min_x:
             min_x, max_x = max_x, min_x
         span_x = max(1e-6, max_x - min_x)
@@ -1148,6 +1194,7 @@ class AnalysisTab(QtWidgets.QWidget):
         plot_item.setYRange(padded_min, padded_max, padding=0.0)
 
     def _selected_y_metric(self) -> str:
+        """Parse the Y-axis metric combo selection to a metric key."""
         label = self.metric_combo.currentText().lower()
         if "interval" in label:
             return "interval"
@@ -1160,6 +1207,7 @@ class AnalysisTab(QtWidgets.QWidget):
         return "ed"
 
     def _selected_x_metric(self) -> str:
+        """Parse the X-axis metric combo selection to a metric key."""
         label = self.metric_xaxis_combo.currentText().lower()
         if "time" in label:
             return "time"
@@ -1172,6 +1220,7 @@ class AnalysisTab(QtWidgets.QWidget):
         return "ed"
 
     def _on_axis_metric_changed(self) -> None:
+        """Handle axis metric combo changes and update plot labels."""
         metric = self._selected_y_metric()
         if metric == "ed":
             self.metrics_plot.setLabel("left", "Energy Density")
@@ -1212,6 +1261,7 @@ class AnalysisTab(QtWidgets.QWidget):
         current: Optional[QtWidgets.QListWidgetItem],
         previous: Optional[QtWidgets.QListWidgetItem],
     ) -> None:
+        """Handle cluster list selection change."""
         del previous
         if current is None:
             self._selected_cluster_id = None
@@ -1222,6 +1272,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._update_cluster_button_states()
 
     def _update_cluster_visuals(self) -> None:
+        """Update cluster ROI pen widths based on selection."""
         base_width = 1.5
         selected_id = self._selected_cluster_id
         for cluster in self._clusters:
@@ -1232,6 +1283,7 @@ class AnalysisTab(QtWidgets.QWidget):
             roi.setPen(pg.mkPen(cluster.color, width=width))
 
     def _update_cluster_button_states(self) -> None:
+        """Enable/disable cluster buttons based on state."""
         enabled = self.clustering_enabled_check.isChecked()
         has_selection = self.class_list.currentItem() is not None
         self.add_class_btn.setEnabled(enabled)
@@ -1240,6 +1292,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self.export_class_btn.setEnabled(enabled and has_selection)
 
     def _update_sta_view_button(self) -> None:
+        """Enable/disable STA view button based on data availability."""
         has_data = (
             self._sta_enabled
             and self._sta_aligned_windows is not None
@@ -1251,6 +1304,7 @@ class AnalysisTab(QtWidgets.QWidget):
             self.sta_view_waveforms_btn.setEnabled(bool(has_data))
 
     def _set_cluster_panel_visible(self, visible: bool) -> None:
+        """Show/hide the cluster management panel with layout adjustments."""
         if visible:
             self.cluster_panel.show()
             self.metrics_container_layout.setStretchFactor(self.metrics_plot, 7)
@@ -1320,16 +1374,19 @@ class AnalysisTab(QtWidgets.QWidget):
             self._sta_target_channel_id = None
 
     def _show_sta_plot(self) -> None:
+        """Show the STA plot widget and adjust layout."""
         self.sta_plot.show()
         self.raw_row_layout.setStretchFactor(self.plot_widget, 7)
         self.raw_row_layout.setStretchFactor(self.sta_plot, 3)
 
     def _hide_sta_plot(self) -> None:
+        """Hide the STA plot widget and restore layout."""
         self.sta_plot.hide()
         self.raw_row_layout.setStretchFactor(self.plot_widget, 10)
         self.raw_row_layout.setStretchFactor(self.sta_plot, 0)
 
     def _get_cluster_for_event(self, event_id: int | None) -> MetricCluster | None:
+        """Look up the cluster containing the given event ID."""
         if event_id is None:
             return None
         cluster_id = self._event_cluster_labels.get(event_id)
@@ -1351,6 +1408,7 @@ class AnalysisTab(QtWidgets.QWidget):
         return cluster.color
 
     def _on_clustering_toggled(self, checked: bool) -> None:
+        """Handle clustering enable checkbox toggle."""
         self._set_cluster_panel_visible(checked)
         if checked:
             self._recompute_cluster_membership()
@@ -1366,6 +1424,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._refresh_overlay_colors()
 
     def _on_sta_toggled(self, checked: bool) -> None:
+        """Handle STA enable checkbox toggle."""
         self._sta_enabled = bool(checked)
         if self._sta_enabled:
             self._show_sta_plot()
@@ -1383,6 +1442,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._update_sta_view_button()
 
     def _on_sta_source_changed(self, index: int) -> None:
+        """Handle STA event source combo change."""
         if index < 0:
             self._sta_source_cluster_id = None
         else:
@@ -1391,6 +1451,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._on_sta_clear_clicked()
 
     def _on_sta_channel_changed(self, index: int) -> None:
+        """Handle STA signal channel combo change."""
         if index < 0:
             self._sta_target_channel_id = None
         else:
@@ -1402,6 +1463,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._on_sta_clear_clicked()
 
     def _on_sta_window_changed(self, index: int) -> None:
+        """Handle STA window duration combo change."""
         if index < 0:
             return
         value = self.sta_window_combo.itemData(index)
@@ -1414,6 +1476,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._on_sta_clear_clicked()
 
     def _on_sta_clear_clicked(self) -> None:
+        """Reset all STA state and clear traces."""
         self._sta_windows.clear()
         self._sta_time_axis = None
         self._sta_aligned_windows = None
@@ -1425,6 +1488,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._update_sta_view_button()
 
     def _sta_handle_task(self, task: StaTask) -> None:
+        """Process pending STA events and collect trigger windows."""
         controller = self._controller
         if controller is None:
             return
@@ -1463,6 +1527,7 @@ class AnalysisTab(QtWidgets.QWidget):
         event: Event,
         window_ms: float,
     ) -> str:
+        """Collect trigger window for a single event and add to STA."""
         event_channel = getattr(event, "channelId", getattr(event, "channel_id", None))
         if event_channel is not None and channel_info is not None:
             try:
@@ -1582,6 +1647,7 @@ class AnalysisTab(QtWidgets.QWidget):
         return waveforms
 
     def _on_sta_view_waveforms_clicked(self) -> None:
+        """Open dialog to view STA waveforms."""
         waveforms = self._build_sta_waveform_payload()
         if not waveforms:
             QtWidgets.QMessageBox.information(self, "Waveforms", "No cross-correlation data available.")
@@ -1592,6 +1658,7 @@ class AnalysisTab(QtWidgets.QWidget):
         dialog.exec()
 
     def _on_add_class_clicked(self) -> None:
+        """Create a new cluster ROI when Add Class clicked."""
         if not self.clustering_enabled_check.isChecked():
             return
         view_box = self.metrics_plot.getViewBox()
@@ -1629,6 +1696,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._update_cluster_button_states()
 
     def _on_remove_class_clicked(self) -> None:
+        """Remove the selected cluster and its ROI."""
         current_item = self.class_list.currentItem()
         if current_item is None:
             return
@@ -1733,6 +1801,7 @@ class AnalysisTab(QtWidgets.QWidget):
             QtWidgets.QMessageBox.critical(self, "Export Error", f"Failed to write CSV file:\n{e}")
 
     def _on_view_class_waveforms_clicked(self) -> None:
+        """Open dialog to view waveforms for the selected cluster."""
         if not self.clustering_enabled_check.isChecked():
             QtWidgets.QMessageBox.information(self, "Waveforms", "Enable clustering to view class waveforms.")
             return
@@ -1771,11 +1840,13 @@ class AnalysisTab(QtWidgets.QWidget):
         dialog.exec()
 
     def _release_metrics(self) -> None:
+        """Clear all metric event records."""
         self._metric_events = []
         self._t0_event = None
         self._update_metric_points()
 
     def _update_metric_points(self) -> None:
+        """Refresh the scatter plot with current metric data."""
         y_key = self._selected_y_metric()
         x_key = self._selected_x_metric()
         if y_key not in {"ed", "max", "min", "freq", "interval"}:
@@ -1895,6 +1966,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._set_metrics_range(plot_item, min(xs), max(xs), min(ys), max(ys))
 
     def _record_overlay_metrics(self, overlay: dict[str, object]) -> None:
+        """Extract metrics from overlay and store for scatter plot."""
         metrics = overlay.get("metrics")
         metric_time = overlay.get("metric_time")
         if metrics is None or metric_time is None:
@@ -1934,6 +2006,7 @@ class AnalysisTab(QtWidgets.QWidget):
         # Flag metrics for refresh; UI updates happen in the timer to avoid per-event churn.
 
     def _build_overlay_payload(self, event: Event) -> Optional[OverlayPayload]:
+        """Build overlay data from a detected event for visualization."""
         samples = np.asarray(event.samples, dtype=np.float32)
         if samples.size < 8:
             return None
@@ -2019,6 +2092,7 @@ class AnalysisTab(QtWidgets.QWidget):
         payload: OverlayPayload,
         reuse_overlay: Optional[dict[str, object]] = None,
     ) -> Optional[dict[str, object]]:
+        """Create a plot item from overlay payload data."""
         curve: Optional[pg.PlotCurveItem] = None
         overlay_data = reuse_overlay if reuse_overlay is not None else {}
         if reuse_overlay is not None:
@@ -2062,6 +2136,7 @@ class AnalysisTab(QtWidgets.QWidget):
         width: float,
         window_start_idx: Optional[int],
     ) -> bool:
+        """Position and clip overlay data to current view window."""
         times = overlay.get("times")
         samples = overlay.get("samples")
         item = overlay.get("item")
@@ -2089,10 +2164,12 @@ class AnalysisTab(QtWidgets.QWidget):
         return True
 
     def _on_cluster_roi_changed(self) -> None:
+        """Handle cluster ROI resize/move: recompute membership."""
         self._recompute_cluster_membership()
         self._update_metric_points()
 
     def _recompute_cluster_membership(self) -> None:
+        """Recalculate which events belong to which clusters based on ROI bounds."""
         if not self._clusters:
             self._event_cluster_labels.clear()
             self._refresh_overlay_colors()

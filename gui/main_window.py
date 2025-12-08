@@ -146,6 +146,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(0, self._try_load_default_config)
 
     def _init_ui(self) -> None:
+        """Initialize the main window UI components and layout."""
         self._settings_tab: Optional[SettingsTab] = None
         self._apply_palette()
         self._style_plot()
@@ -190,13 +191,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @property
     def chunk_rate(self) -> float:
+        """Current chunk processing rate in Hz."""
         return float(self._chunk_rate)
 
     @property
     def plot_refresh_hz(self) -> float:
+        """Current plot refresh rate in Hz."""
         return float(self._plot_refresh_hz)
 
     def set_plot_refresh_hz(self, hz: float) -> None:
+        """Set target plot refresh rate and update runtime metrics."""
         hz = max(1.0, float(hz))
         self._plot_refresh_hz = hz
         self._plot_interval = 1.0 / hz
@@ -228,6 +232,7 @@ class MainWindow(QtWidgets.QMainWindow):
         filter_settings: Optional[FilterSettings] = None,
         trigger_cfg: Optional[TriggerConfig] = None,
     ) -> None:
+        """Push filter/trigger/channel updates to the runtime."""
         cfg_trigger = trigger_cfg
         try:
             self.runtime.configure_acquisition(
@@ -258,6 +263,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
     def set_default_window_sec(self, value: float) -> None:
+        """Set default time window duration before device connection."""
         value = max(0.05, float(value))
         if self._device_connected:
             return
@@ -268,6 +274,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
 
     def _create_scope_widget(self) -> QtWidgets.QWidget:
+        """Build the main scope view with device and channel controls."""
         scope = QtWidgets.QWidget(self)
         grid = QtWidgets.QGridLayout(scope)
         grid.setContentsMargins(8, 8, 8, 8)
@@ -379,6 +386,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return scope
 
     def attach_controller(self, controller: Optional[PipelineController]) -> None:
+        """Bind a pipeline controller and wire up signals."""
         # Check removed to allow re-wiring signals even if controller instance is same
 
 
@@ -436,6 +444,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._bind_app_settings_store()
 
     def _bind_dispatcher_signals(self) -> None:
+        """Connect or reconnect to dispatcher tick signals."""
         if self._controller is None:
             self._dispatcher_signals = None
             return
@@ -462,6 +471,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._dispatcher_signals = signals
 
     def _apply_palette(self) -> None:
+        """Apply the application color palette and stylesheet."""
         palette = self.palette()
         palette.setColor(QtGui.QPalette.Window, QtGui.QColor(200, 200, 200))
         palette.setColor(QtGui.QPalette.WindowText, QtGui.QColor(0, 0, 0))
@@ -557,14 +567,17 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _style_plot(self) -> None:
+        """Configure PyQtGraph global options."""
         pg.setConfigOption("foreground", (0, 0, 139))
         pg.setConfigOptions(antialias=False)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # type: ignore[override]
+        """Handle window resize to update splash image."""
         super().resizeEvent(event)
         self._update_splash_pixmap()
 
     def _load_splash_pixmap(self) -> Optional[QtGui.QPixmap]:
+        """Load the splash image from media directory."""
         splash_path = Path(__file__).resolve().parent.parent / "media" / "mph_cornell_splash.png"
         if not splash_path.exists():
             return None
@@ -576,6 +589,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return pixmap
 
     def _update_splash_pixmap(self) -> None:
+        """Scale and update the splash image to fit the label."""
         if self._splash_label is None or self._splash_pixmap is None or self._splash_pixmap.isNull():
             return
 
@@ -610,16 +624,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._splash_label.updateGeometry()
 
     def _label(self, text: str) -> QtWidgets.QLabel:
+        """Create a left-aligned label with the given text."""
         label = QtWidgets.QLabel(text)
         label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         return label
 
     def _color_to_tuple(self, color: QtGui.QColor) -> tuple[int, int, int, int]:
+        """Convert QColor to RGBA tuple."""
         if not isinstance(color, QtGui.QColor):
             return (0, 0, 0, 255)
         return (color.red(), color.green(), color.blue(), color.alpha())
 
     def _color_from_tuple(self, data: Sequence[int]) -> QtGui.QColor:
+        """Convert RGBA tuple to QColor."""
         try:
             r, g, b, a = (int(x) for x in data)
             return QtGui.QColor(r, g, b, a)
@@ -739,6 +756,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._config_manager.try_load_default_config()
 
     def _on_device_button_clicked(self) -> None:
+        """Handle device connect/disconnect button toggle."""
         dm = getattr(self.runtime, "device_manager", None)
         if dm is None:
             return
@@ -840,6 +858,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
     def _on_devices_changed(self, entries: List[dict]) -> None:
+        """Handle device list refresh from DeviceManager."""
         self._device_map = {entry["key"]: entry for entry in entries}
         self.device_control.device_combo.blockSignals(True)
         self.device_control.device_combo.clear()
@@ -881,6 +900,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_channel_buttons()
 
     def _on_device_selected(self) -> None:
+        """Handle device combo selection change."""
         key = self.device_control.device_combo.currentData()
         entry = self._device_map.get(key) if key else None
         
@@ -902,6 +922,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
     def _populate_sample_rate_options(self, entry: Optional[dict]) -> None:
+        """Populate sample rate dropdown from device capabilities."""
         self.device_control.sample_rate_combo.blockSignals(True)
         
         # Determine the target sample rate to restore
@@ -939,6 +960,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_control.sample_rate_combo.blockSignals(False)
 
     def _set_sample_rate_value(self, sample_rate: float) -> None:
+        """Set sample rate combo to the given value."""
         if self.device_control.sample_rate_combo.count() == 0:
             return
         idx = self.device_control.sample_rate_combo.findData(float(sample_rate))
@@ -947,6 +969,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_control.sample_rate_combo.setCurrentIndex(idx)
 
     def _current_sample_rate_value(self) -> float:
+        """Get current sample rate from the dropdown."""
         data = self.device_control.sample_rate_combo.currentData()
         try:
             value = float(data)
@@ -966,6 +989,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return value
 
     def _update_sample_rate_enabled(self) -> None:
+        """Enable/disable sample rate dropdown based on connection state."""
         connected = self._device_connected
         has_active = self.channel_controls.active_combo.count() > 0
         enabled = self.device_control.sample_rate_combo.count() > 0 and not connected
@@ -974,6 +998,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.device_control.sample_rate_label.setEnabled(enabled)
 
     def _on_device_connected(self, key: str) -> None:
+        """Handle device connection event."""
         self._device_connected = True
         self._apply_device_state(True)
         idx = self.device_control.device_combo.findData(key)
@@ -1045,6 +1070,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
     def _on_scan_hardware(self) -> None:
+        """Handle hardware rescan request."""
         dm = getattr(self.runtime, "device_manager", None)
         if dm is None:
             return
@@ -1062,6 +1088,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._analysis_dock.select_scope()
 
     def _on_available_channels(self, channels: Sequence[object]) -> None:
+        """Handle available channels list update from device."""
         # Update DeviceControlWidget with available channels
         self.device_control.set_available_channels(list(channels))
         
@@ -1079,6 +1106,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
     def _publish_active_channels(self) -> None:
+        """Publish active channel list to all listeners."""
         # Delegate channel collection to ChannelManager
         ids, names = self._channel_manager.publish_active_channels()
         
