@@ -98,7 +98,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # TriggerController manages all trigger state and detection logic
         self._trigger_controller = TriggerController(parent=self)
         self._trigger_controller.configChanged.connect(self._on_trigger_config_changed)
-        # captureReady signal available for future use if needed
         self._plot_refresh_hz = 40.0
         self._plot_interval = 1.0 / self._plot_refresh_hz
         self._last_plot_refresh = 0.0
@@ -281,7 +280,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         
         # Connect ScopeWidget signals
-        # Connect ScopeWidget signals
         self.scope.viewClicked.connect(self._on_scope_clicked)
         self.scope.viewDragged.connect(self._on_scope_dragged)
         self.scope.viewDragFinished.connect(self._on_scope_drag_finished)
@@ -326,7 +324,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # Trigger Control Widget (extracted)
         self.trigger_control = TriggerControlWidget(self._trigger_controller)
         side_layout.addWidget(self.trigger_control)
-
 
 
         # Bottom row (spanning full width): device / channel controls.
@@ -651,13 +648,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._config_manager.apply_config_data(data, source, show_dialogs=show_dialogs)
 
 
-
     @QtCore.Slot(dict)
     def _on_trigger_config_changed(self, config: dict) -> None:
         """Handle trigger configuration changes from controller."""
-        # self._trigger_mode cache removed - use controller or config directly
-        
-        # Determine if we should clear existing plots
         is_triggered = config.get("mode", "stream") != "stream"
         if not is_triggered:
             # Stream mode
@@ -667,46 +660,32 @@ class MainWindow(QtWidgets.QMainWindow):
             # Trigger mode
             pre = float(config.get("pre_seconds", 0.01))
             self.scope.set_pretrigger_position(pre, visible=True)
-            thresh = float(config.get("threshold", 0.0))
+        
         if self._device_connected:
             self.configure_acquisition(trigger_cfg=config)
         
         self._update_trigger_visuals(config)
 
-
-
-
-
     def _on_scope_threshold_changed(self, value: float) -> None:
         """Handle threshold line moved by user."""
-        # value is in normalized 0-1 screen coordinates, convert to volts
         cfg = self._channel_configs.get(self._trigger_controller.channel_id) or self._channel_configs.get(self._active_channel_id)
         if cfg is not None:
             span = cfg.vertical_span_v
             offset = cfg.screen_offset
-            # Convert from normalized screen coords to volts
-            # Must match trace_renderer.py: voltage = (y_norm - offset) * (2 * span)
             voltage = (value - offset) * (2.0 * span)
         else:
-            # No channel config, can't convert properly
             voltage = 0.0
         
         self.trigger_control.threshold_spin.blockSignals(True)
         self.trigger_control.threshold_spin.setValue(voltage)
         self.trigger_control.threshold_spin.blockSignals(False)
-        # Spinbox change will trigger Controller update via TriggerControlWidget
-        # But we need to update line position visually immediately? 
-        # Actually setValue triggers valueChanged which TriggerControlWidget handles.
-        # It calls configure -> configChanged -> _on_trigger_config_changed -> _update_trigger_visuals.
-        # So loop is closed.
-
-
 
     def _update_trigger_visuals(self, config: dict, update_line: bool = True) -> None:
+        """Update trigger visual elements on the scope."""
         mode = config.get("mode", "stream")
         channel_valid = config.get("channel_index", -1) != -1
+        
         if mode == "stream" or not channel_valid:
-            # Use ScopeWidget API to hide threshold
             self.scope.set_threshold(visible=False)
             self.scope.pretrigger_line.setVisible(False)
             return
@@ -717,24 +696,24 @@ class MainWindow(QtWidgets.QMainWindow):
         if cfg is not None:
             span = cfg.vertical_span_v
             offset = cfg.screen_offset
-            # Transform threshold from volts to normalized 0-1 screen coords
-            # Must match trace_renderer.py: y = (voltage / (2 * span)) + offset
             normalized_value = (threshold_value / (2.0 * span)) + offset
         else:
             normalized_value = 0.5
         
-        # Use ScopeWidget API to show and position threshold
         if update_line:
             self.scope.set_threshold(normalized_value, visible=True)
         else:
             self.scope.set_threshold(visible=True)
         
+        # Style threshold line
         pen = pg.mkPen((0, 0, 0), width=5)
         self.scope.threshold_line.setPen(pen)
         try:
             self.scope.threshold_line.setZValue(100)
         except AttributeError:
             pass
+        
+        # Pretrigger line
         pre_value = float(config.get("pretrigger_frac", 0.0) or 0.0)
         if pre_value > 0.0:
             self.scope.pretrigger_line.setVisible(True)
@@ -1660,7 +1639,7 @@ class MainWindow(QtWidgets.QMainWindow):
         pass
 
     def _reset_trigger_state(self) -> None:
-        """Reset trigger state. Delegates to TriggerController."""
+        """Reset trigger state and hide visual indicators."""
         self._trigger_controller.reset_state()
         self.scope.pretrigger_line.setVisible(False)
 
