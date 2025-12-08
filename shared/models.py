@@ -150,12 +150,12 @@ class ChunkPointer:
 
 
 @dataclass(frozen=True)
-class Event:
+class DetectionEvent:
     """Detected feature emitted by the dispatcher/detection layer.
     
     This is the simpler, lower-level Event type used by the detection pipeline.
-    For the more detailed analysis-layer Event with timing metadata, see
-    `shared.types.Event`.
+    For the more detailed analysis-layer AnalysisEvent with timing metadata, see
+    `shared.types.AnalysisEvent`.
     
     Attributes:
         t: Timestamp of the event (seconds since stream start)
@@ -165,7 +165,7 @@ class Event:
         params: Detection parameters used (e.g., threshold value)
     
     See Also:
-        shared.types.Event: Analysis-layer Event with detailed timing info
+        shared.types.AnalysisEvent: Analysis-layer Event with detailed timing info
     """
 
     t: float
@@ -228,6 +228,9 @@ class TriggerConfig:
     mode: str
 
 
+# Backward compatibility alias
+Event = DetectionEvent
+
 __all__ = [
     "DeviceInfo",
     "ChannelInfo",
@@ -235,7 +238,8 @@ __all__ = [
     "ActualConfig",
     "Chunk",
     "ChunkPointer",
-    "Event",
+    "DetectionEvent",
+    "Event",  # Alias for DetectionEvent
     "EndOfStream",
     "TriggerConfig",
 ]
