@@ -19,22 +19,27 @@ Designed “scope-first”: a GUI can treat every hardware backend the same—co
 ### Simulated input
 
 ```python
-from simulated_source import SimulatedSource
+from daq.simulated_source import SimulatedSource
 
 src = SimulatedSource()
 devs = src.list_available_devices()
 src.open(devs[0].id)
-src.configure(sample_rate=20_000, channels=None, chunk_size=1024)  # channels=None => all
+src.configure(sample_rate=20_000, channels=None, chunk_size=1024)
 src.start()
 
-# Consume chunks (e.g., in your GUI thread)
+# Consume data (e.g., in your processing thread)
 while some_condition:
     try:
-        ch = src.data_queue.get(timeout=0.050)  # ch is a Chunk
-        # ch.data shape: (frames, channels), dtype=float32
-        # use ch.mono_time, ch.device_time (optional), ch.seq, ch.start_sample
-    except Exception:
-        pass
+        # 1. Get pointer from queue (ChunkPointer | EndOfStream)
+        ptr = src.data_queue.get(timeout=1.0)
+        
+        # 2. Access data from shared ring buffer
+        # Shape: (channels, frames), dtype: float32
+        samples = src.get_buffer().read(ptr.start_index, ptr.length)
+        
+        print(f"Got {ptr.length} frames at t={ptr.render_time}")
+    except:
+        break
 
 src.stop()
 src.close()
@@ -43,22 +48,24 @@ src.close()
 ### Sound card input (cross-platform)
 
 ```python
-from soundcard_source import SoundCardSource
+from daq.soundcard_source import SoundCardSource
 
 src = SoundCardSource()
+print("Devices:")
 for d in src.list_available_devices():
-    print(d.id, d.name)
+    print(f" - {d.id}: {d.name}")
 
-src.open(device_id="default")  # or choose an ID from the printed list
+src.open(device_id="default")
 caps = src.get_capabilities("default")
 chans = src.list_available_channels("default")
 
 # pick first two channels
-src.configure(sample_rate=48_000, channels=[chans[0].id, chans[1].id], chunk_size=1024)
-src.start()
-
-# drain chunks as above...
-src.stop()
+if len(chans) >= 2:
+    src.configure(sample_rate=48_000, channels=[chans[0].id, chans[1].id], chunk_size=1024)
+    src.start()
+    
+    # consume data as shown above...
+    src.stop()
 src.close()
 ```
 
@@ -75,7 +82,7 @@ open(device_id)
   └─ list_available_channels(device_id)
 configure(sample_rate, channels, chunk_size, **options) -> ActualConfig
 start()
-  [ driver thread/callback emits Chunk -> BaseDevice.data_queue ]
+  [ driver thread emits array -> BaseDevice writes Buffer + emits ChunkPointer ]
 stop()
 close()
 ```
@@ -86,6 +93,10 @@ Illegal transitions raise `RuntimeError` early (e.g., `start()` without `configu
 ---
 
 ## Data model
+
+The DAQ system uses standard data types defined in `shared.models`.
+
+### Device Metadata
 
 ```python
 @dataclass(frozen=True)
@@ -101,40 +112,53 @@ class ChannelInfo:
     name: str
     units: str = "V"
     range: tuple[float, float] | None = None
+```
 
+### Config & Capabilities
+
+```python
 @dataclass(frozen=True)
 class Capabilities:
     max_channels_in: int
     sample_rates: list[int] | None  # None => continuous range
     dtype: str = "float32"
-    notes: str | None = None
 
 @dataclass(frozen=True)
 class ActualConfig:
     sample_rate: int
     channels: list[ChannelInfo]
     chunk_size: int
-    latency_s: float | None = None
     dtype: str = "float32"
-
-@dataclass(frozen=True)
-class Chunk:
-    start_sample: int            # 0-based from start()
-    mono_time: float             # host monotonic time (seconds)
-    seq: int                     # chunk sequence (0,1,2,…)
-    data: np.ndarray             # shape: (frames, channels), dtype=float32 by default
-    device_time: float | None = None  # hardware ADC clock time (if available)
 ```
 
-**Timebases**
+### Streaming Data
 
-* `mono_time`: host‐side `_time.monotonic()` at the first sample of the chunk.
-* `device_time`: (optional) ADC/driver timestamp for the first sample (e.g., PortAudio’s `input_buffer_adc_time`). Use this to align cross-device streams or estimate drift/jitter. If absent, treat as `None`.
+Drivers produce `Chunk` objects internally (or write directly to the buffer), but consumers receive `ChunkPointer`s to zero-copy data in the ring buffer.
+
+```python
+@dataclass(frozen=True)
+class Chunk:
+    """Atomic unit of streaming data passed explicitly (e.g. from tests)."""
+    samples: np.ndarray          # Shape: (channels, frames)
+    start_time: float            # Host monotonic time
+    dt: float                    # Sample period (1/rate)
+    seq: int
+    channel_names: tuple[str, ...]
+    units: str
+
+@dataclass(frozen=True)
+class ChunkPointer:
+    """Pointer to data in the SharedRingBuffer."""
+    start_index: int             # Index in ring buffer
+    length: int                  # Number of frames
+    render_time: float           # Approximate time for visualization
+```
 
 **Shape & dtype**
 
-* All drivers emit **float32** by default.
-* `Chunk.data` is always `(frames, channels)` in the **user-selected channel order**.
+* **Ring Buffer**: Stores `float32` data as `(channels, frames)`.
+* **Drivers**: Emit `float32` arrays to the buffer.
+
 
 ---
 
@@ -158,8 +182,8 @@ class BaseDevice(ABC):
     def set_active_channels(self, channel_ids: Sequence[int]) -> None: ...
     def get_active_channels(self) -> list[ChannelInfo]: ...
 
-    # Queue of data to consume (non-blocking producer)
-    data_queue: "queue.Queue[Chunk]"
+    # Queue of pointers to consume (ChunkPointer | EndOfStream)
+    data_queue: "queue.Queue[ChunkPointer]"
 
     # Introspection
     @property
@@ -167,13 +191,15 @@ class BaseDevice(ABC):
     @property
     def running(self) -> bool: ...
     def stats(self) -> dict[str, Any]: ...
+    def get_buffer(self) -> SharedRingBuffer: ...
 ```
 
 **Backpressure policy**
 
-* `data_queue` is bounded (default size 64).
-* On overflow, the **oldest** chunk is evicted and a counter increments (`"drops"` in `stats()`).
-* This keeps the UI responsive and memory bounded.
+* `data_queue` uses **blocking backpressure** (not drop-oldest).
+* The driver writes to a `SharedRingBuffer` and enqueues a pointer.
+* If the queue fills up, the driver blocks (up to 10s) to enforce lossless transmission.
+* Drop-oldest behavior is implemented downstream (in the Dispatcher) if the visualization/analysis threads cannot keep up, but the core acquisition pipeline remains lossless.
 
 **Threading model**
 
@@ -311,7 +337,7 @@ class MyDeviceSource(BaseDevice):
   * validates shape and dtype,
   * slices a superset down to the active channels (when possible),
   * stamps `seq`, `start_sample`, `mono_time` (+ optional `device_time`),
-  * enqueues with the module’s **drop-oldest** backpressure policy.
+  * writes to the `SharedRingBuffer` and enqueues a pointer (blocking if full).
 
 ### Timestamps
 
@@ -346,9 +372,9 @@ class MyDeviceSource(BaseDevice):
 * [ ] `start()/_start_impl()`: producer runs; emits via `emit_array(...)`
 * [ ] `stop()/_stop_impl()`: producer stops within \~2s
 * [ ] `close()/_close_impl()`: resources released; state is `"closed"`
-* [ ] Emits **float32**, `(frames, channels)`, correct channel order
+* [ ] Emits **float32** (frames, channels) via `emit_array`
 * [ ] Optional `device_time` passed when available
-* [ ] Handles backpressure implicitly via base class
+* [ ] Helper `emit_array` takes care of ring buffer writes and queueing
 
 ---
 
@@ -385,8 +411,8 @@ Use this sparingly (e.g., once per second) to drive a small “health” indicat
 
 ## FAQ
 
-**Q: Why do I see “drops” in `stats()`?**
-Your consumer isn’t draining fast enough for bursts. That’s OK for live scope use—the policy drops the **oldest** chunk to keep latency low. If you need lossless capture, attach a file writer thread behind the queue with a larger buffer and disk I/O.
+**Q: What happens if the consumer is too slow?**
+The source will block (up to 10s) and then raise an error. We enforce **lossless** transmission for the core pipeline. If you see high latency or errors, ensure your consumer drains the queue faster than real-time. Drop-oldest policies are applied downstream (e.g. in the `Dispatcher` visualization queues) to protect the UI, but the raw data acquisition is never compromised.
 
 **Q: What chunk size should I start with?**
 Start at `1024` frames. Go smaller (`256–512`) if you want snappier interactivity (at the cost of more callbacks), or larger (`2048–4096`) if you want fewer calls and can tolerate extra latency.

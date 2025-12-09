@@ -84,18 +84,7 @@ class SpikeHoundRuntime:
         """Get the underlying pipeline controller."""
         return self._pipeline
 
-    def __getattr__(self, name: str):
-        """
-        Temporary delegation to the underlying pipeline controller so existing
-        GUI components keep working while the runtime grows real behavior.
-        """
-        pipeline = self.__dict__.get("_pipeline")
-        if pipeline is not None:
-            try:
-                return getattr(pipeline, name)
-            except AttributeError:
-                pass
-        raise AttributeError(f"{self.__class__.__name__!s} has no attribute {name!r}")
+
 
     def open_device(self, driver: BaseDevice, sample_rate: float, channels: Sequence[object]) -> None:
         """Open and prepare the requested DAQ backend/device."""
@@ -306,6 +295,24 @@ class SpikeHoundRuntime:
             self.device_manager.set_list_all_audio_devices(enabled, refresh=True)
         except Exception as exc:
             self.logger.warning("Failed to set list all audio devices: %s", exc)
+
+    def set_audio_monitoring(self, channel_id: Optional[int]) -> None:
+        """Enable or disable audio monitoring (listen) for a channel."""
+        controller = self._pipeline
+        if controller is not None:
+            controller.set_audio_monitoring(channel_id)
+
+    def set_audio_gain(self, gain: float) -> None:
+        """Set output volume gain (0.0 - 1.0)."""
+        controller = self._pipeline
+        if controller is not None:
+            controller.set_audio_gain(gain)
+
+    def set_audio_output_device(self, device_id: Optional[int]) -> None:
+        """Set the active audio output device index."""
+        controller = self._pipeline
+        if controller is not None:
+            controller.set_audio_device(device_id)
 
     def open_analysis_stream(self, channel_name: str, sample_rate: float) -> tuple[Optional[queue.Queue], Optional["AnalysisWorker"]]:
         """
