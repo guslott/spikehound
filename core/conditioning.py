@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from scipy import signal
 
-from .models import Chunk
+from shared.models import Chunk
 
 
 @dataclass(frozen=True)

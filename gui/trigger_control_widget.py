@@ -127,7 +127,7 @@ class TriggerControlWidget(QtWidgets.QWidget):
         self.pretrigger_combo.setMaximumWidth(110)
         for value in (0.0, 0.01, 0.02, 0.05):
             self.pretrigger_combo.addItem(f"{value:.2f}", value)
-        self.pretrigger_combo.setCurrentIndex(0)
+        self.pretrigger_combo.setCurrentIndex(3)
         pretrig_box.addWidget(self.pretrigger_combo)
         trigger_layout.addLayout(pretrig_box, row, 0, 1, 2)
         row += 1

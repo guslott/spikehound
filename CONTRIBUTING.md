@@ -627,7 +627,7 @@ See `test/test_integration.py` for patterns on:
 | `Chunk` | `shared/models.py` | Raw data packets |
 | `DetectionEvent` | `shared/models.py` | Detected spikes |
 | `FilterSettings` | `core/conditioning.py` | Filter configuration |
-| `TriggerConfig` | `core/models.py` | Trigger settings |
+| `TriggerConfig` | `shared/models.py` | Trigger settings |
 
 ---
 
