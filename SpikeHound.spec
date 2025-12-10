@@ -78,4 +78,8 @@ if sys.platform == 'darwin':
         name="SpikeHound.app",
         icon=icon_file,
         bundle_identifier="org.mphschool.spikehound",
+        info_plist={
+            'NSMicrophoneUsageDescription': 'SpikeHound needs access to the microphone to acquire audio signals for analysis.',
+            'NSHighResolutionCapable': 'True'
+        },
     )
