@@ -342,3 +342,21 @@ class SpikeHoundRuntime:
             except Exception:
                 return None, None
         return getattr(worker, "output_queue", None), worker
+
+    def collect_trigger_window(
+        self,
+        event: AnalysisEvent,
+        target_channel_id: int,
+        window_ms: float,
+    ) -> tuple[Any, int, int]:
+        """Delegate trigger window collection to the pipeline controller."""
+        import numpy as np
+        controller = self._pipeline
+        if controller is None:
+            return np.empty(0, dtype=np.float32), 0, 0
+        return controller.collect_trigger_window(
+            event,
+            target_channel_id=target_channel_id,
+            window_ms=window_ms,
+        )
+
