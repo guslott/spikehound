@@ -200,6 +200,10 @@ class AnalysisTab(QtWidgets.QWidget):
         energy_scatter_color = QtGui.QColor(UNCLASSIFIED_COLOR)
         energy_scatter_color.setAlpha(170)
         self.energy_scatter = pg.ScatterPlotItem(size=6, brush=pg.mkBrush(energy_scatter_color), pen=None, name="Energy Density")
+        # Disable mouse event interception so cluster ROI handles can receive clicks
+        # This fixes the issue where scatter points block ROI edge/handle dragging
+        self.energy_scatter.setAcceptedMouseButtons(QtCore.Qt.NoButton)
+        self.energy_scatter.setZValue(-10)  # Below ROI items (z=50) for visual order
         self.metrics_plot.addItem(self.energy_scatter)
         self.energy_scatter.hide()
 
@@ -2000,7 +2004,10 @@ class AnalysisTab(QtWidgets.QWidget):
             removed_id = removed.get("event_id")
             if isinstance(removed_id, int):
                 self._event_details.pop(removed_id, None)
-                removed_cluster = self._event_cluster_labels.pop(removed_id, None) is not None
+                # Only evict cluster labels when not paused.
+                # When paused, preserve labels so visible overlays keep their colors.
+                if not self._viz_paused:
+                    removed_cluster = self._event_cluster_labels.pop(removed_id, None) is not None
         if removed_cluster:
             self._refresh_overlay_colors()
         # Flag metrics for refresh; UI updates happen in the timer to avoid per-event churn.

@@ -126,25 +126,51 @@ class _MeasureLine:
 
 
 class ClusterRectROI(pg.ROI):
-    """Rectangular ROI used for metric clusters."""
+    """Rectangular ROI used for metric clusters.
+    
+    Features:
+    - Edge handles for resizing (midpoints of each edge)
+    - Corner handles for diagonal resizing
+    - Shift+drag to move the entire ROI
+    - Handles are sized for easy clicking
+    """
 
     def __init__(self, pos, size, pen=None, **kwargs):
         super().__init__(pos, size, movable=False, rotatable=False, **kwargs)
-        self.addScaleHandle((0.0, 0.5), (1.0, 0.5))
-        self.addScaleHandle((1.0, 0.5), (0.0, 0.5))
-        self.addScaleHandle((0.5, 0.0), (0.5, 1.0))
-        self.addScaleHandle((0.5, 1.0), (0.5, 0.0))
+        
+        # Edge handles (midpoints)
+        self.addScaleHandle((0.0, 0.5), (1.0, 0.5))  # Left edge
+        self.addScaleHandle((1.0, 0.5), (0.0, 0.5))  # Right edge
+        self.addScaleHandle((0.5, 0.0), (0.5, 1.0))  # Bottom edge
+        self.addScaleHandle((0.5, 1.0), (0.5, 0.0))  # Top edge
+        
+        # Corner handles for diagonal resizing
+        self.addScaleHandle((0.0, 0.0), (1.0, 1.0))  # Bottom-left corner
+        self.addScaleHandle((1.0, 0.0), (0.0, 1.0))  # Bottom-right corner
+        self.addScaleHandle((0.0, 1.0), (1.0, 0.0))  # Top-left corner
+        self.addScaleHandle((1.0, 1.0), (0.0, 0.0))  # Top-right corner
+        
+        # Configure handle size and appearance for easier clicking
         for handle in self.handles:
             item = handle.get("item")
             if item is not None:
                 try:
-                    item.setSize(10)
+                    item.setSize(14)  # Larger handles for easier grabbing
                 except AttributeError:
                     pass
+                # Ensure handle accepts mouse events
+                try:
+                    item.setAcceptedMouseButtons(QtCore.Qt.LeftButton)
+                except AttributeError:
+                    pass
+                    
         if pen is None:
             pen = pg.mkPen(CLUSTER_COLORS[0])
         self.setPen(pen)
         self._dragging_with_shift = False
+        
+        # Enable hover for visual feedback
+        self.setAcceptHoverEvents(True)
 
     def mouseDragEvent(self, ev):
         if ev.isStart():
