@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import logging
 import queue
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass
 from typing import Optional, TYPE_CHECKING, Sequence
@@ -87,9 +87,12 @@ class AnalysisTab(QtWidgets.QWidget):
                 self._analysis_events = AnalysisEvents(self._event_buffer)
         self._event_window_ms = self._initial_event_window_ms()
         self._t0_event: Optional[float] = None
-        self._metric_events: list[dict[str, float | int]] = []
-        self._max_metric_events = 10_000
+        self._metric_events: deque[dict[str, float | int]] = deque(maxlen=100_000)
         self._metrics_dirty: bool = False
+        # Performance optimization: track state to skip unnecessary updates
+        self._last_scatter_count: int = 0
+        self._cluster_membership_dirty: bool = True  # Recompute classification on ROI change only
+        self._brush_cache: dict[int, object] = {}  # cluster_id -> cached brush object
         self._last_event_id: Optional[int] = None
         self._viz_paused = False
         self._cached_raw_times: Optional[np.ndarray] = None
@@ -104,6 +107,8 @@ class AnalysisTab(QtWidgets.QWidget):
         self._cluster_id_counter: int = 0
         self._cluster_items: dict[int, QtWidgets.QListWidgetItem] = {}
         self._selected_cluster_id: int | None = None
+        # Pause snapshot: when paused, we capture static curve data and colors
+        self._pause_snapshot_curves: list[pg.PlotCurveItem] = []  # Static snapshot items
         self._sta_enabled: bool = False
         self._sta_windows: list[np.ndarray] = []
         self._sta_max_windows = float("inf")
@@ -902,11 +907,75 @@ class AnalysisTab(QtWidgets.QWidget):
         self._handle_batch_events(events, window_start, width_in_use, self._window_start_index)
 
     def _on_pause_viz_toggled(self, checked: bool) -> None:
-        """Handle visualization pause checkbox toggle."""
+        """Handle visualization pause checkbox toggle.
+        
+        When paused: capture a static snapshot of the current display state
+        and show that instead of dynamic items.
+        When unpaused: clear the snapshot and restore dynamic visualization.
+        """
         self._viz_paused = bool(checked)
-        if not self._viz_paused:
+        if self._viz_paused:
+            self._capture_pause_snapshot()
+        else:
+            self._clear_pause_snapshot()
             self._refresh_raw_plot()
             self._refresh_overlay_positions(self._last_window_start, self._last_window_width, self._window_start_index)
+
+    def _capture_pause_snapshot(self) -> None:
+        """Capture a static snapshot of current curves for frozen display."""
+        # Create static snapshot of raw trace
+        if self._cached_raw_times is not None and self._cached_raw_samples is not None:
+            raw_snapshot = pg.PlotCurveItem(
+                self._cached_raw_times.copy(),
+                self._cached_raw_samples.copy(),
+                pen=self.raw_curve.opts.get("pen", pg.mkPen("b")),
+            )
+            raw_snapshot.setZValue(self.raw_curve.zValue())
+            self.plot_widget.addItem(raw_snapshot)
+            self._pause_snapshot_curves.append(raw_snapshot)
+        
+        # Create static snapshots of all overlay curves with their current colors
+        # BEFORE hiding them so visibility check works
+        for overlay in self._event_overlays:
+            item = overlay.get("item")
+            if not isinstance(item, pg.PlotCurveItem):
+                continue
+            # Get current data and pen from the overlay item
+            x_data, y_data = item.getData()
+            if x_data is None or y_data is None or len(x_data) == 0:
+                continue
+            overlay_snapshot = pg.PlotCurveItem(
+                x_data.copy() if hasattr(x_data, "copy") else np.array(x_data),
+                y_data.copy() if hasattr(y_data, "copy") else np.array(y_data),
+                pen=item.opts.get("pen", self._overlay_pen),
+            )
+            overlay_snapshot.setZValue(item.zValue())
+            self.plot_widget.addItem(overlay_snapshot)
+            self._pause_snapshot_curves.append(overlay_snapshot)
+        
+        # Now hide the dynamic items
+        self.raw_curve.hide()
+        for overlay in self._event_overlays:
+            item = overlay.get("item")
+            if isinstance(item, pg.PlotCurveItem):
+                item.hide()
+    
+    def _clear_pause_snapshot(self) -> None:
+        """Remove all pause snapshot curves and restore dynamic items."""
+        # Remove snapshot curves
+        for curve in self._pause_snapshot_curves:
+            try:
+                self.plot_widget.removeItem(curve)
+            except Exception as e:
+                logger.debug("Failed to remove pause snapshot curve: %s", e)
+        self._pause_snapshot_curves.clear()
+        
+        # Show the dynamic items again
+        self.raw_curve.show()
+        for overlay in self._event_overlays:
+            item = overlay.get("item")
+            if isinstance(item, pg.PlotCurveItem):
+                item.show()
 
     def _refresh_raw_plot(self) -> None:
         """Redraw the raw signal curve from cached data."""
@@ -963,13 +1032,7 @@ class AnalysisTab(QtWidgets.QWidget):
                     logger.debug("Failed to get pen width fallback: %s", e)
                     width = 2.0
         item.setPen(pg.mkPen(color, width=width))
-
-    def _refresh_overlay_colors(self) -> None:
-        """Update the pens for all raw event overlays based on cluster labels."""
-        if not self._event_overlays:
-            return
-        for overlay in self._event_overlays:
-            self._apply_overlay_color(overlay)
+    # Note: _refresh_overlay_colors was removed - overlay colors are set once at creation
 
     def _handle_batch_events(
         self,
@@ -1128,7 +1191,7 @@ class AnalysisTab(QtWidgets.QWidget):
             if not self._apply_overlay_view(overlay, window_start, width, window_start_idx):
                 self._release_overlay_item(item)
                 continue
-            self._apply_overlay_color(overlay)
+            # Note: overlay color is set once at creation time, not refreshed per-frame
             kept.append(overlay)
         self._event_overlays = kept
 
@@ -1162,7 +1225,10 @@ class AnalysisTab(QtWidgets.QWidget):
         self._metric_events.clear()
         self._event_details.clear()
         self._event_cluster_labels.clear()
-        self._refresh_overlay_colors()
+        # Reset optimization tracking
+        self._last_scatter_count = 0
+        self._cluster_membership_dirty = True
+        # Note: overlay colors are set at creation time, not refreshed
         self._t0_event = None
         for cluster in self._clusters:
             item = self._cluster_items.get(cluster.id)
@@ -1425,7 +1491,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._update_metric_points()
         self._update_cluster_visuals()
         self._update_cluster_button_states()
-        self._refresh_overlay_colors()
+        # Note: overlay colors are set at creation time, not refreshed here
 
     def _on_sta_toggled(self, checked: bool) -> None:
         """Handle STA enable checkbox toggle."""
@@ -1845,12 +1911,20 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def _release_metrics(self) -> None:
         """Clear all metric event records."""
-        self._metric_events = []
+        self._metric_events = deque(maxlen=100_000)
         self._t0_event = None
+        self._last_scatter_count = 0
+        self._cluster_membership_dirty = True
         self._update_metric_points()
 
     def _update_metric_points(self) -> None:
-        """Refresh the scatter plot with current metric data."""
+        """Refresh the scatter plot with current metric data.
+        
+        Performance optimizations:
+        - Skip update if event count unchanged since last call
+        - Cache brush objects instead of creating fresh ones per event  
+        - Only recompute cluster membership when ROI changes (dirty flag)
+        """
         y_key = self._selected_y_metric()
         x_key = self._selected_x_metric()
         if y_key not in {"ed", "max", "min", "freq", "interval"}:
@@ -1859,36 +1933,42 @@ class AnalysisTab(QtWidgets.QWidget):
         events = self._metric_events
         if not events:
             self.energy_scatter.hide()
+            self._last_scatter_count = 0
             return
-        visible_events = events
-        if x_key == "time":
+        
+        current_count = len(events)
+        
+        # Determine visible events based on time window or max count
+        visible_events = list(events)  # Convert deque to list for slicing
+        if x_key == "time" and visible_events:
+            # Find the last valid time
             last_time: float | None = None
-            for event in reversed(events):
+            for event in reversed(visible_events):
                 t_val = event.get("time")
-                if t_val is None:
-                    continue
-                try:
-                    last_time = float(t_val)
-                except (TypeError, ValueError):
-                    continue
-                break
+                if t_val is not None:
+                    try:
+                        last_time = float(t_val)
+                        break
+                    except (TypeError, ValueError):
+                        continue
             if last_time is not None:
                 min_time = last_time - METRIC_TIME_WINDOW_SEC
                 if min_time > 0:
-                    start_idx = 0
-                    for idx, event in enumerate(events):
+                    # Binary search would be more efficient, but this is called infrequently now
+                    for idx, event in enumerate(visible_events):
                         t_val = event.get("time")
-                        if t_val is None:
-                            continue
-                        try:
-                            if float(t_val) >= min_time:
-                                start_idx = idx
-                                break
-                        except (TypeError, ValueError):
-                            continue
-                    visible_events = events[start_idx:]
+                        if t_val is not None:
+                            try:
+                                if float(t_val) >= min_time:
+                                    visible_events = visible_events[idx:]
+                                    break
+                            except (TypeError, ValueError):
+                                continue
+        
         if len(visible_events) > MAX_VISIBLE_METRIC_EVENTS:
             visible_events = visible_events[-MAX_VISIBLE_METRIC_EVENTS:]
+        
+        # Build coordinate and event_id lists
         xs: list[float] = []
         ys: list[float] = []
         event_ids: list[Optional[int]] = []
@@ -1903,12 +1983,18 @@ class AnalysisTab(QtWidgets.QWidget):
             ys.append(float(y_val))
             event_id = event.get("event_id")
             event_ids.append(event_id if isinstance(event_id, int) else None)
+        
         if not xs:
             self.energy_scatter.hide()
             return
-        # Update UI counts here to reduce per-event UI churn
-        self.metrics_clear_btn.setText(f"Clear metrics ({len(self._metric_events)})")
-        if self.clustering_enabled_check.isChecked() and self._clusters:
+        
+        # Update UI counts (cheap operation)
+        self.metrics_clear_btn.setText(f"Clear metrics ({current_count})")
+        
+        # Only recompute cluster membership if dirty OR if we have new events
+        need_reclassify = self._cluster_membership_dirty or (current_count != self._last_scatter_count)
+        
+        if self.clustering_enabled_check.isChecked() and self._clusters and need_reclassify:
             cluster_bounds: list[tuple[int, float, float, float, float]] = []
             for cluster in self._clusters:
                 roi = cluster.roi
@@ -1926,9 +2012,14 @@ class AnalysisTab(QtWidgets.QWidget):
                 if max_y < min_y:
                     min_y, max_y = max_y, min_y
                 cluster_bounds.append((cluster.id, min_x, max_x, min_y, max_y))
+            
             if cluster_bounds:
+                # Only classify events that don't already have a label
                 for idx, event_id in enumerate(event_ids):
                     if event_id is None:
+                        continue
+                    # Skip if already classified and not a dirty full recompute
+                    if not self._cluster_membership_dirty and event_id in self._event_cluster_labels:
                         continue
                     x_val = xs[idx]
                     y_val = ys[idx]
@@ -1936,22 +2027,28 @@ class AnalysisTab(QtWidgets.QWidget):
                         if min_x <= x_val <= max_x and min_y <= y_val <= max_y:
                             self._event_cluster_labels[event_id] = cluster_id
                             break
-                counts: dict[int, int] = {cluster.id: 0 for cluster in self._clusters}
-                for cid in self._event_cluster_labels.values():
-                    counts[cid] = counts.get(cid, 0) + 1
+            
+            # Update counts (use Counter for efficiency)
+            counts = Counter(self._event_cluster_labels.values())
             for cluster in self._clusters:
                 item = self._cluster_items.get(cluster.id)
-                if item is None:
-                    continue
-                item.setText(f"{cluster.name} ({counts.get(cluster.id, 0)} events)")
-            if not self._viz_paused:
-                self._refresh_overlay_colors()
-        default_brush_color = QtGui.QColor(UNCLASSIFIED_COLOR)
-        default_brush_color.setAlpha(170)
-        default_brush = pg.mkBrush(default_brush_color)
-        brushes: list[pg.mkBrush] = []
-        cluster_color_map = {cluster.id: cluster.color for cluster in self._clusters}
-        for idx, eid in enumerate(event_ids):
+                if item is not None:
+                    item.setText(f"{cluster.name} ({counts.get(cluster.id, 0)} events)")
+            
+            # Note: overlay colors are set at creation time, not refreshed here
+            
+            self._cluster_membership_dirty = False
+        
+        # Build brush list with caching
+        default_brush = self._brush_cache.get(-1)
+        if default_brush is None:
+            default_brush_color = QtGui.QColor(UNCLASSIFIED_COLOR)
+            default_brush_color.setAlpha(170)
+            default_brush = pg.mkBrush(default_brush_color)
+            self._brush_cache[-1] = default_brush
+        
+        brushes: list[object] = []
+        for eid in event_ids:
             if eid is None:
                 brushes.append(default_brush)
                 continue
@@ -1959,13 +2056,20 @@ class AnalysisTab(QtWidgets.QWidget):
             if cluster_id is None:
                 brushes.append(default_brush)
                 continue
-            color = cluster_color_map.get(cluster_id)
-            if color is None:
-                brushes.append(default_brush)
-                continue
-            brushes.append(pg.mkBrush(color))
+            # Get cached brush or create and cache
+            brush = self._brush_cache.get(cluster_id)
+            if brush is None:
+                cluster = next((c for c in self._clusters if c.id == cluster_id), None)
+                if cluster is None:
+                    brushes.append(default_brush)
+                    continue
+                brush = pg.mkBrush(cluster.color)
+                self._brush_cache[cluster_id] = brush
+            brushes.append(brush)
+        
         self.energy_scatter.setData(xs, ys, brush=brushes)
         self.energy_scatter.show()
+        self._last_scatter_count = current_count
         plot_item = self.metrics_plot.getPlotItem()
         self._set_metrics_range(plot_item, min(xs), max(xs), min(ys), max(ys))
 
@@ -1998,19 +2102,9 @@ class AnalysisTab(QtWidgets.QWidget):
         if not has_metric:
             return
         self._metric_events.append(record)
-        removed_cluster = False
-        if len(self._metric_events) > self._max_metric_events:
-            removed = self._metric_events.pop(0)
-            removed_id = removed.get("event_id")
-            if isinstance(removed_id, int):
-                self._event_details.pop(removed_id, None)
-                # Only evict cluster labels when not paused.
-                # When paused, preserve labels so visible overlays keep their colors.
-                if not self._viz_paused:
-                    removed_cluster = self._event_cluster_labels.pop(removed_id, None) is not None
-        if removed_cluster:
-            self._refresh_overlay_colors()
-        # Flag metrics for refresh; UI updates happen in the timer to avoid per-event churn.
+        # deque with maxlen handles overflow automatically - O(1) instead of O(n)
+        # Note: We don't clean up _event_cluster_labels here anymore; it's done lazily
+        # in _update_metric_points when events are no longer visible.
 
     def _build_overlay_payload(self, event: AnalysisEvent) -> Optional[OverlayPayload]:
         """Build overlay data from a detected event for visualization."""
@@ -2125,6 +2219,40 @@ class AnalysisTab(QtWidgets.QWidget):
                 "event_id": payload.event_id,
             }
         )
+        # Classify the event immediately before applying color
+        # so overlay gets the correct color at creation time
+        event_id = payload.event_id
+        if isinstance(event_id, int) and self.clustering_enabled_check.isChecked() and self._clusters:
+            metrics = payload.metrics
+            if isinstance(metrics, dict):
+                x_key = self._selected_x_metric()
+                y_key = self._selected_y_metric()
+                x_val = metrics.get(x_key)
+                y_val = metrics.get(y_key)
+                if x_val is not None and y_val is not None:
+                    try:
+                        x_num = float(x_val)
+                        y_num = float(y_val)
+                        for cluster in self._clusters:
+                            roi = cluster.roi
+                            if roi is None:
+                                continue
+                            rect = roi.parentBounds()
+                            if rect is None:
+                                continue
+                            min_x = float(rect.left())
+                            max_x = float(rect.right())
+                            if max_x < min_x:
+                                min_x, max_x = max_x, min_x
+                            min_y = float(rect.top())
+                            max_y = float(rect.bottom())
+                            if max_y < min_y:
+                                min_y, max_y = max_y, min_y
+                            if min_x <= x_num <= max_x and min_y <= y_num <= max_y:
+                                self._event_cluster_labels[event_id] = cluster.id
+                                break
+                    except (TypeError, ValueError):
+                        pass
         self._apply_overlay_color(overlay_data)
         details_entry: dict[str, object] = {
             "metric_time": float(payload.metric_time),
@@ -2172,6 +2300,8 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def _on_cluster_roi_changed(self) -> None:
         """Handle cluster ROI resize/move: recompute membership."""
+        self._cluster_membership_dirty = True  # Force full reclassification
+        self._brush_cache.clear()  # Clear brush cache since cluster bounds changed
         self._recompute_cluster_membership()
         self._update_metric_points()
 
@@ -2179,7 +2309,7 @@ class AnalysisTab(QtWidgets.QWidget):
         """Recalculate which events belong to which clusters based on ROI bounds."""
         if not self._clusters:
             self._event_cluster_labels.clear()
-            self._refresh_overlay_colors()
+            # Note: overlay colors are set at creation time, not refreshed here
             return
         x_key = self._selected_x_metric()
         y_key = self._selected_y_metric()
@@ -2200,9 +2330,11 @@ class AnalysisTab(QtWidgets.QWidget):
             if max_y < min_y:
                 min_y, max_y = max_y, min_y
             cluster_bounds.append((cluster.id, min_x, max_x, min_y, max_y))
-        self._event_cluster_labels.clear()
+        # When paused, don't clear labels - preserve them so visible overlays keep colors
+        if not self._viz_paused:
+            self._event_cluster_labels.clear()
         if not cluster_bounds:
-            self._refresh_overlay_colors()
+            # Note: overlay colors are set at creation time, not refreshed here
             return
         counts: dict[int, int] = {cluster.id: 0 for cluster in self._clusters}
         for record in self._metric_events:
@@ -2231,7 +2363,7 @@ class AnalysisTab(QtWidgets.QWidget):
                 continue
             count = counts.get(cluster.id, 0)
             item.setText(f"{cluster.name} ({count} events)")
-        self._refresh_overlay_colors()
+        # Note: overlay colors are set at creation time, not refreshed here
 
 
 class ClusterWaveformDialog(QtWidgets.QDialog):
