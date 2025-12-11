@@ -53,10 +53,7 @@ class RecordingControlWidget(QtWidgets.QGroupBox):
         path_row.addWidget(self.browse_btn)
         layout.addLayout(path_row)
 
-        # Auto-increment checkbox
-        self.autoinc_checkbox = QtWidgets.QCheckBox("Auto-increment filename if exists")
-        self.autoinc_checkbox.setChecked(True)
-        layout.addWidget(self.autoinc_checkbox)
+        # Note: Auto-increment and Pro options moved to Settings tab
 
         # Record toggle button
         self.toggle_btn = QtWidgets.QPushButton("Start Recording")
@@ -77,7 +74,6 @@ class RecordingControlWidget(QtWidgets.QGroupBox):
         """Enable/disable controls (except toggle button during recording)."""
         self.path_edit.setEnabled(enabled)
         self.browse_btn.setEnabled(enabled)
-        self.autoinc_checkbox.setEnabled(enabled)
 
     # -------------------------------------------------------------------------
     # Properties for backward compatibility
@@ -92,11 +88,6 @@ class RecordingControlWidget(QtWidgets.QGroupBox):
     def record_browse_btn(self) -> QtWidgets.QPushButton:
         """Backward compatible property for browse_btn."""
         return self.browse_btn
-
-    @property
-    def record_autoinc(self) -> QtWidgets.QCheckBox:
-        """Backward compatible property for autoinc_checkbox."""
-        return self.autoinc_checkbox
 
     @property
     def record_toggle_btn(self) -> QtWidgets.QPushButton:
@@ -129,7 +120,9 @@ class RecordingControlWidget(QtWidgets.QGroupBox):
                 self.toggle_btn.setChecked(False)
                 return
             
-            rollover = self.autoinc_checkbox.isChecked()
+            rollover = True
+            if self._controller and hasattr(self._controller, "app_settings"):
+                rollover = bool(self._controller.app_settings.recording_auto_increment)
             
             # Auto-increment filename if enabled
             if rollover:

@@ -8,26 +8,71 @@ import logging
 import os
 import queue
 import threading
-import wave
+import struct
 from typing import Optional, Union
-
 import numpy as np
 
 from shared.models import Chunk, EndOfStream
 
 logger = logging.getLogger(__name__)
 
+class WaveWriter32:
+    """Writes 32-bit floating point WAV files (IEEE Float)."""
+    
+    def __init__(self, f, channels: int, sample_rate: int):
+        self._f = f
+        self._channels = channels
+        self._sample_rate = sample_rate
+        self._data_size = 0
+        self._write_header()
+        
+    def _write_header(self):
+        """Write placeholder WAV header."""
+        # RIFF header
+        self._f.write(b'RIFF')
+        self._f.write(struct.pack('<I', 0))  # ChunkSize (placeholder)
+        self._f.write(b'WAVE')
+        
+        # fmt chunk
+        self._f.write(b'fmt ')
+        self._f.write(struct.pack('<I', 16)) # Subchunk1Size (16 for PCM)
+        self._f.write(struct.pack('<H', 3))  # AudioFormat (3 = IEEE Float)
+        self._f.write(struct.pack('<H', self._channels))
+        self._f.write(struct.pack('<I', self._sample_rate))
+        bytes_per_sample = 4 # float32
+        block_align = self._channels * bytes_per_sample
+        byte_rate = self._sample_rate * block_align
+        self._f.write(struct.pack('<I', byte_rate))
+        self._f.write(struct.pack('<H', block_align))
+        self._f.write(struct.pack('<H', bytes_per_sample * 8)) # BitsPerSample
+        
+        # data chunk
+        self._f.write(b'data')
+        self._f.write(struct.pack('<I', 0))  # Subchunk2Size (placeholder)
+        
+    def write_frames(self, data: np.ndarray):
+        """Write raw float32 bytes."""
+        byte_data = data.tobytes()
+        self._f.write(byte_data)
+        self._data_size += len(byte_data)
+        
+    def close(self):
+        """Update header lengths and close."""
+        if not self._f.closed:
+            # Update sizes
+            file_size = 4 + (8 + 16) + (8 + self._data_size) # RIFF + fmt + data
+            self._f.seek(4)
+            self._f.write(struct.pack('<I', file_size))
+            
+            # data chunk size
+            self._f.seek(40)
+            self._f.write(struct.pack('<I', self._data_size))
+            self._f.close()
 
 class WavLoggerThread:
     """
-    Consumes Chunk objects from a queue and writes to a WAV file as 16-bit PCM.
-    
-    The thread handles:
-    - Extracting samples from Chunk objects
-    - Transposing (channels, samples) -> (samples, channels) for interleaved WAV
-    - Converting float32 [-1, 1] to int16 PCM
-    - Thread-safe start/stop lifecycle
-    - Clean shutdown on EndOfStream sentinel
+    Consumes Chunk objects from a queue and writes to a WAV file.
+    Supports standard 16-bit PCM (default) or 32-bit Float (Pro).
     """
 
     def __init__(
@@ -36,56 +81,50 @@ class WavLoggerThread:
         out_path: str,
         sample_rate: int,
         channels: int,
+        use_float32: bool = False,
     ) -> None:
-        """
-        Initialize the WAV logger.
-        
-        Args:
-            data_queue: Queue to consume Chunk objects from (typically logging_queue)
-            out_path: Output file path for the WAV file
-            sample_rate: Sample rate in Hz
-            channels: Number of audio channels
-        """
         self._queue = data_queue
         self._out_path = out_path
         self._sample_rate = int(sample_rate)
         self._channels = int(channels)
+        self._use_float32 = use_float32
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._wf: Optional[wave.Wave_write] = None
+        # _writer is either WaveWriter32, or a wave.Wave_write object
+        self._writer = None
         self._frames_written: int = 0
 
     @property
     def frames_written(self) -> int:
-        """Total number of audio frames written to the file."""
         return self._frames_written
 
     @property
     def duration_seconds(self) -> float:
-        """Duration of recorded audio in seconds."""
         if self._sample_rate <= 0:
             return 0.0
         return self._frames_written / self._sample_rate
 
     def start(self) -> None:
-        """Start the logger thread and open the WAV file for writing."""
         if self._thread is not None and self._thread.is_alive():
             logger.warning("WavLoggerThread already running")
             return
 
-        # Ensure output directory exists
         out_dir = os.path.dirname(self._out_path)
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
 
-        # Open WAV file
         try:
-            wf = wave.open(self._out_path, "wb")
-            wf.setnchannels(self._channels)
-            wf.setsampwidth(2)  # 16-bit PCM
-            wf.setframerate(self._sample_rate)
-            self._wf = wf
+            if self._use_float32:
+                f = open(self._out_path, "wb")
+                self._writer = WaveWriter32(f, self._channels, self._sample_rate)
+            else:
+                import wave
+                w = wave.open(self._out_path, "wb")
+                w.setnchannels(self._channels)
+                w.setsampwidth(2)  # 16-bit
+                w.setframerate(self._sample_rate)
+                self._writer = w
         except Exception as exc:
             logger.error("Failed to open WAV file %s: %s", self._out_path, exc)
             raise
@@ -98,20 +137,17 @@ class WavLoggerThread:
             daemon=True,
         )
         self._thread.start()
+        
+        fmt = "32-bit float" if self._use_float32 else "16-bit PCM"
         logger.info(
-            "WavLoggerThread started: %s (sr=%d, ch=%d)",
+            "WavLoggerThread started: %s (sr=%d, ch=%d, %s)",
             self._out_path,
             self._sample_rate,
             self._channels,
+            fmt,
         )
 
     def stop(self, join_timeout: float = 2.0) -> None:
-        """
-        Stop the logger thread and finalize the WAV file.
-        
-        Args:
-            join_timeout: Maximum time to wait for thread to finish
-        """
         self._stop_event.set()
 
         if self._thread is not None:
@@ -120,12 +156,12 @@ class WavLoggerThread:
                 logger.warning("WavLoggerThread did not stop within timeout")
             self._thread = None
 
-        if self._wf is not None:
+        if self._writer is not None:
             try:
-                self._wf.close()
+                self._writer.close()
             except Exception as exc:
                 logger.warning("Error closing WAV file: %s", exc)
-            self._wf = None
+            self._writer = None
 
         logger.info(
             "WavLoggerThread stopped: %d frames (%.2f sec)",
@@ -134,7 +170,6 @@ class WavLoggerThread:
         )
 
     def _run(self) -> None:
-        """Main thread loop - consume chunks and write to WAV."""
         while not self._stop_event.is_set():
             try:
                 item = self._queue.get(timeout=0.05)
@@ -142,7 +177,6 @@ class WavLoggerThread:
                 continue
 
             try:
-                # Handle end-of-stream sentinel
                 if item is EndOfStream:
                     logger.debug("WavLoggerThread received EndOfStream")
                     break
@@ -156,30 +190,21 @@ class WavLoggerThread:
                 self._queue.task_done()
 
     def _write_chunk(self, chunk: Chunk) -> None:
-        """
-        Extract samples from a Chunk and write to WAV.
-        
-        Args:
-            chunk: Chunk object with samples shaped (channels, samples)
-        """
-        if self._wf is None:
+        if self._writer is None:
             return
 
-        samples = chunk.samples  # shape: (channels, samples)
+        samples = chunk.samples
         if samples.size == 0:
             return
 
-        # Transpose to (samples, channels) for interleaved WAV format
-        # Then ensure contiguous memory layout
+        # Transpose to (samples, channels)
         interleaved = np.ascontiguousarray(samples.T, dtype=np.float32)
 
-        # Handle channel count mismatch
         if interleaved.ndim == 1:
             interleaved = interleaved[:, np.newaxis]
         
         actual_channels = interleaved.shape[1]
         if actual_channels != self._channels:
-            # Pad or truncate channels to match expected count
             if actual_channels < self._channels:
                 padding = np.zeros(
                     (interleaved.shape[0], self._channels - actual_channels),
@@ -189,14 +214,20 @@ class WavLoggerThread:
             else:
                 interleaved = interleaved[:, :self._channels]
 
-        # Convert float32 [-1, 1] to int16  
-        # Clip to prevent overflow artifacts
-        clipped = np.clip(interleaved, -1.0, 1.0)
-        int16_data = (clipped * 32767.0).astype("<i2")  # little-endian int16
-
-        # Write raw frames
         try:
-            self._wf.writeframesraw(int16_data.tobytes())
-            self._frames_written += int16_data.shape[0]
+            if self._use_float32:
+                # No clipping needed for float32
+                # WaveWriter32.write_frames expects ndarray
+                self._writer.write_frames(interleaved)
+            else:
+                # Convert to int16
+                # (samples, channels) flattened to bytes
+                # 32767 is max int16
+                pcm = (interleaved * 32767).clip(-32768, 32767).astype(np.int16)
+                # wave module expects bytes
+                self._writer.writeframes(pcm.tobytes())
+            
+            self._frames_written += interleaved.shape[0]
+            
         except Exception as exc:
             logger.error("Error writing WAV frames: %s", exc)

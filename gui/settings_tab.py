@@ -80,7 +80,24 @@ class SettingsTab(QtWidgets.QWidget):
         self.load_launch_check.stateChanged.connect(self._on_load_launch_toggled)
         config_row.addWidget(self.load_launch_check)
         config_row.addStretch()
+        config_row.addWidget(self.load_launch_check)
+        config_row.addStretch()
         form.addRow(config_row)
+
+        # Recording settings (Pro float32 and Auto-increment)
+        rec_row = QtWidgets.QHBoxLayout()
+        self.rec_float32_check = QtWidgets.QCheckBox("Use 32-bit Pro WAV (float)")
+        self.rec_float32_check.setToolTip("Record as 32-bit floating point WAV instead of standard 16-bit PCM. Prevents clipping but creates larger files.")
+        self.rec_float32_check.stateChanged.connect(self._on_rec_float32_toggled)
+        
+        self.rec_autoinc_check = QtWidgets.QCheckBox("Auto-increment filename")
+        self.rec_autoinc_check.setToolTip("Automatically append a number if the file already exists (e.g. file1.wav, file2.wav)")
+        self.rec_autoinc_check.stateChanged.connect(self._on_rec_autoinc_toggled)
+
+        rec_row.addWidget(self.rec_float32_check)
+        rec_row.addWidget(self.rec_autoinc_check)
+        rec_row.addStretch()
+        form.addRow("Recording Defaults:", rec_row)
 
         # Audio output device selection
         audio_row = QtWidgets.QHBoxLayout()
@@ -190,6 +207,16 @@ class SettingsTab(QtWidgets.QWidget):
         self.load_launch_check.blockSignals(False)
         self._update_launch_checkbox_label()
 
+        # Update recording checkboxes
+        if hasattr(self, "rec_float32_check"):
+            self.rec_float32_check.blockSignals(True)
+            self.rec_float32_check.setChecked(bool(settings.recording_use_float32))
+            self.rec_float32_check.blockSignals(False)
+
+            self.rec_autoinc_check.blockSignals(True)
+            self.rec_autoinc_check.setChecked(bool(settings.recording_auto_increment))
+            self.rec_autoinc_check.blockSignals(False)
+
     def _update_launch_checkbox_label(self) -> None:
         """Update the launch config checkbox label to show path if set."""
         if self._launch_config_path:
@@ -256,6 +283,12 @@ class SettingsTab(QtWidgets.QWidget):
         
         # Refresh input list (via controller scan)
         self._on_rescan_clicked()
+
+    def _on_rec_float32_toggled(self, state: int) -> None:
+        self._update_settings(recording_use_float32=bool(state))
+
+    def _on_rec_autoinc_toggled(self, state: int) -> None:
+        self._update_settings(recording_auto_increment=bool(state))
 
     def _on_rescan_clicked(self) -> None:
         """Trigger a device scan via the controller."""

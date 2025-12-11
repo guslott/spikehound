@@ -18,6 +18,8 @@ class AppSettings:
     list_all_audio_devices: bool = False
     load_config_on_launch: bool = False
     launch_config_path: Optional[str] = None
+    recording_use_float32: bool = False
+    recording_auto_increment: bool = True
 
 
 class AppSettingsStore:
@@ -53,6 +55,12 @@ class AppSettingsStore:
         if launch_path is not None:
             launch_path = str(launch_path)
 
+        rec_float32 = qsettings.value("recording_use_float32", AppSettings.recording_use_float32)
+        rec_float32 = bool(int(rec_float32)) if isinstance(rec_float32, str) else bool(rec_float32)
+
+        rec_autoinc = qsettings.value("recording_auto_increment", AppSettings.recording_auto_increment)
+        rec_autoinc = bool(int(rec_autoinc)) if isinstance(rec_autoinc, str) else bool(rec_autoinc)
+
         return AppSettings(
             plot_refresh_hz=refresh,
             default_window_sec=window_sec,
@@ -60,6 +68,8 @@ class AppSettingsStore:
             list_all_audio_devices=list_all_audio,
             load_config_on_launch=load_launch,
             launch_config_path=launch_path,
+            recording_use_float32=rec_float32,
+            recording_auto_increment=rec_autoinc,
         )
 
     def get(self) -> AppSettings:
@@ -108,6 +118,9 @@ class AppSettingsStore:
             self._qsettings.remove("launch_config_path")
         else:
             self._qsettings.setValue("launch_config_path", settings.launch_config_path)
+
+        self._qsettings.setValue("recording_use_float32", int(bool(settings.recording_use_float32)))
+        self._qsettings.setValue("recording_auto_increment", int(bool(settings.recording_auto_increment)))
 
 
 __all__ = ["AppSettings", "AppSettingsStore"]

@@ -44,9 +44,10 @@ class MainWindow(QtWidgets.QMainWindow):
     startRequested = QtCore.Signal()
     stopRequested = QtCore.Signal()
     recordToggled = QtCore.Signal(bool)
-    startRecording = QtCore.Signal(str, bool)
     stopRecording = QtCore.Signal()
-    triggerConfigChanged = QtCore.Signal(dict)
+    stopRecording = QtCore.Signal()
+    startRecording = QtCore.Signal(str, bool)  # path, rollover
+    triggerConfigChanged = QtCore.Signal(TriggerConfig)
 
     def __init__(self, controller: Optional[PipelineController] = None) -> None:
         super().__init__()

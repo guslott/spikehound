@@ -9,6 +9,9 @@ import time
 import wave
 from pathlib import Path
 from typing import List, Optional, Sequence, Any
+import scipy.io.wavfile as wavfile
+
+import numpy as np
 
 import numpy as np
 
@@ -48,10 +51,10 @@ class FileSource(BaseDevice):
         
         # File state
         self._file_path: Optional[Path] = None
-        self._wav_file: Optional[wave.Wave_read] = None
+        self._raw_data: Optional[np.ndarray] = None  # Mapped/Loaded raw audio data
         self._n_channels: int = 0
         self._sample_rate: int = 0
-        self._sample_width: int = 0  # Bytes per sample
+        self._dtype: np.dtype = np.float32
         self._n_frames: int = 0
         self._current_frame: int = 0
         
@@ -111,13 +114,7 @@ class FileSource(BaseDevice):
 
     def _open_impl(self, device_id: str) -> None:
         """
-        Open a file dialog to select a WAV file, then parse its header.
-        
-        This method shows a file dialog to the user and parses the selected
-        WAV file to determine its properties (channels, sample rate, etc.).
-        
-        Raises:
-            RuntimeError: If no file is selected or the file cannot be parsed.
+        Open a file dialog to select a WAV file, then read it via scipy.io.wavfile.
         """
         # Show file dialog
         file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -135,41 +132,52 @@ class FileSource(BaseDevice):
             raise RuntimeError(f"File not found: {path}")
         
         try:
-            wav = wave.open(str(path), "rb")
+            # Use mmap=True to avoid loading large files entirely into RAM
+            # valid only for real files, not file-like objects
+            sr, data = wavfile.read(str(path), mmap=True)
         except Exception as exc:
             raise RuntimeError(f"Failed to open WAV file: {exc}") from exc
         
-        # Parse WAV header
+        # Determine shape
+        if data.ndim == 1:
+            n_frames = data.shape[0]
+            n_channels = 1
+            # Reshape to (frames, 1) for consistency
+            # Note: cannot reshape mmap array easily if it's 1D? 
+            # Actually we'll handle 1D slicing in loop
+            self._is_mono = True
+        else:
+            n_frames, n_channels = data.shape
+            self._is_mono = False
+
         self._file_path = path
-        self._wav_file = wav
-        self._n_channels = wav.getnchannels()
-        self._sample_rate = wav.getframerate()
-        self._sample_width = wav.getsampwidth()
-        self._n_frames = wav.getnframes()
+        self._raw_data = data
+        self._sample_rate = int(sr)
+        self._n_channels = n_channels
+        self._n_frames = n_frames
         self._current_frame = 0
+        self._dtype = data.dtype
         
         logger.info(
-            "Opened WAV file: %s (%d channels, %d Hz, %d-bit, %d frames)",
+            "Opened WAV file: %s (%d channels, %d Hz, %s, %d frames)",
             path.name,
             self._n_channels,
             self._sample_rate,
-            self._sample_width * 8,
+            self._dtype,
             self._n_frames,
         )
 
     def _close_impl(self) -> None:
-        """Close the WAV file and reset state."""
-        if self._wav_file is not None:
-            try:
-                self._wav_file.close()
-            except Exception as e:
-                logger.debug("Failed to close WAV file: %s", e)
-            self._wav_file = None
+        """Close the file (release mmap handle) and reset state."""
+        # For mmap, just releasing the object is usually enough
+        if self._raw_data is not None:
+             # If it was a generic mmap, could confirm close?
+             # numpy memmap has ._mmap.close() but plain ndarray doesn't
+             self._raw_data = None
         
         self._file_path = None
         self._n_channels = 0
         self._sample_rate = 0
-        self._sample_width = 0
         self._n_frames = 0
         self._current_frame = 0
         self._paused = False
@@ -183,7 +191,7 @@ class FileSource(BaseDevice):
         **options: Any,
     ) -> ActualConfig:
         """Configure the device for streaming."""
-        if self._wav_file is None:
+        if self._raw_data is None:
             raise RuntimeError("No file loaded; call open() first")
         
         # The sample rate must match the file's native rate
@@ -211,11 +219,10 @@ class FileSource(BaseDevice):
         if self._worker is not None and self._worker.is_alive():
             return
         
-        if self._wav_file is None:
+        if self._raw_data is None:
             raise RuntimeError("No file loaded")
         
         # Reset position to beginning
-        self._wav_file.rewind()
         self._current_frame = 0
         self._paused = False
         self._seek_requested = None
@@ -288,7 +295,7 @@ class FileSource(BaseDevice):
 
     def _run_loop(self) -> None:
         """Main playback loop running in a worker thread."""
-        if self.config is None or self._wav_file is None:
+        if self.config is None or self._raw_data is None:
             return
         
         chunk_size = self.config.chunk_size
@@ -297,6 +304,8 @@ class FileSource(BaseDevice):
         
         next_deadline = time.perf_counter() + chunk_duration
         
+        total_frames = self._n_frames
+        
         while not self.stop_event.is_set():
             # Check for pause and seek requests
             with self._lock:
@@ -304,44 +313,40 @@ class FileSource(BaseDevice):
                 seek_frame = self._seek_requested
                 self._seek_requested = None
             
-            # Handle seek request FIRST (even when paused)
+            # Handle seek request FIRST
             if seek_frame is not None:
-                try:
-                    self._wav_file.setpos(seek_frame)
-                    self._current_frame = seek_frame
-                except Exception as exc:
-                    logger.warning("Seek failed: %s", exc)
+                self._current_frame = max(0, min(seek_frame, total_frames))
             
             # If paused, just wait and loop
             if paused:
                 time.sleep(0.01)
                 next_deadline = time.perf_counter() + chunk_duration
                 continue
-
             
-            # Read chunk from file
-            try:
-                raw_bytes = self._wav_file.readframes(chunk_size)
-            except Exception as exc:
-                logger.error("Failed to read from WAV file: %s", exc)
-                break
-            
-            if not raw_bytes:
-                # End of file - pause and wait for seek or stop
+            # Check if EOS
+            if self._current_frame >= total_frames:
+                # End of file - pause
                 logger.info("End of file reached, paused at end")
                 with self._lock:
                     self._paused = True
-                # Stay in loop, waiting for seek or stop
                 continue
             
-            # Decode to float32
-            data = self._decode_frames(raw_bytes)
-            if data is None or data.size == 0:
-                # Empty decode - pause and wait like EOF
-                with self._lock:
-                    self._paused = True
-                continue
+            # Read chunk from memory/mmap
+            start = self._current_frame
+            end = min(start + chunk_size, total_frames)
             
+            # Slice the raw data
+            # Handle 1D (mono) vs 2D (stereo/multi)
+            if self._raw_data.ndim == 1:
+                raw_chunk = self._raw_data[start:end]
+                # Reshape to (frames, 1)
+                raw_chunk = raw_chunk[:, np.newaxis]
+            else:
+                raw_chunk = self._raw_data[start:end, :]
+
+            # Convert to float32 and normalize
+            data = self._normalize_chunk(raw_chunk)
+
             frames_read = data.shape[0]
             self._current_frame += frames_read
             
@@ -356,57 +361,20 @@ class FileSource(BaseDevice):
             elif sleep_time < -0.5:
                 # We're falling behind; reset deadline
                 next_deadline = time.perf_counter() + chunk_duration
-        
-        # Streaming complete - transition back to 'open' state
-        # This is handled by the base class when stop_event is set
 
-
-    def _decode_frames(self, raw_bytes: bytes) -> Optional[np.ndarray]:
-        """
-        Convert raw WAV bytes to float32 (frames, channels) array.
+    def _normalize_chunk(self, chunk: np.ndarray) -> np.ndarray:
+        """Normalize audio chunk to float32 [-1, 1]."""
+        # Note: input is (frames, channels)
         
-        Handles 8-bit unsigned, 16-bit signed, and 24-bit signed PCM.
-        """
-        if not raw_bytes:
-            return None
-        
-        try:
-            if self._sample_width == 1:  # 8-bit unsigned
-                data = np.frombuffer(raw_bytes, dtype=np.uint8)
-                data = (data.astype(np.float32) - 128.0) / 128.0
-            elif self._sample_width == 2:  # 16-bit signed
-                data = np.frombuffer(raw_bytes, dtype=np.int16)
-                data = data.astype(np.float32) / 32768.0
-            elif self._sample_width == 3:  # 24-bit signed
-                # Unpack 24-bit samples (3 bytes each, little-endian)
-                n_samples = len(raw_bytes) // 3
-                raw_arr = np.frombuffer(raw_bytes, dtype=np.uint8)
-                # Create 32-bit integers by padding with sign extension
-                padded = np.zeros(n_samples, dtype=np.int32)
-                for i in range(n_samples):
-                    b0 = raw_arr[i * 3]
-                    b1 = raw_arr[i * 3 + 1]
-                    b2 = raw_arr[i * 3 + 2]
-                    # Little-endian: b0 is LSB, b2 is MSB
-                    val = b0 | (b1 << 8) | (b2 << 16)
-                    # Sign extend if negative
-                    if val & 0x800000:
-                        val |= 0xFF000000
-                    padded[i] = np.int32(val)
-                data = padded.astype(np.float32) / 8388608.0  # 2^23
-            elif self._sample_width == 4:  # 32-bit signed
-                data = np.frombuffer(raw_bytes, dtype=np.int32)
-                data = data.astype(np.float32) / 2147483648.0  # 2^31
-            else:
-                logger.error("Unsupported sample width: %d", self._sample_width)
-                return None
-            
-            # Reshape to (frames, channels)
-            frames = len(data) // self._n_channels
-            if frames == 0:
-                return None
-            return data.reshape((frames, self._n_channels))
-        
-        except Exception as exc:
-            logger.error("Failed to decode WAV frames: %s", exc)
-            return None
+        if chunk.dtype == np.float32 or chunk.dtype == np.float64:
+            return chunk.astype(np.float32)
+        elif chunk.dtype == np.int16:
+            return chunk.astype(np.float32) / 32768.0
+        elif chunk.dtype == np.int32:
+            return chunk.astype(np.float32) / 2147483648.0
+        elif chunk.dtype == np.uint8:
+            return (chunk.astype(np.float32) - 128.0) / 128.0
+        else:
+            # Unknown type, just cast (or error?)
+            # Scipy might return other types?
+            return chunk.astype(np.float32)

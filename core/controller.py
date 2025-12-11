@@ -465,11 +465,15 @@ class PipelineController:
             
             from recording.wav_logger import WavLoggerThread
             
+            # Read format preference from settings default False (16-bit)
+            use_float32 = bool(self.app_settings.recording_use_float32)
+
             self._wav_logger = WavLoggerThread(
                 data_queue=self.logging_queue,
                 out_path=path,
                 sample_rate=sample_rate,
                 channels=channels,
+                use_float32=use_float32,
             )
             self._wav_logger.start()
             
