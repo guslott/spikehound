@@ -37,6 +37,7 @@ from gui.analysis.helpers import (
     StaTask,
     AnalysisUpdate,
 )
+from .waveform_loader import WaveformLoader, StaWaveformLoader
 
 from analysis.metrics import baseline, energy_density, min_max, peak_frequency_sinc
 
@@ -1752,14 +1753,41 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def _on_sta_view_waveforms_clicked(self) -> None:
         """Open dialog to view STA waveforms."""
-        waveforms = self._build_sta_waveform_payload()
-        if not waveforms:
-            QtWidgets.QMessageBox.information(self, "Waveforms", "No cross-correlation data available.")
-            return
+        if self._sta_aligned_windows is None or self._sta_time_axis is None:
+             QtWidgets.QMessageBox.information(self, "Waveforms", "No cross-correlation data available.")
+             return
+             
         channel_label = self.sta_channel_combo.currentText().strip() if self.sta_channel_combo.count() else ""
-        title = f"Cross correlation \u2013 {channel_label}" if channel_label else "Cross correlation"
-        dialog = ClusterWaveformDialog(self, title, waveforms, None)
-        dialog.exec()
+        
+        # Prepare data in background thread
+        progress = QtWidgets.QProgressDialog("Loading cross-correlation data...", "Cancel", 0, 100, self)
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        progress.setAutoClose(True)
+        progress.setMinimumDuration(200)
+        
+        self._sta_loader = StaWaveformLoader(
+            self._sta_aligned_windows, 
+            self._sta_time_axis, 
+            channel_label, 
+            self
+        )
+        self._sta_loader.progress.connect(progress.setValue)
+        
+        def on_data_ready(title, color, waveforms, median):
+            if hasattr(self, "_sta_loader"):
+                self._sta_loader.wait()
+                del self._sta_loader
+                
+            if not waveforms:
+                QtWidgets.QMessageBox.information(self, "Waveforms", "No cross-correlation data available.")
+                return
+                
+            dialog = ClusterWaveformDialog(self, title, waveforms, None, median_waveform=median)
+            dialog.exec()
+            
+        self._sta_loader.data_ready.connect(on_data_ready)
+        progress.canceled.connect(self._sta_loader.cancel)
+        self._sta_loader.start()
 
     def _on_add_class_clicked(self) -> None:
         """Create a new cluster ROI when Add Class clicked."""
@@ -1917,6 +1945,7 @@ class AnalysisTab(QtWidgets.QWidget):
         if not isinstance(cluster_id, int):
             return
         
+        
         # Handle Unclassified group
         if cluster_id == self._UNCLASSIFIED_ID:
             class_name = "Unclassified"
@@ -1933,29 +1962,31 @@ class AnalysisTab(QtWidgets.QWidget):
             class_name = cluster.name
             class_color = cluster.color
             event_ids = [event_id for event_id, cid in self._event_cluster_labels.items() if cid == cluster_id]
+
+        # Prepare data in background thread to avoid blocking UI
+        progress = QtWidgets.QProgressDialog("Loading waveforms...", "Cancel", 0, 100, self)
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        progress.setAutoClose(True)
+        progress.setMinimumDuration(200) # Show only if taking > 200ms
         
-        waveforms: list[tuple[np.ndarray, np.ndarray]] = []
-        for event_id in event_ids:
-            details = self._event_details.get(event_id)
-            if not details:
-                continue
-            times = details.get("times")
-            samples = details.get("samples")
-            if times is None or samples is None:
-                continue
-            arr_t = np.asarray(times, dtype=np.float64)
-            arr_s = np.asarray(samples, dtype=np.float32)
-            if arr_t.size == 0 or arr_s.size == 0 or arr_t.size != arr_s.size:
-                continue
-            t_rel = arr_t - arr_t[0]
-            baseline = float(np.median(arr_s)) if arr_s.size else 0.0
-            s_rel = arr_s - baseline
-            waveforms.append((t_rel, s_rel))
-        if not waveforms:
-            QtWidgets.QMessageBox.information(self, "Waveforms", "No waveform data available for this class.")
-            return
-        dialog = ClusterWaveformDialog(self, class_name, waveforms, class_color)
-        dialog.exec()
+        self._waveform_loader = WaveformLoader(event_ids, self._event_details, class_name, class_color, self)
+        self._waveform_loader.progress.connect(progress.setValue)
+        
+        def on_data_ready(c_name, c_color, waveforms, median):
+            # Cleanup thread
+            if hasattr(self, "_waveform_loader"):
+                self._waveform_loader.wait()
+                del self._waveform_loader
+            if not waveforms:
+                QtWidgets.QMessageBox.information(self, "Waveforms", "No waveform data available for this class.")
+                return
+            dialog = ClusterWaveformDialog(self, c_name, waveforms, c_color, median_waveform=median)
+            dialog.exec()
+            
+        self._waveform_loader.data_ready.connect(on_data_ready)
+        progress.canceled.connect(self._waveform_loader.cancel)
+        
+        self._waveform_loader.start()
 
     def _release_metrics(self) -> None:
         """Clear all metric event records."""
@@ -2089,10 +2120,12 @@ class AnalysisTab(QtWidgets.QWidget):
         
         # Always update Unclassified count when clustering is enabled (even with no user classes)
         if self.clustering_enabled_check.isChecked() and self._unclassified_item is not None:
-            total_with_id = sum(1 for eid in event_ids if eid is not None)
-            total_classified = len(self._event_cluster_labels)
-            unclassified_count = total_with_id - total_classified
-            self._unclassified_item.setText(f"Unclassified ({max(0, unclassified_count)} events)")
+            # Count visible events that are NOT classified (not in _event_cluster_labels)
+            unclassified_count = sum(
+                1 for eid in event_ids 
+                if eid is not None and eid not in self._event_cluster_labels
+            )
+            self._unclassified_item.setText(f"Unclassified ({unclassified_count} events)")
         
         # Build brush list with caching
         default_brush = self._brush_cache.get(-1)
@@ -2420,9 +2453,15 @@ class AnalysisTab(QtWidgets.QWidget):
             item.setText(f"{cluster.name} ({count} events)")
         
         # Update Unclassified count
+        # Count events with valid event_id that are not in any cluster
         total_events_with_id = sum(1 for r in self._metric_events if isinstance(r.get("event_id"), int))
-        total_classified = sum(counts.values())
-        unclassified_count = total_events_with_id - total_classified
+        # This count is tricky because self._event_cluster_labels accumulates history
+        # but self._metric_events is capped.
+        # However, for consistency with _update_metric_points, we should ideally count visible/active events.
+        # But here we are recomputing membership for ALL events in the deque.
+        current_classified_count = sum(counts.values())
+        unclassified_count = total_events_with_id - current_classified_count
+        
         if self._unclassified_item is not None:
             self._unclassified_item.setText(f"Unclassified ({max(0, unclassified_count)} events)")
         
@@ -2436,6 +2475,7 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
         class_name: str,
         waveforms: Sequence[tuple[np.ndarray, np.ndarray]],
         color: Optional[QtGui.QColor] = None,
+        median_waveform: Optional[np.ndarray] = None,
     ) -> None:
         super().__init__(parent)
         self._class_name = class_name
@@ -2444,7 +2484,7 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
         self._aligned_samples: list[np.ndarray] = []
         self._plot_time_axis: np.ndarray | None = None
         self._export_time_axis: np.ndarray | None = None
-        self._median_waveform: np.ndarray | None = None
+        self._median_waveform: np.ndarray | None = median_waveform
         self._measure_mode: str = "none"  # none | point | line
         self._measure_points: list[dict[str, object]] = []
         self._dragging_point_idx: int | None = None
@@ -2452,6 +2492,8 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
         self._measure_lines: list[_MeasureLine] = []
         self._line_anchor: QtCore.QPointF | None = None
 
+        # Data prep is likely already done by loader, but call this to set axes
+        # and if median is missing, calculate it.
         self._prepare_waveform_data()
         self._build_ui()
         self._plot_waveforms()
@@ -2490,6 +2532,13 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
             return
         self._plot_time_axis = aligned[0][0]
         self._aligned_samples = [samples for _, samples in aligned]
+        
+        if self._median_waveform is not None and self._plot_time_axis is not None:
+             # Already calculated passed in or calculated
+             if self._export_time_axis is None:
+                 self._export_time_axis = self._build_export_time_axis(self._plot_time_axis)
+             return
+            
         stack = np.stack(self._aligned_samples, axis=0)
         self._median_waveform = np.median(stack, axis=0)
         self._export_time_axis = self._build_export_time_axis(self._plot_time_axis)
@@ -2581,9 +2630,32 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
         if not self._aligned_samples or self._plot_time_axis is None:
             return
         line_color = QtGui.QColor(STA_TRACE_PEN.color())
-        line_pen = pg.mkPen(line_color, width=1)
-        for samples in self._aligned_samples:
-            self.plot_widget.plot(self._plot_time_axis, samples, pen=line_pen, clear=False)
+        
+        # Use a single plot item with connect='finite' to draw all lines at once
+        # This is massively faster for thousands of lines
+        
+        # Prepare concatenated data with NaN separators
+        t_vals = self._plot_time_axis
+        n_waveforms = len(self._aligned_samples)
+        
+        # Fast construction using numpy:
+        if n_waveforms > 0:
+            samples_mat = np.stack(self._aligned_samples) # (N, L)
+            # Create NaN column
+            nan_col = np.full((n_waveforms, 1), np.nan, dtype=np.float32)
+            # Concatenate (N, L+1) then flatten
+            samples_param = np.hstack([samples_mat, nan_col]).flatten()
+            
+            # Prepare time axis repeated
+            t_mat = np.tile(t_vals, (n_waveforms, 1))
+            nan_col_t = np.full((n_waveforms, 1), np.nan, dtype=np.float64)
+            t_param = np.hstack([t_mat, nan_col_t]).flatten()
+            
+            # Plot single item
+            line_pen = pg.mkPen(line_color, width=1)
+            # Use 'finite' to break lines at NaNs
+            self.plot_widget.plot(t_param, samples_param, pen=line_pen, connect="finite", clear=False)
+            
         if self._median_waveform is not None:
             median_pen = pg.mkPen(WAVEFORM_MEDIAN_COLOR, width=3)
             self.plot_widget.plot(self._plot_time_axis, self._median_waveform, pen=median_pen)
