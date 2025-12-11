@@ -75,11 +75,8 @@ class AnalysisWorker(threading.Thread):
         idx = self._resolve_channel_index(chunk)
         if idx is None:
             return
-        try:
-            samples = np.array(chunk.samples[idx : idx + 1], dtype=np.float32)
-        except Exception as e:
-            logger.debug("Failed to slice chunk samples: %s", e)
-            return
+        # Zero-copy optimization: sample is already float32 and read-only, slice returns a view
+        samples = chunk.samples[idx : idx + 1]
         if samples.size == 0:
             return
         channel_names: tuple[str, ...]
@@ -148,22 +145,17 @@ class AnalysisWorker(threading.Thread):
         if self._channel_index is not None:
             if 0 <= self._channel_index < chunk.samples.shape[0]:
                 name = None
-                try:
+                if self._channel_index < len(chunk.channel_names):
                     name = chunk.channel_names[self._channel_index]
-                except (IndexError, TypeError):
-                    name = None
                 if name == self.channel_name:
                     return self._channel_index
         try:
+            # Type ignore because tuple has index method but mypy might be confused by protocol
             idx = chunk.channel_names.index(self.channel_name)  # type: ignore[attr-defined]
+            self._channel_index = int(idx)
+            return self._channel_index
         except ValueError:
-            idx = None
-        except AttributeError:
-            idx = None
-        if idx is None:
             return None
-        self._channel_index = int(idx)
-        return self._channel_index
 
     def stop(self) -> None:
         self._stop_evt.set()

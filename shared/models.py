@@ -8,10 +8,12 @@ import numpy as np
 
 def _freeze_array(array: np.ndarray, *, ndim: int | None = None) -> np.ndarray:
     """Return a read-only, C-contiguous view of `array`, validating dimensions."""
-    arr = np.array(array, copy=True, order="C")
+    # Zero-copy optimization: Input is likely already C-contiguous float32 from Dispatcher
+    arr = np.asarray(array, order="C")
     if ndim is not None and arr.ndim != ndim:
         raise ValueError(f"array must be {ndim}D, got {arr.ndim}D")
-    arr.setflags(write=False)
+    if arr.flags.writeable:
+        arr.setflags(write=False)
     return arr
 
 
@@ -116,20 +118,7 @@ class Chunk:
     def duration(self) -> float:
         return self.n_samples * self.dt
 
-    def __reduce__(self):
-        meta = None if self.meta is None else dict(self.meta)
-        return (
-            self.__class__,
-            (
-                np.array(self.samples, copy=True, order="C"),
-                self.start_time,
-                self.dt,
-                self.seq,
-                tuple(self.channel_names),
-                self.units,
-                meta,
-            ),
-        )
+
 
 
 @dataclass(frozen=True)
@@ -186,17 +175,7 @@ class DetectionEvent:
         object.__setattr__(self, "properties", _copy_mapping(self.properties) or {})
         object.__setattr__(self, "params", _copy_mapping(self.params) or {})
 
-    def __reduce__(self):
-        return (
-            self.__class__,
-            (
-                self.t,
-                self.chan,
-                np.array(self.window, copy=True, order="C"),
-                dict(self.properties),
-                dict(self.params),
-            ),
-        )
+
 
 
 def _restore_end_of_stream() -> "_EndOfStreamSentinel":
