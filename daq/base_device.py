@@ -347,68 +347,74 @@ class BaseDevice(ABC):
             # Conservative: convert but avoid copy if possible
             data = np.asarray(data, dtype=desired_dtype)
 
-        # Validate shape
-        if data.ndim != 2:
-            raise ValueError("data must be 2D array shaped (frames, channels).")
-        frames, chans = data.shape
-        expected_chans = len(self._active_channel_ids)
-        if expected_chans != chans:
-            # Allow drivers to deliver superset and slice here as a fallback.
-            with self._channel_lock:
-                if chans >= expected_chans and chans == len(self._available_channels):
-                    # Slice by active channel order
-                    idx = [self._index_of_channel_id(cid) for cid in self._active_channel_ids]
-                    data = data[:, idx]
-                    frames, chans = data.shape
-                elif chans < expected_chans:
-                    actual_ids = None
-                    if meta is not None:
-                        actual_ids = meta.get("active_channel_ids")
-                    if isinstance(actual_ids, Sequence):
-                        out = np.zeros((frames, expected_chans), dtype=data.dtype)
-                        id_to_col = {cid: i for i, cid in enumerate(actual_ids)}
-                        for out_idx, cid in enumerate(self._active_channel_ids):
-                            src_idx = id_to_col.get(cid)
-                            if src_idx is not None and src_idx < chans:
-                                out[:, out_idx] = data[:, src_idx]
-                        data = out
-                        chans = data.shape[1]
-                    else:
-                        raise ValueError(
-                            f"data has {chans} channels, expected {expected_chans}."
-                        )
-                else:
-                    raise ValueError(
-                        f"data has {chans} channels, expected {expected_chans}."
-                    )
-
-        if frames == 0:
-            raise ValueError("data must contain at least one frame")
-
         # Stamp times/counters
         mono = _time.monotonic() if mono_time is None else mono_time
+        
         with self._state_lock:
+            # Validate shape (and possibly adapt) within the lock to ensure synchronization 
+            # with active_channel_ids and ring_buffer updates from configure().
+            if data.ndim != 2:
+                raise ValueError("data must be 2D array shaped (frames, channels).")
+            frames, chans = data.shape
+            expected_chans = len(self._active_channel_ids)
+            
+            if expected_chans != chans:
+                # Allow drivers to deliver superset and slice here as a fallback.
+                with self._channel_lock:
+                    expected_chans_now = len(self._active_channel_ids)
+                    # Re-check in case channel lock revealed a change (though state_lock should prevent it)
+                    if chans >= expected_chans_now and chans == len(self._available_channels):
+                        # Slice by active channel order
+                        idx = [self._index_of_channel_id(cid) for cid in self._active_channel_ids]
+                        data = data[:, idx]
+                        frames, chans = data.shape
+                    elif chans < expected_chans_now:
+                        actual_ids = None
+                        if meta is not None:
+                            actual_ids = meta.get("active_channel_ids")
+                        if isinstance(actual_ids, Sequence):
+                            out = np.zeros((frames, expected_chans_now), dtype=data.dtype)
+                            id_to_col = {cid: i for i, cid in enumerate(actual_ids)}
+                            for out_idx, cid in enumerate(self._active_channel_ids):
+                                src_idx = id_to_col.get(cid)
+                                if src_idx is not None and src_idx < chans:
+                                    out[:, out_idx] = data[:, src_idx]
+                            data = out
+                            chans = data.shape[1]
+                        else:
+                            raise ValueError(
+                                f"data has {chans} channels, expected {expected_chans_now}."
+                            )
+                    else:
+                        raise ValueError(
+                            f"data has {chans} channels, expected {expected_chans_now}."
+                        )
+
+            if frames == 0:
+                raise ValueError("data must contain at least one frame")
+
             # Advance counters for diagnostics/compatibility with existing stats
             self._next_start_sample += frames
             self._next_seq += 1
 
-        # Write channel-major data into the ring buffer
-        channel_major = np.ascontiguousarray(data.T)
-        rb = self.ring_buffer
-        if rb is None:
-            raise RuntimeError("ring buffer not initialized; call configure() first.")
-        if rb.shape[0] != channel_major.shape[0]:
-            raise ValueError(
-                f"ring buffer channel dimension {rb.shape[0]} does not match incoming data {channel_major.shape[0]}"
-            )
-        start_index = rb.write(channel_major)
+            # Write channel-major data into the ring buffer
+            channel_major = np.ascontiguousarray(data.T)
+            rb = self.ring_buffer
+            if rb is None:
+                raise RuntimeError("ring buffer not initialized; call configure() first.")
+            if rb.shape[0] != channel_major.shape[0]:
+                raise ValueError(
+                    f"ring buffer channel dimension {rb.shape[0]} does not match incoming data {channel_major.shape[0]}"
+                )
+            start_index = rb.write(channel_major)
 
-        pointer = ChunkPointer(
-            start_index=start_index,
-            length=frames,
-            render_time=mono,
-        )
-        self._safe_put(pointer)
+            pointer = ChunkPointer(
+                start_index=start_index,
+                length=frames,
+                render_time=mono,
+            )
+            self._safe_put(pointer)
+            
         return pointer
 
     def emit_chunk(self, chunk: Chunk) -> None:
@@ -423,13 +429,15 @@ class BaseDevice(ABC):
         with self._state_lock:
             self._next_start_sample += frames
             self._next_seq += 1
-        start_index = self.ring_buffer.write(np.ascontiguousarray(chunk.samples))
-        pointer = ChunkPointer(
-            start_index=start_index,
-            length=frames,
-            render_time=chunk.start_time,
-        )
-        self._safe_put(pointer)
+            if self.ring_buffer is None:
+                raise RuntimeError("ring buffer not initialized; call configure() first.")
+            start_index = self.ring_buffer.write(np.ascontiguousarray(chunk.samples))
+            pointer = ChunkPointer(
+                start_index=start_index,
+                length=frames,
+                render_time=chunk.start_time,
+            )
+            self._safe_put(pointer)
 
     def note_xrun(self, count: int = 1) -> None:
         """Drivers can call this when the backend reports over/underruns."""

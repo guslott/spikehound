@@ -22,9 +22,11 @@ a = Analysis(
     ],
     hiddenimports=[
         "daq.simulated_source",
-        "daq.backyard_brains_source",
+        "daq.backyard_brains",
         "daq.soundcard_source",
         "daq.file_source",
+        "serial",
+        "serial.tools.list_ports",
     ],
     hookspath=[],
     hooksconfig={},
