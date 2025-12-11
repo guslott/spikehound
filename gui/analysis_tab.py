@@ -683,7 +683,7 @@ class AnalysisTab(QtWidgets.QWidget):
         """Timer callback: drain analysis queue and render batches."""
         if self._analysis_queue is None:
             return
-        max_batches = 3
+        max_batches = 100
         processed = 0
         while processed < max_batches:
             try:
@@ -2230,9 +2230,15 @@ class AnalysisTab(QtWidgets.QWidget):
         metrics: Optional[dict[str, float]] = None
         metric_values: dict[str, float] = {}
         if samples.size >= 4:
-            ed = energy_density(samples, sr)
-            mx, mn = min_max(samples)
-            pf = peak_frequency_sinc(samples, sr, center_index=cross_idx)
+            props = getattr(event, "properties", None)
+            if isinstance(props, dict) and "energy_density" in props and "peak_freq_hz" in props:
+                ed = float(props["energy_density"])
+                pf = float(props["peak_freq_hz"])
+                mx, mn = min_max(samples)
+            else:
+                ed = energy_density(samples, sr)
+                mx, mn = min_max(samples)
+                pf = peak_frequency_sinc(samples, sr, center_index=cross_idx)
             metric_values.update(
                 {
                     "ed": float(ed),

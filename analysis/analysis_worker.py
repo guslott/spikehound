@@ -23,7 +23,7 @@ from core.detection import AmpThresholdDetector, DETECTOR_REGISTRY
 class AnalysisWorker(threading.Thread):
     """Background worker that receives filtered chunks and forwards them to an output queue."""
 
-    def __init__(self, controller, channel_name: str, sample_rate: float, *, queue_size: int = 64) -> None:
+    def __init__(self, controller, channel_name: str, sample_rate: float, *, queue_size: int = 512) -> None:
         super().__init__(name=f"AnalysisWorker-{channel_name}", daemon=True)
         self._controller = controller
         self.channel_name = channel_name
