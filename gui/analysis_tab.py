@@ -1511,6 +1511,7 @@ class AnalysisTab(QtWidgets.QWidget):
                 self._unclassified_item = QtWidgets.QListWidgetItem("Unclassified (0 events)")
                 self._unclassified_item.setData(QtCore.Qt.UserRole, self._UNCLASSIFIED_ID)
             self.class_list.insertItem(0, self._unclassified_item)
+            self.class_list.setCurrentItem(self._unclassified_item)
             self._recompute_cluster_membership()
         else:
             # Remove the Unclassified entry

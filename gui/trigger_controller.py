@@ -56,6 +56,10 @@ class TriggerController(QtCore.QObject):
         self._window_samples: int = 1
         self._last_sample_rate: float = 0.0
         
+        # Alignment config
+        self._alignment_mode: str = "peak"  # "simple" or "peak"
+        self._alignment_search_window_sec: float = 0.002
+        
         # History buffer for pretrigger
         self._history: Deque[np.ndarray] = deque()
         self._history_length: int = 0
@@ -102,6 +106,14 @@ class TriggerController(QtCore.QObject):
     def is_triggered_mode(self) -> bool:
         """True if in single or continuous trigger mode (not stream)."""
         return self._mode in ("single", "continuous")
+    
+    @property
+    def alignment_mode(self) -> str:
+        return self._alignment_mode
+    
+    @alignment_mode.setter
+    def alignment_mode(self, value: str) -> None:
+        self._alignment_mode = value
     
     @property
     def display_data(self) -> Optional[np.ndarray]:
@@ -310,11 +322,21 @@ class TriggerController(QtCore.QObject):
             return
             
         pre = self._pre_samples
+        
+        # Add alignment padding if needed
+        align_pad = 0
+        if self._alignment_mode == "peak":
+            align_pad = int(self._alignment_search_window_sec * self._last_sample_rate)
+            # Ensure at least a few samples for search
+            align_pad = max(align_pad, 5)
+
         earliest_abs = self._history_total - self._history_length
-        start_abs = max(chunk_start_abs + trigger_idx - pre, earliest_abs)
+        # Request data starting earlier to allow for alignment search
+        start_abs = max(chunk_start_abs + trigger_idx - pre - align_pad, earliest_abs)
         
         self._capture_start_abs = start_abs
-        self._capture_end_abs = start_abs + window
+        # Capture enough for window + 2*padding (search left and right)
+        self._capture_end_abs = start_abs + window + 2 * align_pad
         
         if self._mode == "single":
             self._single_armed = False
@@ -370,12 +392,55 @@ class TriggerController(QtCore.QObject):
         
         # Slice to get the window
         start_idx = start_abs - data_start_abs
+        
+        # Perform alignment if requested
+        if self._alignment_mode == "peak":
+            align_pad = int(self._alignment_search_window_sec * self._last_sample_rate)
+            align_pad = max(align_pad, 5)
+            
+            # The nominal trigger point is at start_idx + align_pad + pre_samples
+            nominal_trigger = start_idx + align_pad + self._pre_samples
+            
+            # Search window around nominal trigger
+            # We look +/- align_pad
+            s_start = max(0, nominal_trigger - align_pad)
+            s_end = min(data.shape[0], nominal_trigger + align_pad)
+            
+            search_region = data[s_start:s_end]
+            if search_region.size > 0:
+                # Find peak offset relative to start of search region
+                peak_offset = np.argmax(np.abs(search_region))
+                
+                # Absolute index of the peak in data
+                peak_abs_idx = s_start + peak_offset
+                
+                # We want peak_abs_idx to end up at index 'pre_samples' in the final snippet
+                # snippet = data[start:end]
+                # peak_abs_idx - start = pre_samples
+                # start = peak_abs_idx - pre_samples
+                
+                final_start = peak_abs_idx - self._pre_samples
+                start_idx = final_start
+
         end_idx = start_idx + self._window_samples
         
+        # Handle start before available data (if peak shifted left past start)
+        pad_front = 0
+        if start_idx < 0:
+            pad_front = -start_idx
+            start_idx = 0
+            
         if end_idx > data.shape[0]:
             end_idx = data.shape[0]
             
         snippet = data[start_idx:end_idx]
+        
+        if pad_front > 0:
+            if snippet.ndim == 1:
+                padding = np.zeros(pad_front, dtype=snippet.dtype)
+            else:
+                padding = np.zeros((pad_front, snippet.shape[1]), dtype=snippet.dtype)
+            snippet = np.concatenate([padding, snippet], axis=0)
         
         # Pad if needed
         if snippet.shape[0] < self._window_samples:
