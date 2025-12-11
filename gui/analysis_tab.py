@@ -107,6 +107,8 @@ class AnalysisTab(QtWidgets.QWidget):
         self._cluster_id_counter: int = 0
         self._cluster_items: dict[int, QtWidgets.QListWidgetItem] = {}
         self._selected_cluster_id: int | None = None
+        self._unclassified_item: QtWidgets.QListWidgetItem | None = None  # Permanent "Unclassified" entry
+        self._UNCLASSIFIED_ID: int = -1  # Special ID for Unclassified pseudo-class
         # Pause snapshot: when paused, we capture static curve data and colors
         self._pause_snapshot_curves: list[pg.PlotCurveItem] = []  # Static snapshot items
         self._sta_enabled: bool = False
@@ -403,16 +405,22 @@ class AnalysisTab(QtWidgets.QWidget):
         self.sta_view_waveforms_btn.setEnabled(False)
         sta_buttons_row.addWidget(self.sta_view_waveforms_btn, 1)
         sta_layout.addLayout(sta_buttons_row)
-        sta_layout.addStretch(1)
 
         controls_layout.addLayout(sta_layout)
-        controls_layout.addStretch(1)
+        # Note: No addStretch here - let widgets fill the available space
 
         controls.setLayout(controls_layout)
-        layout.addWidget(controls, stretch=2)
+        # Controls panel has fixed content height - prevent vertical expansion
+        controls.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Maximum)
+        layout.addWidget(controls, stretch=0)
         self._refresh_cluster_options()
 
         self.metrics_container = QtWidgets.QWidget(self)
+        # Set expanding policy to fill remaining vertical space
+        self.metrics_container.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, 
+            QtWidgets.QSizePolicy.Expanding
+        )
         metrics_container_layout = QtWidgets.QHBoxLayout(self.metrics_container)
         metrics_container_layout.setContentsMargins(0, 0, 0, 0)
         metrics_container_layout.setSpacing(10)
@@ -423,13 +431,19 @@ class AnalysisTab(QtWidgets.QWidget):
         cluster_layout = QtWidgets.QVBoxLayout()
         cluster_layout.setContentsMargins(12, 10, 12, 10)
         cluster_layout.setSpacing(6)
-        self.add_class_btn = QtWidgets.QPushButton("Add class…")
+        
+        # Add Class and Remove Class buttons side-by-side
+        add_remove_row = QtWidgets.QHBoxLayout()
+        add_remove_row.setSpacing(6)
+        self.add_class_btn = QtWidgets.QPushButton("Add class")
         self.add_class_btn.clicked.connect(self._on_add_class_clicked)
-        cluster_layout.addWidget(self.add_class_btn)
+        add_remove_row.addWidget(self.add_class_btn, stretch=1)
         self.remove_class_btn = QtWidgets.QPushButton("Remove class")
         self.remove_class_btn.clicked.connect(self._on_remove_class_clicked)
-        cluster_layout.addWidget(self.remove_class_btn)
+        add_remove_row.addWidget(self.remove_class_btn, stretch=1)
+        cluster_layout.addLayout(add_remove_row)
         
+        # Export row
         export_row = QtWidgets.QHBoxLayout()
         export_row.setSpacing(6)
         self.export_class_btn = QtWidgets.QPushButton("Export to CSV")
@@ -440,18 +454,20 @@ class AnalysisTab(QtWidgets.QWidget):
         self.export_class_combo.addItem("All events", None)
         export_row.addWidget(self.export_class_combo, stretch=1)
         cluster_layout.addLayout(export_row)
-        self.view_class_waveforms_btn = QtWidgets.QPushButton("View waveforms…")
+        
+        self.view_class_waveforms_btn = QtWidgets.QPushButton("View waveforms")
         self.view_class_waveforms_btn.clicked.connect(self._on_view_class_waveforms_clicked)
         cluster_layout.addWidget(self.view_class_waveforms_btn)
+        
+        # Class list - gets more room now
         self.class_list = QtWidgets.QListWidget()
         self.class_list.currentItemChanged.connect(self._on_class_selection_changed)
-        cluster_layout.addWidget(self.class_list, stretch=1)
-        cluster_layout.addStretch(1)
+        cluster_layout.addWidget(self.class_list, stretch=2)
         self.cluster_panel.setLayout(cluster_layout)
         metrics_container_layout.addWidget(self.cluster_panel, stretch=0)
         self._set_cluster_panel_visible(False)
 
-        layout.addWidget(self.metrics_container, stretch=4)
+        layout.addWidget(self.metrics_container, stretch=6)
 
         self.raw_curve = self.plot_widget.plot(pen=pg.mkPen((30, 144, 255), width=2))
         self.event_curve = self.plot_widget.plot(pen=pg.mkPen((200, 0, 0), width=2))
@@ -469,8 +485,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self.threshold2_line.setZValue(10)
         self.threshold2_line.setVisible(False)
         self.plot_widget.addItem(self.threshold2_line)
-
-        layout.addStretch(1)
+        # Note: No addStretch at end - let metrics_container fill remaining space
 
         self.width_combo.currentIndexChanged.connect(self._apply_ranges)
         self.height_combo.currentIndexChanged.connect(self._apply_ranges)
@@ -1355,9 +1370,18 @@ class AnalysisTab(QtWidgets.QWidget):
     def _update_cluster_button_states(self) -> None:
         """Enable/disable cluster buttons based on state."""
         enabled = self.clustering_enabled_check.isChecked()
-        has_selection = self.class_list.currentItem() is not None
+        current_item = self.class_list.currentItem()
+        has_selection = current_item is not None
+        
+        # Check if the selected item is the Unclassified entry
+        is_unclassified = False
+        if has_selection:
+            selected_id = current_item.data(QtCore.Qt.UserRole)
+            is_unclassified = (selected_id == self._UNCLASSIFIED_ID)
+        
         self.add_class_btn.setEnabled(enabled)
-        self.remove_class_btn.setEnabled(enabled and has_selection)
+        # Remove class only enabled for user-added classes, not Unclassified
+        self.remove_class_btn.setEnabled(enabled and has_selection and not is_unclassified)
         self.view_class_waveforms_btn.setEnabled(enabled and has_selection)
         self.export_class_btn.setEnabled(enabled and has_selection)
 
@@ -1481,8 +1505,18 @@ class AnalysisTab(QtWidgets.QWidget):
         """Handle clustering enable checkbox toggle."""
         self._set_cluster_panel_visible(checked)
         if checked:
+            # Add the permanent "Unclassified" entry at the top
+            if self._unclassified_item is None:
+                self._unclassified_item = QtWidgets.QListWidgetItem("Unclassified (0 events)")
+                self._unclassified_item.setData(QtCore.Qt.UserRole, self._UNCLASSIFIED_ID)
+            self.class_list.insertItem(0, self._unclassified_item)
             self._recompute_cluster_membership()
         else:
+            # Remove the Unclassified entry
+            if self._unclassified_item is not None:
+                row = self.class_list.row(self._unclassified_item)
+                if row >= 0:
+                    self.class_list.takeItem(row)
             self._event_cluster_labels.clear()
             for cluster in self._clusters:
                 item = self._cluster_items.get(cluster.id)
@@ -1882,10 +1916,24 @@ class AnalysisTab(QtWidgets.QWidget):
         cluster_id = current_item.data(QtCore.Qt.UserRole)
         if not isinstance(cluster_id, int):
             return
-        cluster = next((c for c in self._clusters if c.id == cluster_id), None)
-        if cluster is None:
-            return
-        event_ids = [event_id for event_id, cid in self._event_cluster_labels.items() if cid == cluster_id]
+        
+        # Handle Unclassified group
+        if cluster_id == self._UNCLASSIFIED_ID:
+            class_name = "Unclassified"
+            class_color = QtGui.QColor(UNCLASSIFIED_COLOR)
+            # Find all events NOT in any cluster
+            all_event_ids = {r.get("event_id") for r in self._metric_events if isinstance(r.get("event_id"), int)}
+            classified_ids = set(self._event_cluster_labels.keys())
+            event_ids = list(all_event_ids - classified_ids)
+        else:
+            # Find the cluster
+            cluster = next((c for c in self._clusters if c.id == cluster_id), None)
+            if cluster is None:
+                return
+            class_name = cluster.name
+            class_color = cluster.color
+            event_ids = [event_id for event_id, cid in self._event_cluster_labels.items() if cid == cluster_id]
+        
         waveforms: list[tuple[np.ndarray, np.ndarray]] = []
         for event_id in event_ids:
             details = self._event_details.get(event_id)
@@ -1906,7 +1954,7 @@ class AnalysisTab(QtWidgets.QWidget):
         if not waveforms:
             QtWidgets.QMessageBox.information(self, "Waveforms", "No waveform data available for this class.")
             return
-        dialog = ClusterWaveformDialog(self, cluster.name, waveforms, cluster.color)
+        dialog = ClusterWaveformDialog(self, class_name, waveforms, class_color)
         dialog.exec()
 
     def _release_metrics(self) -> None:
@@ -2038,6 +2086,13 @@ class AnalysisTab(QtWidgets.QWidget):
             # Note: overlay colors are set at creation time, not refreshed here
             
             self._cluster_membership_dirty = False
+        
+        # Always update Unclassified count when clustering is enabled (even with no user classes)
+        if self.clustering_enabled_check.isChecked() and self._unclassified_item is not None:
+            total_with_id = sum(1 for eid in event_ids if eid is not None)
+            total_classified = len(self._event_cluster_labels)
+            unclassified_count = total_with_id - total_classified
+            self._unclassified_item.setText(f"Unclassified ({max(0, unclassified_count)} events)")
         
         # Build brush list with caching
         default_brush = self._brush_cache.get(-1)
@@ -2363,6 +2418,14 @@ class AnalysisTab(QtWidgets.QWidget):
                 continue
             count = counts.get(cluster.id, 0)
             item.setText(f"{cluster.name} ({count} events)")
+        
+        # Update Unclassified count
+        total_events_with_id = sum(1 for r in self._metric_events if isinstance(r.get("event_id"), int))
+        total_classified = sum(counts.values())
+        unclassified_count = total_events_with_id - total_classified
+        if self._unclassified_item is not None:
+            self._unclassified_item.setText(f"Unclassified ({max(0, unclassified_count)} events)")
+        
         # Note: overlay colors are set at creation time, not refreshed here
 
 
