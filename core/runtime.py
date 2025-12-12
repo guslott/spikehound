@@ -228,6 +228,20 @@ class SpikeHoundRuntime:
         queues["audio"] = _queue_status(self.audio_queue)
         queues["logging"] = _queue_status(self.logging_queue)
 
+        # Aggregate analysis workers (pick worst case)
+        max_ana_util = -1.0
+        worst_ana_queue = None
+        for worker in list(self._analysis_workers.values()):
+            if not worker.is_alive():
+                continue
+            qs = _queue_status(getattr(worker, "input_queue", None))
+            u = qs.get("utilization", 0.0)
+            if u > max_ana_util:
+                max_ana_util = u
+                worst_ana_queue = qs
+        
+        queues["analysis"] = worst_ana_queue if worst_ana_queue else {"size": 0, "max": 0, "utilization": 0.0}
+
         dispatcher = self.dispatcher
         if dispatcher is not None:
             try:

@@ -86,7 +86,7 @@ class SettingsTab(QtWidgets.QWidget):
 
         # Recording settings (Pro float32 and Auto-increment)
         rec_row = QtWidgets.QHBoxLayout()
-        self.rec_float32_check = QtWidgets.QCheckBox("Use 32-bit Pro WAV (float)")
+        self.rec_float32_check = QtWidgets.QCheckBox("Use 32-bit Float Pro WAV Format (instead of 16-bit)")
         self.rec_float32_check.setToolTip("Record as 32-bit floating point WAV instead of standard 16-bit PCM. Prevents clipping but creates larger files.")
         self.rec_float32_check.stateChanged.connect(self._on_rec_float32_toggled)
         
@@ -120,27 +120,29 @@ class SettingsTab(QtWidgets.QWidget):
         grid.setHorizontalSpacing(12)
         grid.setVerticalSpacing(6)
 
-        labels = [
-            # Pipeline status
+        col1_labels = [
             ("Sample Rate", "sample_rate"),
             ("Uptime", "uptime"),
             ("Chunk rate", "chunk_rate"),
             ("Throughput", "throughput"),
             ("Plot refresh", "plot_refresh"),
-            # Queue health
+            ("Xruns", "xruns"),
+            ("Drops", "drops"),
+        ]
+        
+        col2_labels = [
             ("Source queue", "source_queue"),
             ("Viz queue", "viz_queue"),
             ("Audio queue", "audio_queue"),
             ("Logging queue", "logging_queue"),
-            # Buffer status
+            ("Analysis queue", "analysis_queue"),
             ("Viz buffer", "viz_buffer"),
-            # Data integrity
-            ("Xruns", "xruns"),
-            ("Drops", "drops"),
-            ("Dispatcher", "dispatcher"),
         ]
+
         self._metric_fields: Dict[str, QtWidgets.QLabel] = {}
-        for row, (title, key) in enumerate(labels):
+        
+        # Populate Column 1 (0, 1)
+        for row, (title, key) in enumerate(col1_labels):
             name_label = QtWidgets.QLabel(title + ":")
             name_label.setStyleSheet("font-weight: bold;")
             grid.addWidget(name_label, row, 0, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
@@ -148,10 +150,32 @@ class SettingsTab(QtWidgets.QWidget):
             value.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
             grid.addWidget(value, row, 1)
             self._metric_fields[key] = value
+
+        # Populate Column 2 (2, 3)
+        for row, (title, key) in enumerate(col2_labels):
+            name_label = QtWidgets.QLabel(title + ":")
+            name_label.setStyleSheet("font-weight: bold;")
+            grid.addWidget(name_label, row, 2, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+            value = QtWidgets.QLabel("–")
+            value.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+            grid.addWidget(value, row, 3)
+            self._metric_fields[key] = value
         
-        # Keep columns close together - label column fixed, value column can stretch
+        # Dispatcher stats span the bottom
+        row = max(len(col1_labels), len(col2_labels))
+        name_label = QtWidgets.QLabel("Dispatcher:")
+        name_label.setStyleSheet("font-weight: bold;")
+        grid.addWidget(name_label, row, 0, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        
+        disp_val = QtWidgets.QLabel("–")
+        grid.addWidget(disp_val, row, 1, 1, 3) # Span 3 columns
+        self._metric_fields["dispatcher"] = disp_val
+
+        # Add a vertical divider line or just use spacing? Spacing is fine.
         grid.setColumnStretch(0, 0)
         grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 0)
+        grid.setColumnStretch(3, 1)
         
         # State for rate calculation
         self._last_frames = 0
@@ -421,6 +445,7 @@ class SettingsTab(QtWidgets.QWidget):
         self._metric_fields["viz_queue"].setText(self._format_queue(depths.get("visualization")))
         self._metric_fields["audio_queue"].setText(self._format_queue(depths.get("audio")))
         self._metric_fields["logging_queue"].setText(self._format_queue(depths.get("logging")))
+        self._metric_fields["analysis_queue"].setText(self._format_queue(depths.get("analysis")))
         
         # Viz buffer status
         viz_buf = depths.get("viz_buffer", {})
