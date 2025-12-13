@@ -165,21 +165,7 @@ class AnalysisWorker(threading.Thread):
             self.input_queue.put_nowait(EndOfStream)
         except queue.Full:
             pass
-        removed_stop_attr = False
-        cached_stop_attr = None
-        if hasattr(self, "_stop"):
-            cached_stop_attr = getattr(self, "_stop")
-            if not callable(cached_stop_attr):
-                try:
-                    delattr(self, "_stop")
-                    removed_stop_attr = True
-                except AttributeError:
-                    removed_stop_attr = False
-        try:
-            self.join(timeout=1.0)
-        finally:
-            if removed_stop_attr:
-                setattr(self, "_stop", cached_stop_attr)
+        self.join(timeout=1.0)
         if self._registration_token is not None:
             try:
                 self._controller.unregister_analysis_queue(self._registration_token)
