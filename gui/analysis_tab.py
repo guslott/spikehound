@@ -207,7 +207,7 @@ class AnalysisTab(QtWidgets.QWidget):
             vb.setMouseEnabled(x=False, y=False)
         energy_scatter_color = QtGui.QColor(UNCLASSIFIED_COLOR)
         energy_scatter_color.setAlpha(170)
-        self.energy_scatter = pg.ScatterPlotItem(size=6, brush=pg.mkBrush(energy_scatter_color), pen=None, name="Energy Density")
+        self.energy_scatter = pg.ScatterPlotItem(size=3, brush=pg.mkBrush(energy_scatter_color), pen=None, name="Energy Density")
         # Disable mouse event interception so cluster ROI handles can receive clicks
         # This fixes the issue where scatter points block ROI edge/handle dragging
         self.energy_scatter.setAcceptedMouseButtons(QtCore.Qt.NoButton)
@@ -1368,15 +1368,18 @@ class AnalysisTab(QtWidgets.QWidget):
         self._update_cluster_button_states()
 
     def _update_cluster_visuals(self) -> None:
-        """Update cluster ROI pen widths based on selection."""
+        """Update cluster ROI visibility and pen widths based on selection."""
+        visible = self.clustering_enabled_check.isChecked()
         base_width = 1.5
         selected_id = self._selected_cluster_id
         for cluster in self._clusters:
             roi = cluster.roi
             if roi is None:
                 continue
-            width = base_width * 3.0 if cluster.id == selected_id else base_width
-            roi.setPen(pg.mkPen(cluster.color, width=width))
+            roi.setVisible(visible)
+            if visible:
+                width = base_width * 3.0 if cluster.id == selected_id else base_width
+                roi.setPen(pg.mkPen(cluster.color, width=width))
 
     def _update_cluster_button_states(self) -> None:
         """Enable/disable cluster buttons based on state."""
