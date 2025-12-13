@@ -112,11 +112,11 @@ class ChannelConfig:
     vertical_span_v: float = 1.0     # Y-axis scale (±1V = 2V span)
     screen_offset: float = 0.5       # Y position (0=bottom, 1=top)
     notch_enabled: bool = False      # 60Hz filter
-    notch_freq: float = 60.0
+    notch_freq_hz: float = 60.0
     highpass_enabled: bool = False   # High-pass filter
-    highpass_freq: float = 10.0
+    highpass_hz: float = 10.0
     lowpass_enabled: bool = False    # Low-pass filter
-    lowpass_freq: float = 1000.0
+    lowpass_hz: float = 1000.0
     listen_enabled: bool = False     # Audio monitoring
     analyze_enabled: bool = False    # Spike analysis
     channel_name: str = ""

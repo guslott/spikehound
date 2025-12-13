@@ -313,6 +313,7 @@ class AnalysisTab(QtWidgets.QWidget):
             "Energy Density",
             "Peak Frequency (Hz)",
             "Interval since last event (s)",
+            "Event Width (ms)",
         ):
             item = QtGui.QStandardItem(label)
             metric_model.appendRow(item)
@@ -334,6 +335,7 @@ class AnalysisTab(QtWidgets.QWidget):
             "Min in window (V)",
             "Energy Density",
             "Peak Frequency (Hz)",
+            "Event Width (ms)",
         ):
             item = QtGui.QStandardItem(label)
             metric_x_model.appendRow(item)
@@ -1290,6 +1292,8 @@ class AnalysisTab(QtWidgets.QWidget):
             return "min"
         if "frequency" in label:
             return "freq"
+        if "width" in label:
+            return "width"
         return "ed"
 
     def _selected_x_metric(self) -> str:
@@ -1299,6 +1303,8 @@ class AnalysisTab(QtWidgets.QWidget):
             return "time"
         if "frequency" in label:
             return "freq"
+        if "width" in label:
+            return "width"
         if "max" in label:
             return "max"
         if "min" in label:
@@ -2173,7 +2179,7 @@ class AnalysisTab(QtWidgets.QWidget):
         rel_time = max(0.0, float(metric_time) - (self._t0_event or 0.0))
         record: dict[str, float | int] = {"time": rel_time}
         has_metric = False
-        for key in ("ed", "max", "min", "freq", "interval"):
+        for key in ("ed", "max", "min", "freq", "interval", "width"):
             value = metrics.get(key)
             if value is None:
                 continue
@@ -2241,6 +2247,7 @@ class AnalysisTab(QtWidgets.QWidget):
                     "max": float(mx),
                     "min": float(mn),
                     "freq": float(pf),
+                    "width": float(props.get("event_width_ms", 0.0)),
                 }
             )
         interval_val = float(getattr(event, "intervalSinceLastSec", float("nan")))

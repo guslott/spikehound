@@ -77,7 +77,6 @@ class BackyardBrainsSource(BaseDevice):
         self._requires_start = True
         self._supports_channel_cfg = False
         self._hint_sample_rate: Optional[int] = None
-        self._hint_sample_rate: Optional[int] = None
         self._stream_channel_count = 1
         # Default capabilities fallback (updated on open)
         self._max_channels = 2
@@ -269,8 +268,6 @@ class BackyardBrainsSource(BaseDevice):
 
         # Some devices allow channel-count configuration (SpikerShield family).
         # Others stream a fixed set; in those cases we simply decode that many.
-        # Some devices allow channel-count configuration (SpikerShield family).
-        # Others stream a fixed set; in those cases we simply decode that many.
         if self._supports_channel_cfg:
             # Stop first to be safe on devices that honor start/stop
             if self._requires_start:
@@ -335,7 +332,6 @@ class BackyardBrainsSource(BaseDevice):
         if not self._ser or not self.config:
             return
 
-        # Always decode the full stream channel count (hardware order).
         # Always decode the full stream channel count (hardware order).
         stream_channels = self._stream_channel_count
         stream_channels = max(1, stream_channels)

@@ -78,9 +78,7 @@ class AmpThresholdDetector:
         self._n_channels = n_channels
         self._noise_levels = None  # Will be estimated from first chunk(s) or running average
         self._refractory_samples = int(self._refractory_ms * 1e-3 * sample_rate) if sample_rate > 0 else 0
-        self._refractory_samples = int(self._refractory_ms * 1e-3 * sample_rate) if sample_rate > 0 else 0
         self._last_event_time = np.zeros(n_channels, dtype=np.float64) - 1000.0
-        self._last_event_time = np.zeros(n_channels, dtype=np.float64) - 1000.0 # Initialize far in the past
         self._residue = None # Reset residue buffer
 
     def process_chunk(self, chunk: Chunk) -> Iterable[DetectionEvent]:

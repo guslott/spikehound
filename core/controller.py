@@ -378,7 +378,8 @@ class PipelineController:
                 raise
             channel_ids = [info.id for info in channels]
             channel_names = [info.name for info in channels]
-            self._dispatcher.set_channel_layout(channel_ids, channel_names)
+            channel_units = [info.units for info in channels]
+            self._dispatcher.set_channel_layout(channel_ids, channel_names, channel_units)
             self._dispatcher.set_window_duration(self._window_sec)
             self._dispatcher.clear_active_channels()
             logger.info("Source attached successfully (sr=%s, channels=%s)", effective_sr, channel_ids)
@@ -428,8 +429,10 @@ class PipelineController:
                 # This is critical - previously we iterated _channel_infos which is in device order,
                 # not the user-added order stored in _active_channel_ids
                 id_to_name = {info.id: info.name for info in self._channel_infos}
+                id_to_info = {info.id: info for info in self._channel_infos}
                 active_names = [id_to_name.get(cid, f"Channel {cid}") for cid in self._active_channel_ids]
-                self._dispatcher.set_channel_layout(self._active_channel_ids, active_names)
+                active_units = [id_to_info[cid].units for cid in self._active_channel_ids if cid in id_to_info]
+                self._dispatcher.set_channel_layout(self._active_channel_ids, active_names, active_units)
                 self._dispatcher.set_active_channels(self._active_channel_ids)
 
             # If we weren't running but have channels, ensure streaming state is correct
@@ -659,7 +662,8 @@ class PipelineController:
             # Always set the FULL layout to match the source
             full_ids = [info.id for info in self._channel_infos]
             full_names = [info.name for info in self._channel_infos]
-            self._dispatcher.set_channel_layout(full_ids, full_names)
+            full_units = [info.units for info in self._channel_infos]
+            self._dispatcher.set_channel_layout(full_ids, full_names, full_units)
             self._dispatcher.set_active_channels(self._active_channel_ids)
             self._dispatcher.start()
         except Exception as exc:

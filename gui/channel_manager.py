@@ -393,15 +393,15 @@ class ChannelManager(QtCore.QObject):
         
         if previous.notch_enabled != current.notch_enabled:
             return True
-        if current.notch_enabled and _diff(previous.notch_freq, current.notch_freq):
+        if current.notch_enabled and _diff(previous.notch_freq_hz, current.notch_freq_hz):
             return True
         if previous.highpass_enabled != current.highpass_enabled:
             return True
-        if current.highpass_enabled and _diff(previous.highpass_freq, current.highpass_freq):
+        if current.highpass_enabled and _diff(previous.highpass_hz, current.highpass_hz):
             return True
         if previous.lowpass_enabled != current.lowpass_enabled:
             return True
-        if current.lowpass_enabled and _diff(previous.lowpass_freq, current.lowpass_freq):
+        if current.lowpass_enabled and _diff(previous.lowpass_hz, current.lowpass_hz):
             return True
         return False
     

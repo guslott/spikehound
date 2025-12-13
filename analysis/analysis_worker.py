@@ -16,7 +16,7 @@ from shared.types import AnalysisEvent
 
 from .models import AnalysisBatch
 from .settings import AnalysisSettings, AnalysisSettingsStore
-from .metrics import energy_density, peak_frequency_sinc
+from .metrics import energy_density, peak_frequency_sinc, event_width
 from core.detection import AmpThresholdDetector, DETECTOR_REGISTRY
 
 
@@ -52,6 +52,8 @@ class AnalysisWorker(threading.Thread):
         self._auto_detector: Optional[AmpThresholdDetector] = None
         if isinstance(self._settings_store, AnalysisSettingsStore):
             self._settings_unsub = self._settings_store.subscribe(self._on_settings_changed)
+        self._noise_mad: float = 0.0
+        self._noise_initialized: bool = False
 
     def start(self) -> None:  # type: ignore[override]
         if self._controller is None:
@@ -278,6 +280,25 @@ class AnalysisWorker(threading.Thread):
             self.sample_rate = sample_rate
             self._last_window_end_sample = -10**12
 
+    def _update_noise_level(self, chunk: Chunk) -> None:
+        if chunk.samples.size == 0:
+            return
+        sig = np.asarray(chunk.samples[0], dtype=np.float32)
+        if sig.size == 0:
+            return
+        
+        # Calculate MAD for global noise estimation
+        med = float(np.median(sig))
+        mad = float(np.median(np.abs(sig - med)))
+        
+        with self._state_lock:
+            if not self._noise_initialized:
+                self._noise_mad = mad
+                self._noise_initialized = True
+            else:
+                alpha = 0.05
+                self._noise_mad = alpha * mad + (1.0 - alpha) * self._noise_mad
+
     # ------------------------------------------------------------------
     # Event detection
     # ------------------------------------------------------------------
@@ -287,15 +308,13 @@ class AnalysisWorker(threading.Thread):
         return self._event_id
 
     def _detect_events(self, chunk: Chunk) -> list[AnalysisEvent]:
+        self._update_noise_level(chunk)
         with self._state_lock:
             event_window_ms = float(self._event_window_ms)
             threshold_enabled = bool(self._threshold_enabled)
             threshold_value = float(self._threshold_value)
             threshold_direction = self._threshold_direction
             secondary_enabled = bool(self._secondary_threshold_enabled)
-            secondary_value = float(self._secondary_threshold_value)
-            last_window_end = self._last_window_end_sample
-            last_crossing_time = self._last_crossing_time_sec
             secondary_value = float(self._secondary_threshold_value)
             last_window_end = self._last_window_end_sample
             last_crossing_time = self._last_crossing_time_sec
@@ -566,6 +585,12 @@ class AnalysisWorker(threading.Thread):
                 props["peak_wavelength_s"] = peak_wavelength
                 if np.isfinite(interval_sec):
                     props["interval_sec"] = float(interval_sec)
+
+                # Event Width
+                width_th = float(6.0 * 1.4826 * self._noise_mad) if self._noise_initialized else None
+                width_ms = event_width(wf, sr, threshold=width_th, sigma=6.0, pre_samples=pre_count)
+                props["event_width_ms"] = width_ms
+
             last_end = candidate_last_end
             events.append((event, last_end, float(crossing_time)))
             prev_crossing_time = float(crossing_time)

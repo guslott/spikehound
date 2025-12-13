@@ -19,9 +19,9 @@ Designed “scope-first”: a GUI can treat every hardware backend the same—co
 ### Simulated input
 
 ```python
-from daq.simulated_source import SimulatedSource
+from daq.simulated_source import SimulatedPhysiologySource
 
-src = SimulatedSource()
+src = SimulatedPhysiologySource()
 devs = src.list_available_devices()
 src.open(devs[0].id)
 src.configure(sample_rate=20_000, channels=None, chunk_size=1024)
@@ -436,12 +436,12 @@ daq/
 
 ```python
 from .base_device import BaseDevice, DeviceInfo, ChannelInfo, Capabilities, ActualConfig, Chunk
-from .simulated_source import SimulatedSource
+from .simulated_source import SimulatedPhysiologySource
 from .soundcard_source import SoundCardSource
 
 __all__ = [
     "BaseDevice", "DeviceInfo", "ChannelInfo", "Capabilities", "ActualConfig", "Chunk",
-    "SimulatedSource", "SoundCardSource",
+    "SimulatedPhysiologySource", "SoundCardSource",
 ]
 ```
 

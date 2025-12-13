@@ -106,11 +106,11 @@ class ScopeConfigManager:
             "vertical_span_v": float(config.vertical_span_v),
             "screen_offset": float(config.screen_offset),
             "notch_enabled": bool(config.notch_enabled),
-            "notch_freq": float(config.notch_freq),
+            "notch_freq_hz": float(config.notch_freq_hz),
             "highpass_enabled": bool(config.highpass_enabled),
-            "highpass_freq": float(config.highpass_freq),
+            "highpass_hz": float(config.highpass_hz),
             "lowpass_enabled": bool(config.lowpass_enabled),
-            "lowpass_freq": float(config.lowpass_freq),
+            "lowpass_hz": float(config.lowpass_hz),
             "listen_enabled": bool(config.listen_enabled),
             "analyze_enabled": bool(config.analyze_enabled),
             "channel_name": config.channel_name,
@@ -129,11 +129,11 @@ class ScopeConfigManager:
             cfg.vertical_span_v = float(payload.get("vertical_span_v", payload.get("range_v", 1.0)))
             cfg.screen_offset = float(payload.get("screen_offset", payload.get("offset_v", 0.5)))
             cfg.notch_enabled = bool(payload.get("notch_enabled", False))
-            cfg.notch_freq = float(payload.get("notch_freq", 60.0))
+            cfg.notch_freq_hz = float(payload.get("notch_freq_hz", payload.get("notch_freq", 60.0)))
             cfg.highpass_enabled = bool(payload.get("highpass_enabled", False))
-            cfg.highpass_freq = float(payload.get("highpass_freq", 10.0))
+            cfg.highpass_hz = float(payload.get("highpass_hz", payload.get("highpass_freq", 10.0)))
             cfg.lowpass_enabled = bool(payload.get("lowpass_enabled", False))
-            cfg.lowpass_freq = float(payload.get("lowpass_freq", 1_000.0))
+            cfg.lowpass_hz = float(payload.get("lowpass_hz", payload.get("lowpass_freq", 1_000.0)))
             cfg.listen_enabled = bool(payload.get("listen_enabled", False))
             cfg.analyze_enabled = bool(payload.get("analyze_enabled", False))
             cfg.channel_name = str(payload.get("channel_name") or fallback_name or "")
@@ -161,7 +161,7 @@ class ScopeConfigManager:
         
         window_value = float(p.window_combo.currentData() or p._current_window_sec or 0.0)
         payload = {
-            "version": 1,
+            "version": 2,
             "device_key": device_key,
             "sample_rate": float(p._current_sample_rate_value()),
             "window_sec": float(window_value),
@@ -228,7 +228,7 @@ class ScopeConfigManager:
                 p.statusBar().showMessage(message, 8000)
 
         version = int(data.get("version", 1) or 1)
-        if version != 1:
+        if version not in {1, 2}:
             _warning("Load Config", f"Unsupported config version: {version}")
             return
         

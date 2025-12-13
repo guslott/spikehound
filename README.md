@@ -268,7 +268,7 @@ Use the built-in **Simulated Source** to demonstrate concepts without any physic
 
 Copyright © 2025 Gus K. Lott III
 
-This software is open-source under the MIT License. See `LICENSE` for details.
+This software is open-source under the 0BSD License. See `LICENSE` for details.
 
 ---
 

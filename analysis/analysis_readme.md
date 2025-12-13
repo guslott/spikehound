@@ -106,13 +106,13 @@ class ThresholdConfig:
     window_post_s: float = 0.004    # Samples after crossing to capture
 ```
 
-### Event (shared/types.py)
+### AnalysisEvent (shared/types.py)
 
 Detailed event for GUI display (analysis layer):
 
 ```python
 @dataclass(frozen=True)
-class Event:
+class AnalysisEvent:
     id: int                       # Unique event ID
     channelId: int                # Source channel
     thresholdValue: float         # Threshold that was crossed
@@ -373,7 +373,7 @@ unsubscribe()
 - [ ] Create detector class or function
 - [ ] Handle edge cases (empty arrays, invalid sample rate)
 - [ ] Enforce refractory period between detections
-- [ ] Create Event objects with proper timing metadata
+- [ ] Create AnalysisEvent objects with proper timing metadata
 - [ ] Compute and attach relevant metrics to `event.properties`
 - [ ] Add tests with synthetic signals
 - [ ] Document expected input/output formats

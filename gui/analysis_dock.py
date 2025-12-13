@@ -249,4 +249,3 @@ class AnalysisDock(QtWidgets.QDockWidget):
         widget.setParent(None)
         self._settings_widget = None
         self.settingsClosed.emit()
-        self.settingsClosed.emit()

@@ -78,10 +78,8 @@ class SettingsTab(QtWidgets.QWidget):
         self._launch_config_path: Optional[str] = None
         self.load_launch_check = QtWidgets.QCheckBox("Load Config on Launch")
         self.load_launch_check.stateChanged.connect(self._on_load_launch_toggled)
+        config_row.addStretch(1)
         config_row.addWidget(self.load_launch_check)
-        config_row.addStretch()
-        config_row.addWidget(self.load_launch_check)
-        config_row.addStretch()
         form.addRow(config_row)
 
         # Recording settings (Pro float32 and Auto-increment)
@@ -483,4 +481,3 @@ class SettingsTab(QtWidgets.QWidget):
         if maxsize <= 0:
             return f"{size}/∞"
         return f"{size}/{maxsize} ({util:3.0f}%)"
-

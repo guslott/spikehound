@@ -53,7 +53,7 @@ class Dispatcher:
         visualization_queue: "queue.Queue[ChunkPointer | EndOfStream]",
         audio_queue: "queue.Queue[ChunkPointer | EndOfStream]",
         logging_queue: "queue.Queue[Chunk | EndOfStream]",
-        event_queue: "queue.Queue[Event | EndOfStream]",
+        event_queue: "queue.Queue[DetectionEvent | EndOfStream]",
         *,
         filter_settings: Optional[FilterSettings] = None,
         poll_timeout: float = 0.05,
@@ -86,6 +86,7 @@ class Dispatcher:
         self._sample_rate: Optional[float] = None
         self._window_sec: float = 0.2
         self._channel_names: tuple[str, ...] = tuple()
+        self._channel_units: tuple[str, ...] = tuple()
         self._channel_ids: tuple[int, ...] = tuple()
         self._channel_index_map: Dict[int, int] = {}
         self._current_trigger: Optional[TriggerConfig] = None
@@ -196,14 +197,24 @@ class Dispatcher:
             self._active_channel_ids = []
             self._reset_viz_counters_locked()
 
-    def set_channel_layout(self, channel_ids: Sequence[int], channel_names: Sequence[str]) -> None:
+    def set_channel_layout(
+        self,
+        channel_ids: Sequence[int],
+        channel_names: Sequence[str],
+        channel_units: Optional[Sequence[str]] = None,
+    ) -> None:
         with self._ring_lock:
             new_ids = tuple(channel_ids)
             new_names = tuple(channel_names)
+            new_units = tuple(channel_units) if channel_units is not None else tuple("unknown" for _ in new_ids)
             
             # Only reset if layout actually changed - prevents unnecessary buffer resets
             # that would truncate PSP tails spanning multiple chunks
-            if new_ids == self._channel_ids and new_names == self._channel_names:
+            if (
+                new_ids == self._channel_ids
+                and new_names == self._channel_names
+                and new_units == self._channel_units
+            ):
                 # logger.info("Layout unchanged, skipping reset")
                 return
             
@@ -214,6 +225,7 @@ class Dispatcher:
                 
             self._channel_ids = new_ids
             self._channel_names = new_names
+            self._channel_units = new_units
             self._channel_index_map = {cid: idx for idx, cid in enumerate(self._channel_ids)}
             channels = len(self._channel_ids) if self._channel_ids else len(self._channel_names)
             min_capacity = self._source_buffer.capacity if self._source_buffer is not None else 1
@@ -355,6 +367,19 @@ class Dispatcher:
             elif not self._channel_names:
                 self._channel_names = tuple(str(idx) for idx in range(raw.shape[0]))
             channel_names: tuple[str, ...] = self._channel_names
+            
+            # Determine common unit
+            common_unit = "unknown"
+            if self._channel_units and len(self._channel_units) == len(channel_names):
+                units = self._channel_units
+                first = units[0]
+                if all(u == first for u in units):
+                    common_unit = first
+                else:
+                    common_unit = "mixed"
+            elif not self._channel_units:
+                 # Should have been initialized in set_channel_layout or fallback
+                 pass
         dt = 1.0 / float(sample_rate)
 
         start_sample = self._next_start_sample
@@ -369,7 +394,7 @@ class Dispatcher:
             dt=dt,
             seq=seq,
             channel_names=channel_names,
-            units="unknown",
+            units=common_unit,
             meta=meta,
         )
 
@@ -384,7 +409,7 @@ class Dispatcher:
             dt=dt,
             seq=seq,
             channel_names=channel_names,
-            units="unknown",
+            units=common_unit,
             meta=filtered_meta,
         )
 

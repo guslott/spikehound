@@ -95,7 +95,7 @@ from core.controller import PipelineController
 controller = PipelineController()
 
 # Switch to a new source
-controller.switch_source(SimulatedSource, configure_kwargs={...})
+controller.switch_source(SimulatedPhysiologySource, configure_kwargs={...})
 
 # Start/stop
 controller.start()
@@ -143,15 +143,14 @@ Per-channel digital signal processing:
 from core.conditioning import FilterSettings, ChannelFilterSettings
 
 settings = FilterSettings(
-    sample_rate=20000.0,
-    channels={
-        0: ChannelFilterSettings(
+    default=ChannelFilterSettings(ac_couple=True, ac_cutoff_hz=1.0),
+    overrides={
+        "ch0": ChannelFilterSettings(
             notch_enabled=True,
-            notch_freq=60.0,
-            highpass_enabled=True,
-            highpass_freq=10.0,
+            notch_freq_hz=60.0,
+            highpass_hz=10.0,
         ),
-    }
+    },
 )
 
 controller.update_filter_settings(settings)
@@ -160,9 +159,9 @@ controller.update_filter_settings(settings)
 **Filter Types:**
 | Filter | Parameter | Effect |
 |--------|-----------|--------|
-| Notch | `notch_freq` (Hz) | Remove mains hum (50/60 Hz) |
-| High-pass | `highpass_freq` (Hz) | Remove DC offset, drift |
-| Low-pass | `lowpass_freq` (Hz) | Anti-aliasing, noise reduction |
+| Notch | `notch_freq_hz` | Remove mains hum (50/60 Hz) |
+| High-pass | `highpass_hz` | Remove DC offset, drift |
+| Low-pass | `lowpass_hz` | Anti-aliasing, noise reduction |
 
 ---
 

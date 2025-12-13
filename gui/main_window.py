@@ -45,7 +45,6 @@ class MainWindow(QtWidgets.QMainWindow):
     stopRequested = QtCore.Signal()
     recordToggled = QtCore.Signal(bool)
     stopRecording = QtCore.Signal()
-    stopRecording = QtCore.Signal()
     startRecording = QtCore.Signal(str, bool)  # path, rollover
     triggerConfigChanged = QtCore.Signal(TriggerConfig)
 
@@ -1435,11 +1434,11 @@ class MainWindow(QtWidgets.QMainWindow):
         return any(
             [
                 previous.notch_enabled != current.notch_enabled,
-                _diff(previous.notch_freq, current.notch_freq),
+                _diff(previous.notch_freq_hz, current.notch_freq_hz),
                 previous.highpass_enabled != current.highpass_enabled,
-                _diff(previous.highpass_freq, current.highpass_freq),
+                _diff(previous.highpass_hz, current.highpass_hz),
                 previous.lowpass_enabled != current.lowpass_enabled,
-                _diff(previous.lowpass_freq, current.lowpass_freq),
+                _diff(previous.lowpass_hz, current.lowpass_hz),
             ]
         )
 
@@ -1456,9 +1455,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             overrides[name] = ChannelFilterSettings(
                 notch_enabled=config.notch_enabled,
-                notch_freq_hz=config.notch_freq,
-                lowpass_hz=config.lowpass_freq if config.lowpass_enabled else None,
-                highpass_hz=config.highpass_freq if config.highpass_enabled else None,
+                notch_freq_hz=config.notch_freq_hz,
+                lowpass_hz=config.lowpass_hz if config.lowpass_enabled else None,
+                highpass_hz=config.highpass_hz if config.highpass_enabled else None,
             )
         base = controller.filter_settings
         settings = FilterSettings(default=base.default, overrides=overrides)
@@ -2135,5 +2134,3 @@ class MainWindow(QtWidgets.QMainWindow):
     @property
     def active_combo(self) -> QtWidgets.QComboBox:
         return self.channel_controls.active_combo
-
-
