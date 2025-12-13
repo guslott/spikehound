@@ -732,7 +732,7 @@ class AnalysisTab(QtWidgets.QWidget):
         width = float(self.width_combo.currentData() or 0.5)
         plot_item = self.plot_widget.getPlotItem()
         plot_item.setXRange(0.0, width, padding=0.0)
-        if self._selected_y_metric() in {"ed", "max", "min", "freq", "interval"}:
+        if self._selected_y_metric() in {"ed", "max", "min", "freq", "interval", "width"}:
             # Metrics overlay controls the Y range; leave amplitude height unchanged.
             pass
         else:
@@ -1324,6 +1324,8 @@ class AnalysisTab(QtWidgets.QWidget):
             self.metrics_plot.setLabel("left", "Peak Frequency (Hz)")
         elif metric == "interval":
             self.metrics_plot.setLabel("left", "Interval (s)")
+        elif metric == "width":
+            self.metrics_plot.setLabel("left", "Event Width (ms)")
         else:
             self.metrics_plot.setLabel("left", "Value")
         x_metric = self._selected_x_metric()
@@ -1337,6 +1339,8 @@ class AnalysisTab(QtWidgets.QWidget):
             self.metrics_plot.setLabel("bottom", "Min Amplitude (V)")
         elif x_metric == "freq":
             self.metrics_plot.setLabel("bottom", "Peak Frequency (Hz)")
+        elif x_metric == "width":
+            self.metrics_plot.setLabel("bottom", "Event Width (ms)")
         else:
             self.metrics_plot.setLabel("bottom", "Energy Density")
         if metric in {"ed", "max", "min", "freq", "interval"}:
@@ -2013,7 +2017,7 @@ class AnalysisTab(QtWidgets.QWidget):
         """
         y_key = self._selected_y_metric()
         x_key = self._selected_x_metric()
-        if y_key not in {"ed", "max", "min", "freq", "interval"}:
+        if y_key not in {"ed", "max", "min", "freq", "interval", "width"}:
             self.energy_scatter.hide()
             return
         events = self._metric_events

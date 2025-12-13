@@ -428,6 +428,12 @@ class AnalysisWorker(threading.Thread):
                     if np.isfinite(interval_sec):
                         props["interval_sec"] = float(interval_sec)
                 
+                    # Event Width
+                    # Use local noise estimate from worker state (updated via _update_noise_level)
+                    width_th = float(6.0 * 1.4826 * self._noise_mad) if self._noise_initialized else None
+                    width_ms = event_width(wf, sr, threshold=width_th, sigma=6.0, pre_samples=pre_samples)
+                    props["event_width_ms"] = width_ms
+                
                 # Update last_end
                 # We need to know where this event ends in absolute samples
                 # abs_idx is the crossing. Window end is approx abs_idx + half?
