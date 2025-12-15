@@ -204,7 +204,11 @@ class AnalysisTab(QtWidgets.QWidget):
         metrics_item = self.metrics_plot.getPlotItem()
         vb = metrics_item.getViewBox()
         if vb is not None:
-            vb.setMouseEnabled(x=False, y=False)
+            vb.setMouseEnabled(x=True, y=True)
+            vb.sigRangeChanged.connect(self._on_metrics_view_changed)
+        self._metrics_auto_scale = True
+        self._metrics_data_range: tuple[float, float, float, float] | None = None
+        self._suppress_view_updates = False
         energy_scatter_color = QtGui.QColor(UNCLASSIFIED_COLOR)
         energy_scatter_color.setAlpha(170)
         self.energy_scatter = pg.ScatterPlotItem(size=3, brush=pg.mkBrush(energy_scatter_color), pen=None, name="Energy Density")
@@ -1272,14 +1276,64 @@ class AnalysisTab(QtWidgets.QWidget):
         """Set the X and Y ranges for the metrics scatter plot with padding."""
         if max_x < min_x:
             min_x, max_x = max_x, min_x
+        if max_y < min_y:
+            min_y, max_y = max_y, min_y
+            
         span_x = max(1e-6, max_x - min_x)
         padded_min_x = min_x - span_x * 0.02
         padded_max_x = max_x + span_x * 0.02
+        
         span_y = max(1e-6, max_y - min_y)
-        padded_min = min_y - span_y * 0.05
-        padded_max = max_y + span_y * 0.05
-        plot_item.setXRange(padded_min_x, padded_max_x, padding=0)
-        plot_item.setYRange(padded_min, padded_max, padding=0.0)
+        # Add slight extra padding for Y to ensure points don't clip at edges
+        padded_min_y = min_y - span_y * 0.05
+        padded_max_y = max_y + span_y * 0.05
+        
+        # Store current data bounds for zoom logic
+        self._metrics_data_range = (padded_min_x, padded_max_x, padded_min_y, padded_max_y)
+
+        # Apply limits to restrict zooming OUT beyond the data
+        vb = plot_item.getViewBox()
+        if vb is not None:
+            # We must block our own view-change handler to avoid disabling auto-scale
+            self._suppress_view_updates = True
+            try:
+                # setLimits prevents the view from exceeding these bounds
+                vb.setLimits(xMin=padded_min_x, xMax=padded_max_x, yMin=padded_min_y, yMax=padded_max_y)
+                
+                if self._metrics_auto_scale:
+                    plot_item.setXRange(padded_min_x, padded_max_x, padding=0)
+                    plot_item.setYRange(padded_min_y, padded_max_y, padding=0.0)
+            finally:
+                self._suppress_view_updates = False
+
+    def _on_metrics_view_changed(self) -> None:
+        """Handle user zoom/pan: disable auto-scale on interaction, re-enable on zoom-out."""
+        if self._suppress_view_updates or self._metrics_data_range is None:
+            return
+
+        plot_item = self.metrics_plot.getPlotItem()
+        vb = plot_item.getViewBox()
+        if vb is None:
+            return
+
+        # Check if current view covers (or exceeds) the full data range
+        # Use a small epsilon to detect "hit the wall"
+        view_rect = vb.viewRect()
+        d_min_x, d_max_x, d_min_y, d_max_y = self._metrics_data_range
+        
+        # Calculate coverage ratio
+        # If view range is basically the full data range (or larger due to limits snapping), snap back to auto
+        covers_x = (view_rect.left() <= d_min_x + 1e-9) and (view_rect.right() >= d_max_x - 1e-9)
+        covers_y = (view_rect.top() <= d_min_y + 1e-9) and (view_rect.bottom() >= d_max_y - 1e-9)
+        
+        # Logic: If user zoomed OUT to the limits, re-enable auto-scale
+        if covers_x and covers_y:
+            if not self._metrics_auto_scale:
+                self._metrics_auto_scale = True
+        else:
+            # User is zoomed IN
+            if self._metrics_auto_scale:
+                self._metrics_auto_scale = False
 
     def _selected_y_metric(self) -> str:
         """Parse the Y-axis metric combo selection to a metric key."""
