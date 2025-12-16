@@ -134,7 +134,7 @@ class WavLoggerThread:
         self._thread = threading.Thread(
             target=self._run,
             name="WavLoggerThread",
-            daemon=True,
+            daemon=False,  # Non-daemon to ensure WAV header is finalized on exit
         )
         self._thread.start()
         

@@ -136,6 +136,13 @@ class FileSource(BaseDevice):
             # valid only for real files, not file-like objects
             sr, data = wavfile.read(str(path), mmap=True)
         except Exception as exc:
+            error_msg = str(exc)
+            # Provide a more user-friendly error message for common corruption cases
+            if "cannot access local variable" in error_msg or "'fs'" in error_msg:
+                raise RuntimeError(
+                    f"Failed to open WAV file: The file appears to be corrupted or incomplete. "
+                    f"This can happen if recording was interrupted before the file was properly closed."
+                ) from exc
             raise RuntimeError(f"Failed to open WAV file: {exc}") from exc
         
         # Determine shape

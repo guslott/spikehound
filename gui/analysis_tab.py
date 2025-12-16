@@ -279,6 +279,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self.threshold1_spin.setMinimumWidth(90)
         self.threshold1_spin.setRange(-10.0, 10.0)
         self.threshold1_spin.setValue(0.5)
+        self.threshold1_spin.setEnabled(False)  # Initially disabled until checkbox is checked
         t1_row = QtWidgets.QHBoxLayout()
         t1_row.setSpacing(6)
         t1_row.addWidget(self.threshold1_check)
@@ -286,12 +287,13 @@ class AnalysisTab(QtWidgets.QWidget):
         threshold_layout.addLayout(t1_row)
 
         self.threshold2_check = QtWidgets.QCheckBox("Threshold 2")
-        self.threshold2_check.setEnabled(True)
+        self.threshold2_check.setEnabled(False)  # Initially disabled until threshold1 is checked
         self.threshold2_spin = QtWidgets.QDoubleSpinBox()
         self.threshold2_spin.setDecimals(3)
         self.threshold2_spin.setMinimumWidth(90)
         self.threshold2_spin.setRange(-10.0, 10.0)
         self.threshold2_spin.setValue(-0.5)
+        self.threshold2_spin.setEnabled(False)  # Initially disabled until checkbox is checked
         t2_row = QtWidgets.QHBoxLayout()
         t2_row.setSpacing(6)
         t2_row.addWidget(self.threshold2_check)
@@ -792,6 +794,8 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def _on_threshold1_toggled(self, checked: bool) -> None:
         """Handle threshold 1 checkbox toggle, update dependent controls."""
+        # Enable/disable the spinbox for threshold 1 based on checkbox state
+        self.threshold1_spin.setEnabled(checked)
         self.threshold2_check.setEnabled(checked)
         self.threshold2_spin.setEnabled(checked and self.threshold2_check.isChecked())
         if not checked:

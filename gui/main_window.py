@@ -1585,6 +1585,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_channel_buttons()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[override]
+        # Stop recording first to ensure WAV file header is properly finalized
+        if self._is_recording and self._controller is not None:
+            try:
+                self._controller.stop_recording()
+                self._is_recording = False
+            except Exception as e:
+                self._logger.debug("Exception stopping recording on close: %s", e)
+        
         dm = getattr(self.runtime, "device_manager", None)
         if dm is not None:
             try:
