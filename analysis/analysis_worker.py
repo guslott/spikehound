@@ -16,7 +16,7 @@ from shared.types import AnalysisEvent
 
 from .models import AnalysisBatch
 from .settings import AnalysisSettings, AnalysisSettingsStore
-from .metrics import energy_density, peak_frequency_sinc, event_width
+from .metrics import envelope, peak_frequency_sinc, event_width
 from core.detection import AmpThresholdDetector, DETECTOR_REGISTRY
 
 
@@ -342,10 +342,8 @@ class AnalysisWorker(threading.Thread):
                 baseline_val = float(np.median(wf)) # Simple median
                 centered_wf = wf.astype(np.float64) - baseline_val
                 
-                # Energy
-                energy = float(np.sum(wf.astype(np.float32) ** 2))
-                window_sec = max(1e-12, wf.size * dt)
-                ed = float(np.sqrt(energy / window_sec))
+                # Envelope (max - min)
+                env = envelope(wf)
                 
                 # Peak Freq
                 peak_freq = peak_frequency_sinc(centered_wf, sr)
@@ -406,14 +404,11 @@ class AnalysisWorker(threading.Thread):
                 
                 props = getattr(event, "properties", None)
                 if isinstance(props, dict):
-                    props["energy"] = energy
-                    props["window_sec"] = window_sec
-                    props["energy_density"] = ed
+                    props["envelope"] = env
                     props["peak_freq_hz"] = peak_freq
                     props["peak_wavelength_s"] = peak_wavelength
                     if np.isfinite(interval_sec):
                         props["interval_sec"] = float(interval_sec)
-                
                     # Event Width
                     # Use local noise estimate from worker state (updated via _update_noise_level)
                     width_th = float(6.0 * 1.4826 * self._noise_mad) if self._noise_initialized else None
@@ -549,9 +544,7 @@ class AnalysisWorker(threading.Thread):
                 peak_idx = peak_window_start + local_idx
             else:
                 peak_idx = pre_count
-            energy = float(np.sum(wf.astype(np.float32) ** 2))
-            window_sec = max(1e-12, wf.size * dt_sec)
-            energy_density = float(np.sqrt(energy / window_sec))
+            env = envelope(wf)
             peak_freq = peak_frequency_sinc(centered_wf, sr, center_index=peak_idx)
             peak_wavelength = 1.0 / peak_freq if peak_freq > 1e-9 else 0.0
             event = AnalysisEvent(
@@ -570,14 +563,11 @@ class AnalysisWorker(threading.Thread):
             )
             props = getattr(event, "properties", None)
             if isinstance(props, dict):
-                props["energy"] = energy
-                props["window_sec"] = window_sec
-                props["energy_density"] = energy_density
+                props["envelope"] = env
                 props["peak_freq_hz"] = peak_freq
                 props["peak_wavelength_s"] = peak_wavelength
                 if np.isfinite(interval_sec):
                     props["interval_sec"] = float(interval_sec)
-
                 # Event Width
                 width_th = float(6.0 * 1.4826 * self._noise_mad) if self._noise_initialized else None
                 width_ms = event_width(wf, sr, threshold=width_th, sigma=6.0, pre_samples=pre_count)

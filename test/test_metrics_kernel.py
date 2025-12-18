@@ -2,7 +2,7 @@ import math
 import numpy as np
 import pytest
 
-from analysis.metrics import baseline, energy_density, min_max, peak_frequency_sinc
+from analysis.metrics import baseline, envelope, min_max, peak_frequency_sinc
 
 
 def test_baseline_median():
@@ -11,14 +11,16 @@ def test_baseline_median():
     assert baseline(samples, 0) == 0.0
 
 
-def test_energy_density_monotonic():
-    sr = 20000.0
-    t = np.linspace(0, 1e-3, 200, dtype=np.float32)
-    # Use sine waves with different amplitudes - energy_density subtracts baseline,
-    # so constant signals have zero energy
-    ed_small = energy_density(0.1 * np.sin(2 * np.pi * 500 * t), sr)
-    ed_big = energy_density(1.0 * np.sin(2 * np.pi * 500 * t), sr)
-    assert ed_big > ed_small
+def test_envelope_returns_range():
+    """Test envelope returns max - min of signal."""
+    samples = np.array([-0.5, 0.0, 1.0, 0.5], dtype=np.float32)
+    env = envelope(samples)
+    assert math.isclose(env, 1.5, rel_tol=1e-6)  # 1.0 - (-0.5) = 1.5
+
+
+def test_envelope_empty():
+    """Test envelope handles empty arrays."""
+    assert envelope(np.array([], dtype=np.float32)) == 0.0
 
 
 def test_min_max_matches_signal():

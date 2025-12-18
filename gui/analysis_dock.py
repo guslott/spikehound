@@ -142,6 +142,28 @@ class AnalysisDock(QtWidgets.QDockWidget):
             if isinstance(worker, AnalysisWorker):
                 worker.update_sample_rate(sample_rate)
 
+    def update_scales(self, window_sec: float, channel_configs: dict) -> None:
+        """Update all Analysis tabs with scope scale settings.
+        
+        Args:
+            window_sec: Global window width in seconds (from scope)
+            channel_configs: Dict mapping channel_id -> ChannelConfig with vertical_span_v
+        """
+        # Build a name -> vertical_span_v lookup
+        vertical_spans: dict[str, float] = {}
+        for channel_id, config in channel_configs.items():
+            name = getattr(config, "channel_name", "")
+            span = getattr(config, "vertical_span_v", 1.0)
+            if name:
+                vertical_spans[name] = float(span)
+        
+        for widget in list(self._tab_info.keys()):
+            if not isinstance(widget, AnalysisTab):
+                continue
+            channel_name = widget.channel_name
+            vertical_span = vertical_spans.get(channel_name, 1.0)
+            widget.update_scale(window_sec, vertical_span)
+
     def close_tab(self, channel_name: str) -> None:
         removed = False
         for widget, info in list(self._tab_info.items()):

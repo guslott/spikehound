@@ -39,7 +39,7 @@ from gui.analysis.helpers import (
 )
 from .waveform_loader import WaveformLoader, StaWaveformLoader
 
-from analysis.metrics import baseline, energy_density, min_max, peak_frequency_sinc
+from analysis.metrics import baseline, envelope, min_max, peak_frequency_sinc
 
 if TYPE_CHECKING:
     from analysis.analysis_worker import AnalysisWorker
@@ -100,6 +100,9 @@ class AnalysisTab(QtWidgets.QWidget):
         self._cached_raw_samples: Optional[np.ndarray] = None
         self._last_window_start: float = 0.0
         self._last_window_width: float = 0.5
+        # Scope-linked scale values (updated from MainWindow)
+        self._scope_window_sec: float = 1.0
+        self._scope_vertical_span: float = 1.0
         self._fallback_start_sample: int = 0
         self._next_event_id: int = 0
         self._event_details: dict[int, dict[str, object]] = {}
@@ -224,64 +227,29 @@ class AnalysisTab(QtWidgets.QWidget):
         controls_layout.setContentsMargins(8, 6, 8, 8)
         controls_layout.setSpacing(10)
 
-        size_layout = QtWidgets.QVBoxLayout()
-        size_layout.setContentsMargins(0, 0, 0, 0)
-        size_layout.setSpacing(3)
-
-        width_row = QtWidgets.QHBoxLayout()
-        width_row.setSpacing(4)
-        width_row.addWidget(QtWidgets.QLabel("Width (s)"))
-        self.width_combo = QtWidgets.QComboBox()
-        self.width_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
-        self.width_combo.setFixedWidth(72)
-        for value in (0.2, 0.5, 1.0, 2.0, 5.0):
-            self.width_combo.addItem(f"{value:.1f}", value)
-        self.width_combo.setCurrentIndex(1)
-        width_row.addWidget(self.width_combo)
-        size_layout.addLayout(width_row)
-
-        height_row = QtWidgets.QHBoxLayout()
-        height_row.setSpacing(4)
-        height_row.addWidget(QtWidgets.QLabel("Height (±V)"))
-        self.height_combo = QtWidgets.QComboBox()
-        self.height_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
-        self.height_combo.setFixedWidth(72)
-        for value in (0.1, 0.2, 0.5, 1.0, 2.0, 5.0):
-            self.height_combo.addItem(f"{value:.1f}", value)
-        self.height_combo.setCurrentIndex(3)
-        height_row.addWidget(self.height_combo)
-        size_layout.addLayout(height_row)
-
-        event_window_row = QtWidgets.QHBoxLayout()
-        event_window_row.setSpacing(4)
-        event_window_row.addWidget(QtWidgets.QLabel("Event Width (ms)"))
-        self.event_window_combo = QtWidgets.QComboBox()
-        self.event_window_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
-        self.event_window_combo.setFixedWidth(72)
-        for label, value in (("5", 5.0), ("10", 10.0), ("20", 20.0)):
-            self.event_window_combo.addItem(label, value)
-        self._set_event_window_selection(self._event_window_ms)
-        event_window_row.addWidget(self.event_window_combo)
-        size_layout.addLayout(event_window_row)
-        controls_layout.addLayout(size_layout)
-
+        # Threshold controls (leftmost section)
         threshold_layout = QtWidgets.QVBoxLayout()
-        threshold_layout.setSpacing(4)
+        threshold_layout.setSpacing(2)
 
-        self.auto_detect_check = QtWidgets.QCheckBox("Auto-detect events (5\u03c3)")
-        self.auto_detect_check.setToolTip("Automatically detect events crossing 5 * MAD threshold (positive or negative).")
+        self.auto_detect_check = QtWidgets.QCheckBox("Auto-detect spikes (Recommended)")
+        self.auto_detect_check.setToolTip("Uses a 5σ threshold relative to baseline noise.")
         self.auto_detect_check.toggled.connect(self._on_auto_detect_toggled)
         threshold_layout.addWidget(self.auto_detect_check)
+
+        # "or" separator
+        or_label = QtWidgets.QLabel("or")
+        or_label.setStyleSheet("color: #888; font-style: italic; padding-left: 4px;")
+        threshold_layout.addWidget(or_label)
 
         self.threshold1_check = QtWidgets.QCheckBox("Threshold 1")
         self.threshold1_spin = QtWidgets.QDoubleSpinBox()
         self.threshold1_spin.setDecimals(3)
         self.threshold1_spin.setMinimumWidth(90)
         self.threshold1_spin.setRange(-10.0, 10.0)
-        self.threshold1_spin.setValue(0.5)
+        self.threshold1_spin.setValue(0.0)
         self.threshold1_spin.setEnabled(False)  # Initially disabled until checkbox is checked
         t1_row = QtWidgets.QHBoxLayout()
-        t1_row.setSpacing(6)
+        t1_row.setSpacing(4)
         t1_row.addWidget(self.threshold1_check)
         t1_row.addWidget(self.threshold1_spin)
         threshold_layout.addLayout(t1_row)
@@ -292,19 +260,42 @@ class AnalysisTab(QtWidgets.QWidget):
         self.threshold2_spin.setDecimals(3)
         self.threshold2_spin.setMinimumWidth(90)
         self.threshold2_spin.setRange(-10.0, 10.0)
-        self.threshold2_spin.setValue(-0.5)
+        self.threshold2_spin.setValue(0.0)
         self.threshold2_spin.setEnabled(False)  # Initially disabled until checkbox is checked
         t2_row = QtWidgets.QHBoxLayout()
-        t2_row.setSpacing(6)
+        t2_row.setSpacing(4)
         t2_row.addWidget(self.threshold2_check)
         t2_row.addWidget(self.threshold2_spin)
         threshold_layout.addLayout(t2_row)
 
+        # Event Window Width control (under thresholds)
+        event_window_row = QtWidgets.QHBoxLayout()
+        event_window_row.setSpacing(4)
+        event_window_row.addWidget(QtWidgets.QLabel("Event Window Width (ms)"))
+        self.event_window_combo = QtWidgets.QComboBox()
+        self.event_window_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        self.event_window_combo.setFixedWidth(72)
+        for label, value in (("5", 5.0), ("10", 10.0), ("20", 20.0)):
+            self.event_window_combo.addItem(label, value)
+        self._set_event_window_selection(self._event_window_ms)
+        event_window_row.addWidget(self.event_window_combo)
+        threshold_layout.addLayout(event_window_row)
+
         controls_layout.addLayout(threshold_layout)
 
-        metrics_layout = QtWidgets.QVBoxLayout()
+        # Vertical separator 1
+        self._separator1 = QtWidgets.QFrame()
+        self._separator1.setFrameShape(QtWidgets.QFrame.VLine)
+        self._separator1.setFrameShadow(QtWidgets.QFrame.Sunken)
+        self._separator1.setVisible(False)
+        controls_layout.addWidget(self._separator1)
+
+        # Metrics section (hidden until threshold enabled)
+        self._metrics_container = QtWidgets.QWidget()
+        metrics_layout = QtWidgets.QVBoxLayout(self._metrics_container)
+        metrics_layout.setContentsMargins(0, 0, 0, 0)
         metrics_layout.setSpacing(4)
-        metrics_label = QtWidgets.QLabel("Metrics")
+        metrics_label = QtWidgets.QLabel("Spike Metrics")
         metrics_label.setStyleSheet("font-weight: bold;")
         metrics_layout.addWidget(metrics_label)
 
@@ -316,7 +307,7 @@ class AnalysisTab(QtWidgets.QWidget):
         for label in (
             "Max in window (V)",
             "Min in window (V)",
-            "Energy Density",
+            "Envelope (max-min)",
             "Peak Frequency (Hz)",
             "Interval since last event (s)",
             "Event Width (ms)",
@@ -324,7 +315,7 @@ class AnalysisTab(QtWidgets.QWidget):
             item = QtGui.QStandardItem(label)
             metric_model.appendRow(item)
         self.metric_combo.setModel(metric_model)
-        self.metric_combo.setCurrentIndex(0)
+        self.metric_combo.setCurrentIndex(0)  # Max
         self.metric_combo.setMinimumWidth(180)
         self.metric_combo.currentIndexChanged.connect(self._on_axis_metric_changed)
         metric_row.addWidget(self.metric_combo)
@@ -339,13 +330,14 @@ class AnalysisTab(QtWidgets.QWidget):
             "Time (s)",
             "Max in window (V)",
             "Min in window (V)",
-            "Energy Density",
+            "Envelope (max-min)",
             "Peak Frequency (Hz)",
             "Event Width (ms)",
         ):
             item = QtGui.QStandardItem(label)
             metric_x_model.appendRow(item)
         self.metric_xaxis_combo.setModel(metric_x_model)
+        self.metric_xaxis_combo.setCurrentIndex(2)  # Min - for max vs min default
         self.metric_xaxis_combo.setMinimumWidth(180)
         self.metric_xaxis_combo.currentIndexChanged.connect(self._on_axis_metric_changed)
         xaxis_row.addWidget(self.metric_xaxis_combo)
@@ -359,17 +351,29 @@ class AnalysisTab(QtWidgets.QWidget):
         buttons_row.addWidget(self.metrics_clear_btn)
         buttons_row.addStretch(1)
         metrics_layout.addLayout(buttons_row)
-        self.clustering_enabled_check = QtWidgets.QCheckBox("Enable clustering")
-        self.clustering_enabled_check.toggled.connect(self._on_clustering_toggled)
-        metrics_layout.addWidget(self.clustering_enabled_check)
         metrics_layout.addStretch(1)
 
-        controls_layout.addLayout(metrics_layout)
+        self._metrics_container.setVisible(False)
+        controls_layout.addWidget(self._metrics_container)
 
-        sta_layout = QtWidgets.QVBoxLayout()
+        # Vertical separator 2
+        self._separator2 = QtWidgets.QFrame()
+        self._separator2.setFrameShape(QtWidgets.QFrame.VLine)
+        self._separator2.setFrameShadow(QtWidgets.QFrame.Sunken)
+        self._separator2.setVisible(False)
+        controls_layout.addWidget(self._separator2)
+
+        # STA section (hidden until threshold enabled)
+        self._sta_container = QtWidgets.QWidget()
+        sta_layout = QtWidgets.QVBoxLayout(self._sta_container)
+        sta_layout.setContentsMargins(0, 0, 0, 0)
         sta_layout.setSpacing(4)
 
-        self.sta_enable_check = QtWidgets.QCheckBox("Enable Spike Triggered Average (STA)")
+        sta_label = QtWidgets.QLabel("Spike Triggered Average")
+        sta_label.setStyleSheet("font-weight: bold;")
+        sta_layout.addWidget(sta_label)
+
+        self.sta_enable_check = QtWidgets.QCheckBox("Enable STA")
         self.sta_enable_check.setChecked(False)
         self.sta_enable_check.toggled.connect(self._on_sta_toggled)
         sta_layout.addWidget(self.sta_enable_check)
@@ -415,8 +419,11 @@ class AnalysisTab(QtWidgets.QWidget):
         sta_buttons_row.addWidget(self.sta_view_waveforms_btn, 1)
         sta_layout.addLayout(sta_buttons_row)
 
-        controls_layout.addLayout(sta_layout)
-        # Note: No addStretch here - let widgets fill the available space
+        self._sta_container.setVisible(False)
+        controls_layout.addWidget(self._sta_container)
+        
+        # Add stretch to keep threshold section left-aligned when other sections are hidden
+        controls_layout.addStretch(1)
 
         controls.setLayout(controls_layout)
         # Controls panel has fixed content height - prevent vertical expansion
@@ -436,7 +443,7 @@ class AnalysisTab(QtWidgets.QWidget):
         metrics_container_layout.addWidget(self.metrics_plot, stretch=1)
         self.metrics_container_layout = metrics_container_layout
 
-        self.cluster_panel = QtWidgets.QGroupBox("Event Clusters")
+        self.cluster_panel = QtWidgets.QGroupBox("Spike Classes")
         cluster_layout = QtWidgets.QVBoxLayout()
         cluster_layout.setContentsMargins(12, 10, 12, 10)
         cluster_layout.setSpacing(6)
@@ -474,7 +481,12 @@ class AnalysisTab(QtWidgets.QWidget):
         cluster_layout.addWidget(self.class_list, stretch=2)
         self.cluster_panel.setLayout(cluster_layout)
         metrics_container_layout.addWidget(self.cluster_panel, stretch=0)
-        self._set_cluster_panel_visible(False)
+        self._set_cluster_panel_visible(True)
+        # Initialize Unclassified entry
+        self._unclassified_item = QtWidgets.QListWidgetItem("Unclassified (0 events)")
+        self._unclassified_item.setData(QtCore.Qt.UserRole, self._UNCLASSIFIED_ID)
+        self.class_list.insertItem(0, self._unclassified_item)
+        self.class_list.setCurrentItem(self._unclassified_item)
 
         layout.addWidget(self.metrics_container, stretch=6)
 
@@ -496,8 +508,6 @@ class AnalysisTab(QtWidgets.QWidget):
         self.plot_widget.addItem(self.threshold2_line)
         # Note: No addStretch at end - let metrics_container fill remaining space
 
-        self.width_combo.currentIndexChanged.connect(self._apply_ranges)
-        self.height_combo.currentIndexChanged.connect(self._apply_ranges)
         self.threshold1_check.toggled.connect(lambda checked: self._toggle_threshold(self.threshold1_line, self.threshold1_spin, checked))
         self.threshold1_check.toggled.connect(self._on_threshold1_toggled)
         self.threshold1_spin.valueChanged.connect(lambda val: self._update_threshold_from_spin(self.threshold1_line, val))
@@ -716,7 +726,7 @@ class AnalysisTab(QtWidgets.QWidget):
             new_events, new_last_id = self._analysis_events.pull_events(self._last_event_id)
             if new_events:
                 window_start = self._last_window_start
-                width = self._last_window_width or float(self.width_combo.currentData() or 0.5)
+                width = self._last_window_width or self._scope_window_sec
                 self._handle_batch_events(new_events, window_start, width, self._window_start_index)
                 self._last_event_id = new_last_id
 
@@ -734,15 +744,15 @@ class AnalysisTab(QtWidgets.QWidget):
         self._sta_dirty = False
 
     def _apply_ranges(self) -> None:
-        """Apply width/height settings to the plot axes."""
-        width = float(self.width_combo.currentData() or 0.5)
+        """Apply scope-linked settings to the plot axes."""
+        width = self._scope_window_sec
+        height = self._scope_vertical_span
         plot_item = self.plot_widget.getPlotItem()
         plot_item.setXRange(0.0, width, padding=0.0)
-        if self._selected_y_metric() in {"ed", "max", "min", "freq", "interval", "width"}:
+        if self._selected_y_metric() in {"envelope", "max", "min", "freq", "interval", "width"}:
             # Metrics overlay controls the Y range; leave amplitude height unchanged.
             pass
         else:
-            height = float(self.height_combo.currentData() or 1.0)
             plot_item.setYRange(-height, height, padding=0.0)
         self._ensure_buffer_capacity(max(width, 1.0))
         if self.threshold1_check.isChecked():
@@ -752,6 +762,19 @@ class AnalysisTab(QtWidgets.QWidget):
         self._last_window_width = float(width)
         if not self._viz_paused:
             self._refresh_overlay_positions(self._last_window_start, self._last_window_width, self._window_start_index)
+
+    def update_scale(self, window_sec: float, vertical_span_v: float) -> None:
+        """Update plot scaling to match Scope settings.
+        
+        Called by MainWindow when scope window or channel vertical span changes.
+        
+        Args:
+            window_sec: Time window width in seconds (from scope)
+            vertical_span_v: Amplitude scale in volts (from channel config)
+        """
+        self._scope_window_sec = max(0.1, float(window_sec))
+        self._scope_vertical_span = max(0.01, float(vertical_span_v))
+        self._apply_ranges()
 
     def _initial_event_window_ms(self) -> float:
         """Get initial event window duration from settings or default to 5ms."""
@@ -794,12 +817,17 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def _on_threshold1_toggled(self, checked: bool) -> None:
         """Handle threshold 1 checkbox toggle, update dependent controls."""
+        # If user enables manual threshold while auto-detect is on, switch to manual mode
+        if checked and self.auto_detect_check.isChecked():
+            self.auto_detect_check.setChecked(False)
+        
         # Enable/disable the spinbox for threshold 1 based on checkbox state
         self.threshold1_spin.setEnabled(checked)
         self.threshold2_check.setEnabled(checked)
         self.threshold2_spin.setEnabled(checked and self.threshold2_check.isChecked())
         if not checked:
             self.threshold2_check.setChecked(False)
+        self._update_advanced_sections_visibility()
         self._notify_threshold_change()
 
     def _on_threshold2_toggled(self, checked: bool) -> None:
@@ -808,15 +836,21 @@ class AnalysisTab(QtWidgets.QWidget):
         self._notify_threshold_change()
 
     def _on_auto_detect_toggled(self, checked: bool) -> None:
-        """Handle auto-detect checkbox toggle, disable manual thresholds."""
-        # Disable manual thresholds if auto-detect is on?
-        # User said "add a third checkbox above...".
-        # Let's disable manual controls to avoid confusion.
-        self.threshold1_check.setEnabled(not checked)
-        self.threshold1_spin.setEnabled(not checked and self.threshold1_check.isChecked())
-        self.threshold2_check.setEnabled(not checked and self.threshold1_check.isChecked())
-        self.threshold2_spin.setEnabled(not checked and self.threshold2_check.isChecked())
+        """Handle auto-detect checkbox toggle."""
+        if checked:
+            # Auto-detect is mutually exclusive with manual thresholds
+            self.threshold1_check.setChecked(False)
+            self.threshold2_check.setChecked(False)
+        self._update_advanced_sections_visibility()
         self._notify_threshold_change()
+
+    def _update_advanced_sections_visibility(self) -> None:
+        """Show/hide Metrics and STA sections based on threshold state."""
+        threshold_active = self.auto_detect_check.isChecked() or self.threshold1_check.isChecked()
+        self._separator1.setVisible(threshold_active)
+        self._metrics_container.setVisible(threshold_active)
+        self._separator2.setVisible(threshold_active)
+        self._sta_container.setVisible(threshold_active)
 
     def _notify_threshold_change(self) -> None:
         """Push current threshold settings to the analysis worker."""
@@ -883,7 +917,7 @@ class AnalysisTab(QtWidgets.QWidget):
             chunk_dt = self._dt
         self._latest_sample_time = float(chunk.start_time) + frames * chunk_dt
 
-        width = float(self.width_combo.currentData() or 0.5)
+        width = self._scope_window_sec
         self._ensure_buffer_capacity(max(width, 1.0))
         samples_needed = int(max(1, round(width / self._dt))) if self._dt > 0 else frames
         recent = self._extract_recent(samples_needed)
@@ -909,7 +943,7 @@ class AnalysisTab(QtWidgets.QWidget):
 
         plot_item = self.plot_widget.getPlotItem()
         plot_item.setXRange(0.0, width, padding=0.0)
-        height = float(self.height_combo.currentData() or 1.0)
+        height = self._scope_vertical_span
         plot_item.setYRange(-height, height, padding=0.0)
 
         if self._window_start_time is not None:
@@ -1268,12 +1302,12 @@ class AnalysisTab(QtWidgets.QWidget):
         self._update_metric_points()
         self.metrics_clear_btn.setText("Clear metrics (0)")
 
-    def get_energy_density_points(self) -> list[tuple[float, float]]:
-        """Return (time, energy_density) pairs for all recorded events."""
+    def get_envelope_points(self) -> list[tuple[float, float]]:
+        """Return (time, envelope) pairs for all recorded events."""
         return [
-            (event["time"], event["ed"])
+            (event["time"], event["envelope"])
             for event in self._metric_events
-            if "time" in event and "ed" in event
+            if "time" in event and "envelope" in event
         ]
 
     def _set_metrics_range(self, plot_item: pg.PlotItem, min_x: float, max_x: float, min_y: float, max_y: float) -> None:
@@ -1344,6 +1378,8 @@ class AnalysisTab(QtWidgets.QWidget):
         label = self.metric_combo.currentText().lower()
         if "interval" in label:
             return "interval"
+        if "envelope" in label:
+            return "envelope"
         if "max" in label:
             return "max"
         if "min" in label:
@@ -1352,13 +1388,15 @@ class AnalysisTab(QtWidgets.QWidget):
             return "freq"
         if "width" in label:
             return "width"
-        return "ed"
+        return "envelope"
 
     def _selected_x_metric(self) -> str:
         """Parse the X-axis metric combo selection to a metric key."""
         label = self.metric_xaxis_combo.currentText().lower()
         if "time" in label:
             return "time"
+        if "envelope" in label:
+            return "envelope"
         if "frequency" in label:
             return "freq"
         if "width" in label:
@@ -1367,13 +1405,13 @@ class AnalysisTab(QtWidgets.QWidget):
             return "max"
         if "min" in label:
             return "min"
-        return "ed"
+        return "envelope"
 
     def _on_axis_metric_changed(self) -> None:
         """Handle axis metric combo changes and update plot labels."""
         metric = self._selected_y_metric()
-        if metric == "ed":
-            self.metrics_plot.setLabel("left", "Energy Density")
+        if metric == "envelope":
+            self.metrics_plot.setLabel("left", "Envelope (V)")
         elif metric == "max":
             self.metrics_plot.setLabel("left", "Max Amplitude (V)")
         elif metric == "min":
@@ -1389,8 +1427,8 @@ class AnalysisTab(QtWidgets.QWidget):
         x_metric = self._selected_x_metric()
         if x_metric == "time":
             self.metrics_plot.setLabel("bottom", "Time (s)")
-        elif x_metric == "ed":
-            self.metrics_plot.setLabel("bottom", "Energy Density")
+        elif x_metric == "envelope":
+            self.metrics_plot.setLabel("bottom", "Envelope (V)")
         elif x_metric == "max":
             self.metrics_plot.setLabel("bottom", "Max Amplitude (V)")
         elif x_metric == "min":
@@ -1400,14 +1438,13 @@ class AnalysisTab(QtWidgets.QWidget):
         elif x_metric == "width":
             self.metrics_plot.setLabel("bottom", "Event Width (ms)")
         else:
-            self.metrics_plot.setLabel("bottom", "Energy Density")
-        if metric in {"ed", "max", "min", "freq", "interval"}:
+            self.metrics_plot.setLabel("bottom", "Envelope (V)")
+        if metric in {"envelope", "max", "min", "freq", "interval"}:
             self.energy_scatter.show()
         else:
             self.energy_scatter.hide()
             self.energy_scatter.setData([], [])
-        if self.clustering_enabled_check.isChecked():
-            self._recompute_cluster_membership()
+        self._recompute_cluster_membership()
         self._update_metric_points()
 
     def _on_class_selection_changed(
@@ -1427,21 +1464,18 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def _update_cluster_visuals(self) -> None:
         """Update cluster ROI visibility and pen widths based on selection."""
-        visible = self.clustering_enabled_check.isChecked()
         base_width = 1.5
         selected_id = self._selected_cluster_id
         for cluster in self._clusters:
             roi = cluster.roi
             if roi is None:
                 continue
-            roi.setVisible(visible)
-            if visible:
-                width = base_width * 3.0 if cluster.id == selected_id else base_width
-                roi.setPen(pg.mkPen(cluster.color, width=width))
+            roi.setVisible(True)
+            width = base_width * 3.0 if cluster.id == selected_id else base_width
+            roi.setPen(pg.mkPen(cluster.color, width=width))
 
     def _update_cluster_button_states(self) -> None:
-        """Enable/disable cluster buttons based on state."""
-        enabled = self.clustering_enabled_check.isChecked()
+        """Enable/disable cluster buttons based on selection state."""
         current_item = self.class_list.currentItem()
         has_selection = current_item is not None
         
@@ -1451,11 +1485,11 @@ class AnalysisTab(QtWidgets.QWidget):
             selected_id = current_item.data(QtCore.Qt.UserRole)
             is_unclassified = (selected_id == self._UNCLASSIFIED_ID)
         
-        self.add_class_btn.setEnabled(enabled)
+        self.add_class_btn.setEnabled(True)
         # Remove class only enabled for user-added classes, not Unclassified
-        self.remove_class_btn.setEnabled(enabled and has_selection and not is_unclassified)
-        self.view_class_waveforms_btn.setEnabled(enabled and has_selection)
-        self.export_class_btn.setEnabled(enabled and has_selection)
+        self.remove_class_btn.setEnabled(has_selection and not is_unclassified)
+        self.view_class_waveforms_btn.setEnabled(has_selection)
+        self.export_class_btn.setEnabled(has_selection)
 
     def _update_sta_view_button(self) -> None:
         """Enable/disable STA view button based on data availability."""
@@ -1572,33 +1606,6 @@ class AnalysisTab(QtWidgets.QWidget):
         if cluster is None:
             return QtGui.QColor(UNCLASSIFIED_COLOR)
         return cluster.color
-
-    def _on_clustering_toggled(self, checked: bool) -> None:
-        """Handle clustering enable checkbox toggle."""
-        self._set_cluster_panel_visible(checked)
-        if checked:
-            # Add the permanent "Unclassified" entry at the top
-            if self._unclassified_item is None:
-                self._unclassified_item = QtWidgets.QListWidgetItem("Unclassified (0 events)")
-                self._unclassified_item.setData(QtCore.Qt.UserRole, self._UNCLASSIFIED_ID)
-            self.class_list.insertItem(0, self._unclassified_item)
-            self.class_list.setCurrentItem(self._unclassified_item)
-            self._recompute_cluster_membership()
-        else:
-            # Remove the Unclassified entry
-            if self._unclassified_item is not None:
-                row = self.class_list.row(self._unclassified_item)
-                if row >= 0:
-                    self.class_list.takeItem(row)
-            self._event_cluster_labels.clear()
-            for cluster in self._clusters:
-                item = self._cluster_items.get(cluster.id)
-                if item is not None:
-                    item.setText(f"{cluster.name} (0 events)")
-        self._update_metric_points()
-        self._update_cluster_visuals()
-        self._update_cluster_button_states()
-        # Note: overlay colors are set at creation time, not refreshed here
 
     def _on_sta_toggled(self, checked: bool) -> None:
         """Handle STA enable checkbox toggle."""
@@ -1863,8 +1870,6 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def _on_add_class_clicked(self) -> None:
         """Create a new cluster ROI when Add Class clicked."""
-        if not self.clustering_enabled_check.isChecked():
-            return
         view_box = self.metrics_plot.getViewBox()
         if view_box is None:
             return
@@ -2006,9 +2011,6 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def _on_view_class_waveforms_clicked(self) -> None:
         """Open dialog to view waveforms for the selected cluster."""
-        if not self.clustering_enabled_check.isChecked():
-            QtWidgets.QMessageBox.information(self, "Waveforms", "Enable clustering to view class waveforms.")
-            return
         current_item = self.class_list.currentItem()
         if current_item is None:
             QtWidgets.QMessageBox.information(self, "Waveforms", "Select a class to view its waveforms.")
@@ -2078,7 +2080,7 @@ class AnalysisTab(QtWidgets.QWidget):
         """
         y_key = self._selected_y_metric()
         x_key = self._selected_x_metric()
-        if y_key not in {"ed", "max", "min", "freq", "interval", "width"}:
+        if y_key not in {"envelope", "max", "min", "freq", "interval", "width"}:
             self.energy_scatter.hide()
             return
         events = self._metric_events
@@ -2145,7 +2147,7 @@ class AnalysisTab(QtWidgets.QWidget):
         # Only recompute cluster membership if dirty OR if we have new events
         need_reclassify = self._cluster_membership_dirty or (current_count != self._last_scatter_count)
         
-        if self.clustering_enabled_check.isChecked() and self._clusters and need_reclassify:
+        if self._clusters and need_reclassify:
             cluster_bounds: list[tuple[int, float, float, float, float]] = []
             for cluster in self._clusters:
                 roi = cluster.roi
@@ -2191,7 +2193,7 @@ class AnalysisTab(QtWidgets.QWidget):
             self._cluster_membership_dirty = False
         
         # Always update Unclassified count when clustering is enabled (even with no user classes)
-        if self.clustering_enabled_check.isChecked() and self._unclassified_item is not None:
+        if self._unclassified_item is not None:
             # Count visible events that are NOT classified (not in _event_cluster_labels)
             unclassified_count = sum(
                 1 for eid in event_ids 
@@ -2244,7 +2246,7 @@ class AnalysisTab(QtWidgets.QWidget):
         rel_time = max(0.0, float(metric_time) - (self._t0_event or 0.0))
         record: dict[str, float | int] = {"time": rel_time}
         has_metric = False
-        for key in ("ed", "max", "min", "freq", "interval", "width"):
+        for key in ("envelope", "max", "min", "freq", "interval", "width"):
             value = metrics.get(key)
             if value is None:
                 continue
@@ -2303,12 +2305,12 @@ class AnalysisTab(QtWidgets.QWidget):
         if samples.size >= 4:
             props = getattr(event, "properties", {})
             # Strict mode: worker must compute these
-            ed = float(props.get("energy_density", 0.0))
+            env = float(props.get("envelope", 0.0))
             pf = float(props.get("peak_freq_hz", 0.0))
             mx, mn = min_max(samples)
             metric_values.update(
                 {
-                    "ed": float(ed),
+                    "envelope": float(env),
                     "max": float(mx),
                     "min": float(mn),
                     "freq": float(pf),
@@ -2385,7 +2387,7 @@ class AnalysisTab(QtWidgets.QWidget):
         # Classify the event immediately before applying color
         # so overlay gets the correct color at creation time
         event_id = payload.event_id
-        if isinstance(event_id, int) and self.clustering_enabled_check.isChecked() and self._clusters:
+        if isinstance(event_id, int) and self._clusters:
             metrics = payload.metrics
             if isinstance(metrics, dict):
                 x_key = self._selected_x_metric()

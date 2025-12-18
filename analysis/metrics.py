@@ -3,7 +3,7 @@
 This module provides signal processing utilities for computing metrics on
 detected events, including:
 - baseline: Median-based baseline estimation from pre-event samples
-- energy_density: Windowed energy density computation
+- envelope: Signal envelope (max - min) amplitude range
 - min_max: Peak amplitude extraction
 - peak_frequency_sinc: High-resolution frequency estimation with FFT and sinc interpolation
 - autocorr_frequency: Autocorrelation-based frequency estimation fallback
@@ -24,17 +24,19 @@ def blackman(n: int) -> np.ndarray:
     return np.blackman(max(1, n))
 
 
-def energy_density(x: np.ndarray, sr: float) -> float:
-    arr = np.asarray(x, dtype=np.float32)
-    if arr.size == 0 or sr <= 0:
+def envelope(samples: np.ndarray) -> float:
+    """Compute signal envelope as the difference between max and min amplitudes.
+
+    Args:
+        samples: 1D array of waveform samples around event.
+
+    Returns:
+        Envelope amplitude (max - min). Returns 0.0 for empty input.
+    """
+    arr = np.asarray(samples, dtype=np.float32)
+    if arr.size == 0:
         return 0.0
-    base = baseline(arr, max(1, int(0.1 * arr.size)))
-    x_detrend = arr - base
-    window = blackman(arr.size)
-    weighted = x_detrend * window
-    energy = np.sum(weighted * weighted, dtype=np.float64)
-    window_sec = max(1e-12, arr.size / float(sr))
-    return float(np.sqrt(energy / window_sec))
+    return float(np.max(arr) - np.min(arr))
 
 
 def min_max(x: np.ndarray) -> Tuple[float, float]:

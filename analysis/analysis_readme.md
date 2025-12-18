@@ -5,7 +5,7 @@ Real-time spike detection and event analysis for neural signals. Processes strea
 * Simple threshold detection with auto-thresholding
 * Refractory period enforcement
 * Waveform capture around detection points
-* Centralized metric computation (energy, frequency, amplitude)
+* Centralized metric computation (envelope, frequency, amplitude)
 * Thread-safe settings with observer pattern
 
 > This README covers analysis patterns for adding new detection algorithms and metrics.
@@ -147,7 +147,7 @@ All metrics are **pure functions** in `analysis/metrics.py`:
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `baseline` | `(samples, pre_samples) → float` | Median baseline from pre-event samples |
-| `energy_density` | `(samples, sr) → float` | Windowed RMS energy density |
+| `envelope` | `(samples) → float` | Signal envelope (max - min) |
 | `min_max` | `(samples) → (max, min)` | Peak amplitude extraction |
 | `peak_frequency_sinc` | `(samples, sr, min_hz, center_index) → float` | FFT + sinc interpolation frequency |
 | `autocorr_frequency` | `(segment, sr, min_hz, max_hz) → float` | Autocorrelation frequency fallback |
@@ -185,7 +185,7 @@ def spike_width(samples: np.ndarray, sr: float, threshold_frac: float = 0.5) -> 
 2. **Add to `__all__` export** (if module has one):
 
 ```python
-__all__ = ["baseline", "energy_density", "min_max", "peak_frequency_sinc", "spike_width"]
+__all__ = ["baseline", "envelope", "min_max", "peak_frequency_sinc", "spike_width"]
 ```
 
 3. **Use in AnalysisWorker._detect_events()**:

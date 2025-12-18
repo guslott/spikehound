@@ -1300,6 +1300,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._handle_listen_change(channel_id, config.listen_enabled)
         if display_changed and config.display_enabled and self._channel_ids_current and self._channel_names_current:
             self._reset_scope_for_channels(self._channel_ids_current, self._channel_names_current)
+        # Sync Analysis tab scaling when vertical span changes
+        self._sync_analysis_scales()
 
     def _update_channel_display(self, channel_id: int) -> None:
         """Re-render a single channel's curve using the last raw samples and current offset/range."""
@@ -1638,6 +1640,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_status(viz_depth=0)
         if self._trigger_controller.sample_rate > 0:
             self._update_trigger_sample_parameters(self._trigger_controller.sample_rate)
+        # Sync Analysis tab scaling when window width changes
+        self._sync_analysis_scales()
 
     def _on_window_changed(self) -> None:
         value = float(self.trigger_control.window_combo.currentData() or 0.0)
@@ -1876,6 +1880,13 @@ class MainWindow(QtWidgets.QMainWindow):
         dock = getattr(self, "_analysis_dock", None)
         if isinstance(dock, AnalysisDock):
             dock.update_sample_rate(sample_rate)
+
+    def _sync_analysis_scales(self) -> None:
+        """Push current scope window and channel scales to all Analysis tabs."""
+        dock = getattr(self, "_analysis_dock", None)
+        if not isinstance(dock, AnalysisDock):
+            return
+        dock.update_scales(self._current_window_sec, self._channel_configs)
 
 
     @QtCore.Slot(object)
