@@ -18,6 +18,19 @@ from shared.ring_buffer import SharedRingBuffer
 logger = logging.getLogger(__name__)
 
 
+# Explicit backpressure policies for each queue.
+# - "lossless": blocks until space available (fail loudly if timeout)
+# - "drop-newest": drops incoming item if queue is full
+# - "drop-oldest": evicts oldest item to make room for new one
+QUEUE_POLICIES: Dict[str, str] = {
+    "visualization": "drop-newest",
+    "audio": "drop-newest",
+    "logging": "lossless",
+    "analysis": "drop-oldest",
+    "events": "drop-newest",
+}
+
+
 @dataclass
 class DispatcherStats:
     received: int = 0
@@ -37,6 +50,7 @@ class DispatcherStats:
             "forwarded": dict(self.forwarded),
             "evicted": dict(self.evicted),
             "dropped": dict(self.dropped),
+            "policies": dict(QUEUE_POLICIES),
         }
 
 

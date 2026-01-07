@@ -36,6 +36,13 @@ from shared.models import (
 from shared.ring_buffer import SharedRingBuffer
 
 
+# Default ring buffer duration in seconds. The buffer must be large enough that
+# consumers can read pointers before the buffer wraps. 30 seconds provides ample
+# headroom for typical visualization/analysis latencies. Increase if observing
+# "wrap risk" warnings in the Health Metrics panel.
+RING_BUFFER_DURATION_SEC: float = 30.0
+
+
 # ----------------------------
 # Data model (shared contract)
 # ----------------------------
@@ -202,8 +209,8 @@ class BaseDevice(ABC):
             self._dtype = actual.dtype
             # Store the echo so GUI can query it directly
             self.config = actual
-            # Allocate a shared ring buffer sized for ~30 seconds of data
-            capacity = max(int(actual.sample_rate * 30), actual.chunk_size)
+            # Allocate a shared ring buffer sized for RING_BUFFER_DURATION_SEC seconds
+            capacity = max(int(actual.sample_rate * RING_BUFFER_DURATION_SEC), actual.chunk_size)
             if capacity <= 0:
                 raise ValueError("computed ring buffer capacity must be positive")
             n_channels = len(self._active_channel_ids)
@@ -290,13 +297,17 @@ class BaseDevice(ABC):
             desired_channels = len(self._active_channel_ids)
             if rb is not None and desired_channels > 0 and rb.shape[0] != desired_channels:
                 capacity = rb.capacity
-                dtype = rb._data.dtype  # type: ignore[attr-defined]  # internal dtype reuse
+                dtype = rb.dtype
                 self.ring_buffer = SharedRingBuffer(shape=(desired_channels, capacity), dtype=dtype)
                 
-                # CRITICAL: Clear the queue of any pointers to the old buffer
+                # Clear the queue of any pointers to the old buffer
                 # This prevents the consumer from trying to read from a replaced/closed buffer
-                with self.data_queue.mutex:
-                    self.data_queue.queue.clear()
+                # Use public API (get_nowait drain) instead of internal queue.mutex/queue.clear()
+                try:
+                    while True:
+                        self.data_queue.get_nowait()
+                except queue.Empty:
+                    pass
 
     def get_active_channels(self) -> List[ChannelInfo]:
         with self._channel_lock:

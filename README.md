@@ -65,24 +65,43 @@ SpikeHound **democratizes neurophysiology** by removing financial and technical 
 
 ## 📦 Installation
 
-### Requirements
+### Option 1: Download Binary Installer (Recommended)
+
+Pre-built installers are available for **Windows** and **macOS**—no programming experience required!
+
+1. Visit the [latest release page](https://github.com/guslott/spikehound/releases/latest)
+2. Scroll to the **Assets** section at the bottom
+3. Download the appropriate installer:
+   - **Windows:** `SpikeHound-Setup.exe`
+   - **macOS:** `SpikeHound.dmg`
+4. Run the installer and follow the prompts
+
+---
+
+### Option 2: Run from Source (Advanced)
+
+For developers or those who want to modify the code:
+
+#### Requirements
 - **Python 3.12+**
 - Any supported operating system (Windows, macOS, Linux)
 
-### Quick Start
+#### Quick Start
 ```bash
 # Clone the repository
 git clone https://github.com/guslott/spikehound.git
 cd spikehound
 
 # Install dependencies
-pip install numpy scipy PySide6 pyqtgraph miniaudio pyserial
+pip install -r requirements.txt
 
 # Run the application
 python main.py
 ```
 
-### Building a Standalone App
+> **Dependencies:** numpy, scipy, PySide6, pyqtgraph, miniaudio, pyserial (see `requirements.txt` for version constraints)
+
+#### Building a Standalone App
 ```bash
 pip install pyinstaller
 pyinstaller SpikeHound.spec

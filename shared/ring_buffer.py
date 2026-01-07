@@ -35,6 +35,11 @@ class SharedRingBuffer:
     def shape(self) -> Tuple[int, ...]:
         return self._shape
 
+    @property
+    def dtype(self) -> np.dtype:
+        """Return the data type of the buffer elements."""
+        return self._data.dtype
+
     def write(self, data: np.ndarray) -> int:
         """
         Write `data` into the ring buffer, handling wrap-around.

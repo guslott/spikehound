@@ -247,11 +247,10 @@ class TriggerController(QtCore.QObject):
             self._window_samples = max(int(window_sec * sample_rate), 1)
             
             # Clear history on sample rate change
-            if sample_rate != self._last_sample_rate:
-                self._history.clear()
-                self._history_length = 0
-                self._history_total = 0
-                self._max_chunk = 0
+            self._history.clear()
+            self._history_length = 0
+            self._history_total = 0
+            self._max_chunk = 0
         
         self._history.append(chunk_samples)
         self._history_length += chunk_samples.shape[0]

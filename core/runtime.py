@@ -255,11 +255,24 @@ class SpikeHoundRuntime:
         if source is not None:
             try:
                 src_info = source.stats()
+                # Calculate buffer headroom from ring buffer capacity
+                rb = getattr(source, "ring_buffer", None)
+                capacity_sec = 0.0
+                if rb is not None and self.sample_rate > 0:
+                    capacity_sec = rb.capacity / self.sample_rate
+                # Estimate headroom: capacity minus queue depth (samples waiting)
+                queue_samples = src_info.get("queue_size", 0) * src_info.get("next_start_sample", 0) / max(src_info.get("next_seq", 1), 1)
+                # Simplified: queue_size * chunk_size approximation
+                chunk_size = getattr(getattr(source, "config", None), "chunk_size", 1024)
+                queue_samples = src_info.get("queue_size", 0) * chunk_size
+                headroom_sec = capacity_sec - (queue_samples / self.sample_rate if self.sample_rate > 0 else 0)
                 source_stats = {
                     "xruns": src_info.get("xruns", 0),
                     "drops": src_info.get("drops", 0),
                     "queue_size": src_info.get("queue_size", 0),
                     "queue_max": src_info.get("queue_maxsize", 0),
+                    "buffer_capacity_sec": capacity_sec,
+                    "buffer_headroom_sec": max(headroom_sec, 0.0),
                 }
             except Exception:
                 pass

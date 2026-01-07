@@ -135,6 +135,7 @@ class SettingsTab(QtWidgets.QWidget):
             ("Logging queue", "logging_queue"),
             ("Analysis queue", "analysis_queue"),
             ("Viz buffer", "viz_buffer"),
+            ("Buffer headroom", "buffer_headroom"),
         ]
 
         self._metric_fields: Dict[str, QtWidgets.QLabel] = {}
@@ -438,12 +439,24 @@ class SettingsTab(QtWidgets.QWidget):
         else:
             self._metric_fields["source_queue"].setText("–")
         
-        # Queue health
+        # Queue health with drop counts
         depths = snapshot.get("queues", {})
-        self._metric_fields["viz_queue"].setText(self._format_queue(depths.get("visualization")))
-        self._metric_fields["audio_queue"].setText(self._format_queue(depths.get("audio")))
-        self._metric_fields["logging_queue"].setText(self._format_queue(depths.get("logging")))
-        self._metric_fields["analysis_queue"].setText(self._format_queue(depths.get("analysis")))
+        dropped = stats.get("dropped", {}) if isinstance(stats, dict) else {}
+        evicted = stats.get("evicted", {}) if isinstance(stats, dict) else {}
+        policies = stats.get("policies", {}) if isinstance(stats, dict) else {}
+        
+        self._metric_fields["viz_queue"].setText(
+            self._format_queue_with_drops(depths.get("visualization"), policies.get("visualization", "?"), dropped.get("visualization", 0))
+        )
+        self._metric_fields["audio_queue"].setText(
+            self._format_queue_with_drops(depths.get("audio"), policies.get("audio", "?"), dropped.get("audio", 0))
+        )
+        self._metric_fields["logging_queue"].setText(
+            self._format_queue_with_drops(depths.get("logging"), policies.get("logging", "?"), evicted.get("logging", 0))
+        )
+        self._metric_fields["analysis_queue"].setText(
+            self._format_queue_with_drops(depths.get("analysis"), policies.get("analysis", "?"), evicted.get("analysis", 0) + dropped.get("analysis", 0))
+        )
         
         # Viz buffer status
         viz_buf = depths.get("viz_buffer", {})
@@ -460,6 +473,25 @@ class SettingsTab(QtWidgets.QWidget):
         drops = source.get("drops", 0)
         self._metric_fields["xruns"].setText(str(xruns))
         self._metric_fields["drops"].setText(str(drops))
+        
+        # Buffer headroom (wrap risk indicator)
+        headroom_sec = source.get("buffer_headroom_sec", 0.0)
+        capacity_sec = source.get("buffer_capacity_sec", 0.0)
+        headroom_label = self._metric_fields.get("buffer_headroom")
+        if headroom_label is not None:
+            if capacity_sec > 0:
+                # Color-code: green > 10s, yellow 5-10s, red < 5s
+                if headroom_sec >= 10.0:
+                    color = "green"
+                elif headroom_sec >= 5.0:
+                    color = "orange"
+                else:
+                    color = "red"
+                headroom_label.setText(f"{headroom_sec:.1f} / {capacity_sec:.0f} sec")
+                headroom_label.setStyleSheet(f"color: {color};")
+            else:
+                headroom_label.setText("–")
+                headroom_label.setStyleSheet("")
         
         # Dispatcher stats
         dropped = stats.get("dropped", {}) if isinstance(stats, dict) else {}
@@ -481,3 +513,16 @@ class SettingsTab(QtWidgets.QWidget):
         if maxsize <= 0:
             return f"{size}/∞"
         return f"{size}/{maxsize} ({util:3.0f}%)"
+
+    def _format_queue_with_drops(self, info: Optional[dict], policy: str, drops: int) -> str:
+        """Format queue status with policy abbreviation and drop count."""
+        if not info:
+            return "–"
+        size = int(info.get("size", 0))
+        maxsize = int(info.get("max", 0))
+        # Policy abbreviations: L=lossless, DN=drop-newest, DO=drop-oldest
+        policy_abbr = {"lossless": "L", "drop-newest": "DN", "drop-oldest": "DO"}.get(policy, "?")
+        drop_str = f" ↓{drops}" if drops > 0 else ""
+        if maxsize <= 0:
+            return f"{size}/∞ [{policy_abbr}]{drop_str}"
+        return f"{size}/{maxsize} [{policy_abbr}]{drop_str}"

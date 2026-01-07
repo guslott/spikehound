@@ -7,13 +7,12 @@ import numpy as np
 
 
 def _freeze_array(array: np.ndarray, *, ndim: int | None = None) -> np.ndarray:
-    """Return a read-only, C-contiguous view of `array`, validating dimensions."""
-    # Zero-copy optimization: Input is likely already C-contiguous float32 from Dispatcher
-    arr = np.asarray(array, order="C")
+    """Return a read-only, C-contiguous copy of `array`, validating dimensions."""
+    # Make a copy to avoid mutating the caller's array when we set write=False
+    arr = np.array(array, order="C", copy=True)
     if ndim is not None and arr.ndim != ndim:
         raise ValueError(f"array must be {ndim}D, got {arr.ndim}D")
-    if arr.flags.writeable:
-        arr.setflags(write=False)
+    arr.setflags(write=False)
     return arr
 
 
@@ -118,6 +117,21 @@ class Chunk:
     def duration(self) -> float:
         return self.n_samples * self.dt
 
+    def __reduce__(self):
+        # Ensure __post_init__ runs on unpickle to re-freeze arrays
+        return (
+            self.__class__,
+            (
+                self.samples,
+                self.start_time,
+                self.dt,
+                self.seq,
+                self.channel_names,
+                self.units,
+                self.meta,
+            ),
+        )
+
 
 
 
@@ -174,6 +188,13 @@ class DetectionEvent:
         object.__setattr__(self, "window", window)
         object.__setattr__(self, "properties", _copy_mapping(self.properties) or {})
         object.__setattr__(self, "params", _copy_mapping(self.params) or {})
+
+    def __reduce__(self):
+        # Ensure __post_init__ runs on unpickle to re-freeze arrays
+        return (
+            self.__class__,
+            (self.t, self.chan, self.window, self.properties, self.params),
+        )
 
 
 
