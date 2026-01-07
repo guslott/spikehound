@@ -36,6 +36,10 @@ from .scope_config_manager import ScopeConfigManager, ScopeConfigProvider
 from .trigger_control_widget import TriggerControlWidget
 from .channel_manager import ChannelManager
 from .audio_listen_manager import AudioListenManager
+from .theme_manager import ThemeManager
+from .branding_manager import BrandingManager
+from .tab_plugin_manager import TabPluginManager
+from .signal_bridge import SignalBridge
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -59,7 +63,7 @@ class MainWindow(QtWidgets.QMainWindow):
         device_registry = DeviceRegistry()
         device_manager = DeviceManager(device_registry)
         self.runtime = SpikeHoundRuntime(
-            app_settings_store=getattr(controller, "app_settings_store", None),
+            app_settings_store=controller.app_settings_store,
             logger=self._logger,
             pipeline=controller,
             device_registry=device_registry,
@@ -110,9 +114,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._downsample_supported = None
         self._window_combo_user_set = False
         self._window_combo_suppress = False
-        self._splash_pixmap: Optional[QtGui.QPixmap] = None
-        self._splash_label: Optional[QtWidgets.QLabel] = None
-        self._splash_aspect_ratio: float = 1.0
+        self._signal_bridge = SignalBridge(self)
+        self._branding_manager: Optional[BrandingManager] = None
 
         # Config manager for save/load operations
         self._config_manager = ScopeConfigManager(self)
@@ -125,10 +128,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_timer.timeout.connect(self._update_playback_position)
         
         self.attach_controller(controller)
-        self.runtime.device_manager.devicesChanged.connect(self._on_devices_changed)
-        self.runtime.device_manager.deviceConnected.connect(self._on_device_connected)
-        self.runtime.device_manager.deviceDisconnected.connect(self._on_device_disconnected)
-        self.runtime.device_manager.availableChannelsChanged.connect(self._on_available_channels)
+        self._signal_bridge.wire_runtime_signals()
         self._apply_device_state(False)
         self.runtime.device_manager.refresh_devices()
         app_settings = controller.app_settings if controller is not None else None
@@ -143,14 +143,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._close_shortcut.activated.connect(self.close)
         self._bind_app_settings_store()
         
-        QtCore.QTimer.singleShot(0, self._update_splash_pixmap)
+        # Initial splash scale and default config load
+        QtCore.QTimer.singleShot(0, lambda: self._branding_manager.update_splash_pixmap() if self._branding_manager else None)
         QtCore.QTimer.singleShot(0, self._try_load_default_config)
 
     def _init_ui(self) -> None:
         """Initialize the main window UI components and layout."""
         self._settings_tab: Optional[SettingsTab] = None
-        self._apply_palette()
-        self._style_plot()
+        
+        # Apply global application theme and styling
+        ThemeManager.apply_theme(self)
 
         scope_widget = self._create_scope_widget()
         
@@ -160,7 +162,6 @@ class MainWindow(QtWidgets.QMainWindow):
             trigger_controller=self._trigger_controller,
             parent=self,
         )
-        self._plot_manager.sampleRateChanged.connect(self._maybe_update_analysis_sample_rate)
         
         central_placeholder = QtWidgets.QWidget(self)
         central_placeholder.setSizePolicy(
@@ -176,12 +177,20 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Create and add permanent Settings tab
         self._settings_tab = SettingsTab(self.runtime, self)
-        self._settings_tab.saveConfigRequested.connect(self._on_save_scope_config)
-        self._settings_tab.loadConfigRequested.connect(self._on_load_scope_config)
         self._analysis_dock.set_settings_widget(self._settings_tab, "Settings")
         
         self.addDockWidget(QtCore.Qt.TopDockWidgetArea, self._analysis_dock)
         self._analysis_dock.select_scope()
+
+        # Wire UI components after they are all created
+        self._signal_bridge.wire_ui_internal()
+
+        # Load dynamic plugin tabs
+        self._tab_manager = TabPluginManager(self.runtime)
+        plugin_tabs = self._tab_manager.discover_and_instantiate()
+        for tab in plugin_tabs:
+            title = getattr(tab, "TAB_TITLE", "Plugin Tab")
+            self._analysis_dock.add_plugin_tab(tab, title)
 
 
 
@@ -310,29 +319,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._splash_label.setStyleSheet(
             "#splashLabel { border: 2px solid rgb(0,0,0); background-color: rgb(0,0,0); padding: 0px; margin: 0px; }"
         )
-        self._splash_pixmap = self._load_splash_pixmap()
-        if self._splash_pixmap is None:
-            self._splash_label.setText("Manlius Pebble Hill School\\nCornell University")
-            self._splash_label.setWordWrap(True)
-            self._splash_label.setStyleSheet(
-                "#splashLabel { border: 2px solid rgb(0,0,0); background-color: rgb(0,0,0); color: rgb(240,240,240); padding: 6px; font-weight: bold; }"
-            )
-        else:
-            self._update_splash_pixmap()
         side_layout.addWidget(self._splash_label)
+        self._branding_manager = BrandingManager(self._splash_label, self)
         side_layout.addSpacing(10)
 
         # Recording controls - use extracted widget
         self.record_group = RecordingControlWidget(self)
-        self.record_group.recordingStarted.connect(self._on_recording_started)
-        self.record_group.recordingStopped.connect(self._on_recording_stopped)
         side_layout.addWidget(self.record_group)
-
 
         # Trigger Control Widget (extracted)
         self.trigger_control = TriggerControlWidget(self._trigger_controller)
         side_layout.addWidget(self.trigger_control)
-
 
         # Bottom row (spanning full width): device / channel controls.
         self.device_control = DeviceControlWidget(self)
@@ -355,24 +352,7 @@ class MainWindow(QtWidgets.QMainWindow):
             show_message=lambda title, msg: QtWidgets.QMessageBox.information(self, title, msg),
         )
         
-        # Wire ChannelManager signals
-        self._channel_manager.channelConfigChanged.connect(self._on_channel_manager_config_changed)
-        self._channel_manager.activeChannelChanged.connect(self._on_channel_manager_active_changed)
-        self._channel_manager.channelsUpdated.connect(self._on_channel_manager_channels_updated)
-        self._channel_manager.listenChannelRequested.connect(self._audio_listen_manager.handle_listen_change)
-        self._channel_manager.analysisRequested.connect(self._open_analysis_for_channel)
-        self._channel_manager.filterSettingsChanged.connect(self._sync_filter_settings)
-        
-        # Connect DeviceControlWidget signals
-        self.device_control.deviceSelected.connect(self._on_device_selected)
-        self.device_control.deviceConnectRequested.connect(self._on_device_connect_requested)
-        self.device_control.deviceDisconnectRequested.connect(self._on_device_disconnect_requested)
-        self.device_control.channelAddRequested.connect(self._on_channel_add_requested)
-        # Note: activeChannelSelected is now handled by ChannelManager
-        
-        # Connect playback control signals (for file source)
-        self.device_control.playPauseToggled.connect(self._on_playback_toggled)
-        self.device_control.seekRequested.connect(self._on_seek_requested)
+        # Note: All signal connections between these widgets are now handled by SignalBridge.
 
         grid.addWidget(side_panel, 0, 2)  # Trigger panel top right (col 2)
         grid.addWidget(self.device_control, 1, 0) # Device control bottom left (col 0)
@@ -417,28 +397,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 except (TypeError, RuntimeError):
                     pass
 
-        if hasattr(self, "runtime") and self.runtime is not None:
-            try:
-                self.runtime.set_pipeline(controller)
-            except Exception as exc:
-                self._logger.debug("Failed to set pipeline on runtime: %s", exc)
+        self.runtime.set_pipeline(controller)
 
         self._controller = controller
-        if hasattr(self, "_audio_listen_manager"):
-            self._audio_listen_manager.set_controller(controller)
-        if hasattr(self, "_analysis_dock") and self._analysis_dock is not None:
-            self._analysis_dock._controller = self.runtime
+        self._audio_listen_manager.set_controller(controller)
+        self._analysis_dock._controller = self.runtime
 
-        if controller is None:
-            return
-
-        self.startRecording.connect(controller.start_recording)
-        self.stopRecording.connect(controller.stop_recording)
-        self.triggerConfigChanged.connect(controller.update_trigger_config)
-        
-        # Wire controller to recording widget for duration queries
-        if hasattr(self, "record_group") and hasattr(self.record_group, "set_controller"):
-            self.record_group.set_controller(controller)
+        self._signal_bridge.wire_controller(controller)
 
         self._bind_dispatcher_signals()
         self._update_status(0)
@@ -471,179 +436,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._dispatcher_signals = signals
 
-    def _apply_palette(self) -> None:
-        """Apply the application color palette and stylesheet."""
-        palette = self.palette()
-        palette.setColor(QtGui.QPalette.Window, QtGui.QColor(200, 200, 200))
-        palette.setColor(QtGui.QPalette.WindowText, QtGui.QColor(0, 0, 0))
-        palette.setColor(QtGui.QPalette.Base, QtGui.QColor(223, 223, 223))
-        palette.setColor(QtGui.QPalette.AlternateBase, QtGui.QColor(200, 200, 200))
-        palette.setColor(QtGui.QPalette.ToolTipBase, QtGui.QColor(255, 255, 220))
-        palette.setColor(QtGui.QPalette.ToolTipText, QtGui.QColor(0, 0, 0))
-        palette.setColor(QtGui.QPalette.Text, QtGui.QColor(0, 0, 0))
-        palette.setColor(QtGui.QPalette.Button, QtGui.QColor(223, 223, 223))
-        palette.setColor(QtGui.QPalette.ButtonText, QtGui.QColor(0, 0, 0))
-        palette.setColor(QtGui.QPalette.Highlight, QtGui.QColor(30, 144, 255))
-        palette.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor(255, 255, 255))
-        self.setPalette(palette)
-        self.setStyleSheet(
-            """
-            QMainWindow { background-color: rgb(200,200,200); }
-            QWidget { color: rgb(0,0,0); }
-            QGroupBox {
-                background-color: rgb(223,223,223);
-                border: 1px solid rgb(120, 120, 120);
-                border-radius: 4px;
-                margin-top: 12px;
-                padding: 6px;
-                font-weight: bold;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 8px;
-                padding: 0px 4px 0px 4px;
-                color: rgb(128, 0, 0);
-            }
-            QLabel { color: rgb(0,0,0); }
-            QPushButton {
-                background-color: rgb(223,223,223);
-                color: rgb(0,0,0);
-                border: 1px solid rgb(120,120,120);
-                padding: 4px 8px;
-            }
-            QPushButton:checked {
-                background-color: rgb(200,200,200);
-            }
-            QLineEdit,
-            QPlainTextEdit,
-            QTextEdit,
-            QAbstractSpinBox,
-            QComboBox {
-                color: rgb(0,0,0);
-                background-color: rgb(245,245,245);
-                selection-background-color: rgb(30,144,255);
-                selection-color: rgb(255,255,255);
-                border: 1px solid rgb(120,120,120);
-                padding: 2px 4px;
-            }
-            QComboBox::drop-down {
-                subcontrol-origin: padding;
-                subcontrol-position: top right;
-                width: 18px;
-                border-left: 1px solid rgb(120,120,120);
-                background-color: rgb(223,223,223);
-            }
-            QComboBox QAbstractItemView {
-                color: rgb(0,0,0);
-                background-color: rgb(245,245,245);
-                selection-background-color: rgb(30,144,255);
-                selection-color: rgb(255,255,255);
-            }
-            QListView,
-            QListWidget {
-                color: rgb(0,0,0);
-                background-color: rgb(245,245,245);
-                selection-background-color: rgb(30,144,255);
-                selection-color: rgb(255,255,255);
-                border: 1px solid rgb(120,120,120);
-            }
-            QCheckBox,
-            QRadioButton {
-                color: rgb(0,0,0);
-            }
-            QSlider::groove:horizontal {
-                border: 1px solid rgb(120,120,120);
-                height: 6px;
-                background: rgb(200,200,200);
-                margin: 0px;
-            }
-            QSlider::handle:horizontal {
-                background: rgb(30,144,255);
-                border: 1px solid rgb(0,0,0);
-                width: 14px;
-                margin: -4px 0;
-            }
-            QStatusBar { background-color: rgb(192,192,192); }
-            """
-        )
-
-    def _style_plot(self) -> None:
-        """Configure PyQtGraph global options."""
-        pg.setConfigOption("foreground", (0, 0, 139))
-        pg.setConfigOptions(antialias=False)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # type: ignore[override]
         """Handle window resize to update splash image."""
         super().resizeEvent(event)
-        self._update_splash_pixmap()
+        if self._branding_manager:
+            self._branding_manager.update_splash_pixmap()
 
-    def _load_splash_pixmap(self) -> Optional[QtGui.QPixmap]:
-        """Load the splash image from media directory."""
-        splash_path = Path(__file__).resolve().parent.parent / "media" / "mph_cornell_splash.png"
-        if not splash_path.exists():
-            return None
-        pixmap = QtGui.QPixmap(str(splash_path))
-        if pixmap.isNull():
-            return None
-        if pixmap.height() > 0:
-            self._splash_aspect_ratio = pixmap.width() / float(pixmap.height())
-        return pixmap
 
-    def _update_splash_pixmap(self) -> None:
-        """Scale and update the splash image to fit the label."""
-        if self._splash_label is None or self._splash_pixmap is None or self._splash_pixmap.isNull():
-            return
 
-        label_rect = self._splash_label.contentsRect()
-        available_width = label_rect.width()
-        if available_width <= 0:
-            available_width = self._splash_label.width()
-        if available_width <= 0 and self._splash_label.parentWidget() is not None:
-            available_width = self._splash_label.parentWidget().width()
-        if available_width <= 0:
-            available_width = 200
-
-        border_px = 4  # 2 px on each side defined in stylesheet
-        available_width = int(max(50, available_width - border_px))
-
-        aspect = self._splash_aspect_ratio if self._splash_aspect_ratio > 0 else self._splash_pixmap.width() / max(1, self._splash_pixmap.height())
-        target_height = max(1, int(round(available_width / aspect)))
-
-        scaled = self._splash_pixmap.scaled(
-            available_width,
-            target_height,
-            QtCore.Qt.KeepAspectRatio,
-            QtCore.Qt.SmoothTransformation,
-        )
-        if scaled.isNull():
-            return
-
-        total_height = scaled.height() + border_px
-        self._splash_label.setMinimumHeight(total_height)
-        self._splash_label.setMaximumHeight(total_height)
-        self._splash_label.setPixmap(scaled)
-        self._splash_label.updateGeometry()
-
-    def _label(self, text: str) -> QtWidgets.QLabel:
-        """Create a left-aligned label with the given text."""
-        label = QtWidgets.QLabel(text)
-        label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-        return label
-
-    def _color_to_tuple(self, color: QtGui.QColor) -> tuple[int, int, int, int]:
-        """Convert QColor to RGBA tuple."""
-        if not isinstance(color, QtGui.QColor):
-            return (0, 0, 0, 255)
-        return (color.red(), color.green(), color.blue(), color.alpha())
-
-    def _color_from_tuple(self, data: Sequence[int]) -> QtGui.QColor:
-        """Convert RGBA tuple to QColor."""
-        try:
-            r, g, b, a = (int(x) for x in data)
-            return QtGui.QColor(r, g, b, a)
-        except Exception as exc:
-            self._logger.debug("Failed to parse color tuple: %s", exc)
-            return QtGui.QColor(0, 0, 139)
 
     def _channel_config_to_dict(self, config: ChannelConfig) -> dict:
         """Delegate to config manager."""
@@ -758,7 +559,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_device_button_clicked(self) -> None:
         """Handle device connect/disconnect button toggle."""
-        dm = getattr(self.runtime, "device_manager", None)
+        dm = self.runtime.device_manager
         if dm is None:
             return
         if self._device_connected:
@@ -799,7 +600,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_device_disconnect_requested(self) -> None:
         """Handle disconnection request from DeviceControlWidget."""
         if self._device_connected:
-            dm = getattr(self.runtime, "device_manager", None)
+            dm = self.runtime.device_manager
             if dm is not None:
                 dm.disconnect_device()
 
@@ -890,7 +691,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.device_control.device_combo.setItemData(idx, tooltip, QtCore.Qt.ToolTipRole)
         self.device_control.device_combo.blockSignals(False)
         if self._device_connected:
-            dm = getattr(self.runtime, "device_manager", None)
+            dm = self.runtime.device_manager
             active_key = dm.active_key() if dm is not None else None
             if active_key is not None:
                 idx = self.device_control.device_combo.findData(active_key)
@@ -930,8 +731,8 @@ class MainWindow(QtWidgets.QMainWindow):
         target_rate = 0.0
         if self._device_connected:
             # If connected, the driver config is the absolute source of truth
-            driver = getattr(self.runtime, "daq_source", None)
-            if driver is not None and getattr(driver, "config", None) is not None:
+            driver = self.runtime.daq_source
+            if driver is not None and driver.config is not None:
                 target_rate = driver.config.sample_rate
             elif self.runtime.sample_rate > 0:
                 target_rate = self.runtime.sample_rate
@@ -943,10 +744,10 @@ class MainWindow(QtWidgets.QMainWindow):
         rates = []
         if entry is not None:
             caps = entry.get("capabilities")
-            if hasattr(caps, "sample_rates"):
-                rates = getattr(caps, "sample_rates") or []
-            elif isinstance(caps, dict):
+            if isinstance(caps, dict):
                 rates = caps.get("sample_rates") or []
+            elif caps is not None:
+                rates = getattr(caps, "sample_rates", []) or []
         
         for rate in rates:
             self.device_control.sample_rate_combo.addItem(f"{int(rate):,}", float(rate))
@@ -995,8 +796,7 @@ class MainWindow(QtWidgets.QMainWindow):
         has_active = self.channel_controls.active_combo.count() > 0
         enabled = self.device_control.sample_rate_combo.count() > 0 and not connected
         self.device_control.sample_rate_combo.setEnabled(enabled)
-        if hasattr(self, "device_control") and hasattr(self.device_control, "sample_rate_label"):
-            self.device_control.sample_rate_label.setEnabled(enabled)
+        self.device_control.sample_rate_label.setEnabled(enabled)
 
     def _on_device_connected(self, key: str) -> None:
         """Handle device connection event."""
@@ -1011,8 +811,8 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Sync UI with actual negotiated sample rate
         # Prefer driver config (immediate) over runtime metric (delayed)
-        driver = getattr(self.runtime, "daq_source", None)
-        if driver is not None and getattr(driver, "config", None) is not None:
+        driver = self.runtime.daq_source
+        if driver is not None and driver.config is not None:
             self._set_sample_rate_value(driver.config.sample_rate)
         elif self.runtime.sample_rate > 0:
             self._set_sample_rate_value(self.runtime.sample_rate)
@@ -1072,7 +872,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_scan_hardware(self) -> None:
         """Handle hardware rescan request."""
-        dm = getattr(self.runtime, "device_manager", None)
+        dm = self.runtime.device_manager
         if dm is None:
             return
         try:
@@ -1081,7 +881,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._logger.debug("Failed to refresh devices: %s", exc)
         self._publish_active_channels()
         self._clear_scope_display()
-        if hasattr(self, "_analysis_dock") and self._analysis_dock is not None:
+        if self._analysis_dock is not None:
             try:
                 self._analysis_dock.shutdown()
             except Exception as exc:
@@ -1125,7 +925,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Sync panels via ChannelManager
         self._channel_manager.sync_channel_panels(
             ids, names,
-            analysis_dock=getattr(self, "_analysis_dock", None),
+            analysis_dock=self._analysis_dock,
         )
         # CRITICAL: Sync configs and panels back to MainWindow BEFORE resetting scope
         # This ensures PlotManager gets the correct configs for creating renderers
@@ -1162,7 +962,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # Stop acquisition if no channels are active
             self.stop_acquisition()
         self._update_sample_rate_enabled()
-        dock = getattr(self, "_analysis_dock", None)
+        dock = self._analysis_dock
         if dock is not None:
             try:
                 dock.update_active_channels(infos)
@@ -1170,7 +970,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
         
         # Ensure AudioManager knows about the current active channels
-        if self._controller and hasattr(self._controller, '_audio_manager') and self._controller._audio_manager:
+        if self._controller and self._controller._audio_manager:
             self._controller._audio_manager.update_active_channels(ids)
 
 
@@ -1182,7 +982,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Delegate to ChannelManager."""
         self._channel_manager.sync_channel_panels(
             channel_ids, channel_names,
-            analysis_dock=getattr(self, "_analysis_dock", None),
+            analysis_dock=self._analysis_dock,
         )
         # Sync local state
         self._channel_panels = self._channel_manager.channel_panels
@@ -1244,19 +1044,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._drag_channel_id = None
 
     def _on_channel_config_changed(self, channel_id: int, config: ChannelConfig) -> None:
-        # Handle missing or renamed fields
-        if not hasattr(config, "vertical_span_v"):
-            try:
-                config.vertical_span_v = float(getattr(config, "range_v", 1.0))
-            except Exception as e:
-                self._logger.debug("Failed to get vertical_span_v: %s", e)
-                config.vertical_span_v = 1.0
-        if not hasattr(config, "screen_offset"):
-            try:
-                config.screen_offset = float(getattr(config, "offset_v", 0.5))
-            except Exception as e:
-                self._logger.debug("Failed to get screen_offset: %s", e)
-                config.screen_offset = 0.5
         existing = self._channel_configs.get(channel_id)
         if existing is not None:
             config.channel_name = existing.channel_name or config.channel_name
@@ -1318,7 +1105,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._listen_channel_id = self._audio_listen_manager.listen_channel_id
 
     def _open_analysis_for_channel(self, channel_id: int) -> None:
-        dock = getattr(self, "_analysis_dock", None)
+        dock = self._analysis_dock
         if dock is None:
             return
         config = self._channel_configs.get(channel_id)
@@ -1466,7 +1253,7 @@ class MainWindow(QtWidgets.QMainWindow):
         controller.update_filter_settings(settings)
 
     def _drain_visualization_queue(self) -> List[ChunkPointer]:
-        queue_obj = getattr(self.runtime, "visualization_queue", None)
+        queue_obj = self.runtime.visualization_queue
         if queue_obj is None:
             return []
         pointers: List[ChunkPointer] = []
@@ -1496,9 +1283,7 @@ class MainWindow(QtWidgets.QMainWindow):
         can_add = connected and not_recording and self.device_control.available_combo.count() > 0
         self.device_control.add_channel_btn.setEnabled(can_add)
         self.device_control.available_combo.setEnabled(connected and not_recording)
-        # Delegate to trigger control
-        if hasattr(self, "trigger_control"):
-            self.trigger_control.set_enabled_for_scanning(connected)
+        self.trigger_control.set_enabled_for_scanning(connected)
 
     # -------------------------------------------------------------------------
     # Recording signal handlers (logic delegated to RecordingControlWidget)
@@ -1524,48 +1309,38 @@ class MainWindow(QtWidgets.QMainWindow):
         cosmetic controls (window width, etc.) remain enabled.
         """
         # Trigger control: disable data-affecting controls, keep cosmetic ones
-        if hasattr(self, "trigger_control"):
-            tc = self.trigger_control
-            # Window combo is purely cosmetic - keep it enabled
-            if hasattr(tc, "window_combo"):
-                tc.window_combo.setEnabled(True)  # Always enabled
-            # Trigger mode affects which data is captured - disable during recording
-            if hasattr(tc, "trigger_mode_combo"):
-                tc.trigger_mode_combo.setEnabled(enabled)
-            if hasattr(tc, "threshold_spin"):
-                tc.threshold_spin.setEnabled(enabled)
-            if hasattr(tc, "channel_combo"):
-                tc.channel_combo.setEnabled(enabled)
-            if hasattr(tc, "rearm_btn"):
-                tc.rearm_btn.setEnabled(enabled)
-            
-        for attr_name in ("device_group", "channels_group", "channel_opts_group"):
+        # Trigger control: disable data-affecting controls, keep cosmetic ones
+        tc = self.trigger_control
+        # Window combo is purely cosmetic - keep it enabled
+        tc.window_combo.setEnabled(True)  # Always enabled
+        # Trigger mode affects which data is captured - disable during recording
+        tc.trigger_mode_single.setEnabled(enabled)
+        tc.trigger_mode_repeating.setEnabled(enabled)
+        self.trigger_control.threshold_spin.setEnabled(enabled)
+        self.trigger_control.trigger_channel_combo.setEnabled(enabled)
+        self.trigger_control.trigger_single_button.setEnabled(enabled)
+        
+        for attr_name in ("device_control", "channel_controls"):
             panel = getattr(self, attr_name, None)
             if panel is not None:
                 panel.setEnabled(enabled)
         
         # Recording widget handles its own enable/disable
-        if hasattr(self, "record_group") and hasattr(self.record_group, "set_enabled_for_recording"):
-            self.record_group.set_enabled_for_recording(enabled)
+        self.record_group.set_enabled_for_recording(enabled)
         
         # Device controls - disable channel add/modification during recording
-        if hasattr(self, "device_control"):
-            dc = self.device_control
-            if hasattr(dc, "device_combo"):
-                dc.device_combo.setEnabled(not self._device_connected)
-            if hasattr(dc, "sample_rate_combo"):
-                dc.sample_rate_combo.setEnabled(not self._device_connected)
-            # Disable adding new channels during recording
-            if hasattr(dc, "available_combo"):
-                dc.available_combo.setEnabled(enabled and self._device_connected)
-            if hasattr(dc, "add_channel_btn"):
-                dc.add_channel_btn.setEnabled(enabled and self._device_connected)
+        dc = self.device_control
+        dc.device_combo.setEnabled(not self._device_connected and enabled)
+        dc.sample_rate_combo.setEnabled(not self._device_connected and enabled)
+        # Disable adding new channels during recording
+        dc.available_combo.setEnabled(enabled and self._device_connected)
+        dc.add_channel_btn.setEnabled(enabled and self._device_connected)
         
         # Note: active_combo intentionally NOT disabled so users can still
         # switch channels and adjust filters/visualization during recording
         
         # If disabling, ensure we don't leave stale state
-        if not enabled and hasattr(self, "_update_channel_buttons"):
+        if not enabled:
             self._update_channel_buttons()
 
 
@@ -1595,7 +1370,7 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception as e:
                 self._logger.debug("Exception stopping recording on close: %s", e)
         
-        dm = getattr(self.runtime, "device_manager", None)
+        dm = self.runtime.device_manager
         if dm is not None:
             try:
                 dm.disconnect_device()
@@ -1606,7 +1381,7 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception as e:
                 self._logger.debug("Exception during device manager cleanup: %s", e)
         self._clear_listen_channel()
-        if hasattr(self, "_analysis_dock") and self._analysis_dock is not None:
+        if self._analysis_dock is not None:
             self._analysis_dock.shutdown()
         super().closeEvent(event)
 
@@ -1614,8 +1389,6 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.instance().exit()
 
     def _set_window_combo_value(self, value: float) -> None:
-        if not hasattr(self, "window_combo"):
-            return
         target = max(float(value), 0.05)
         idx = -1
         for i in range(self.trigger_control.window_combo.count()):
@@ -1784,27 +1557,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def set_active_channels(self, channels: Sequence[str]) -> None:
         """Display the channels currently routed to the plot."""
-        names = [getattr(ch, "name", str(ch)) for ch in channels]
+        names = [ch.name if hasattr(ch, "name") else str(ch) for ch in channels]
         self._ensure_renderers_for_ids(self._channel_ids_current, names)
         
         # Trigger widget handles its own channel logic
-        if hasattr(self, "trigger_control"):
-            # Must pass list of (name, id) tuples
-            # We assume self._channel_ids_current aligns with channels/names
-            # If lengths mismatch, zip will truncate safe-ly
-            trigger_channels = list(zip(names, self._channel_ids_current))
-            self.trigger_control.update_channels(trigger_channels)
+        # Must pass list of (name, id) tuples
+        # We assume self._channel_ids_current aligns with channels/names
+        # If lengths mismatch, zip will truncate safe-ly
+        trigger_channels = list(zip(names, self._channel_ids_current))
+        self.trigger_control.update_channels(trigger_channels)
 
     def set_trigger_channels(self, channels: Sequence[object], *, current: Optional[int] = None) -> None:
         """Update trigger channel choices presented to the user."""
-        if not hasattr(self, "trigger_control"):
-            return
             
         # Convert objects to (name, id) list
         formatted_channels = []
         for entry in channels:
-            name = getattr(entry, "name", str(entry))
-            cid = getattr(entry, "id", None)
+            # Safely handle both ChannelInfo objects and fallback types
+            name = entry.name if hasattr(entry, "name") else str(entry)
+            cid = entry.id if hasattr(entry, "id") else None
             if cid is not None:
                 formatted_channels.append((name, cid))
                 
@@ -1877,13 +1648,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if abs(sample_rate - self._analysis_sample_rate) < 1e-3:
             return
         self._analysis_sample_rate = float(sample_rate)
-        dock = getattr(self, "_analysis_dock", None)
+        dock = self._analysis_dock
         if isinstance(dock, AnalysisDock):
             dock.update_sample_rate(sample_rate)
 
     def _sync_analysis_scales(self) -> None:
         """Push current scope window and channel scales to all Analysis tabs."""
-        dock = getattr(self, "_analysis_dock", None)
+        dock = self._analysis_dock
         if not isinstance(dock, AnalysisDock):
             return
         dock.update_scales(self._current_window_sec, self._channel_configs)
@@ -2030,7 +1801,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _bind_app_settings_store(self) -> None:
         controller = self._controller
-        if controller is None or not hasattr(controller, "app_settings_store"):
+        if controller is None:
             if self._app_settings_unsub:
                 self._app_settings_unsub()
                 self._app_settings_unsub = None
@@ -2061,7 +1832,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _apply_listen_output_preference(self, key: Optional[str]) -> None:
         """Apply audio output device preference."""
-        prev = self._audio_listen_manager.listen_device_key if hasattr(self, "_audio_listen_manager") else None
+        prev = self._audio_listen_manager.listen_device_key
         self._audio_listen_manager.set_listen_device(key)
         self._listen_device_key = self._audio_listen_manager.listen_device_key
         if self._settings_tab is not None:
@@ -2088,7 +1859,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _get_file_source(self):
         """Get the current device if it's a FileSource, otherwise None."""
         from daq.file_source import FileSource
-        source = getattr(self.runtime, "daq_source", None)
+        source = self.runtime.daq_source
         if isinstance(source, FileSource):
             return source
         return None
@@ -2126,12 +1897,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _start_playback_timer(self) -> None:
         """Start the playback position update timer."""
-        if hasattr(self, "_playback_timer") and self._playback_timer is not None:
+        if self._playback_timer is not None:
             self._playback_timer.start()
 
     def _stop_playback_timer(self) -> None:
         """Stop the playback position update timer."""
-        if hasattr(self, "_playback_timer") and self._playback_timer is not None:
+        if self._playback_timer is not None:
             self._playback_timer.stop()
 
     # -------------------------------------------------------------------------

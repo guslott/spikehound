@@ -183,6 +183,8 @@ class PipelineController:
         """Swap in a new source; keeps queues and filter settings intact."""
 
         configure_kwargs = dict(configure_kwargs or {})
+        if "sample_rate" not in configure_kwargs:
+            configure_kwargs["sample_rate"] = self.sample_rate or 20000
 
         with self._lock:
             self.stop(join=True)

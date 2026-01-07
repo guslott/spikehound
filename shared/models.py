@@ -7,13 +7,16 @@ import numpy as np
 
 
 def _freeze_array(array: np.ndarray, *, ndim: int | None = None) -> np.ndarray:
-    """Return a read-only, C-contiguous copy of `array`, validating dimensions."""
-    # Make a copy to avoid mutating the caller's array when we set write=False
-    arr = np.array(array, order="C", copy=True)
+    """Return a read-only, C-contiguous view or copy of `array`, validating dimensions."""
+    # Only copy if we must to achieve C-contiguity or if it's not already a numpy array
+    arr = np.asanyarray(array, order="C")
     if ndim is not None and arr.ndim != ndim:
         raise ValueError(f"array must be {ndim}D, got {arr.ndim}D")
-    arr.setflags(write=False)
-    return arr
+    
+    # Return a read-only view
+    view = arr.view()
+    view.setflags(write=False)
+    return view
 
 
 def _copy_mapping(mapping: Optional[Mapping[str, Any]]) -> Optional[Mapping[str, Any]]:
@@ -88,8 +91,8 @@ class Chunk:
     meta: Optional[Mapping[str, Any]] = field(default=None)
 
     def __post_init__(self) -> None:
-        if self.dt <= 0:
-            raise ValueError("dt must be positive")
+        if self.dt <= 0 or not np.isfinite(self.dt):
+            raise ValueError("dt must be positive and finite")
         if self.seq < 0:
             raise ValueError("seq must be non-negative")
         if not self.channel_names:
@@ -178,8 +181,8 @@ class DetectionEvent:
     params: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.t < 0:
-            raise ValueError("t must be non-negative")
+        if self.t < 0 or not np.isfinite(self.t):
+            raise ValueError("t must be non-negative and finite")
         if self.chan < 0:
             raise ValueError("chan must be non-negative")
 

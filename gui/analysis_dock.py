@@ -151,9 +151,9 @@ class AnalysisDock(QtWidgets.QDockWidget):
         """
         # Build a name -> vertical_span_v lookup
         vertical_spans: dict[str, float] = {}
-        for channel_id, config in channel_configs.items():
-            name = getattr(config, "channel_name", "")
-            span = getattr(config, "vertical_span_v", 1.0)
+        for config in channel_configs.values():
+            name = config.channel_name
+            span = config.vertical_span_v
             if name:
                 vertical_spans[name] = float(span)
         
@@ -173,7 +173,7 @@ class AnalysisDock(QtWidgets.QDockWidget):
             index = self._tabs.indexOf(widget)
             if index >= 0:
                 self._tabs.removeTab(index)
-            if hasattr(widget, "_release_metrics"):
+            if isinstance(widget, AnalysisTab):
                 widget._release_metrics()
             widget.deleteLater()
             worker = info.get("worker") if isinstance(info, dict) else None
@@ -219,7 +219,7 @@ class AnalysisDock(QtWidgets.QDockWidget):
                 self._analysis_count[mapped_name] = current
             else:
                 self._analysis_count.pop(mapped_name, None)
-        if hasattr(widget, "_release_metrics"):
+        if isinstance(widget, AnalysisTab):
             widget._release_metrics()
         widget.deleteLater()
         if not self._tab_info:
@@ -232,7 +232,7 @@ class AnalysisDock(QtWidgets.QDockWidget):
             worker = info.get("worker") if isinstance(info, dict) else None
             if isinstance(worker, AnalysisWorker):
                 worker.stop()
-            if hasattr(widget, "_release_metrics"):
+            if isinstance(widget, AnalysisTab):
                 try:
                     widget._release_metrics()
                 except Exception as e:
@@ -245,6 +245,15 @@ class AnalysisDock(QtWidgets.QDockWidget):
         if self._settings_widget is not None:
             self.close_settings()
         self.select_scope()
+
+    def add_plugin_tab(self, widget: QtWidgets.QWidget, title: str) -> None:
+        """Add a custom plugin tab to the workspace."""
+        if widget is None:
+            return
+        widget.setParent(self._tabs)
+        self._tabs.addTab(widget, title)
+        # We don't track these in _tab_info for now unless they need active channel updates
+        # If they inherit from BaseTab they can access runtime themselves.
 
     def open_settings(self, widget: QtWidgets.QWidget, title: str = "Settings & Debug") -> None:
         if widget is None:

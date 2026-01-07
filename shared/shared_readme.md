@@ -133,20 +133,6 @@ config = TriggerConfig(
 
 ---
 
-## Backward Compatibility
-
-## Backward Compatibility
-
-The generic `Event` alias has been removed to avoid ambiguity. Code must use `DetectionEvent` or `AnalysisEvent` explicitly.
-
-```python
-# Use explicit imports:
-from shared.models import DetectionEvent
-from shared.types import AnalysisEvent
-```
-
----
-
 ## Other Utilities
 
 ### SharedRingBuffer (`ring_buffer.py`)

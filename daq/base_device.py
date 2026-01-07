@@ -238,6 +238,8 @@ class BaseDevice(ABC):
     def start(self) -> None:
         """Begin streaming. Resets run counters and queue timing origin."""
         with self._state_lock:
+            if self._state == "running":
+                return
             self._assert_state(expected=("open",))
             if self.config is None:
                 raise RuntimeError("configure() must be called before start().")

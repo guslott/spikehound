@@ -82,8 +82,8 @@ class AnalysisTab(QtWidgets.QWidget):
         self._latest_sample_index: Optional[int] = None
         self._window_start_index: Optional[int] = None
         if controller is not None:
-            self._analysis_settings = getattr(controller, "analysis_settings_store", None)
-            self._event_buffer = getattr(controller, "event_buffer", None)
+            self._analysis_settings = controller.analysis_settings_store
+            self._event_buffer = controller.event_buffer
             if self._event_buffer is not None:
                 self._analysis_events = AnalysisEvents(self._event_buffer)
         self._event_window_ms = self._initial_event_window_ms()
@@ -539,12 +539,11 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         """Clean up analysis executor threads on window close."""
-        executor = getattr(self, "_analysis_executor", None)
-        if executor is not None:
+        if self._analysis_executor is not None:
             try:
                 for fut in list(self._analysis_futures):
                     fut.cancel()
-                executor.shutdown(wait=False)
+                self._analysis_executor.shutdown(wait=False)
             except Exception as e:
                 logger.debug("Exception shutting down analysis executor: %s", e)
             self._analysis_executor = None
@@ -713,9 +712,9 @@ class AnalysisTab(QtWidgets.QWidget):
             if isinstance(item, AnalysisBatch):
                 batch = item
             elif isinstance(item, Chunk):
-                meta = getattr(item, "meta", None)
+                meta = item.meta
                 events_from_meta = ()
-                if meta is not None and hasattr(meta, "get"):
+                if meta is not None:
                     events_from_meta = tuple(meta.get("analysis_events") or ())
                 batch = AnalysisBatch(chunk=item, events=events_from_meta)
             else:
@@ -1694,7 +1693,7 @@ class AnalysisTab(QtWidgets.QWidget):
             if status == "added":
                 updated = True
             elif status == "pending":
-                event_id = getattr(event, "id", None)
+                event_id = event.id
                 if not isinstance(event_id, int):
                     continue
                 if attempts >= self._sta_retry_limit:
@@ -2303,7 +2302,7 @@ class AnalysisTab(QtWidgets.QWidget):
         metrics: Optional[dict[str, float]] = None
         metric_values: dict[str, float] = {}
         if samples.size >= 4:
-            props = getattr(event, "properties", {})
+            props = event.properties
             # Strict mode: worker must compute these
             env = float(props.get("envelope", 0.0))
             pf = float(props.get("peak_freq_hz", 0.0))
@@ -2317,9 +2316,9 @@ class AnalysisTab(QtWidgets.QWidget):
                     "width": float(props.get("event_width_ms", 0.0)),
                 }
             )
-        interval_val = float(getattr(event, "intervalSinceLastSec", float("nan")))
+        interval_val = float(event.intervalSinceLastSec)
         if not np.isfinite(interval_val):
-            props = getattr(event, "properties", None)
+            props = event.properties
             if isinstance(props, dict):
                 try:
                     interval_candidate = props.get("interval_sec")
@@ -2331,7 +2330,7 @@ class AnalysisTab(QtWidgets.QWidget):
             metric_values["interval"] = float(interval_val)
         if metric_values:
             metrics = metric_values
-        raw_event_id = getattr(event, "id", None)
+        raw_event_id = event.id
         if isinstance(raw_event_id, int):
             event_id = raw_event_id
         else:

@@ -48,7 +48,22 @@ Follow these steps to add support for a new data acquisition device.
    DRIVER_CLASSES.append(MyDeviceSource)
    ```
 
-6. **Test the driver**
+6. **Update `SpikeHound.spec` for binary builds**
+   
+   PyInstaller cannot auto-discover dynamically loaded modules. Add your driver to the `hiddenimports` list:
+   ```python
+   hiddenimports=[
+       "daq.simulated_source",
+       "daq.backyard_brains",
+       "daq.soundcard_source",
+       "daq.file_source",
+       "daq.my_device_source",  # <-- Add your new driver here
+       ...
+   ],
+   ```
+   > **Note**: Without this step, the driver will work when running from source (`python main.py`) but will be missing from packaged builds (`pyinstaller --clean --noconfirm SpikeHound.spec`).
+
+7. **Test the driver**
    - Run the application and verify device appears in dropdown
    - Connect and verify data streams correctly
    - Check `stats()` for drops/xruns

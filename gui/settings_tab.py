@@ -119,31 +119,32 @@ class SettingsTab(QtWidgets.QWidget):
         grid.setVerticalSpacing(6)
 
         col1_labels = [
-            ("Sample Rate", "sample_rate"),
-            ("Uptime", "uptime"),
-            ("Chunk rate", "chunk_rate"),
-            ("Throughput", "throughput"),
-            ("Plot refresh", "plot_refresh"),
-            ("Xruns", "xruns"),
-            ("Drops", "drops"),
+            ("Sample Rate", "sample_rate", "The rate at which samples are acquired by the hardware. Expected: Should match the requested sampling rate (e.g., 44.1 kHz, 100 kHz)."),
+            ("Uptime", "uptime", "Time since the tool started running. Expected: Continuously increasing during operation."),
+            ("Chunk rate", "chunk_rate", "Frequency of data chunks being delivered by the source. Expected: Usually stable (e.g., ~10-100 Hz) depending on hardware settings."),
+            ("Throughput", "throughput", "Number of samples processed per second. Expected: Should match the Sample Rate if the system is keeping up."),
+            ("Plot refresh", "plot_refresh", "Frequency of UI plot updates. Expected: Usually stabilizes at ~30-60 Hz for smooth visualization."),
+            ("Xruns", "xruns", "Hardware under-runs or over-runs reported by the driver. Expected: Should be 0. Any value > 0 indicates potential data loss or timing glitches."),
+            ("Drops", "drops", "Total samples dropped by the source before reaching the dispatcher. Expected: Should be 0. Values > 0 indicate the system cannot pull data fast enough."),
         ]
         
         col2_labels = [
-            ("Source queue", "source_queue"),
-            ("Viz queue", "viz_queue"),
-            ("Audio queue", "audio_queue"),
-            ("Logging queue", "logging_queue"),
-            ("Analysis queue", "analysis_queue"),
-            ("Viz buffer", "viz_buffer"),
-            ("Buffer headroom", "buffer_headroom"),
+            ("Source queue", "source_queue", "Queue between the DAQ source and the dispatcher. Expected: Low utilization (< 50%). High utilization suggests a processing bottleneck."),
+            ("Viz queue", "viz_queue", "Data queued for visualization. Expected: Low occupancy. High values indicate UI thread lag."),
+            ("Audio queue", "audio_queue", "Data queued for audio playback. Expected: Low occupancy. High values indicate audio driver lag."),
+            ("Logging queue", "logging_queue", "Data queued for disk logging. Expected: Low occupancy. High values indicate slow disk I/O."),
+            ("Analysis queue", "analysis_queue", "Data queued for real-time analysis (spikes, filters). Expected: Balanced occupancy. Large backlogs indicate analysis code is too slow."),
+            ("Viz buffer", "viz_buffer", "Size of the rolling buffer used for plotting. Expected: Stable size based on the \"Scope Time\" setting."),
+            ("Buffer headroom", "buffer_headroom", "Safety margin in the hardware/driver buffer before it wraps. Expected: > 5s (Green). Low values (< 5s, Red) indicate imminent wrap-around."),
         ]
 
         self._metric_fields: Dict[str, QtWidgets.QLabel] = {}
         
         # Populate Column 1 (0, 1)
-        for row, (title, key) in enumerate(col1_labels):
+        for row, (title, key, tooltip) in enumerate(col1_labels):
             name_label = QtWidgets.QLabel(title + ":")
             name_label.setStyleSheet("font-weight: bold;")
+            name_label.setToolTip(tooltip)
             grid.addWidget(name_label, row, 0, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
             value = QtWidgets.QLabel("–")
             value.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
@@ -151,9 +152,10 @@ class SettingsTab(QtWidgets.QWidget):
             self._metric_fields[key] = value
 
         # Populate Column 2 (2, 3)
-        for row, (title, key) in enumerate(col2_labels):
+        for row, (title, key, tooltip) in enumerate(col2_labels):
             name_label = QtWidgets.QLabel(title + ":")
             name_label.setStyleSheet("font-weight: bold;")
+            name_label.setToolTip(tooltip)
             grid.addWidget(name_label, row, 2, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
             value = QtWidgets.QLabel("–")
             value.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
@@ -164,6 +166,7 @@ class SettingsTab(QtWidgets.QWidget):
         row = max(len(col1_labels), len(col2_labels))
         name_label = QtWidgets.QLabel("Dispatcher:")
         name_label.setStyleSheet("font-weight: bold;")
+        name_label.setToolTip("Internal statistics of the message dispatcher. Expected: Received and Processed counts should be close; drops should be zero.")
         grid.addWidget(name_label, row, 0, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         
         disp_val = QtWidgets.QLabel("–")
@@ -231,14 +234,13 @@ class SettingsTab(QtWidgets.QWidget):
         self._update_launch_checkbox_label()
 
         # Update recording checkboxes
-        if hasattr(self, "rec_float32_check"):
-            self.rec_float32_check.blockSignals(True)
-            self.rec_float32_check.setChecked(bool(settings.recording_use_float32))
-            self.rec_float32_check.blockSignals(False)
+        self.rec_float32_check.blockSignals(True)
+        self.rec_float32_check.setChecked(bool(settings.recording_use_float32))
+        self.rec_float32_check.blockSignals(False)
 
-            self.rec_autoinc_check.blockSignals(True)
-            self.rec_autoinc_check.setChecked(bool(settings.recording_auto_increment))
-            self.rec_autoinc_check.blockSignals(False)
+        self.rec_autoinc_check.blockSignals(True)
+        self.rec_autoinc_check.setChecked(bool(settings.recording_auto_increment))
+        self.rec_autoinc_check.blockSignals(False)
 
     def _update_launch_checkbox_label(self) -> None:
         """Update the launch config checkbox label to show path if set."""
@@ -315,7 +317,7 @@ class SettingsTab(QtWidgets.QWidget):
 
     def _on_rescan_clicked(self) -> None:
         """Trigger a device scan via the controller."""
-        if self._controller and hasattr(self._controller, "scan_devices"):
+        if self._controller:
             self._controller.scan_devices()
 
     # ------------------------------------------------------------------
@@ -348,20 +350,14 @@ class SettingsTab(QtWidgets.QWidget):
             return
         key = self.listen_combo.itemData(index)
         value = str(key) if key is not None else None
-        if self._controller is not None and hasattr(self._controller, "set_listen_output_device"):
+        if self._controller is not None:
             try:
                 self._controller.set_listen_output_device(value)
                 return
             except Exception as exc:
                 logger.debug("Failed to set listen output device via controller: %s", exc)
-        if hasattr(self._main_window, "set_listen_output_device"):
-            self._main_window.set_listen_output_device(value)
-            return
-        if self._controller is None:
-            return
-        store = self._controller.app_settings_store
-        if store is not None:
-            store.update(listen_output_key=value)
+        
+        self._main_window.set_listen_output_device(value)
 
     def set_listen_device(self, device_key: Optional[str]) -> None:
         if self.listen_combo.count() == 0:
@@ -383,12 +379,11 @@ class SettingsTab(QtWidgets.QWidget):
         if controller is None:
             return
         snapshot = {}
-        if hasattr(self._main_window, "health_snapshot"):
-            try:
-                snapshot = self._main_window.health_snapshot()
-            except Exception as exc:
-                logger.debug("Failed to get health snapshot: %s", exc)
-                snapshot = {}
+        try:
+            snapshot = self._main_window.health_snapshot()
+        except Exception as exc:
+            logger.debug("Failed to get health snapshot: %s", exc)
+            snapshot = {}
         
         # Sample rate
         sample_rate = snapshot.get("sample_rate", 0.0)
@@ -415,9 +410,9 @@ class SettingsTab(QtWidgets.QWidget):
         stats = snapshot.get("dispatcher", {})
         processed_frames = stats.get("processed_frames", 0) if isinstance(stats, dict) else 0
         now = time.perf_counter()
-        dt = now - getattr(self, "_last_time", now)
+        dt = now - self._last_time
         if dt > 0.0:
-            df = processed_frames - getattr(self, "_last_frames", 0)
+            df = processed_frames - self._last_frames
             if df < 0:
                 df = 0
             rate = df / dt

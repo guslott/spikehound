@@ -68,7 +68,7 @@ def peak_frequency_sinc(
         else int(np.argmax(np.abs(data)))
     )
 
-    span = max(64, int(round(sr * 0.008)))  # ~8 ms window
+    span = max(100, int(round(sr * 0.020)))  # ~20 ms window
     half = span // 2
     start = max(0, center - half)
     end = min(data.size, start + span)
@@ -98,7 +98,7 @@ def peak_frequency_sinc(
     if freqs.size != mags.size or mags.size <= 1:
         return 0.0
 
-    max_freq = min(sr / 6.0, 1000.0)
+    max_freq = min(sr / 2.5, 4000.0)
     valid = (freqs >= max(min_hz, 1.0)) & (freqs <= max_freq)
     if not np.any(valid):
         return 0.0
@@ -147,8 +147,8 @@ def autocorr_frequency(segment: np.ndarray, sr: float, min_hz: float, max_hz: fl
     corr = corr[corr.size // 2 :]
     if corr.size <= 1:
         return 0.0
-    counts = np.arange(corr.size, 0, -1, dtype=np.float64)
-    corr = corr / counts
+    # Use biased autocorrelation to favor earlier peaks (higher frequencies)
+    # over later, noisier peaks. This prevents picking up sub-harmonics.
     corr[0] = 0.0
     max_period = min(int(sr / max(min_hz, 1e-6)), corr.size - 1)
     min_period = max(1, int(sr / max(max_hz, 1e-6)))
@@ -158,7 +158,7 @@ def autocorr_frequency(segment: np.ndarray, sr: float, min_hz: float, max_hz: fl
     lags = np.arange(min_period, max_period + 1, dtype=np.float64)
     if segment_corr.size != lags.size or not np.any(np.isfinite(segment_corr)):
         return 0.0
-    scores = segment_corr * np.sqrt(np.maximum(1.0, lags))
+    scores = segment_corr
     best_idx = int(np.argmax(scores))
     if best_idx <= 0 or best_idx >= segment_corr.size - 1:
         return 0.0

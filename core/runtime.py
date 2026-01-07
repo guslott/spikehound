@@ -10,7 +10,7 @@ from daq.base_device import BaseDevice
 
 from .conditioning import FilterSettings, SignalConditioner
 from .device_registry import DeviceRegistry
-from shared.app_settings import AppSettingsStore
+from shared.app_settings import AppSettings, AppSettingsStore
 from shared.models import TriggerConfig
 from shared.types import AnalysisEvent
 
@@ -44,7 +44,6 @@ class SpikeHoundRuntime:
     ) -> None:
         self.app_settings_store = app_settings_store
         self.logger = logger or logging.getLogger(__name__)
-        self.daq_source: Optional[BaseDevice] = None
         self.conditioner = SignalConditioner()
         self._queues: dict[str, queue.Queue] = {}
         self._threads: dict[str, threading.Thread] = {}
@@ -63,12 +62,17 @@ class SpikeHoundRuntime:
         self.sample_rate: float = 0.0
         self._acquisition_start_time: Optional[float] = None  # For uptime tracking
         
+        if pipeline is None:
+            from .controller import PipelineController
+            pipeline = PipelineController()
+        
+        self.set_pipeline(pipeline)
+        
         # Initialize AudioManager and wire it to pipeline
         from .audio_manager import AudioManager
         audio_manager = AudioManager(runtime=self)
-        if pipeline is not None:
-            pipeline._audio_manager = audio_manager
-            audio_manager.start()  # Start audio routing thread
+        pipeline._audio_manager = audio_manager
+        audio_manager.start()  # Start audio routing thread
 
     def set_pipeline(self, controller: Optional["PipelineController"]) -> None:
         """Update the underlying pipeline controller used for delegation."""
@@ -84,11 +88,26 @@ class SpikeHoundRuntime:
         """Get the underlying pipeline controller."""
         return self._pipeline
 
+    @property
+    def daq_source(self) -> Optional[BaseDevice]:
+        """Get the current DAQ source device."""
+        return self._pipeline.source if self._pipeline is not None else None
 
+    @property
+    def app_settings(self) -> AppSettings:
+        """Get the current application settings snapshot."""
+        if self.app_settings_store is not None:
+            return self.app_settings_store.get()
+        return AppSettings()  # Return defaults if no store is set
 
     def open_device(self, driver: BaseDevice, sample_rate: float, channels: Sequence[object]) -> None:
         """Open and prepare the requested DAQ backend/device."""
         self.attach_source(driver, sample_rate, channels)
+
+    def scan_devices(self) -> None:
+        """Scan for available DAQ devices."""
+        if self.device_manager is not None:
+            self.device_manager.refresh_devices()
 
     def connect_device(self, device_key: str, sample_rate: float, chunk_size: int = 1024) -> None:
         """Connect a device via the DeviceManager and wire it into the pipeline."""
@@ -154,6 +173,16 @@ class SpikeHoundRuntime:
                 except Exception as exc:
                     self.logger.warning("Failed to clear active channels: %s", exc)
 
+    def update_filter_settings(self, settings: FilterSettings) -> None:
+        """Update filter settings for the pipeline."""
+        if self._pipeline is not None:
+            self._pipeline.update_filter_settings(settings)
+
+    def update_trigger_config(self, config: TriggerConfig) -> None:
+        """Update trigger configuration for the pipeline."""
+        if self._pipeline is not None:
+            self._pipeline.update_trigger_config(config)
+
     def start_acquisition(self) -> None:
         """Start streaming data from the DAQ source into the pipeline.
         
@@ -170,6 +199,45 @@ class SpikeHoundRuntime:
         except Exception as exc:
             self.logger.warning("Failed to start acquisition: %s", exc)
             return
+
+    def start(self) -> None:
+        """Alias for start_acquisition."""
+        self.start_acquisition()
+
+    def stop(self) -> None:
+        """Alias for stop_acquisition."""
+        self.stop_acquisition()
+
+    def shutdown(self) -> None:
+        """Shutdown the pipeline and release resources."""
+        if self._pipeline is not None:
+            self._pipeline.shutdown()
+        self._acquisition_start_time = None
+
+    def release(self) -> None:
+        """Alias for shutdown."""
+        self.shutdown()
+
+    def switch_backend(self, source_cls: Type[BaseDevice], **kwargs) -> None:
+        """Swap in a new DAQ backend/source."""
+        if self._pipeline is not None:
+            # Ensure sample_rate is provided if not in kwargs
+            if "configure_kwargs" not in kwargs:
+                kwargs["configure_kwargs"] = {}
+            if "sample_rate" not in kwargs["configure_kwargs"]:
+                kwargs["configure_kwargs"]["sample_rate"] = int(self.sample_rate or 20000)
+            
+            self._pipeline.switch_source(source_cls, **kwargs)
+            # Re-sync attributes
+            self.set_pipeline(self._pipeline)
+
+    def select_device(self, device_id: str) -> None:
+        """Select a specific device for the current backend."""
+        if self._pipeline is not None and self._pipeline.source is not None:
+            source_cls = type(self._pipeline.source)
+            self._pipeline.switch_source(source_cls, device_id=device_id)
+            # Re-sync attributes
+            self.set_pipeline(self._pipeline)
 
     def stop_acquisition(self) -> None:
         """Stop streaming and wait for pipeline threads to exit.
@@ -199,7 +267,6 @@ class SpikeHoundRuntime:
         controller = self._pipeline
         if controller is None or driver is None:
             return
-        self.daq_source = driver
         try:
             controller.attach_source(driver, float(sample_rate), channels)
         except Exception as exc:
@@ -369,6 +436,15 @@ class SpikeHoundRuntime:
             except Exception:
                 return None, None
         return getattr(worker, "output_queue", None), worker
+
+    def close_analysis_stream(self, worker: "AnalysisWorker") -> None:
+        """Stop and remove an analysis worker."""
+        if worker is not None:
+            worker.stop()
+            # Remove from cache
+            key = (worker.channel_name, float(worker.sample_rate))
+            if self._analysis_workers.get(key) is worker:
+                del self._analysis_workers[key]
 
     def collect_trigger_window(
         self,

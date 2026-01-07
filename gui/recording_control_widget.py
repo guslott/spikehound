@@ -75,24 +75,6 @@ class RecordingControlWidget(QtWidgets.QGroupBox):
         self.path_edit.setEnabled(enabled)
         self.browse_btn.setEnabled(enabled)
 
-    # -------------------------------------------------------------------------
-    # Properties for backward compatibility
-    # -------------------------------------------------------------------------
-
-    @property
-    def record_path_edit(self) -> QtWidgets.QLineEdit:
-        """Backward compatible property for path_edit."""
-        return self.path_edit
-
-    @property
-    def record_browse_btn(self) -> QtWidgets.QPushButton:
-        """Backward compatible property for browse_btn."""
-        return self.browse_btn
-
-    @property
-    def record_toggle_btn(self) -> QtWidgets.QPushButton:
-        """Backward compatible property for toggle_btn."""
-        return self.toggle_btn
 
     # -------------------------------------------------------------------------
     # Event handlers
@@ -121,8 +103,8 @@ class RecordingControlWidget(QtWidgets.QGroupBox):
                 return
             
             rollover = True
-            if self._controller and hasattr(self._controller, "app_settings"):
-                rollover = bool(self._controller.app_settings.recording_auto_increment)
+            if self._controller:
+                rollover = self._controller.app_settings.recording_auto_increment
             
             # Auto-increment filename if enabled
             if rollover:

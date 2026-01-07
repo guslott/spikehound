@@ -35,24 +35,24 @@ class ChannelFilterSettings:
         )
 
     def validate(self, sample_rate: float) -> None:
+        if sample_rate <= 0 or not np.isfinite(sample_rate):
+            raise ValueError("sample_rate must be positive and finite")
         nyquist = sample_rate / 2.0
-        if sample_rate <= 0:
-            raise ValueError("sample_rate must be positive")
-        if self.ac_couple and not (0 < self.ac_cutoff_hz < nyquist):
-            raise ValueError("ac_cutoff_hz must be between 0 and Nyquist")
+        if self.ac_couple and not (0 < self.ac_cutoff_hz < nyquist and np.isfinite(self.ac_cutoff_hz)):
+            raise ValueError("ac_cutoff_hz must be between 0 and Nyquist (finite)")
         if self.notch_enabled:
-            if not (0 < self.notch_freq_hz < nyquist):
-                raise ValueError("notch_freq_hz must be between 0 and Nyquist")
-            if self.notch_q <= 0:
-                raise ValueError("notch_q must be positive")
+            if not (0 < self.notch_freq_hz < nyquist and np.isfinite(self.notch_freq_hz)):
+                raise ValueError("notch_freq_hz must be between 0 and Nyquist (finite)")
+            if self.notch_q <= 0 or not np.isfinite(self.notch_q):
+                raise ValueError("notch_q must be positive and finite")
         if self.lowpass_hz is not None:
-            if not (0 < self.lowpass_hz < nyquist):
-                raise ValueError("lowpass_hz must be between 0 and Nyquist")
+            if not (0 < self.lowpass_hz < nyquist and np.isfinite(self.lowpass_hz)):
+                raise ValueError("lowpass_hz must be between 0 and Nyquist (finite)")
             if self.lowpass_order <= 0:
                 raise ValueError("lowpass_order must be positive")
         if self.highpass_hz is not None:
-            if not (0 < self.highpass_hz < nyquist):
-                raise ValueError("highpass_hz must be between 0 and Nyquist")
+            if not (0 < self.highpass_hz < nyquist and np.isfinite(self.highpass_hz)):
+                raise ValueError("highpass_hz must be between 0 and Nyquist (finite)")
             if self.highpass_order <= 0:
                 raise ValueError("highpass_order must be positive")
 

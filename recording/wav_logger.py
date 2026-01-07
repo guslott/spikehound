@@ -170,10 +170,13 @@ class WavLoggerThread:
         )
 
     def _run(self) -> None:
-        while not self._stop_event.is_set():
+        while True:
             try:
+                # Small timeout to allow periodic check of stop_event
                 item = self._queue.get(timeout=0.05)
             except queue.Empty:
+                if self._stop_event.is_set():
+                    break
                 continue
 
             try:
@@ -186,6 +189,8 @@ class WavLoggerThread:
                     continue
 
                 self._write_chunk(item)
+            except Exception:
+                logger.error("Error in WavLoggerThread loop", exc_info=True)
             finally:
                 self._queue.task_done()
 

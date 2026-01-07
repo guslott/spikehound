@@ -173,11 +173,6 @@ QPushButton:checked {
         # Spectrogram button is not connected yet as per requirements
 
     def set_config(self, config: ChannelConfig) -> None:
-        # Backwards compatibility
-        span = getattr(config, "vertical_span_v", getattr(config, "range_v", 1.0))
-        offset = getattr(config, "screen_offset", getattr(config, "offset_v", 0.5))
-        config.vertical_span_v = span
-        config.screen_offset = offset
         self._config = replace(config)
         self._block_updates = True
         self._apply_color(config.color)
