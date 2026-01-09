@@ -2,7 +2,7 @@
 
 **Real-Time Neurophysiology Software for Education and Research**
 
-SpikeHound 2.0 is a free, open-source desktop application for real-time bioelectric data acquisition, visualization, and analysis. Built for educators, students, and researchers from high school biology classes to graduate neuroscience programs.
+SpikeHound 2.0 is a free, open-source desktop application for real-time bioelectric data acquisition, visualization, and analysis. Designed to bridge the gap between education and research, it scales from high school biology demonstrations to graduate-level neurophysiology data collection.
 
 ---
 
@@ -10,10 +10,11 @@ SpikeHound 2.0 is a free, open-source desktop application for real-time bioelect
 
 | Audience | Use Case |
 |----------|----------|
-| **High School Biology** | Demonstrate action potentials with accessible bioamplifiers |
-| **Undergraduate Labs** | Replace expensive LabVIEW/MATLAB setups in neurophysiology courses |
-| **Graduate Research** | Rapid prototyping for behavioral/neural recordings |
-| **Citizen Scientists** | Explore electrophysiology with low-cost hardware |
+| **High School Biology** | Demonstrate action potentials with simplified, "plug-and-play" hardware |
+| **Undergraduate Labs** | Replace expensive proprietary systems in neurophysiology courses |
+| **Graduate Research** | Thesis-level data collection with precise timing and raw data export |
+| **Research Labs** | Rapid prototyping of new experimental paradigms and custom hardware drivers |
+| **Citizen Scientists** | Explore electrophysiology with low-cost open hardware |
 
 ### Educational Applications
 - **BioNB 491** (Cornell): Principles of Neurophysiology lab exercises
@@ -33,7 +34,8 @@ SpikeHound **democratizes neurophysiology** by removing financial and technical 
 | MATLAB licenses ($$$) | No licenses required—100% free |
 | Windows-only software | Runs on Windows, macOS, and Linux |
 | Complex setup | Single Python script, simple installation |
-| Proprietary formats | Open data formats (WAV, CSV) |
+| Proprietary formats | Standard open formats (WAV, CSV, NumPy) |
+| Black-box software | Fully inspection-ready Python codebase |
 
 ---
 
@@ -51,15 +53,21 @@ SpikeHound **democratizes neurophysiology** by removing financial and technical 
 - **Spike-triggered averaging**: Correlate events across channels
 - **Event capture**: Extract waveforms around detected spikes
 
+### Research-Grade Performance
+- **Lossless Acquisition**: Ring-buffer architecture allows separation of visualization and recording, ensuring no data is lost even if the UI lags.
+- **Precise Timing**: Uses host monotonic clock for reliable timestamping relative to hardware events.
+- **Raw Data Integrity**: Direct float32 streaming from hardware to disk (WAV/CSV) without hidden processing.
+- **Universal Hardware Abstraction**: Treat a \$5 sound card and a \$5000 DAQ the same way.
+
 ### Hardware Support
 | Device | Status | Notes |
 |--------|--------|-------|
-| **Sound Card** | ✅ Supported | Any USB/built-in audio input |
-| **Neuron SpikerBox** | ✅ Supported | Supports Muscle/Neuron/Pro models |
-| **Simulation** | ✅ Supported | Neural simulator for testing |
-| **WAV Files** | ✅ Supported | Replay recorded data |
-| **NI-DAQmx** | 🔄 Planned | National Instruments boards |
-| **LabJack** | 🔄 Planned | T-series DAQ devices |
+| **Sound Card** | ✅ Supported | Any USB/built-in audio input (up to 96kHz+) |
+| **Neuron SpikerBox** | ✅ Supported | Supports Muscle/Neuron/Pro models (Backyard Brains) |
+| **Simulation** | ✅ Supported | Neural simulator for testing analysis pipelines |
+| **WAV Files** | ✅ Supported | Replay recorded data for offline analysis |
+| **NI-DAQmx** | 🔄 Planned | National Instruments boards (via generic Python drivers) |
+| **LabJack** | 🔄 Planned | T-series DAQ devices (via generic Python drivers) |
 
 ---
 
