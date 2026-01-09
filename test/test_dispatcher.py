@@ -241,7 +241,9 @@ def test_dispatcher_fan_out_and_backpressure_tracking():
     dispatcher.set_source_buffer(source_buffer, sample_rate=fs)
     
     # Register analysis queue
-    analysis_queue = queue.Queue(maxsize=1)
+    # Use maxsize=2 so we can retain at least one chunk + EndOfStream
+    # (If maxsize=1, the final EOS will evict the last data chunk)
+    analysis_queue = queue.Queue(maxsize=2)
     token = dispatcher.register_analysis_queue(analysis_queue)
     
     dispatcher.start()
@@ -278,7 +280,106 @@ def test_dispatcher_fan_out_and_backpressure_tracking():
     # Verify data was received by analysis (at least 1 chunk - queue may evict with maxsize=1)
     analysis_received = _drain_chunks(analysis_queue)
     assert len(analysis_received) >= 1, "Should receive at least the last chunk"
+    assert isinstance(analysis_received[0], Chunk), "Analysis queue should receive Chunk objects, not Pointers"
     
     # Note: logging queue is disabled in current dispatcher
     
     dispatcher.unregister_analysis_queue(token)
+
+
+def test_dispatcher_eos_force_delivery_to_analysis():
+    """Test that EndOfStream is delivered to analysis queue even if full, by evicting old items."""
+    settings = FilterSettings()
+    raw_queue = queue.Queue()
+    # Dummy queues
+    visualization_queue = queue.Queue()
+    audio_queue = queue.Queue()
+    logging_queue = queue.Queue()
+    event_queue = queue.Queue()
+
+    dispatcher = Dispatcher(
+        raw_queue,
+        visualization_queue,
+        audio_queue,
+        logging_queue,
+        event_queue,
+        filter_settings=settings,
+    )
+    
+    # Create an analysis queue with very limited capacity
+    analysis_queue = queue.Queue(maxsize=1)
+    dispatcher.register_analysis_queue(analysis_queue)
+    
+    # Fill the queue manually
+    analysis_queue.put(Chunk(
+        samples=np.zeros((1, 10), dtype=np.float32),
+        start_time=0.0,
+        dt=0.01,
+        seq=0,
+        channel_names=("ch0",),
+        units="V",
+        meta={}
+    ))
+    assert analysis_queue.full()
+    
+    # Call internal _broadcast_end_of_stream directly to verify logic without thread timing noise
+    # (Though dispatcher.stop() calls this too)
+    dispatcher._broadcast_end_of_stream()
+    
+    # Verify behavior:
+    # 1. The old item should have been evicted (or at least EOS should be there)
+    # Since maxsize=1, the queue presumably now contains ONLY EndOfStream if it evicted 1 and put 1.
+    # If it evicted multiple times or logic differs, we just ensure we can get EndOfStream.
+    
+    item = analysis_queue.get_nowait()
+    assert item is EndOfStream
+    
+    # Verify stats
+    stats = dispatcher.snapshot()
+    # Should have at least 1 eviction in 'analysis'
+    assert stats["evicted"].get("analysis", 0) >= 1
+
+
+def test_dispatcher_eos_delivery_on_unregister_full_queue():
+    """Test that EndOfStream is delivered when unregistering a full analysis queue."""
+    settings = FilterSettings()
+    raw_queue = queue.Queue()
+    visualization_queue = queue.Queue()
+    audio_queue = queue.Queue()
+    logging_queue = queue.Queue()
+    event_queue = queue.Queue()
+
+    dispatcher = Dispatcher(
+        raw_queue,
+        visualization_queue,
+        audio_queue,
+        logging_queue,
+        event_queue,
+        filter_settings=settings,
+    )
+    
+    # Create analysis queue with maxsize=1
+    analysis_queue = queue.Queue(maxsize=1)
+    token = dispatcher.register_analysis_queue(analysis_queue)
+    
+    # Fill it
+    analysis_queue.put(Chunk(
+        samples=np.zeros((1, 10), dtype=np.float32),
+        start_time=0.0,
+        dt=0.01,
+        seq=0,
+        channel_names=("ch0",),
+        units="V",
+        meta={}
+    ))
+    assert analysis_queue.full()
+    
+    # Unregister - should force EOS
+    dispatcher.unregister_analysis_queue(token)
+    
+    # Verify EOS is prioritized (evicting data)
+    item = analysis_queue.get_nowait()
+    assert item is EndOfStream
+    
+    stats = dispatcher.snapshot()
+    assert stats["evicted"].get("analysis", 0) >= 1

@@ -5,7 +5,7 @@ Designed “scope-first”: a GUI can treat every hardware backend the same—co
 
 * Minimal, boring contract
 * Clean lifecycle: `open → configure → start/stop → close`
-* Bounded queue with **drop-oldest** backpressure
+* **Lossless** backpressure (blocking)
 * Uniform **float32 (frames, channels)** data
 * Dual time bases: host `mono_time` and optional hardware `device_time`
 * A base class that centralizes the tricky bits so drivers stay tiny

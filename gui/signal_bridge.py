@@ -26,8 +26,7 @@ class SignalBridge:
         mw = self.mw
         
         # Plot Manager
-        if hasattr(mw, "_plot_manager"):
-            mw._plot_manager.sampleRateChanged.connect(mw._maybe_update_analysis_sample_rate)
+        mw._plot_manager.sampleRateChanged.connect(mw._maybe_update_analysis_sample_rate)
 
         # Recording Widget
         mw.record_group.recordingStarted.connect(mw._on_recording_started)

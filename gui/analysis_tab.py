@@ -429,7 +429,7 @@ class AnalysisTab(QtWidgets.QWidget):
         # Controls panel has fixed content height - prevent vertical expansion
         controls.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Maximum)
         layout.addWidget(controls, stretch=0)
-        self._refresh_cluster_options()
+
 
         self.metrics_container = QtWidgets.QWidget(self)
         # Set expanding policy to fill remaining vertical space
@@ -487,6 +487,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._unclassified_item.setData(QtCore.Qt.UserRole, self._UNCLASSIFIED_ID)
         self.class_list.insertItem(0, self._unclassified_item)
         self.class_list.setCurrentItem(self._unclassified_item)
+        self._refresh_cluster_options()
 
         layout.addWidget(self.metrics_container, stretch=6)
 
@@ -1293,11 +1294,9 @@ class AnalysisTab(QtWidgets.QWidget):
             item = self._cluster_items.get(cluster.id)
             if item is not None:
                 item.setText(f"{cluster.name} (0 events)")
-        if hasattr(self, "energy_scatter"):
-            self.energy_scatter.clear()
-            self.energy_scatter.hide()
-        if hasattr(self, "metrics_plot"):
-            self.metrics_plot.getPlotItem().enableAutoRange(y=True)
+        self.energy_scatter.clear()
+        self.energy_scatter.hide()
+        self.metrics_plot.getPlotItem().enableAutoRange(y=True)
         self._update_metric_points()
         self.metrics_clear_btn.setText("Clear metrics (0)")
 
@@ -1499,8 +1498,7 @@ class AnalysisTab(QtWidgets.QWidget):
             and self._sta_time_axis is not None
             and self._sta_time_axis.size > 0
         )
-        if hasattr(self, "sta_view_waveforms_btn"):
-            self.sta_view_waveforms_btn.setEnabled(bool(has_data))
+        self.sta_view_waveforms_btn.setEnabled(bool(has_data))
 
     def _set_cluster_panel_visible(self, visible: bool) -> None:
         """Show/hide the cluster management panel with layout adjustments."""
@@ -1516,40 +1514,38 @@ class AnalysisTab(QtWidgets.QWidget):
     def _refresh_cluster_options(self) -> None:
         """Populate the STA event source and export class combos."""
         # Update STA source combo
-        if hasattr(self, "sta_source_combo"):
-            previous_selection = self._sta_source_cluster_id
-            was_blocked = self.sta_source_combo.blockSignals(True)
-            self.sta_source_combo.clear()
-            self.sta_source_combo.addItem("All events", None)
-            for cluster in self._clusters:
-                self.sta_source_combo.addItem(cluster.name, cluster.id)
-            target_index = self.sta_source_combo.findData(previous_selection)
-            if target_index >= 0:
-                self.sta_source_combo.setCurrentIndex(target_index)
-            else:
-                self.sta_source_combo.setCurrentIndex(0)
-            current_data = self.sta_source_combo.currentData()
-            self._sta_source_cluster_id = current_data if isinstance(current_data, int) else None
-            self.sta_source_combo.blockSignals(was_blocked)
+        previous_selection = self._sta_source_cluster_id
+        was_blocked = self.sta_source_combo.blockSignals(True)
+        self.sta_source_combo.clear()
+        self.sta_source_combo.addItem("All events", None)
+        for cluster in self._clusters:
+            self.sta_source_combo.addItem(cluster.name, cluster.id)
+        target_index = self.sta_source_combo.findData(previous_selection)
+        if target_index >= 0:
+            self.sta_source_combo.setCurrentIndex(target_index)
+        else:
+            self.sta_source_combo.setCurrentIndex(0)
+        current_data = self.sta_source_combo.currentData()
+        self._sta_source_cluster_id = current_data if isinstance(current_data, int) else None
+        self.sta_source_combo.blockSignals(was_blocked)
 
         # Update Export class combo
-        if hasattr(self, "export_class_combo"):
-            previous_export = self.export_class_combo.currentData()
-            was_blocked = self.export_class_combo.blockSignals(True)
-            self.export_class_combo.clear()
-            self.export_class_combo.addItem("All events", None)
-            for cluster in self._clusters:
-                self.export_class_combo.addItem(cluster.name, cluster.id)
-            target_index = self.export_class_combo.findData(previous_export)
-            if target_index >= 0:
-                self.export_class_combo.setCurrentIndex(target_index)
-            else:
-                self.export_class_combo.setCurrentIndex(0)
-            self.export_class_combo.blockSignals(was_blocked)
+        previous_export = self.export_class_combo.currentData()
+        was_blocked = self.export_class_combo.blockSignals(True)
+        self.export_class_combo.clear()
+        self.export_class_combo.addItem("All events", None)
+        for cluster in self._clusters:
+            self.export_class_combo.addItem(cluster.name, cluster.id)
+        target_index = self.export_class_combo.findData(previous_export)
+        if target_index >= 0:
+            self.export_class_combo.setCurrentIndex(target_index)
+        else:
+            self.export_class_combo.setCurrentIndex(0)
+        self.export_class_combo.blockSignals(was_blocked)
 
     def _refresh_sta_channel_options(self, channels: Sequence["ChannelInfo"]) -> None:
         """Populate the STA signal channel combo from the active channels."""
-        combo = getattr(self, "sta_channel_combo", None)
+        combo = self.sta_channel_combo
         if combo is None:
             return
         previous = self._sta_target_channel_id

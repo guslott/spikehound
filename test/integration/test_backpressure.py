@@ -213,9 +213,14 @@ class TestDropTracking:
         evicted = stats.get("evicted", {})
         forwarded = stats.get("forwarded", {})
 
-        # evicted + forwarded should account for all chunks per queue
-        # (might not be exactly equal due to timing, but should be close)
-        viz_total = evicted.get("visualization", 0) + forwarded.get("visualization", 0)
+        dropped = stats.get("dropped", {})
+
+        # evicted + dropped + forwarded should account for all chunks per queue
+        viz_total = (
+            evicted.get("visualization", 0) 
+            + dropped.get("visualization", 0)
+            + forwarded.get("visualization", 0)
+        )
         assert viz_total >= n_chunks - 1, f"Viz accounting mismatch: {viz_total} vs {n_chunks}"
 
 

@@ -248,10 +248,9 @@ class Dispatcher:
             
             # CRITICAL: Reset filters if channel count changed
             # Filters need to be re-initialized for the new channel configuration
-            if channel_count_changed and hasattr(self, '_conditioner'):
-                current_settings = self._conditioner.get_settings() if hasattr(self._conditioner, 'get_settings') else getattr(self, '_last_filter_settings', None)
-                if current_settings is not None:
-                    self._conditioner.update_settings(current_settings)
+            if channel_count_changed:
+                current_settings = self._conditioner.settings
+                self._conditioner.update_settings(current_settings)
 
             # Reset detectors if channel count changed
             if channel_count_changed and self._sample_rate:
@@ -281,10 +280,7 @@ class Dispatcher:
         with self._analysis_lock:
             queue_obj = self._analysis_queues.pop(token, None)
         if queue_obj is not None:
-            try:
-                queue_obj.put_nowait(EndOfStream)
-            except queue.Full:
-                pass
+            self._force_put(queue_obj, EndOfStream, "analysis")
 
     # Trigger configuration stubs -------------------------------------
 
@@ -548,31 +544,33 @@ class Dispatcher:
                 with self._stats_lock:
                     self._stats.forwarded[queue_name] += 1
 
+    def _force_put(self, target_queue: queue.Queue, item: object, stat_key: str) -> None:
+        """Force enqueue an item, evicting oldest items if necessary until it fits."""
+        placed = False
+        while not placed:
+            try:
+                target_queue.put_nowait(item)
+                placed = True
+            except queue.Full:
+                try:
+                    _ = target_queue.get_nowait()
+                    with self._stats_lock:
+                        self._stats.evicted[stat_key] += 1
+                except queue.Empty:
+                    pass
+
     def _broadcast_end_of_stream(self) -> None:
         # Deliver sentinel to all downstream queues, draining oldest entries if needed
         targets = {"logging": self._logging_queue, **self._output_queues}
         for name, target in targets.items():
             if target is None:
                 continue
-            placed = False
-            while not placed:
-                try:
-                    target.put_nowait(EndOfStream)
-                    placed = True
-                except queue.Full:
-                    try:
-                        _ = target.get_nowait()
-                        with self._stats_lock:
-                            self._stats.evicted[name] += 1
-                    except queue.Empty:
-                        pass
+            self._force_put(target, EndOfStream, name)
+            
         with self._analysis_lock:
             queues = list(self._analysis_queues.values())
         for q in queues:
-            try:
-                q.put_nowait(EndOfStream)
-            except queue.Full:
-                pass
+            self._force_put(q, EndOfStream, "analysis")
 
     def _start_tick_thread(self) -> None:
         if self._tick_thread is not None and self._tick_thread.is_alive():

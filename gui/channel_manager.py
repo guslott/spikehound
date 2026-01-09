@@ -206,7 +206,7 @@ class ChannelManager(QtCore.QObject):
         idx = self._channel_controls.active_combo.currentIndex()
         if idx >= 0:
             info = self._channel_controls.active_combo.itemData(idx)
-            cid = getattr(info, "id", None)
+            cid = info.id if info is not None else None
             self._show_channel_panel(cid)
         else:
             first_id = channel_ids[0] if channel_ids else None
@@ -262,7 +262,7 @@ class ChannelManager(QtCore.QObject):
         """Select a channel by ID in the active combo."""
         for i in range(self._channel_controls.active_combo.count()):
             info = self._channel_controls.active_combo.itemData(i)
-            if getattr(info, "id", None) == channel_id:
+            if info is not None and info.id == channel_id:
                 self._channel_controls.active_combo.setCurrentIndex(i)
                 self.set_active_channel_focus(channel_id)
                 return
@@ -295,7 +295,7 @@ class ChannelManager(QtCore.QObject):
         )
         self._channel_controls.active_combo.blockSignals(False)
         
-        channel_id = getattr(info, "id", None)
+        channel_id = info.id if info is not None else None
         return channel_id
     
     def publish_active_channels(self) -> tuple[List[int], List[str]]:
@@ -313,9 +313,9 @@ class ChannelManager(QtCore.QObject):
         
         self._active_channel_infos = infos
         
-        ids = [getattr(info, "id", None) for info in infos]
+        ids = [info.id for info in infos if info is not None]
         ids = [cid for cid in ids if cid is not None]
-        names = [getattr(info, "name", str(info)) for info in infos]
+        names = [info.name if info is not None else str(info) for info in infos]
         
         # Track if channels changed
         channels_changed = list(ids) != self._channel_ids_current
@@ -344,8 +344,8 @@ class ChannelManager(QtCore.QObject):
             self._show_channel_panel(None)
             return
         
-        channel_id = getattr(info, "id", None)
-        name = getattr(info, "name", str(info))
+        channel_id = info.id if info is not None else None
+        name = info.name if info is not None else str(info)
         
         if channel_id is None:
             self._show_channel_panel(None)

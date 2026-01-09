@@ -89,14 +89,18 @@ class SharedRingBuffer:
         with self._lock:
             end = start_index + length
             if end <= self._capacity:
-                return self._data[..., start_index:end]
+                view = self._data[..., start_index:end]
+                view.flags.writeable = False
+                return view
 
             first = self._capacity - start_index
             tail_len = end - self._capacity
-            return np.concatenate(
+            result = np.concatenate(
                 (self._data[..., start_index:], self._data[..., :tail_len]),
                 axis=-1,
             )
+            result.flags.writeable = False
+            return result
 
 
 __all__ = ["SharedRingBuffer"]

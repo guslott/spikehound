@@ -17,6 +17,8 @@ from shared.types import AnalysisEvent
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .controller import PipelineController
     from analysis.analysis_worker import AnalysisWorker
+    from analysis.settings import AnalysisSettingsStore
+    from shared.event_buffer import EventRingBuffer
 else:  # pragma: no cover - runtime fallback
     PipelineController = Any
     AnalysisWorker = Any
@@ -99,6 +101,20 @@ class SpikeHoundRuntime:
         if self.app_settings_store is not None:
             return self.app_settings_store.get()
         return AppSettings()  # Return defaults if no store is set
+
+    @property
+    def analysis_settings_store(self) -> Optional["AnalysisSettingsStore"]:
+        """Get the analysis settings store from the pipeline."""
+        if self._pipeline is not None:
+            return self._pipeline.analysis_settings_store
+        return None
+
+    @property
+    def event_buffer(self) -> Optional["EventRingBuffer"]:
+        """Get the event buffer from the pipeline."""
+        if self._pipeline is not None:
+            return self._pipeline.event_buffer
+        return None
 
     def open_device(self, driver: BaseDevice, sample_rate: float, channels: Sequence[object]) -> None:
         """Open and prepare the requested DAQ backend/device."""

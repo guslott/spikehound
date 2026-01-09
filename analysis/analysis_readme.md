@@ -60,7 +60,7 @@ SharedRingBuffer (raw samples)
     ↓
 Dispatcher (filtering)
     ↓
-analysis_queue (filtered ChunkPointers)
+analysis_queue (filtered Chunk objects)
     ↓
 ┌─────────────────────────────────────┐
 │         Analysis Layer              │

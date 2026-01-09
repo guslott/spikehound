@@ -128,8 +128,8 @@ See `doc/dispatcher_readme.md` for details.
 **Queue Semantics:**
 | Queue | Policy | Behavior |
 |-------|--------|----------|
-| Visualization | Lossy | Drops oldest if full |
-| Audio | Lossy | Drops oldest if full |
+| Visualization | Lossy | Drops newest if full |
+| Audio | Lossy | Drops newest if full |
 | Logging | Lossless | Blocks up to 10s |
 | Analysis | Eviction | Evicts oldest if full |
 
@@ -167,7 +167,7 @@ controller.update_filter_settings(settings)
 
 ## Data Flow
 
-1. **DAQ Source** produces `Chunk` objects with raw samples
+1. **DAQ Source** produces `ChunkPointer` objects (referencing raw ring buffer data)
 2. **Dispatcher** reads from source's `data_queue`
 3. **SignalConditioner** applies per-channel filters
 4. **Trigger Logic** detects threshold crossings, captures windows
@@ -220,4 +220,4 @@ self._enqueue_lossy(self._my_queue, chunk_pointer)
 - **Dispatcher** runs in its own thread, pulls from source thread
 - **All queues** are thread-safe (`queue.Queue`)
 - **Settings** use locks for concurrent access
-- **Ring buffers** use atomic operations for lock-free reads
+- **Ring buffers** use `RLock` for thread-safe access (not lock-free)

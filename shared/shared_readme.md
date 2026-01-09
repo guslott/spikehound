@@ -137,7 +137,7 @@ config = TriggerConfig(
 
 ### SharedRingBuffer (`ring_buffer.py`)
 
-Zero-copy, lock-free-read shared memory buffer:
+Thread-safe ring buffer with fast path:
 
 ```python
 from shared.ring_buffer import SharedRingBuffer
