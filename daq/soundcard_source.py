@@ -345,7 +345,7 @@ class SoundCardSource(BaseDevice):
                 nchannels=self._n_in,
                 sample_rate=self.config.sample_rate,
                 input_format=miniaudio.SampleFormat.FLOAT32,
-                buffersize_msec=100 # Reasonable buffer for capture
+                buffersize_msec=30  # Lower buffer for reduced latency and smoother data flow
             )
             
             gen = capture_generator()

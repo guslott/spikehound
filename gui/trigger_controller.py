@@ -57,7 +57,7 @@ class TriggerController(QtCore.QObject):
         self._last_sample_rate: float = 0.0
         
         # Alignment config
-        self._alignment_mode: str = "peak"  # "simple" or "peak"
+        self._alignment_mode: str = "simple"  # "simple" or "peak"
         self._alignment_search_window_sec: float = 0.002
         
         # History buffer for pretrigger
@@ -496,8 +496,6 @@ class TriggerController(QtCore.QObject):
         sr = self._last_sample_rate if self._last_sample_rate > 0 else 10000.0
         pre = self._display_pre_samples
         
-        # Time starts at -pretrigger and goes to window - pretrigger
-        t_start = -pre / sr
-        t_end = (n - pre) / sr
-        
-        return np.linspace(t_start, t_end, n, dtype=np.float32)
+        # Time axis: sample index 'pre' should correspond exactly to t=0.0
+        # Use arange to correctly compute: time[i] = (i - pre) / sr
+        return (np.arange(n, dtype=np.float32) - pre) / sr

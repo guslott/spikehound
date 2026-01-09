@@ -63,7 +63,7 @@ class PlotManager(QtCore.QObject):
         self._current_window_sec: float = 1.0
         
         # Plot refresh rate tracking
-        self._plot_refresh_hz: float = 40.0
+        self._plot_refresh_hz: float = 60.0  # 60Hz for smooth updates
         self._plot_interval: float = 1.0 / self._plot_refresh_hz
         self._last_plot_refresh: float = 0.0
         self._actual_plot_refresh_hz: float = 0.0

@@ -86,7 +86,7 @@ class Dispatcher:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._tick_thread: Optional[threading.Thread] = None
-        self._tick_interval = 1.0 / 30.0
+        self._tick_interval = 1.0 / 60.0  # 60Hz tick rate for smooth visualization
         self._stats = DispatcherStats()
         self._stats_lock = threading.Lock()
 

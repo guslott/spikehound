@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from typing import Dict, Optional
 import time
+
+import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
 from shared.app_settings import AppSettings
@@ -21,7 +23,7 @@ class SettingsTab(QtWidgets.QWidget):
         self._controller = controller
         self._main_window = main_window
         self._timer = QtCore.QTimer(self)
-        self._timer.setInterval(500)
+        self._timer.setInterval(1000)  # 1Hz refresh - reduces UI stutter
         self._timer.timeout.connect(self._refresh_metrics)
         self._init_ui()
         self._load_settings()
@@ -136,6 +138,7 @@ class SettingsTab(QtWidgets.QWidget):
             ("Analysis queue", "analysis_queue", "Data queued for real-time analysis (spikes, filters). Expected: Balanced occupancy. Large backlogs indicate analysis code is too slow."),
             ("Viz buffer", "viz_buffer", "Size of the rolling buffer used for plotting. Expected: Stable size based on the \"Scope Time\" setting."),
             ("Buffer headroom", "buffer_headroom", "Safety margin in the hardware/driver buffer before it wraps. Expected: > 5s (Green). Low values (< 5s, Red) indicate imminent wrap-around."),
+            ("Renderer", "renderer", "Graphics rendering backend. OpenGL = hardware accelerated (fast). Software = QPainter fallback (slower)."),
         ]
 
         self._metric_fields: Dict[str, QtWidgets.QLabel] = {}
@@ -183,7 +186,33 @@ class SettingsTab(QtWidgets.QWidget):
         self._last_frames = 0
         self._last_time = time.perf_counter()
         
+        # Populate static renderer status
+        self._update_renderer_status()
+        
         return box
+    
+    def _update_renderer_status(self) -> None:
+        """Check and display the OpenGL rendering status."""
+        renderer_label = self._metric_fields.get("renderer")
+        if renderer_label is None:
+            return
+        
+        # Check if OpenGL is enabled and working
+        opengl_enabled = pg.getConfigOption('useOpenGL')
+        
+        if opengl_enabled:
+            # Try to detect if OpenGL is actually functional
+            try:
+                from OpenGL import GL
+                renderer_label.setText("OpenGL (hardware accelerated)")
+                renderer_label.setStyleSheet("color: green; font-weight: bold;")
+            except ImportError:
+                # PyOpenGL not installed, will fall back to software
+                renderer_label.setText("Software (PyOpenGL not installed)")
+                renderer_label.setStyleSheet("color: orange;")
+        else:
+            renderer_label.setText("Software (OpenGL disabled)")
+            renderer_label.setStyleSheet("color: orange;")
 
     def _build_about_box(self) -> QtWidgets.QGroupBox:
         box = QtWidgets.QGroupBox("About")

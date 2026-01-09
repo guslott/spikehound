@@ -938,7 +938,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._cached_raw_times = times
         self._cached_raw_samples = recent
         if not self._viz_paused:
-            self.raw_curve.setData(times, recent, skipFiniteCheck=True)
+            self.raw_curve.setData(times, recent, skipFiniteCheck=True, connect='all')
             self.event_curve.clear()
 
         plot_item = self.plot_widget.getPlotItem()
@@ -1043,7 +1043,7 @@ class AnalysisTab(QtWidgets.QWidget):
             return
         if self._cached_raw_times is None or self._cached_raw_samples is None:
             return
-        self.raw_curve.setData(self._cached_raw_times, self._cached_raw_samples, skipFiniteCheck=True)
+        self.raw_curve.setData(self._cached_raw_times, self._cached_raw_samples, skipFiniteCheck=True, connect='all')
         self.event_curve.clear()
 
     def _acquire_overlay_item(self) -> pg.PlotCurveItem:
@@ -1062,7 +1062,7 @@ class AnalysisTab(QtWidgets.QWidget):
         if item is None:
             return
         item.hide()
-        item.setData([], [])
+        item.setData([], [], skipFiniteCheck=True)
         self._overlay_pool.append(item)
 
     def _apply_overlay_color(self, overlay: dict[str, object]) -> None:
@@ -1278,7 +1278,7 @@ class AnalysisTab(QtWidgets.QWidget):
         """Hide and clear all STA trace plot items."""
         for item in self._sta_trace_items:
             item.hide()
-            item.setData([], [])
+            item.setData([], [], skipFiniteCheck=True)
 
     def _clear_metrics(self) -> None:
         """Reset all metric data, scatter plots, and cluster counts."""
@@ -1441,7 +1441,7 @@ class AnalysisTab(QtWidgets.QWidget):
             self.energy_scatter.show()
         else:
             self.energy_scatter.hide()
-            self.energy_scatter.setData([], [])
+            self.energy_scatter.setData([], [], skipFiniteCheck=True)
         self._recompute_cluster_membership()
         self._update_metric_points()
 
@@ -1792,14 +1792,14 @@ class AnalysisTab(QtWidgets.QWidget):
             if idx < max_traces:
                 waveform = visible_windows[idx]
                 item.setPen(STA_TRACE_PEN)
-                item.setData(t, waveform)
+                item.setData(t, waveform, skipFiniteCheck=True, connect='all')
                 item.show()
             else:
                 item.hide()
-                item.setData([], [])
+                item.setData([], [], skipFiniteCheck=True)
         median = np.median(windows, axis=0)
         # STA curves always use (time -> x, amplitude -> y)
-        self._sta_median_curve.setData(t, median)
+        self._sta_median_curve.setData(t, median, skipFiniteCheck=True, connect='all')
         self._sta_median_curve.setPen(pg.mkPen(200, 0, 0, 255, width=3))
         self._sta_median_curve.show()
         plot_item.setLabel("bottom", "Lag", units="ms")
@@ -2455,7 +2455,7 @@ class AnalysisTab(QtWidgets.QWidget):
         mask = (relative >= 0.0) & (relative <= width)
         if not np.any(mask):
             return False
-        item.setData(relative[mask].astype(np.float32), arr_samples[mask])
+        item.setData(relative[mask].astype(np.float32), arr_samples[mask], skipFiniteCheck=True, connect='all')
         return True
 
     def _on_cluster_roi_changed(self) -> None:

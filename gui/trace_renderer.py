@@ -18,7 +18,8 @@ class TraceRenderer:
     def __init__(self, plot_item: pg.PlotItem, config: ChannelConfig):
         self._plot_item = plot_item
         self._config = config
-        self._curve = pg.PlotCurveItem(pen=pg.mkPen(config.color, width=3))
+        # Use width=2 for balance of visibility and performance (thick pens are slower)
+        self._curve = pg.PlotCurveItem(pen=pg.mkPen(config.color, width=2))
         self._manual_downsampling = False
         try:
             self._curve.setDownsampling(ds=True, auto=True, method="peak")
@@ -33,7 +34,7 @@ class TraceRenderer:
     def update_config(self, config: ChannelConfig) -> None:
         """Update visual properties based on new config."""
         self._config = config
-        self._curve.setPen(pg.mkPen(config.color, width=3))
+        self._curve.setPen(pg.mkPen(config.color, width=2))
         self._curve.setVisible(config.display_enabled)
         # Re-render with new offset/scale if we have data
         if self._last_samples.size > 0:
@@ -52,35 +53,32 @@ class TraceRenderer:
         self._downsample_factor = downsample
         
         if not self._config.display_enabled:
-            self._curve.setData([], [])
+            self._curve.setData([], [], skipFiniteCheck=True)
             return
 
-        # Apply downsampling
-        if self._manual_downsampling and samples.size > 4000:
+        # Always apply peak downsampling for large datasets
+        # PyQtGraph's auto-downsampling helps but explicit control is faster
+        # Target ~2000 points for display (roughly 2x typical screen width)
+        if samples.size > 4000:
             display_y, display_x = self._resample_peak(samples, times, target=2000)
         else:
             display_y = samples
             display_x = times
             
         # Apply offset and scaling for display
-        # Visual Y = (Data Y / Vertical Span) + Offset
-        # But usually we want to map the vertical span to some visual range.
-        # In MainWindow logic: 
-        #   normalized = data / span
-        #   shifted = normalized + offset
-        # Let's stick to the logic that was likely in MainWindow or intended:
-        # The user selects a "Vertical Range (+/- V)". 
-        # If range is 1V, then +1V maps to +0.5 relative to center, -1V to -0.5.
-        # Then we add the screen offset (0-1, default 0.5).
-        # So: y_final = (y_data / (2 * span)) + offset
-        
+        # y_final = (y_data / (2 * span)) + offset
+        # Combine into single operation to reduce intermediate allocations
         span = max(1e-6, self._config.vertical_span_v)
-        # Map [-span, +span] to [-0.5, +0.5]
-        scaled_y = display_y / (2.0 * span)
-        # Shift by offset (0.0 at bottom, 1.0 at top)
-        final_y = scaled_y + self._config.screen_offset
+        scale = 1.0 / (2.0 * span)
+        offset = self._config.screen_offset
         
-        self._curve.setData(display_x, final_y)
+        # Use in-place operation if possible, otherwise single combined operation
+        # This creates one intermediate array instead of two
+        final_y = display_y * scale + offset
+        
+        # skipFiniteCheck=True: avoid scanning 100k+ points for NaN/Inf
+        # connect='all': skip connection analysis, we know data is contiguous
+        self._curve.setData(display_x, final_y, skipFiniteCheck=True, connect='all')
         
     def _update_curve_data(self) -> None:
         """Re-apply scaling/offset to the last known data."""
@@ -96,7 +94,8 @@ class TraceRenderer:
 
     def set_active(self, active: bool) -> None:
         """Update visual style for active/inactive state."""
-        width = 5.0 if active else 3.0
+        # Reduced widths for performance (thick pens are slower with OpenGL)
+        width = 3.0 if active else 2.0
         self._curve.setPen(pg.mkPen(self._config.color, width=width))
         self._curve.setZValue(1.0 if active else 0.0)
         try:

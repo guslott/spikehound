@@ -400,6 +400,58 @@ self.plot.addItem(self.v_line)
 
 ---
 
+## PyQtGraph Performance Optimization
+
+For real-time high-sample-rate visualization (100kHz+), these optimizations provide significant speedup:
+
+### OpenGL Acceleration
+
+OpenGL hardware rendering provides 5-20× speedup over software QPainter. Enable in `main.py` before any widgets are created:
+
+```python
+import pyqtgraph as pg
+pg.setConfigOptions(useOpenGL=True, enableExperimental=True, antialias=True)
+```
+
+Requires `PyOpenGL` package. With OpenGL enabled, anti-aliasing has minimal performance cost.
+
+### setData() Optimizations
+
+Always use these parameters for high-frequency updates:
+
+```python
+# skipFiniteCheck: avoid scanning 100k+ points for NaN/Inf each frame
+# connect='all': skip connection analysis, we know data is contiguous
+self.curve.setData(x_data, y_data, skipFiniteCheck=True, connect='all')
+```
+
+### Pen Width
+
+Thick pens (>2px) force slower rendering paths. Use `width=1` or `width=2` for maximum performance:
+
+```python
+# Fast
+self.curve = self.plot.plot(pen=pg.mkPen('b', width=1))
+
+# Slower (but more visible)
+self.curve = self.plot.plot(pen=pg.mkPen('b', width=4))
+```
+
+### Downsampling Strategy
+
+For 100kHz data with 1-second window (100k points), always downsample before display:
+
+```python
+# TraceRenderer.py uses automatic downsampling via setDownsampling()
+self._curve.setDownsampling(ds=True, auto=True, method="peak")
+
+# For manual downsampling when auto isn't available:
+if samples.size > 4000:
+    y_down, x_down = self._resample_peak(samples, times, target=2000)
+```
+
+Target ~2000 points (2× typical screen width) for smooth lines without wasted computation.
+
 ## File Reference
 
 | File | Lines | Purpose |

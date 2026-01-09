@@ -103,7 +103,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # TriggerController manages all trigger state and detection logic
         self._trigger_controller = TriggerController(parent=self)
         self._trigger_controller.configChanged.connect(self._on_trigger_config_changed)
-        self._plot_refresh_hz = 40.0
+        self._plot_refresh_hz = 60.0  # 60Hz for smooth updates
         self._plot_interval = 1.0 / self._plot_refresh_hz
         self._last_plot_refresh = 0.0
         self._chunk_mean_samples: float = 0.0

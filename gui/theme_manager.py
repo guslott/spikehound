@@ -33,9 +33,10 @@ class ThemeManager:
 
     @staticmethod
     def style_plot() -> None:
-        """Configure PyQtGraph global options."""
+        """Configure PyQtGraph global options for high-performance rendering."""
         pg.setConfigOption("foreground", (0, 0, 139))
-        pg.setConfigOptions(antialias=False)
+        # OpenGL provides hardware acceleration; antialias is efficient with OpenGL.
+        pg.setConfigOptions(useOpenGL=True, enableExperimental=True, antialias=True)
 
     @staticmethod
     def get_stylesheet() -> str:
