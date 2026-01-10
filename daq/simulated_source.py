@@ -234,7 +234,7 @@ class SimulatedPhysiologySource(BaseDevice):
         return [DeviceInfo(id="sim0", name="Simulated Physiology (virtual)")]
 
     def get_capabilities(self, device_id: str) -> Capabilities:
-        return Capabilities(max_channels_in=3, sample_rates=[10_000, 20_000], dtype="float32")
+        return Capabilities(max_channels_in=3, sample_rates=[20_000], dtype="float32")
 
     def list_available_channels(self, device_id: str):
         return [
@@ -382,7 +382,7 @@ class SimulatedPhysiologySource(BaseDevice):
             sample_rate = 20000
         # Generate random units
         # Multiple units with variable amplitudes for realistic simulation
-        n_units = int(options.get('num_units', 2))
+        n_units = int(options.get('num_units', 6))
         self._line_hum_amp = float(options.get('line_hum_amp', self._default_line_hum_amp))
         self._line_hum_freq = float(options.get('line_hum_freq', 60.0))
         self._line_hum_phase = 0.0
@@ -398,6 +398,11 @@ class SimulatedPhysiologySource(BaseDevice):
     def _start_impl(self) -> None:
         assert self.config is not None
         self._global_sample_counter = 0
+        # Reset per-unit spike timing to avoid stale refractory state after restart
+        for u in self._units:
+            u['last_spike_sample'] = -100000
+        # Clear any lingering PSPs from previous run
+        self._active_psps.clear()
         if self._worker and self._worker.is_alive():
             return
 
