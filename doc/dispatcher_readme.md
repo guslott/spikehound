@@ -12,7 +12,7 @@
 - **Output**: Fans out data to multiple queues:
   - `visualization`: For GUI plotting.
   - `audio`: For audio monitoring.
-  - `logging`: For disk recording.
+  - `logging`: For disk recording (only when recording is enabled).
   - `analysis`: For registered analysis workers.
   - `events`: For detection events (threshold crossings, spikes, etc.).
 
@@ -22,29 +22,37 @@ The Dispatcher handles queues differently based on their criticality. The policy
 
 | Queue | Policy | Behavior |
 |-------|--------|----------|
-| `visualization` | `drop-newest` | Drops incoming item if full |
-| `audio` | `drop-newest` | Drops incoming item if full |
+| `visualization` | `drop-oldest` | Evicts oldest item to make room |
+| `audio` | `drop-oldest` | Evicts oldest item to make room |
 | `logging` | `lossless` | Blocks up to 10s, then raises error |
 | `analysis` | `drop-oldest` | Evicts oldest item to make room |
-| `events` | `drop-newest` | Drops incoming item if full |
+| `events` | `drop-oldest` | Evicts oldest item to make room |
 
 ### Policy Details
 
-1. **Visualization, Audio & Events (drop-newest)**
-   - **Method**: Non-blocking (`put_nowait`).
-   - **Behavior**: If the queue is full, the item is **dropped**. This prevents slow UI or audio consumers from blocking the critical DAQ path.
-   - **Stats**: Drops are recorded in `DispatcherStats.dropped`.
+1. **Visualization, Audio & Events (drop-oldest)**
+   - **Method**: Non-blocking with eviction.
+   - **Behavior**: If the queue is full, the **oldest** item is evicted to make room. This ensures real-time consumers always see the most recent data, minimizing lag.
+   - **Stats**: Evictions are recorded in `DispatcherStats.evicted`.
 
 2. **Logging (lossless)**
    - **Method**: Blocking with timeout (`put(timeout=10.0)`).
    - **Behavior**: If the queue is full (e.g., slow disk I/O), the Dispatcher **blocks** up to 10 seconds.
    - **Failure**: If it remains blocked, it raises a `RuntimeError`, effectively halting the pipeline to prevent silent data loss.
 
-3. **Analysis (drop-oldest)**
-   - **Method**: Non-blocking with eviction (`_enqueue_drop_oldest`).
+4. **Analysis (drop-oldest)**
+   - **Method**: Non-blocking with eviction.
    - **Behavior**: If the queue is full, the **oldest** item is evicted to make room for the new item. This ensures analysis workers always see the most recent data, even if they can't keep up.
-   - **EOS Delivery**: EndOfStream is always delivered using drop-oldest to ensure cleanup.
    - **Stats**: Evictions are recorded in `DispatcherStats.evicted`.
+
+### EOS Delivery Guarantee
+
+EndOfStream (EOS) signals are **always** delivered to all queues, regardless of queue fullness:
+
+- **drop-oldest queues** (viz, audio, events, analysis): EOS is delivered using the native drop-oldest policy (evicts oldest if needed).
+- **lossless queues** (logging): EOS uses the blocking lossless policy to ensure no data loss before shutdown.
+
+This guarantee is enforced in `enqueue_with_policy()` in `shared/models.py`.
 
 ## Stats
 

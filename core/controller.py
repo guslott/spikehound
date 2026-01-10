@@ -241,6 +241,11 @@ class PipelineController:
             return actual
 
     def start(self) -> None:
+        """Start the acquisition pipeline.
+        
+        Delegates to _start_streaming_locked() for the actual startup logic.
+        This is the public API; internal callers use _start_streaming_locked().
+        """
         with self._lock:
             if self._source is None or self._dispatcher is None:
                 raise RuntimeError("No source configured. Call switch_source() first.")
@@ -248,26 +253,23 @@ class PipelineController:
                 return
 
             self._reset_output_queues()
-            self._dispatcher.start()
-            self._source.start()
+            self._start_streaming_locked()
             self._running = True
 
     def stop(self, *, join: bool = True) -> None:
-        """Stop the pipeline; currently always blocks until threads exit."""
+        """Stop the acquisition pipeline.
+        
+        Delegates to _stop_streaming_locked() for the actual shutdown logic.
+        This is the public API; internal callers use _stop_streaming_locked().
+        """
         with self._lock:
             if self._source is None:
                 return
+            if not self._running:
+                return
 
-            if self._source.running:
-                try:
-                    self._source.stop()
-                except Exception as exc:
-                    logger.warning("Failed to stop source during pipeline stop: %s", exc)
-
-            if self._dispatcher is not None:
-                self._push_end_of_stream()
-                self._dispatcher.stop()
-
+            self._push_end_of_stream()
+            self._stop_streaming_locked()
             self._running = False
 
             if join:
@@ -662,11 +664,20 @@ class PipelineController:
         if self._dispatcher is None or self._source is None:
             return
         try:
-            # Always set the FULL layout to match the source
-            full_ids = [info.id for info in self._channel_infos]
-            full_names = [info.name for info in self._channel_infos]
-            full_units = [info.units for info in self._channel_infos]
-            self._dispatcher.set_channel_layout(full_ids, full_names, full_units)
+            # Respect the currently selected active channels and their names
+            if self._active_channel_ids:
+                id_to_name = {info.id: info.name for info in self._channel_infos}
+                id_to_info = {info.id: info for info in self._channel_infos}
+                active_names = [id_to_name.get(cid, f"Channel {cid}") for cid in self._active_channel_ids]
+                active_units = [id_to_info[cid].units for cid in self._active_channel_ids if cid in id_to_info]
+                self._dispatcher.set_channel_layout(self._active_channel_ids, active_names, active_units)
+            else:
+                # Fallback to full layout if no specific channels are active
+                full_ids = [info.id for info in self._channel_infos]
+                full_names = [info.name for info in self._channel_infos]
+                full_units = [info.units for info in self._channel_infos]
+                self._dispatcher.set_channel_layout(full_ids, full_names, full_units)
+
             self._dispatcher.set_active_channels(self._active_channel_ids)
             self._dispatcher.start()
         except Exception as exc:

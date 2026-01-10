@@ -56,6 +56,18 @@ class ChannelFilterSettings:
             if self.highpass_order <= 0:
                 raise ValueError("highpass_order must be positive")
 
+    def describe(self) -> str:
+        parts = []
+        if self.ac_couple:
+            parts.append(f"AC({self.ac_cutoff_hz}Hz)")
+        if self.notch_enabled:
+            parts.append(f"Notch({self.notch_freq_hz}Hz)")
+        if self.highpass_hz is not None:
+            parts.append(f"HP({self.highpass_hz}Hz)")
+        if self.lowpass_hz is not None:
+            parts.append(f"LP({self.lowpass_hz}Hz)")
+        return ", ".join(parts) if parts else "None"
+
 
 @dataclass
 class FilterSettings:
@@ -189,8 +201,10 @@ class SignalConditioner:
         self._channel_filters = []
         self._channel_specs = None
 
-    def describe(self) -> Dict[str, object]:
-        return self._settings.as_dict()
+    def describe(self) -> Dict[str, str]:
+        if not self._channel_names or not self._channel_specs:
+            return {}
+        return {name: spec.describe() for name, spec in zip(self._channel_names, self._channel_specs)}
 
     def _ensure_filters(self, chunk: Chunk) -> bool:
         sample_rate = 1.0 / chunk.dt

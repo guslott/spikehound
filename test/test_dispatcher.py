@@ -427,3 +427,51 @@ def test_eos_delivery_with_drop_policy():
     # 2. Second item should be EndOfStream
     item2 = visualization_queue.get_nowait()
     assert item2 is EndOfStream
+
+
+def test_eos_delivery_to_events_queue_when_full():
+    """Test that EndOfStream is delivered to events queue (drop-oldest) even when full.
+    
+    The events queue uses drop-oldest policy, which natively supports EOS delivery
+    by evicting the oldest item to make room for EOS. This ensures EOS is always
+    delivered for clean shutdown.
+    """
+    settings = FilterSettings()
+    raw_queue = queue.Queue()
+    visualization_queue = queue.Queue()
+    audio_queue = queue.Queue()
+    logging_queue = queue.Queue()
+    # Small events queue to test backpressure
+    event_queue = queue.Queue(maxsize=2)
+
+    # Verify policy is indeed drop-oldest (for freshness)
+    from shared.models import QUEUE_POLICIES, DetectionEvent
+    assert QUEUE_POLICIES["events"] == "drop-oldest"
+
+    dispatcher = Dispatcher(
+        raw_queue,
+        visualization_queue,
+        audio_queue,
+        logging_queue,
+        event_queue,
+        filter_settings=settings,
+    )
+    
+    # Fill events queue with detection events
+    dummy_event1 = DetectionEvent(t=0.0, chan=0, window=np.zeros(10))
+    dummy_event2 = DetectionEvent(t=0.1, chan=0, window=np.zeros(10))
+    event_queue.put(dummy_event1)
+    event_queue.put(dummy_event2)
+    assert event_queue.full()
+    
+    # Broadcast EOS - should force drop-oldest behavior for events queue
+    dispatcher._broadcast_end_of_stream()
+    
+    # EOS should be in the queue (oldest event evicted)
+    # Queue should contain: [dummy_event2, EndOfStream]
+    item1 = event_queue.get_nowait()
+    assert isinstance(item1, DetectionEvent)
+    assert item1.t == 0.1  # This is dummy_event2 (newest kept)
+    
+    item2 = event_queue.get_nowait()
+    assert item2 is EndOfStream

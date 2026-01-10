@@ -17,6 +17,7 @@ from shared.models import (
     EndOfStream,
     TriggerConfig,
     DetectionEvent,
+    QueueName,
     enqueue_with_policy,
 )
 from shared.ring_buffer import SharedRingBuffer
@@ -388,16 +389,20 @@ class Dispatcher:
             return None
 
         with self._ring_lock:
-            # Only reset channel IDs if the COUNT mismatches.
-            # If the count matches, we trust the IDs set by set_channel_layout().
-            # This allows non-contiguous IDs (e.g. [0, 2]) to persist.
-            if not self._channel_ids or len(self._channel_ids) != raw.shape[0]:
+            # Determine if we should fallback to default indices.
+            # We allow the count to match either the total registered layout (set_channel_layout)
+            # OR the active subset (set_active_channels).
+            incoming_count = raw.shape[0]
+            layout_count = len(self._channel_ids)
+            active_count = len(self._active_channel_ids)
+            
+            if not self._channel_ids or (incoming_count != layout_count and incoming_count != active_count):
                 # Fallback: if count is wrong, we have to reset to default indices
-                self._channel_ids = tuple(range(raw.shape[0]))
+                self._channel_ids = tuple(range(incoming_count))
                 self._channel_index_map = {cid: idx for idx, cid in enumerate(self._channel_ids)}
-                self._channel_names = tuple(str(idx) for idx in range(raw.shape[0]))
+                self._channel_names = tuple(str(idx) for idx in range(incoming_count))
             elif not self._channel_names:
-                self._channel_names = tuple(str(idx) for idx in range(raw.shape[0]))
+                self._channel_names = tuple(str(idx) for idx in range(incoming_count))
             channel_names: tuple[str, ...] = self._channel_names
             
             # Determine common unit
@@ -494,9 +499,9 @@ class Dispatcher:
         for token, queue_obj in targets:
             self._enqueue_with_policy("analysis", queue_obj, filtered_chunk)
 
-    def _enqueue_with_policy(self, queue_name: str, target_queue: queue.Queue, item: object) -> None:
+    def _enqueue_with_policy(self, queue_name: QueueName, target_queue: queue.Queue, item: object) -> None:
         """Unified enqueue method that dispatches on shared QUEUE_POLICIES."""
-        def stats_cb(q_name: str, action: str) -> None:
+        def stats_cb(q_name: QueueName, action: str) -> None:
             with self._stats_lock:
                 if action == "forwarded":
                     self._stats.forwarded[q_name] += 1
@@ -525,18 +530,21 @@ class Dispatcher:
             return
         self._eos_sent = True
         
-        # Deliver sentinel to all downstream queues, draining oldest entries if needed
-        # Use drop-oldest for EOS to ensure delivery even if queues are full
+        # Deliver EOS sentinel to all downstream queues.
+        # EOS delivery is guaranteed by enqueue_with_policy():
+        # - drop-oldest queues: natively support eviction
+        # - drop-newest queues: temporarily switched to drop-oldest for EOS
+        # - lossless queues: block until delivered
         targets = {"logging": self._logging_queue, **self._output_queues}
         for name, target in targets.items():
             if target is None:
                 continue
-            self._enqueue_drop_oldest(target, EndOfStream, name)
+            self._enqueue_with_policy(name, target, EndOfStream)
             
         with self._analysis_lock:
             queues = list(self._analysis_queues.values())
         for q in queues:
-            self._enqueue_drop_oldest(q, EndOfStream, "analysis")
+            self._enqueue_with_policy("analysis", q, EndOfStream)
 
     def _start_tick_thread(self) -> None:
         if self._tick_thread is not None and self._tick_thread.is_alive():

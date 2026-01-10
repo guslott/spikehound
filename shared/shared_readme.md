@@ -187,7 +187,7 @@ settings = store.get()
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `models.py` | 245 | Core dataclasses (Chunk, DetectionEvent, etc.) |
+| `models.py` | ~400 | Core dataclasses, queue policies, enqueue helpers |
 | `types.py` | 88 | AnalysisEvent type |
 | `ring_buffer.py` | 100 | SharedRingBuffer |
 | `event_buffer.py` | 84 | EventRingBuffer |

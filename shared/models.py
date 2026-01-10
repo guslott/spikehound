@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Literal, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import logging
 import queue
@@ -207,7 +207,7 @@ class DetectionEvent:
         if self.chan < 0:
             raise ValueError("chan must be non-negative")
 
-        window = _freeze_array(self.window)
+        window = _freeze_array(self.window, ndim=1)
 
         object.__setattr__(self, "window", window)
         object.__setattr__(self, "properties", _copy_mapping(self.properties) or {})
@@ -293,22 +293,25 @@ logger = logging.getLogger(__name__)
 # - "lossless": blocks until space available (fail loudly if timeout)
 # - "drop-newest": drops incoming item if queue is full
 # - "drop-oldest": evicts oldest item to make room for new one
-QUEUE_POLICIES: dict[str, str] = {
+# Typed queue names for type-safe enqueue operations
+QueueName = Literal["visualization", "audio", "logging", "analysis", "events", "daq"]
+
+QUEUE_POLICIES: dict[QueueName, str] = {
     "visualization": "drop-oldest",
     "audio": "drop-oldest",
     "logging": "lossless",
     "analysis": "drop-oldest",
-    "events": "drop-newest",
+    "events": "drop-oldest",
     "daq": "lossless",  # DAQ -> Dispatcher is always lossless
 }
 
 
 def enqueue_with_policy(
-    queue_name: str, 
+    queue_name: QueueName, 
     target_queue: queue.Queue, 
     item: object, 
     *,
-    stats_callback: Optional[Callable[[str, str], None]] = None
+    stats_callback: Optional[Callable[[QueueName, str], None]] = None
 ) -> None:
     """Unified enqueue method that dispatches on QUEUE_POLICIES.
     
@@ -408,6 +411,7 @@ __all__ = [
     "EndOfStream",
     "TriggerConfig",
     
+    "QueueName",
     "QUEUE_POLICIES",
     "enqueue_with_policy",
 ]

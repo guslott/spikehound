@@ -243,11 +243,14 @@ class TestQueuePolicies:
         """Logging queue should use lossless policy (blocks or uses large queue)."""
         assert QUEUE_POLICIES.get("logging") == "lossless"
 
-    def test_visualization_drops_newest(self):
-        """Visualization should drop newest to maintain data freshness."""
-        # The policy might be "drop-newest" or similar
+    def test_visualization_uses_drop_oldest_for_freshness(self):
+        """Visualization should use drop-oldest to maintain data freshness.
+        
+        drop-oldest evicts stale backlog so consumers always see the newest data.
+        This prevents real-time UI/audio from lagging behind acquisition.
+        """
         policy = QUEUE_POLICIES.get("visualization")
-        assert policy in ("drop-newest", "drop-oldest"), f"Unexpected viz policy: {policy}"
+        assert policy == "drop-oldest", f"Unexpected viz policy: {policy}"
 
 
 class TestShutdownBehavior:
@@ -389,7 +392,7 @@ class TestMultipleAnalysisQueues:
             while True:
                 try:
                     item = aq.get_nowait()
-                    if item is EndOfStream or isinstance(item, type(EndOfStream)):
+                    if item is EndOfStream:
                         break
                     count += 1
                 except queue.Empty:

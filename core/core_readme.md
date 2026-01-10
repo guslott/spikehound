@@ -195,14 +195,14 @@ To add a new downstream processor:
 # 1. In controller.py, register a new queue:
 self._my_queue = queue.Queue(maxsize=256)
 
-# 2. In dispatcher.py, add policy to QUEUE_POLICIES dict:
+# 2. In shared/models.py, add policy to QUEUE_POLICIES dict:
 QUEUE_POLICIES["my_queue"] = "drop-newest"  # or "lossless" / "drop-oldest"
 
 # 3. In dispatcher.py _fan_out(), enqueue using the queue name:
 self._enqueue_with_policy("my_queue", self._my_queue, chunk_pointer)
 ```
 
-The `_enqueue()` method uses the queue name to look up the policy from `QUEUE_POLICIES`.
+The `_enqueue_with_policy()` method uses the queue name to look up the policy from `QUEUE_POLICIES`.
 
 ---
 
