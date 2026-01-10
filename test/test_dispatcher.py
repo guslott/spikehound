@@ -150,8 +150,7 @@ def test_dispatcher_filters_dc_and_notch_at_target_frequency():
     # Notch should reduce RMS significantly (< 50% of without notch)
     assert filtered_rms < baseline_rms * 0.5, f"Notch ineffective: {filtered_rms} vs {baseline_rms}"
     
-    # Note: Logging queue is currently disabled in dispatcher
-    # (see Dispatcher._fan_out comment)
+    # Note: Logging queue requires set_recording_enabled(True)
 
 
 def test_dispatcher_preserves_filter_state_across_chunks():
@@ -270,9 +269,11 @@ def test_dispatcher_fan_out_and_backpressure_tracking():
     
     # With small queues (maxsize=1), we expect:
     # - Some chunks to be forwarded
-    # - Some chunks to be dropped (visualization uses drop-newest policy)
+    # - Some chunks to be evicted (visualization uses drop-oldest policy)
+    # - Dropped count should be 0 for visualization (as it evicts instead of drops)
     assert forwarded.get("visualization", 0) >= 1, "Should forward at least 1 viz chunk"
-    assert dropped.get("visualization", 0) >= 1, "Should drop at least 1 viz chunk (backpressure)"
+    assert stats["evicted"].get("visualization", 0) >= 1, "Should evict at least 1 viz chunk (backpressure)"
+
     
     # Analysis queue receives all data chunks + EOS (EOS forwarded via drop-oldest)
     # n_chunks data items + 1 EOS = n_chunks + 1 forwarded
@@ -283,7 +284,7 @@ def test_dispatcher_fan_out_and_backpressure_tracking():
     assert len(analysis_received) >= 1, "Should receive at least the last chunk"
     assert isinstance(analysis_received[0], Chunk), "Analysis queue should receive Chunk objects, not Pointers"
     
-    # Note: logging queue is disabled in current dispatcher
+    # Note: Logging queue requires set_recording_enabled(True)
     
     dispatcher.unregister_analysis_queue(token)
 
@@ -384,3 +385,45 @@ def test_dispatcher_eos_delivery_on_unregister_full_queue():
     
     stats = dispatcher.snapshot()
     assert stats["evicted"].get("analysis", 0) >= 1
+
+def test_eos_delivery_with_drop_policy():
+    """Test that EndOfStream is delivered to drop-oldest queues (e.g. visualization) even if full."""
+    settings = FilterSettings()
+    raw_queue = queue.Queue()
+    # Use maxsize=2 to verify we keep some data (newest) but still deliver EOS
+    visualization_queue = queue.Queue(maxsize=2)
+    audio_queue = queue.Queue()
+    logging_queue = queue.Queue()
+    event_queue = queue.Queue()
+
+    # Verify policy is indeed drop-oldest
+    from shared.models import QUEUE_POLICIES
+    assert QUEUE_POLICIES["visualization"] == "drop-oldest"
+
+    dispatcher = Dispatcher(
+        raw_queue,
+        visualization_queue,
+        audio_queue,
+        logging_queue,
+        event_queue,
+        filter_settings=settings,
+    )
+    
+    # Fill queue manually so it is full: [Old, New]
+    visualization_queue.put(ChunkPointer(0, 100, 0.0, 0, 0)) # Old
+    visualization_queue.put(ChunkPointer(100, 100, 0.1, 1, 100)) # New
+    assert visualization_queue.full()
+    
+    # Broadcast EOS
+    # Should force drop-oldest behavior: Evict 'Old', keep 'New', add 'EOS'
+    # Since visualization is now drop-oldest natively, this happens automatically
+    dispatcher._broadcast_end_of_stream()
+    
+    # 1. First item should be 'New' (seq=1)
+    item1 = visualization_queue.get_nowait()
+    assert isinstance(item1, ChunkPointer)
+    assert item1.seq == 1
+    
+    # 2. Second item should be EndOfStream
+    item2 = visualization_queue.get_nowait()
+    assert item2 is EndOfStream

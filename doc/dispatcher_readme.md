@@ -59,3 +59,22 @@ The `Dispatcher` maintains `DispatcherStats` to track performance:
 
 - **Internal State**: Protected by `threading.Lock`s (`_stats_lock`, `_ring_lock`, `_analysis_lock`).
 - **Queues**: Uses standard thread-safe `queue.Queue`.
+
+## Fail-Fast and Gap Policies
+
+The Dispatcher supports configurable policies for handling internal invariant violations and data gaps, useful for distinguishing between development/debugging ("fail fast") and production resilience ("reset and continue").
+
+### strict_invariants
+- **Default**: `False`
+- **Behavior**:
+  - `False`: Invariants (e.g., missing source buffer, invalid sample rate) log warnings and skip processing.
+  - `True`: Violations raise `RuntimeError`, immediately halting the pipeline.
+
+### gap_policy
+Controls behavior when a discontinuity in sample indices is detected (e.g., dropped chunks from DAQ).
+
+| Policy | Behavior | Use Case |
+|--------|----------|----------|
+| `crash` | Raises `RuntimeError` immediately. | strict dev/science mode (ensure data integrity) |
+| `reset` | Logs warning, resets visualization buffer counters, continues. | production/long-running (recover from glitches) |
+| `ignore` | Logs warning, continues appending (risk of artifacts). | debugging/loose constraints |

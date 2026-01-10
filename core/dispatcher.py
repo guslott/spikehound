@@ -66,6 +66,8 @@ class Dispatcher:
         *,
         filter_settings: Optional[FilterSettings] = None,
         poll_timeout: float = 0.05,
+        strict_invariants: bool = False,
+        gap_policy: str = "crash",  # "crash", "reset", "ignore"
     ) -> None:
         self._raw_queue = raw_queue
         self._output_queues: Dict[str, queue.Queue] = {
@@ -76,6 +78,8 @@ class Dispatcher:
         self._logging_queue = logging_queue
         self._conditioner = SignalConditioner(filter_settings)
         self._poll_timeout = poll_timeout
+        self._strict_invariants = strict_invariants
+        self._gap_policy = gap_policy
         self._tick_callbacks: List[TickCallback] = []
 
         self._stop_event = threading.Event()
@@ -371,7 +375,11 @@ class Dispatcher:
         source_buffer = self._source_buffer
         sample_rate = self._sample_rate
         if source_buffer is None or sample_rate is None or sample_rate <= 0:
-            logger.warning("No source buffer linked; skipping pointer")
+            msg = "Dispatcher Error: No source buffer linked or invalid sample rate"
+            if self._strict_invariants:
+                logger.critical(msg)
+                raise RuntimeError(msg)
+            logger.warning(f"{msg}; skipping pointer")
             return None
 
         raw = source_buffer.read(ptr.start_index, ptr.length)
@@ -765,19 +773,48 @@ class Dispatcher:
         # If we have a gap in samples, we must reset the visualization buffer
         # to avoid plotting a straight line across the gap.
         # Detect gaps - STRICT MODE: This should NEVER happen in lossless mode
+        # Detect gaps - STRICT MODE: This should NEVER happen in lossless mode
         if self._filled > 0 and start_sample != self._latest_sample_index + 1:
             gap_size = start_sample - (self._latest_sample_index + 1)
-            logger.critical(
-                "SAMPLE GAP DETECTED - lossless constraint violated",
-                extra={
-                    "expected_sample": self._latest_sample_index + 1,
-                    "received_sample": start_sample,
-                    "gap_size": gap_size,
-                }
-            )
-            self._stats.sample_gaps += 1
-            self._reset_viz_counters_locked()
-            raise RuntimeError(f"Sample gap detected: expected {self._latest_sample_index + 1}, got {start_sample} (gap={gap_size})")
+            msg = f"Sample gap detected: expected {self._latest_sample_index + 1}, got {start_sample} (gap={gap_size})"
+            
+            if self._gap_policy == "crash":
+                logger.critical(
+                    "SAMPLE GAP DETECTED - lossless constraint violated (policy=crash)",
+                    extra={
+                        "expected_sample": self._latest_sample_index + 1,
+                        "received_sample": start_sample,
+                        "gap_size": gap_size,
+                    }
+                )
+                self._stats.sample_gaps += 1
+                self._reset_viz_counters_locked()
+                raise RuntimeError(msg)
+            
+            elif self._gap_policy == "reset":
+                logger.warning(
+                    "SAMPLE GAP DETECTED - resetting visualization buffer (policy=reset)",
+                    extra={
+                        "expected_sample": self._latest_sample_index + 1,
+                        "received_sample": start_sample,
+                        "gap_size": gap_size,
+                    }
+                )
+                self._stats.sample_gaps += 1
+                self._reset_viz_counters_locked()
+                # Continue with reset counters - will write new data at index 0
+                # start_idx for the new data effectively becomes 0
+                start_idx = 0
+                
+            elif self._gap_policy == "ignore":
+                logger.warning(f"SAMPLE GAP DETECTED - ignoring (policy=ignore). {msg}")
+                self._stats.sample_gaps += 1
+                # Just continue, risking artifacts
+            
+            else:
+                 # Default fallback if unknown policy
+                 logger.error(f"Unknown gap policy '{self._gap_policy}'; defaulting to crash. {msg}")
+                 raise RuntimeError(msg)
             
         end_sample = start_sample + frames - 1
         self._write_idx = (start_idx + frames) % capacity

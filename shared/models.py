@@ -294,8 +294,8 @@ logger = logging.getLogger(__name__)
 # - "drop-newest": drops incoming item if queue is full
 # - "drop-oldest": evicts oldest item to make room for new one
 QUEUE_POLICIES: dict[str, str] = {
-    "visualization": "drop-newest",
-    "audio": "drop-newest",
+    "visualization": "drop-oldest",
+    "audio": "drop-oldest",
     "logging": "lossless",
     "analysis": "drop-oldest",
     "events": "drop-newest",
@@ -320,6 +320,11 @@ def enqueue_with_policy(
                         "forwarded", "dropped", or "evicted".
     """
     policy = QUEUE_POLICIES.get(queue_name, "drop-newest")
+    
+    # SPECIAL CASE: EndOfStream must never be dropped by drop-newest queues.
+    # It signifies shutdown, so we force eviction to make room.
+    if item is EndOfStream and policy == "drop-newest":
+        policy = "drop-oldest"
     
     if policy == "lossless":
         _enqueue_lossless(target_queue, item, queue_name, stats_callback)
