@@ -51,6 +51,7 @@ EndOfStream (EOS) signals are **always** delivered to all queues, regardless of 
 
 - **drop-oldest queues** (viz, audio, events, analysis): EOS is delivered using the native drop-oldest policy (evicts oldest if needed).
 - **lossless queues** (logging): EOS uses the blocking lossless policy to ensure no data loss before shutdown.
+- **drop-newest queues** (if any exist): `enqueue_with_policy()` temporarily upgrades them to `drop-oldest` for EOS messages to guarantee delivery.
 
 This guarantee is enforced in `enqueue_with_policy()` in `shared/models.py`.
 

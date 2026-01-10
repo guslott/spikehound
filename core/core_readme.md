@@ -128,10 +128,13 @@ See `doc/dispatcher_readme.md` for details.
 **Queue Semantics:**
 | Queue | Policy | Behavior |
 |-------|--------|----------|
-| Visualization | Lossy | Drops newest if full |
-| Audio | Lossy | Drops newest if full |
+| Visualization | Eviction | Evicts oldest if full |
+| Audio | Eviction | Evicts oldest if full |
 | Logging | Lossless | Blocks up to 10s |
 | Analysis | Eviction | Evicts oldest if full |
+
+**Note:** `EndOfStream` signals are guaranteed to be delivered. `drop-newest` queues (if any) are temporarily treated as `drop-oldest` for EOS messages.
+
 
 ---
 
