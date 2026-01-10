@@ -19,19 +19,21 @@ import queue
 import threading
 import time as _time
 from abc import ABC, abstractmethod
-from typing import Any, Iterable, List, Literal, Optional, Sequence
+from typing import Any, Iterable, List, Literal, Optional, Sequence, Union
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 from shared.models import (
-    Chunk,
-    ChunkPointer,
     ActualConfig,
     Capabilities,
     ChannelInfo,
+    Chunk,
+    ChunkPointer,
     DeviceInfo,
+    EndOfStream,
+    enqueue_with_policy,
 )
 from shared.ring_buffer import SharedRingBuffer
 
@@ -80,7 +82,7 @@ class BaseDevice(ABC):
     # ---- Lifecycle ---------------------------------------------------------
 
     def __init__(self, queue_maxsize: int = 64) -> None:
-        self.data_queue: "queue.Queue[ChunkPointer]" = queue.Queue(maxsize=queue_maxsize)
+        self.data_queue: "queue.Queue[ChunkPointer | EndOfStream]" = queue.Queue(maxsize=queue_maxsize)
         self._stop_event = threading.Event()
         self._state_lock = threading.RLock()
         self._channel_lock = threading.RLock()
@@ -100,6 +102,7 @@ class BaseDevice(ABC):
 
         # Dtype contract: drivers should deliver float32 unless otherwise negotiated
         self._dtype: str = "float32"
+        self.config: Optional[ActualConfig] = None
         self.ring_buffer: Optional[SharedRingBuffer] = None
 
     # ------------------------
@@ -328,26 +331,14 @@ class BaseDevice(ABC):
         *,
         device_time: Optional[float] = None,
         mono_time: Optional[float] = None,
-        meta: Optional[dict[str, Any]] = None,
     ) -> ChunkPointer:
-        """
-        Write a (frames, channels) array into the shared ring buffer and enqueue a ChunkPointer.
-
-        Parameters
-        ----------
-        data : np.ndarray
-            Samples shaped (frames, channels) as produced by the driver callback.
-        device_time : float | None
-            Optional hardware clock reference for the first frame (reserved for future use).
-        mono_time : float | None
-            Override for the host monotonic timestamp; defaults to `time.monotonic()`.
-        meta : dict[str, Any] | None
-            Reserved for future metadata propagation (currently unused).
-
-        Returns
-        -------
-        ChunkPointer
-            Pointer into the shared ring buffer for downstream consumers.
+        """Helper for simple drivers to emit a 2D float32 array.
+        
+        Args:
+            data: np.ndarray of shape (frames, channels) or (channels, frames).
+                  If (frames, channels) and channels matches config, it is transposed.
+            device_time: Optional hardware timestamp (seconds)
+            mono_time: Optional host monotonic time (recommended if available)
         """
         if self.config is None:
             raise RuntimeError("emit_array() called before configure().")
@@ -382,22 +373,15 @@ class BaseDevice(ABC):
                         data = data[:, idx]
                         frames, chans = data.shape
                     elif chans < expected_chans_now:
-                        actual_ids = None
-                        if meta is not None:
-                            actual_ids = meta.get("active_channel_ids")
-                        if isinstance(actual_ids, Sequence):
-                            out = np.zeros((frames, expected_chans_now), dtype=data.dtype)
-                            id_to_col = {cid: i for i, cid in enumerate(actual_ids)}
-                            for out_idx, cid in enumerate(self._active_channel_ids):
-                                src_idx = id_to_col.get(cid)
-                                if src_idx is not None and src_idx < chans:
-                                    out[:, out_idx] = data[:, src_idx]
-                            data = out
-                            chans = data.shape[1]
-                        else:
-                            raise ValueError(
-                                f"data has {chans} channels, expected {expected_chans_now}."
-                            )
+                        # If the incoming data has fewer channels than expected,
+                        # we assume the driver is providing a subset and we need to
+                        # map it to the full expected channel set.
+                        # This path is less common and requires more context,
+                        # for now, we raise an error if we can't infer the mapping.
+                        raise ValueError(
+                            f"data has {chans} channels, expected {expected_chans_now}. "
+                            "Cannot automatically map subset of channels without metadata."
+                        )
                     else:
                         raise ValueError(
                             f"data has {chans} channels, expected {expected_chans_now}."
@@ -406,7 +390,9 @@ class BaseDevice(ABC):
             if frames == 0:
                 raise ValueError("data must contain at least one frame")
 
-            # Advance counters for diagnostics/compatibility with existing stats
+            # Capture current counters BEFORE incrementing for the pointer
+            seq = self._next_seq
+            start_sample = self._next_start_sample
             self._next_start_sample += frames
             self._next_seq += 1
 
@@ -425,6 +411,9 @@ class BaseDevice(ABC):
                 start_index=start_index,
                 length=frames,
                 render_time=mono,
+                seq=seq,
+                start_sample=start_sample,
+                device_time=device_time,
             )
             self._safe_put(pointer)
             
@@ -440,15 +429,25 @@ class BaseDevice(ABC):
         if frames == 0:
             raise ValueError("chunk must contain at least one frame")
         with self._state_lock:
+            # Capture current counters BEFORE incrementing for the pointer
+            seq = self._next_seq
+            start_sample = self._next_start_sample
             self._next_start_sample += frames
             self._next_seq += 1
             if self.ring_buffer is None:
                 raise RuntimeError("ring buffer not initialized; call configure() first.")
             start_index = self.ring_buffer.write(np.ascontiguousarray(chunk.samples))
+            # Extract device_time from chunk meta if available
+            device_time = None
+            if chunk.meta is not None:
+                device_time = chunk.meta.get("device_time")
             pointer = ChunkPointer(
                 start_index=start_index,
                 length=frames,
                 render_time=chunk.start_time,
+                seq=seq,
+                start_sample=start_sample,
+                device_time=device_time,
             )
             self._safe_put(pointer)
 
@@ -505,25 +504,21 @@ class BaseDevice(ABC):
             self._next_start_sample = 0
             self._xruns = 0
             self._drops = 0
-            # Drain any stale data before starting a new run
             try:
                 while True:
                     self.data_queue.get_nowait()
             except queue.Empty:
                 pass
 
-    def _safe_put(self, ptr: ChunkPointer) -> None:
-        """Enqueue chunk pointer with BLOCKING to ensure lossless data flow."""
+    def _safe_put(self, item: Union[ChunkPointer, type[EndOfStream]]) -> None:
+        """Put item into data_queue using the canonical 'daq' lossless policy."""
         try:
-            # BLOCKING MODE: Wait up to 10 seconds. If still full, something is seriously wrong.
-            self.data_queue.put(ptr, block=True, timeout=10.0)
-        except queue.Full:
-            # This should NEVER happen with blocking mode - indicates deadlock or stuck consumer
-            logger.critical(
-                "Source data_queue BLOCKED for 10+ seconds - consumer (Dispatcher) not keeping up",
-                extra={"queue_maxsize": self.data_queue.maxsize, "timeout_sec": 10.0}
-            )
-            raise RuntimeError("Source data_queue blocked - lossless constraint violated")
+            enqueue_with_policy("daq", self.data_queue, item)
+        except Exception as exc:
+            # If we fail lossless constraint, it's usually a critical error
+            # but we log it here since it might be during shutdown.
+            logger.error("DAQ _safe_put failed: %s", exc)
+            raise
 
     def _assert_state(self, expected: Iterable[State]) -> None:
         if self._state not in expected:

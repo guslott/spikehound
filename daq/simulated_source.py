@@ -234,7 +234,7 @@ class SimulatedPhysiologySource(BaseDevice):
         return [DeviceInfo(id="sim0", name="Simulated Physiology (virtual)")]
 
     def get_capabilities(self, device_id: str) -> Capabilities:
-        return Capabilities(max_channels_in=3, sample_rates=[20_000], dtype="float32")
+        return Capabilities(max_channels_in=3, sample_rates=[10_000, 20_000], dtype="float32")
 
     def list_available_channels(self, device_id: str):
         return [
@@ -376,11 +376,13 @@ class SimulatedPhysiologySource(BaseDevice):
         pass
 
     def _configure_impl(self, sample_rate: int, channels, chunk_size: int, **options) -> ActualConfig:
-        # Force fixed sample rate
-        sample_rate = 20_000
+        # Validate sample rate
+        supported = [10000, 20000]
+        if int(sample_rate) not in supported:
+            sample_rate = 20000
         # Generate random units
         # Multiple units with variable amplitudes for realistic simulation
-        n_units = 6 #fix to 6 units
+        n_units = int(options.get('num_units', 2))
         self._line_hum_amp = float(options.get('line_hum_amp', self._default_line_hum_amp))
         self._line_hum_freq = float(options.get('line_hum_freq', 60.0))
         self._line_hum_phase = 0.0
@@ -395,6 +397,7 @@ class SimulatedPhysiologySource(BaseDevice):
 
     def _start_impl(self) -> None:
         assert self.config is not None
+        self._global_sample_counter = 0
         if self._worker and self._worker.is_alive():
             return
 
@@ -596,7 +599,7 @@ class SimulatedPhysiologySource(BaseDevice):
                 chunk_meta = {"active_channel_ids": active_ids}
                 
                 # Emit the chunk
-                self.emit_array(data_chunk, mono_time=loop_start, meta=chunk_meta)
+                self.emit_array(data_chunk, mono_time=loop_start)
 
                 # ============================================================
                 # STEP 4: CLEANUP

@@ -67,8 +67,18 @@ Common data types and utilities used throughout SpikeHound. This module defines 
 | `AnalysisEvent` | `shared/types.py` | GUI display with full timing |
 
 **Key Difference:**
-- `DetectionEvent`: Simple, lightweight (`t`, `chan`, `window`)
-- `AnalysisEvent`: Rich metadata (timing, sample rate, pre/post windows)
+- `DetectionEvent`: Simple, lightweight (`t`, `chan`, `window`). Canonical output of the detection layer.
+- `AnalysisEvent`: Rich metadata (timing, sample rate, pre/post windows). Enriched version for analysis and UI.
+
+#### Event Conversion Contract
+
+To keep the codebase clean and avoid confusion, we follow a strict conversion contract:
+
+1. **Detectors** (in `core/detection/`) ONLY emit `DetectionEvent`.
+2. **Analysis Workers** (in `analysis/`) receive `DetectionEvent` and convert it to `AnalysisEvent`.
+3. **The GUI** and **Analysis Tabs** consume `AnalysisEvent` for display and metric reporting.
+
+The canonical conversion function is `analysis.analysis_worker.detection_to_analysis_event`.
 
 ---
 

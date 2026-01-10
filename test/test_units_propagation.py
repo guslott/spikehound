@@ -33,7 +33,7 @@ def test_chunk_units_preserved():
     
     # Push data
     start = buf.write(np.zeros((1, 10), dtype=np.float32))
-    ptr = ChunkPointer(start_index=start, length=10, render_time=0.0)
+    ptr = ChunkPointer(start_index=start, length=10, render_time=0.0, seq=0, start_sample=0)
     
     dispatcher.start()
     raw_q.put(ptr)
@@ -60,7 +60,7 @@ def test_chunk_units_mixed():
     
     # Push data
     start = buf.write(np.zeros((2, 10), dtype=np.float32))
-    ptr = ChunkPointer(start_index=start, length=10, render_time=0.0)
+    ptr = ChunkPointer(start_index=start, length=10, render_time=0.0, seq=0, start_sample=0)
     
     dispatcher.start()
     raw_q.put(ptr)
@@ -85,7 +85,7 @@ def test_chunk_units_default():
     dispatcher.register_analysis_queue(analysis_q)
     
     start = buf.write(np.zeros((1, 10), dtype=np.float32))
-    ptr = ChunkPointer(start_index=start, length=10, render_time=0.0)
+    ptr = ChunkPointer(start_index=start, length=10, render_time=0.0, seq=0, start_sample=0)
     
     dispatcher.start()
     raw_q.put(ptr)

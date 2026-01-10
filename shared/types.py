@@ -1,12 +1,24 @@
 """Analysis-layer event types for GUI and worker communication.
 
 This module defines the detailed AnalysisEvent type used by the analysis worker and GUI.
-Unlike `shared.models.DetectionEvent` (which is a simpler detection-layer type), this
-AnalysisEvent includes detailed timing metadata for UI display and metric computation.
 
-When to use which Event type:
-- `shared.models.DetectionEvent`: Use in detection/dispatcher layer for lightweight event passing
-- `shared.types.AnalysisEvent`: Use in analysis worker and GUI for detailed event display
+IMPORTANT: AnalysisEvent is ALWAYS derived from DetectionEvent
+============================================================
+
+AnalysisEvent is created exclusively in the analysis layer by enriching a DetectionEvent
+with timing metadata and computed metrics. Detectors should NEVER emit AnalysisEvent
+directly—they emit the simpler DetectionEvent.
+
+Conversion Contract:
+- Detectors (core/detection/) emit → DetectionEvent
+- AnalysisWorker converts DetectionEvent → AnalysisEvent via `detection_to_analysis_event()`
+- GUI/EventBuffer receives → AnalysisEvent
+
+This explicit conversion makes the data flow clear for both humans and AI tools.
+
+See Also:
+    shared.models.DetectionEvent: The canonical detection-layer event type
+    analysis.analysis_worker.detection_to_analysis_event: The conversion function
 """
 from __future__ import annotations
 

@@ -166,7 +166,7 @@ class TriggerController(QtCore.QObject):
             self.reset_state()
         
         config = TriggerConfig(
-            channel_index=channel_id if channel_id is not None else -1,
+            channel_index=channel_id,
             threshold=threshold,
             hysteresis=0.0,
             pretrigger_frac=pre_seconds,

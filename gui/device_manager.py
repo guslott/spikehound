@@ -13,9 +13,6 @@ from PySide6 import QtCore
 if TYPE_CHECKING:  # pragma: no cover
     from daq.base_device import BaseDevice, ChannelInfo
     from core.device_registry import DeviceRegistry, RegistryEvent
-else:
-    BaseDevice = Any
-    ChannelInfo = Any
 
 
 class DeviceManager(QtCore.QObject):

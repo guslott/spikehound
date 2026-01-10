@@ -138,20 +138,30 @@ Drivers produce `Chunk` objects internally (or write directly to the buffer), bu
 ```python
 @dataclass(frozen=True)
 class Chunk:
-    """Atomic unit of streaming data passed explicitly (e.g. from tests)."""
+    """Atomic unit of streaming data passed between threads."""
     samples: np.ndarray          # Shape: (channels, frames)
     start_time: float            # Host monotonic time
     dt: float                    # Sample period (1/rate)
-    seq: int
+    seq: int                     # Monotonically increasing sequence number
     channel_names: tuple[str, ...]
     units: str
+    meta: Optional[Mapping[str, Any]] = None
 
 @dataclass(frozen=True)
 class ChunkPointer:
-    """Pointer to data in the SharedRingBuffer."""
+    """Lightweight pointer to data stored in a SharedRingBuffer.
+    
+    Carries sequencing metadata from the DAQ layer:
+    - seq: Monotonically increasing sequence number (reset per run)
+    - start_sample: Global sample index for the first sample in this chunk
+    - device_time: Optional hardware timestamp (seconds) if provided by driver
+    """
     start_index: int             # Index in ring buffer
     length: int                  # Number of frames
     render_time: float           # Approximate time for visualization
+    seq: int                     # Monotonically increasing sequence number
+    start_sample: int            # Global sample index for first sample
+    device_time: float | None = None
 ```
 
 **Shape & dtype**
@@ -183,7 +193,7 @@ class BaseDevice(ABC):
     def get_active_channels(self) -> list[ChannelInfo]: ...
 
     # Queue of pointers to consume (ChunkPointer | EndOfStream)
-    data_queue: "queue.Queue[ChunkPointer]"
+    data_queue: "queue.Queue[ChunkPointer | EndOfStream]"
 
     # Introspection
     @property
@@ -334,9 +344,7 @@ class MyDeviceSource(BaseDevice):
 * Emit **float32** arrays shaped `(frames, channels)` in the **active channel order**.
 * Call `self.emit_array(...)` for each produced chunk. It:
 
-  * validates shape and dtype,
-  * slices a superset down to the active channels (when possible),
-  * stamps `seq`, `start_sample`, `mono_time` (+ optional `device_time`),
+  * **automatically stamps** `seq`, `start_sample`, and `mono_time` (+ optional `device_time`),
   * writes to the `SharedRingBuffer` and enqueues a pointer (blocking if full).
 
 ### Timestamps

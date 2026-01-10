@@ -40,6 +40,7 @@ from .theme_manager import ThemeManager
 from .branding_manager import BrandingManager
 from .tab_plugin_manager import TabPluginManager
 from .signal_bridge import SignalBridge
+from .dispatcher_adapter import DispatcherSignals, connect_dispatcher_signals
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -52,10 +53,14 @@ class MainWindow(QtWidgets.QMainWindow):
     startRecording = QtCore.Signal(str, bool)  # path, rollover
     triggerConfigChanged = QtCore.Signal(TriggerConfig)
 
+
     def __init__(self, controller: Optional[PipelineController] = None) -> None:
         super().__init__()
         if controller is None:
-            controller = PipelineController()
+            # Create controller with QSettings persistence for GUI mode
+            from .qsettings_adapter import create_gui_settings_store
+            app_settings_store = create_gui_settings_store()
+            controller = PipelineController(app_settings_store=app_settings_store)
         self._logger = logging.getLogger(__name__)
         
         # Create runtime with dependency-injected DeviceManager (keeps core free of Qt imports)
@@ -94,7 +99,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_sample_rate: float = 0.0
         self._analysis_sample_rate: float = 0.0
         self._current_window_sec: float = 1.0
-        self._dispatcher_signals: Optional[QtCore.QObject] = None
+        self._dispatcher_signals: Optional[DispatcherSignals] = None
+        self._dispatcher_unsubscribe: Optional[Callable[[], None]] = None
         self._drag_channel_id: Optional[int] = None
         self._active_channel_id: Optional[int] = None
         # Track which channel is being monitored (for UI state only, AudioManager handles actual routing)
@@ -226,7 +232,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def open_device(self, driver: object, sample_rate: float, channels: Sequence[object]) -> None:
         """Delegate device attachment to the runtime/pipeline controller."""
         try:
-            self.runtime.open_device(driver, sample_rate, channels)
+            self.runtime.attach_source(driver, sample_rate, channels)
         except Exception as exc:
             self._logger.warning("Failed to open device: %s", exc)
             return
@@ -236,9 +242,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def configure_acquisition(
         self,
         *,
-        sample_rate: Optional[int] = None,
         channels: Optional[list[int]] = None,
-        chunk_size: Optional[int] = None,
         filter_settings: Optional[FilterSettings] = None,
         trigger_cfg: Optional[TriggerConfig] = None,
     ) -> None:
@@ -246,9 +250,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg_trigger = trigger_cfg
         try:
             self.runtime.configure_acquisition(
-                sample_rate=sample_rate,
                 channels=channels,
-                chunk_size=chunk_size,
                 filter_settings=filter_settings,
                 trigger_cfg=cfg_trigger,
             )
@@ -372,6 +374,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
         if self._controller is not None and self._controller is not controller:
+            # Clean up dispatcher signal subscription
+            if self._dispatcher_unsubscribe is not None:
+                self._dispatcher_unsubscribe()
+                self._dispatcher_unsubscribe = None
             if self._dispatcher_signals is not None:
                 try:
                     self._dispatcher_signals.tick.disconnect(self._on_dispatcher_tick)
@@ -390,12 +396,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.triggerConfigChanged.disconnect(self._controller.update_trigger_config)
             except (TypeError, RuntimeError):
                 pass
-            signals = self._controller.dispatcher_signals()
-            if signals is not None:
-                try:
-                    signals.tick.disconnect(self._on_dispatcher_tick)
-                except (TypeError, RuntimeError):
-                    pass
 
         self.runtime.set_pipeline(controller)
 
@@ -410,31 +410,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self._bind_app_settings_store()
 
     def _bind_dispatcher_signals(self) -> None:
-        """Connect or reconnect to dispatcher tick signals."""
-        if self._controller is None:
-            self._dispatcher_signals = None
-            return
-        signals = self._controller.dispatcher_signals()
-        if signals is None:
-            if self._dispatcher_signals is not None:
-                try:
-                    self._dispatcher_signals.tick.disconnect(self._on_dispatcher_tick)
-                except (TypeError, RuntimeError):
-                    pass
-            self._dispatcher_signals = None
-            return
-        if self._dispatcher_signals is signals:
-            return
+        """Connect or reconnect to dispatcher tick signals via adapter."""
+        # Clean up existing connections
+        if self._dispatcher_unsubscribe is not None:
+            self._dispatcher_unsubscribe()
+            self._dispatcher_unsubscribe = None
         if self._dispatcher_signals is not None:
             try:
                 self._dispatcher_signals.tick.disconnect(self._on_dispatcher_tick)
             except (TypeError, RuntimeError):
                 pass
-        try:
-            signals.tick.connect(self._on_dispatcher_tick)
-        except (TypeError, RuntimeError):
+            self._dispatcher_signals = None
+
+        if self._controller is None:
             return
+
+        dispatcher = self._controller.dispatcher_signals()  # Returns dispatcher or None
+        if dispatcher is None:
+            return
+
+        # Use adapter to create Qt signals from dispatcher callbacks
+        signals, unsubscribe = connect_dispatcher_signals(dispatcher)
+        signals.tick.connect(self._on_dispatcher_tick)
         self._dispatcher_signals = signals
+        self._dispatcher_unsubscribe = unsubscribe
 
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # type: ignore[override]
@@ -850,6 +849,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._drain_visualization_queue()
         self._clear_scope_display()
         # Don't clear sample_rate_combo - preserve rates for reconnection
+        if self._dispatcher_unsubscribe is not None:
+            self._dispatcher_unsubscribe()
+            self._dispatcher_unsubscribe = None
         if self._dispatcher_signals is not None:
             try:
                 self._dispatcher_signals.tick.disconnect(self._on_dispatcher_tick)

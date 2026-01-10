@@ -15,10 +15,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from daq.base_device import BaseDevice, ChannelInfo
     from daq.registry import DeviceDescriptor
-else:  # pragma: no cover - runtime fallback
-    BaseDevice = Any
-    ChannelInfo = Any
-    DeviceDescriptor = Any
 
 logger = logging.getLogger(__name__)
 

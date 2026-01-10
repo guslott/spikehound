@@ -94,6 +94,8 @@ class TestSlowConsumerIsolation:
                 start_index=start_idx,
                 length=chunk_size,
                 render_time=seq * chunk_size / sample_rate,
+                seq=seq,
+                start_sample=seq * chunk_size,
             )
             queues["raw"].put(pointer)
 
@@ -158,6 +160,8 @@ class TestSlowConsumerIsolation:
                 start_index=start_idx,
                 length=chunk_size,
                 render_time=seq * chunk_size / sample_rate,
+                seq=seq,
+                start_sample=seq * chunk_size,
             )
             queues["raw"].put(pointer)
 
@@ -198,6 +202,8 @@ class TestDropTracking:
                 start_index=start_idx,
                 length=chunk_size,
                 render_time=seq * chunk_size / sample_rate,
+                seq=seq,
+                start_sample=seq * chunk_size,
             )
             queues["raw"].put(pointer)
 
@@ -267,6 +273,8 @@ class TestShutdownBehavior:
                 start_index=start_idx,
                 length=chunk_size,
                 render_time=seq * chunk_size / sample_rate,
+                seq=seq,
+                start_sample=seq * chunk_size,
             )
             queues["raw"].put(pointer)
 
@@ -317,6 +325,8 @@ class TestDataOrdering:
                 start_index=start_idx,
                 length=chunk_size,
                 render_time=seq * chunk_size / sample_rate,
+                seq=seq,
+                start_sample=seq * chunk_size,
             )
             queues["raw"].put(pointer)
 
@@ -365,6 +375,8 @@ class TestMultipleAnalysisQueues:
                 start_index=start_idx,
                 length=chunk_size,
                 render_time=seq * chunk_size / sample_rate,
+                seq=seq,
+                start_sample=seq * chunk_size,
             )
             queues["raw"].put(pointer)
 
@@ -401,7 +413,7 @@ class TestMultipleAnalysisQueues:
         # Send one chunk
         samples = np.ones((1, 256), dtype=np.float32)
         start_idx = source_buffer.write(samples)
-        pointer = ChunkPointer(start_index=start_idx, length=256, render_time=0.0)
+        pointer = ChunkPointer(start_index=start_idx, length=256, render_time=0.0, seq=0, start_sample=0)
         queues["raw"].put(pointer)
 
         time.sleep(0.1)  # Let it process
@@ -422,7 +434,7 @@ class TestMultipleAnalysisQueues:
         for seq in range(5):
             samples = np.ones((1, 256), dtype=np.float32) * (seq + 10)
             start_idx = source_buffer.write(samples)
-            pointer = ChunkPointer(start_index=start_idx, length=256, render_time=0.0)
+            pointer = ChunkPointer(start_index=start_idx, length=256, render_time=0.0, seq=seq, start_sample=seq * 256)
             queues["raw"].put(pointer)
 
         queues["raw"].put(EndOfStream)

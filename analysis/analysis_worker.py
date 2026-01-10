@@ -10,7 +10,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-from shared.models import Chunk, EndOfStream
+from shared.models import Chunk, DetectionEvent, EndOfStream
 from shared.event_buffer import EventRingBuffer
 from shared.types import AnalysisEvent
 
@@ -18,6 +18,116 @@ from .models import AnalysisBatch
 from .settings import AnalysisSettings, AnalysisSettingsStore
 from .metrics import envelope, peak_frequency_sinc, event_width
 from core.detection import AmpThresholdDetector, DETECTOR_REGISTRY
+
+
+def detection_to_analysis_event(
+    de: DetectionEvent,
+    chunk: Chunk,
+    event_id: int,
+    sample_rate: float,
+    window_ms: float,
+    last_crossing_time: float | None,
+    noise_mad: float,
+    noise_initialized: bool,
+) -> tuple[AnalysisEvent, int, float]:
+    """Convert DetectionEvent to AnalysisEvent with computed metrics.
+    
+    This is the ONLY place where AnalysisEvent should be created from
+    detection output. All enrichment (timing metadata, metrics) happens here.
+    
+    Args:
+        de: DetectionEvent from detector
+        chunk: Source chunk for timing context
+        event_id: Unique event identifier
+        sample_rate: Sample rate in Hz
+        window_ms: Event window duration in ms
+        last_crossing_time: Previous event crossing time for interval calculation
+        noise_mad: Median absolute deviation for noise estimation
+        noise_initialized: Whether noise estimate is valid
+    
+    Returns:
+        Tuple of (AnalysisEvent, event_end_sample, crossing_time)
+    """
+    dt = float(chunk.dt)
+    sr = (1.0 / dt) if dt > 0 else sample_rate
+    wf = de.window
+    
+    if wf.size == 0:
+        raise ValueError("DetectionEvent has empty window")
+    
+    # Calculate metrics
+    baseline_val = float(np.median(wf))
+    centered_wf = wf.astype(np.float64) - baseline_val
+    
+    # Envelope (max - min)
+    env = envelope(wf)
+    
+    # Peak Freq
+    peak_freq = peak_frequency_sinc(centered_wf, sr)
+    peak_wavelength = 1.0 / peak_freq if peak_freq > 1e-9 else 0.0
+    
+    # Interval since last event
+    crossing_time = de.t
+    interval_sec = float("nan")
+    if last_crossing_time is not None:
+        delta = crossing_time - last_crossing_time
+        if delta >= 0:
+            interval_sec = delta
+    
+    # Map timestamp to sample index
+    rel_time = de.t - chunk.start_time
+    rel_idx = int(round(rel_time / dt))
+    
+    start_sample = -1
+    if chunk.meta:
+        try:
+            start_sample = int(chunk.meta.get("start_sample", -1))
+        except (TypeError, ValueError):
+            pass
+    
+    abs_idx = rel_idx if start_sample < 0 else start_sample + rel_idx
+    
+    # Calculate pre/post samples
+    pre_samples = de.params.get("pre_samples")
+    if pre_samples is None:
+        pre_samples = wf.size // 2
+    else:
+        pre_samples = int(pre_samples)
+    
+    first_time_sec = de.t - (pre_samples * dt)
+    
+    event = AnalysisEvent(
+        id=event_id,
+        channelId=de.chan,
+        thresholdValue=de.params.get("threshold", 0.0),
+        crossingIndex=abs_idx,
+        crossingTimeSec=de.t,
+        firstSampleTimeSec=first_time_sec,
+        sampleRateHz=sr,
+        windowMs=float(window_ms),
+        preMs=float(pre_samples * dt * 1000.0),
+        postMs=float((wf.size - pre_samples) * dt * 1000.0),
+        samples=wf,
+        intervalSinceLastSec=interval_sec,
+    )
+    
+    # Add computed properties
+    props = getattr(event, "properties", None)
+    if isinstance(props, dict):
+        props["envelope"] = env
+        props["peak_freq_hz"] = peak_freq
+        props["peak_wavelength_s"] = peak_wavelength
+        if np.isfinite(interval_sec):
+            props["interval_sec"] = float(interval_sec)
+        # Event Width
+        width_th = float(6.0 * 1.4826 * noise_mad) if noise_initialized else None
+        width_ms_val = event_width(wf, sr, threshold=width_th, sigma=6.0, pre_samples=pre_samples)
+        props["event_width_ms"] = width_ms_val
+    
+    # Calculate event end sample
+    event_end = abs_idx + wf.size
+    
+    return event, event_end, crossing_time
 
 
 class AnalysisWorker(threading.Thread):
@@ -308,122 +418,34 @@ class AnalysisWorker(threading.Thread):
             detector = self._auto_detector
         
         if auto_detect and detector is not None:
-            # Use modular detector
-            # Ensure detector sample rate is correct
-            # We can't easily check internal state, but we can re-reset if needed or trust configure/reset
-            # For now, let's assume it's set correctly or we update it here if we track it.
-            # Actually, let's just use it.
-            
-            # Note: AmpThresholdDetector expects a Chunk.
-            # It returns core.detection.Event objects.
-            # We need to convert/augment them.
-            
+            # Use modular detector to process chunk and convert DetectionEvents to AnalysisEvents
             detected_events = detector.process_chunk(chunk)
             if not detected_events:
                 return []
             
             events: list[tuple[AnalysisEvent, int, float]] = []
             
-            # We need to calculate metrics for these events
-            dt = float(chunk.dt)
-            sr = (1.0 / dt) if dt > 0 else self.sample_rate
-            
             for de in detected_events:
-                # de is shared.models.DetectionEvent
-                # We need to create shared.types.AnalysisEvent (which is the same class)
-                # But AnalysisWorker adds extra properties.
-                
-                wf = de.window
-                if wf.size == 0:
+                # Convert DetectionEvent to AnalysisEvent via canonical conversion function
+                if de.window.size == 0:
                     continue
                 
-                # Calculate metrics
-                # Baseline
-                baseline_val = float(np.median(wf)) # Simple median
-                centered_wf = wf.astype(np.float64) - baseline_val
-                
-                # Envelope (max - min)
-                env = envelope(wf)
-                
-                # Peak Freq
-                peak_freq = peak_frequency_sinc(centered_wf, sr)
-                peak_wavelength = 1.0 / peak_freq if peak_freq > 1e-9 else 0.0
-                
-                # Interval
-                crossing_time = de.t
-                interval_sec = float("nan")
-                if self._last_crossing_time_sec is not None:
-                    delta = crossing_time - self._last_crossing_time_sec
-                    if delta >= 0:
-                        interval_sec = delta
-                
-                # Create Event
-                # We need to map de.t (time) to sample index for last_end calculation
-                # t = start_time + idx * dt
-                # idx = (t - start_time) / dt
-                rel_time = de.t - chunk.start_time
-                rel_idx = int(round(rel_time / dt))
-                
-                start_sample = -1
-                if chunk.meta:
-                    try:
-                        start_sample = int(chunk.meta.get("start_sample", -1))
-                    except:
-                        pass
-                
-                abs_idx = rel_idx if start_sample < 0 else start_sample + rel_idx
-                
-                # Calculate pre/post ms based on window
-                # AmpThresholdDetector centers the event roughly?
-                # Actually AmpThresholdDetector extracts window around crossing.
-                # We can assume it's centered or just use the whole window.
-                
-                pre_samples = de.params.get("pre_samples")
-                if pre_samples is None:
-                    # Fallback if not provided
-                    pre_samples = wf.size // 2
-                else:
-                    pre_samples = int(pre_samples)
-                
-                first_time_sec = de.t - (pre_samples * dt)
-                
-                event = AnalysisEvent(
-                    id=self._next_event_id(),
-                    channelId=de.chan, # This might need mapping if we have multiple channels
-                    thresholdValue=de.params.get("threshold", 0.0),
-                    crossingIndex=abs_idx,
-                    crossingTimeSec=de.t,
-                    firstSampleTimeSec=first_time_sec,
-                    sampleRateHz=sr,
-                    windowMs=float(self._event_window_ms),
-                    preMs=float(pre_samples * dt * 1000.0),
-                    postMs=float((wf.size - pre_samples) * dt * 1000.0),
-                    samples=wf,
-                    intervalSinceLastSec=interval_sec
-                )
-                
-                props = getattr(event, "properties", None)
-                if isinstance(props, dict):
-                    props["envelope"] = env
-                    props["peak_freq_hz"] = peak_freq
-                    props["peak_wavelength_s"] = peak_wavelength
-                    if np.isfinite(interval_sec):
-                        props["interval_sec"] = float(interval_sec)
-                    # Event Width
-                    # Use local noise estimate from worker state (updated via _update_noise_level)
-                    width_th = float(6.0 * 1.4826 * self._noise_mad) if self._noise_initialized else None
-                    width_ms = event_width(wf, sr, threshold=width_th, sigma=6.0, pre_samples=pre_samples)
-                    props["event_width_ms"] = width_ms
-                
-                # Update last_end
-                # We need to know where this event ends in absolute samples
-                # abs_idx is the crossing. Window end is approx abs_idx + half?
-                # Let's just say abs_idx + wf.size
-                this_end = abs_idx + wf.size
-                events.append((event, this_end, crossing_time))
-                
-                # Update internal state for interval calculation in loop
-                self._last_crossing_time_sec = crossing_time
+                try:
+                    event, this_end, crossing_time = detection_to_analysis_event(
+                        de=de,
+                        chunk=chunk,
+                        event_id=self._next_event_id(),
+                        sample_rate=self.sample_rate,
+                        window_ms=self._event_window_ms,
+                        last_crossing_time=self._last_crossing_time_sec,
+                        noise_mad=self._noise_mad,
+                        noise_initialized=self._noise_initialized,
+                    )
+                    events.append((event, this_end, crossing_time))
+                    # Update internal state for interval calculation in loop
+                    self._last_crossing_time_sec = crossing_time
+                except ValueError:
+                    continue
             
             # Return collected events
             collected: list[AnalysisEvent] = []
@@ -522,60 +544,32 @@ class AnalysisWorker(threading.Thread):
 
             if use_secondary and self._waveform_crosses_threshold(wf, secondary_value):
                 continue
-            interval_sec = float("nan")
-            if prev_crossing_time is not None:
-                delta = float(crossing_time) - float(prev_crossing_time)
-                if delta < 0:
-                    delta = 0.0
-                interval_sec = delta
-            if pre_count > 0:
-                baseline = float(np.median(wf[:pre_count]))
-            else:
-                baseline = float(np.median(wf))
-            centered_wf = wf.astype(np.float64) - baseline
-            search_radius = max(1, int(round(0.001 * sr)))
-            peak_window_start = max(0, pre_count - search_radius)
-            peak_window_end = min(wf.size, pre_count + search_radius + 1)
-            if peak_window_end <= peak_window_start:
-                peak_window_end = min(wf.size, peak_window_start + 1)
-            window_slice = centered_wf[peak_window_start:peak_window_end]
-            if window_slice.size:
-                local_idx = int(np.argmax(np.abs(window_slice)))
-                peak_idx = peak_window_start + local_idx
-            else:
-                peak_idx = pre_count
-            env = envelope(wf)
-            peak_freq = peak_frequency_sinc(centered_wf, sr, center_index=peak_idx)
-            peak_wavelength = 1.0 / peak_freq if peak_freq > 1e-9 else 0.0
-            event = AnalysisEvent(
-                id=self._next_event_id(),
-                channelId=int(channel_id) if channel_id is not None else 0,
-                thresholdValue=threshold_value,
-                crossingIndex=int(crossing_index),
-                crossingTimeSec=float(crossing_time),
-                firstSampleTimeSec=float(first_time),
-                sampleRateHz=float(sr),
-                windowMs=float(event_window_ms),
-                preMs=float(pre_ms),
-                postMs=float(post_ms),
-                samples=wf,
-                intervalSinceLastSec=float(interval_sec),
-            )
-            props = getattr(event, "properties", None)
-            if isinstance(props, dict):
-                props["envelope"] = env
-                props["peak_freq_hz"] = peak_freq
-                props["peak_wavelength_s"] = peak_wavelength
-                if np.isfinite(interval_sec):
-                    props["interval_sec"] = float(interval_sec)
-                # Event Width
-                width_th = float(6.0 * 1.4826 * self._noise_mad) if self._noise_initialized else None
-                width_ms = event_width(wf, sr, threshold=width_th, sigma=6.0, pre_samples=pre_count)
-                props["event_width_ms"] = width_ms
 
-            last_end = candidate_last_end
-            events.append((event, last_end, float(crossing_time)))
-            prev_crossing_time = float(crossing_time)
+            # Create transient DetectionEvent for processing
+            de = DetectionEvent(
+                t=float(crossing_time),
+                chan=int(channel_id) if channel_id is not None else 0,
+                window=wf,
+                properties={},
+                params={"threshold": float(threshold_value), "pre_samples": int(pre_count)}
+            )
+
+            try:
+                event, last_end_val, crossing_time_val = detection_to_analysis_event(
+                    de=de,
+                    chunk=chunk,
+                    event_id=self._next_event_id(),
+                    sample_rate=self.sample_rate,
+                    window_ms=float(event_window_ms),
+                    last_crossing_time=prev_crossing_time,
+                    noise_mad=self._noise_mad,
+                    noise_initialized=self._noise_initialized,
+                )
+                last_end = last_end_val
+                events.append((event, last_end, float(crossing_time_val)))
+                prev_crossing_time = float(crossing_time_val)
+            except ValueError:
+                continue
 
         if not events:
             return []

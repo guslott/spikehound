@@ -54,16 +54,14 @@ class TestFullPipelineDataFlow:
         try:
             # Set up with simulated source
             devices = SimulatedPhysiologySource.list_available_devices()
-            runtime.switch_backend(SimulatedPhysiologySource)
+            runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
             runtime.configure_acquisition(
-                sample_rate=10000,
                 channels=[0],
-                chunk_size=256,
             )
 
             # Start acquisition
-            runtime.start()
+            runtime.start_acquisition()
             time.sleep(0.3)  # Let data flow
 
             # Check visualization queue
@@ -73,8 +71,8 @@ class TestFullPipelineDataFlow:
             # Items should be ChunkPointers
             assert all(isinstance(item, ChunkPointer) for item in viz_items)
         finally:
-            runtime.stop()
-            runtime.release()
+            runtime.stop_acquisition()
+            runtime.shutdown()
 
     def test_filtered_data_is_actually_filtered(self):
         """Filter settings should affect the output data."""
@@ -82,12 +80,10 @@ class TestFullPipelineDataFlow:
 
         try:
             devices = SimulatedPhysiologySource.list_available_devices()
-            runtime.switch_backend(SimulatedPhysiologySource)
+            runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
             runtime.configure_acquisition(
-                sample_rate=10000,
                 channels=[0],
-                chunk_size=256,
             )
 
             # Apply aggressive low-pass filter
@@ -99,7 +95,7 @@ class TestFullPipelineDataFlow:
             )
             runtime.update_filter_settings(filter_settings)
 
-            runtime.start()
+            runtime.start_acquisition()
             time.sleep(0.2)
 
             # Get some filtered data
@@ -115,8 +111,8 @@ class TestFullPipelineDataFlow:
                 # Just verify we got data and it's finite
                 assert np.all(np.isfinite(data))
         finally:
-            runtime.stop()
-            runtime.release()
+            runtime.stop_acquisition()
+            runtime.shutdown()
 
 
 class TestPipelineLifecycle:
@@ -128,26 +124,24 @@ class TestPipelineLifecycle:
 
         try:
             devices = SimulatedPhysiologySource.list_available_devices()
-            runtime.switch_backend(SimulatedPhysiologySource)
+            runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
             runtime.configure_acquisition(
-                sample_rate=10000,
                 channels=[0],
-                chunk_size=256,
             )
 
             for cycle in range(3):
-                runtime.start()
+                runtime.start_acquisition()
                 time.sleep(0.1)
 
                 # Verify data is flowing
                 viz_items = drain_queue(runtime.visualization_queue)
                 assert len(viz_items) > 0, f"No data in cycle {cycle}"
 
-                runtime.stop()
+                runtime.stop_acquisition()
                 time.sleep(0.05)
         finally:
-            runtime.release()
+            runtime.shutdown()
 
     def test_stop_without_start_is_safe(self):
         """Stopping before starting should not crash."""
@@ -155,18 +149,16 @@ class TestPipelineLifecycle:
 
         try:
             devices = SimulatedPhysiologySource.list_available_devices()
-            runtime.switch_backend(SimulatedPhysiologySource)
+            runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
             runtime.configure_acquisition(
-                sample_rate=10000,
                 channels=[0],
-                chunk_size=256,
             )
 
             # Stop without starting - should not crash
-            runtime.stop()
+            runtime.stop_acquisition()
         finally:
-            runtime.release()
+            runtime.shutdown()
 
     def test_double_start_is_safe(self):
         """Starting twice should not cause issues."""
@@ -174,21 +166,19 @@ class TestPipelineLifecycle:
 
         try:
             devices = SimulatedPhysiologySource.list_available_devices()
-            runtime.switch_backend(SimulatedPhysiologySource)
+            runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
             runtime.configure_acquisition(
-                sample_rate=10000,
                 channels=[0],
-                chunk_size=256,
             )
 
-            runtime.start()
-            runtime.start()  # Second start - should be safe
+            runtime.start_acquisition()
+            runtime.start_acquisition()  # Second start - should be safe
 
             time.sleep(0.1)
-            runtime.stop()
+            runtime.stop_acquisition()
         finally:
-            runtime.release()
+            runtime.shutdown()
 
 
 class TestPipelineResourceCleanup:
@@ -203,24 +193,22 @@ class TestPipelineResourceCleanup:
 
         try:
             devices = SimulatedPhysiologySource.list_available_devices()
-            runtime.switch_backend(SimulatedPhysiologySource)
+            runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
             runtime.configure_acquisition(
-                sample_rate=10000,
                 channels=[0],
-                chunk_size=256,
             )
 
-            runtime.start()
+            runtime.start_acquisition()
             time.sleep(0.2)
             running_threads = threading.active_count()
 
-            runtime.stop()
+            runtime.stop_acquisition()
             time.sleep(0.2)  # Give threads time to clean up
 
             after_stop_threads = threading.active_count()
         finally:
-            runtime.release()
+            runtime.shutdown()
 
         # After release, thread count should be close to initial
         time.sleep(0.1)
@@ -235,18 +223,16 @@ class TestPipelineResourceCleanup:
         runtime = SpikeHoundRuntime()
 
         devices = SimulatedPhysiologySource.list_available_devices()
-        runtime.switch_backend(SimulatedPhysiologySource)
+        runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
         runtime.select_device(devices[0].id)
         runtime.configure_acquisition(
-            sample_rate=10000,
             channels=[0],
-            chunk_size=256,
         )
 
-        runtime.start()
+        runtime.start_acquisition()
         time.sleep(0.1)
-        runtime.stop()
-        runtime.release()
+        runtime.stop_acquisition()
+        runtime.shutdown()
 
         # Source should be None after release
         assert runtime.daq_source is None
@@ -261,28 +247,26 @@ class TestAnalysisQueueIntegration:
 
         try:
             devices = SimulatedPhysiologySource.list_available_devices()
-            runtime.switch_backend(SimulatedPhysiologySource)
+            runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
             runtime.configure_acquisition(
-                sample_rate=10000,
                 channels=[0],
-                chunk_size=256,
             )
 
             # Open analysis stream
             analysis_queue, token = runtime.open_analysis_stream("Extracellular Proximal", 10000.0)
 
-            runtime.start()
+            runtime.start_acquisition()
             time.sleep(0.2)
 
             # Check analysis queue
             analysis_items = drain_queue(analysis_queue, timeout=0.5)
             assert len(analysis_items) > 0, "Analysis queue received no data"
 
-            runtime.stop()
+            runtime.stop_acquisition()
             runtime.close_analysis_stream(token)
         finally:
-            runtime.release()
+            runtime.shutdown()
 
 
 class TestHealthMonitoring:
@@ -294,15 +278,13 @@ class TestHealthMonitoring:
 
         try:
             devices = SimulatedPhysiologySource.list_available_devices()
-            runtime.switch_backend(SimulatedPhysiologySource)
+            runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
             runtime.configure_acquisition(
-                sample_rate=10000,
                 channels=[0],
-                chunk_size=256,
             )
 
-            runtime.start()
+            runtime.start_acquisition()
             time.sleep(0.2)
 
             health = runtime.health_snapshot()
@@ -314,8 +296,8 @@ class TestHealthMonitoring:
             # (exact fields depend on implementation)
             assert len(health) > 0
         finally:
-            runtime.stop()
-            runtime.release()
+            runtime.stop_acquisition()
+            runtime.shutdown()
 
 
 class TestMultiChannelPipeline:
@@ -327,7 +309,7 @@ class TestMultiChannelPipeline:
 
         try:
             devices = SimulatedPhysiologySource.list_available_devices()
-            runtime.switch_backend(SimulatedPhysiologySource)
+            runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
 
             # Configure for multiple channels
@@ -336,12 +318,10 @@ class TestMultiChannelPipeline:
             channels = [c.id for c in available[:n_channels]]
 
             runtime.configure_acquisition(
-                sample_rate=10000,
                 channels=channels,
-                chunk_size=256,
             )
 
-            runtime.start()
+            runtime.start_acquisition()
             time.sleep(0.2)
 
             # Get some data
@@ -353,5 +333,5 @@ class TestMultiChannelPipeline:
                 buf = runtime.dispatcher.viz_buffer
                 assert buf.shape[0] == n_channels
         finally:
-            runtime.stop()
-            runtime.release()
+            runtime.stop_acquisition()
+            runtime.shutdown()

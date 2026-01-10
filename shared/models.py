@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
+import logging
+import queue
 import numpy as np
 
 
@@ -140,11 +142,20 @@ class Chunk:
 
 @dataclass(frozen=True)
 class ChunkPointer:
-    """Lightweight pointer to data stored in a SharedRingBuffer."""
+    """Lightweight pointer to data stored in a SharedRingBuffer.
+    
+    Carries sequencing metadata from the DAQ layer:
+    - seq: Monotonically increasing sequence number (reset per run)
+    - start_sample: Global sample index for the first sample in this chunk
+    - device_time: Optional hardware timestamp (seconds) if provided by driver
+    """
 
     start_index: int
     length: int
     render_time: float
+    seq: int
+    start_sample: int
+    device_time: float | None = None
 
     def __post_init__(self) -> None:
         if self.start_index < 0:
@@ -153,15 +164,24 @@ class ChunkPointer:
             raise ValueError("length must be positive")
         if self.render_time < 0:
             raise ValueError("render_time must be non-negative")
+        if self.seq < 0:
+            raise ValueError("seq must be non-negative")
+        if self.start_sample < 0:
+            raise ValueError("start_sample must be non-negative")
 
 
 @dataclass(frozen=True)
 class DetectionEvent:
-    """Detected feature emitted by the dispatcher/detection layer.
+    """Canonical event type emitted by detectors in the detection pipeline.
     
-    This is the simpler, lower-level Event type used by the detection pipeline.
-    For the more detailed analysis-layer AnalysisEvent with timing metadata, see
-    `shared.types.AnalysisEvent`.
+    IMPORTANT: This is the ONLY event type that detectors should emit.
+    AnalysisEvent is derived from DetectionEvent in the analysis layer.
+    
+    Conversion Flow:
+        Detector emits DetectionEvent → AnalysisWorker converts to AnalysisEvent
+    
+    This type is intentionally lightweight to minimize overhead in the detection
+    hot path. The analysis layer enriches it with timing metadata and metrics.
     
     Attributes:
         t: Timestamp of the event (seconds since stream start)
@@ -171,7 +191,8 @@ class DetectionEvent:
         params: Detection parameters used (e.g., threshold value)
     
     See Also:
-        shared.types.AnalysisEvent: Analysis-layer Event with detailed timing info
+        shared.types.AnalysisEvent: Enriched event type for GUI display
+        analysis.analysis_worker.detection_to_analysis_event: Conversion function
     """
 
     t: float
@@ -219,18 +240,155 @@ class _EndOfStreamSentinel:
 EndOfStream = _EndOfStreamSentinel()
 
 
+_VALID_TRIGGER_MODES = frozenset({"continuous", "stream", "single"})
+
+
 @dataclass(frozen=True)
 class TriggerConfig:
     """Trigger parameters shared with the dispatcher/analyzer layer."""
 
-    channel_index: int
+    channel_index: int | None
     threshold: float
     hysteresis: float
     pretrigger_frac: float
     window_sec: float
     mode: str
 
+    def __post_init__(self) -> None:
+        if self.mode not in _VALID_TRIGGER_MODES:
+            raise ValueError(
+                f"mode must be one of {sorted(_VALID_TRIGGER_MODES)}, got {self.mode!r}"
+            )
+        if self.window_sec <= 0:
+            raise ValueError("window_sec must be positive")
+        if not (0.0 <= self.pretrigger_frac <= 1.0):
+            raise ValueError("pretrigger_frac must be in [0, 1]")
+        if not np.isfinite(self.threshold):
+            raise ValueError("threshold must be finite")
+        if not np.isfinite(self.hysteresis):
+            raise ValueError("hysteresis must be finite")
+        
+        # Validation for channel selection
+        if self.mode in ("single", "continuous"):
+            if self.channel_index is None:
+                raise ValueError(f"channel_index must be specified for mode {self.mode!r}")
+            if self.channel_index < 0:
+                raise ValueError("channel_index must be non-negative")
+        else:
+            # In stream mode, channel_index can be None or non-negative
+            if self.channel_index is not None and self.channel_index < 0:
+                raise ValueError("channel_index must be non-negative if specified")
 
+
+
+
+
+# ----------------------------
+# Queue & Backpressure Policies
+# ----------------------------
+
+logger = logging.getLogger(__name__)
+
+# Explicit backpressure policies for each queue.
+# - "lossless": blocks until space available (fail loudly if timeout)
+# - "drop-newest": drops incoming item if queue is full
+# - "drop-oldest": evicts oldest item to make room for new one
+QUEUE_POLICIES: dict[str, str] = {
+    "visualization": "drop-newest",
+    "audio": "drop-newest",
+    "logging": "lossless",
+    "analysis": "drop-oldest",
+    "events": "drop-newest",
+    "daq": "lossless",  # DAQ -> Dispatcher is always lossless
+}
+
+
+def enqueue_with_policy(
+    queue_name: str, 
+    target_queue: queue.Queue, 
+    item: object, 
+    *,
+    stats_callback: Optional[Callable[[str, str], None]] = None
+) -> None:
+    """Unified enqueue method that dispatches on QUEUE_POLICIES.
+    
+    Args:
+        queue_name: Name of the target queue (used for policy lookup and stats)
+        target_queue: The queue object to put the item into
+        item: The data to enqueue
+        stats_callback: Optional callback(queue_name, action) where action is 
+                        "forwarded", "dropped", or "evicted".
+    """
+    policy = QUEUE_POLICIES.get(queue_name, "drop-newest")
+    
+    if policy == "lossless":
+        _enqueue_lossless(target_queue, item, queue_name, stats_callback)
+    elif policy == "drop-oldest":
+        _enqueue_drop_oldest(target_queue, item, queue_name, stats_callback)
+    else:  # "drop-newest" or unknown
+        _enqueue_drop_newest(target_queue, item, queue_name, stats_callback)
+
+
+def _enqueue_lossless(
+    target_queue: queue.Queue, 
+    item: object, 
+    queue_name: str,
+    stats_callback: Optional[Callable[[str, str], None]] = None
+) -> None:
+    """Block until space available; fail loudly if timeout."""
+    try:
+        target_queue.put(item, block=True, timeout=10.0)
+    except queue.Full:
+        logger.critical(
+            "Queue '%s' BLOCKED for 10+ seconds - downstream too slow",
+            queue_name
+        )
+        if stats_callback:
+            stats_callback(queue_name, "dropped")
+        raise RuntimeError(f"Queue '{queue_name}' blocked - lossless constraint violated")
+    else:
+        if stats_callback:
+            stats_callback(queue_name, "forwarded")
+
+
+def _enqueue_drop_newest(
+    target_queue: queue.Queue, 
+    item: object, 
+    queue_name: str,
+    stats_callback: Optional[Callable[[str, str], None]] = None
+) -> None:
+    """Drop the incoming item if the queue is full."""
+    try:
+        target_queue.put_nowait(item)
+    except queue.Full:
+        if stats_callback:
+            stats_callback(queue_name, "dropped")
+    else:
+        if stats_callback:
+            stats_callback(queue_name, "forwarded")
+
+
+def _enqueue_drop_oldest(
+    target_queue: queue.Queue, 
+    item: object, 
+    queue_name: str,
+    stats_callback: Optional[Callable[[str, str], None]] = None
+) -> None:
+    """Evict oldest items until the new item fits."""
+    placed = False
+    while not placed:
+        try:
+            target_queue.put_nowait(item)
+            placed = True
+        except queue.Full:
+            try:
+                _ = target_queue.get_nowait()
+                if stats_callback:
+                    stats_callback(queue_name, "evicted")
+            except queue.Empty:
+                pass
+    if stats_callback:
+        stats_callback(queue_name, "forwarded")
 
 
 __all__ = [
@@ -244,4 +402,7 @@ __all__ = [
 
     "EndOfStream",
     "TriggerConfig",
+    
+    "QUEUE_POLICIES",
+    "enqueue_with_policy",
 ]

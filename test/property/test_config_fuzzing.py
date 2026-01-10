@@ -206,7 +206,7 @@ class TestChunkPointerValidation:
     def test_negative_start_index_rejected(self, start_index: int):
         """start_index must be non-negative."""
         with pytest.raises(ValueError):
-            ChunkPointer(start_index=start_index, length=100, render_time=0.0)
+            ChunkPointer(start_index=start_index, length=100, render_time=0.0, seq=0, start_sample=0)
 
     @given(
         length=st.integers(max_value=0),
@@ -215,7 +215,7 @@ class TestChunkPointerValidation:
     def test_non_positive_length_rejected(self, length: int):
         """length must be positive."""
         with pytest.raises(ValueError):
-            ChunkPointer(start_index=0, length=length, render_time=0.0)
+            ChunkPointer(start_index=0, length=length, render_time=0.0, seq=0, start_sample=0)
 
     @given(
         render_time=st.floats(max_value=-0.001),
@@ -225,7 +225,7 @@ class TestChunkPointerValidation:
         """render_time must be non-negative."""
         assume(np.isfinite(render_time))
         with pytest.raises(ValueError):
-            ChunkPointer(start_index=0, length=100, render_time=render_time)
+            ChunkPointer(start_index=0, length=100, render_time=render_time, seq=0, start_sample=0)
 
 
 class TestRingBufferValidation:

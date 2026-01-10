@@ -10,11 +10,6 @@ import numpy as np
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from daq.base_device import ActualConfig, BaseDevice, ChannelInfo
     from daq.registry import DeviceDescriptor
-else:  # pragma: no cover - runtime fallback
-    ActualConfig = Any
-    BaseDevice = Any
-    ChannelInfo = Any
-    DeviceDescriptor = Any
 
 from .conditioning import FilterSettings
 from .dispatcher import Dispatcher
@@ -47,6 +42,7 @@ class PipelineController:
         audio_queue_size: int = 256,
         logging_queue_size: int = 512,
         dispatcher_poll_timeout: float = 0.05,
+        app_settings_store: Optional[AppSettingsStore] = None,
     ) -> None:
         self._filter_settings = filter_settings or FilterSettings()
         self.visualization_queue: "queue.Queue" = queue.Queue(maxsize=visualization_queue_size)
@@ -54,7 +50,7 @@ class PipelineController:
         self.logging_queue: "queue.Queue" = queue.Queue(maxsize=logging_queue_size)
         self.event_queue: "queue.Queue" = queue.Queue(maxsize=1024)
         self._analysis_settings = AnalysisSettingsStore()
-        self._app_settings_store = AppSettingsStore()
+        self._app_settings_store = app_settings_store if app_settings_store is not None else AppSettingsStore()
         self._event_buffer = EventRingBuffer(capacity=1000)
         self._analysis_events = AnalysisEvents(self._event_buffer)
 
@@ -319,7 +315,7 @@ class PipelineController:
     def pull_analysis_events(self, last_event_id: Optional[int] = None):
         return self._analysis_events.pull_events(last_event_id)
 
-    # Trigger configuration placeholder ---------------------------------
+    # Trigger configuration ---------------------------------------------
 
     def update_trigger_config(self, config: TriggerConfig) -> None:
         """Receive trigger configuration updates from the GUI and forward them."""
@@ -519,8 +515,13 @@ class PipelineController:
             return self._dispatcher.snapshot()
 
     def dispatcher_signals(self):
+        """DEPRECATED: Use dispatcher.add_tick_callback() instead.
+        
+        Returns the dispatcher for callback registration. GUI layer should use
+        gui.dispatcher_adapter.connect_dispatcher_signals() to get Qt signals.
+        """
         with self._lock:
-            return None if self._dispatcher is None else self._dispatcher.signals
+            return self._dispatcher
 
     def viz_buffer(self) -> Optional[SharedRingBuffer]:
         with self._lock:

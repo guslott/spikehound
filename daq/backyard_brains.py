@@ -469,4 +469,4 @@ class BackyardBrainsSource(BaseDevice):
 
         # _LOGGER.info(f"Emit: frames={frames}, active={len(active_ids)}, shape={out.shape}")
         meta = {"active_channel_ids": active_ids}
-        self.emit_array(out, mono_time=time.monotonic(), meta=meta)
+        self.emit_array(out, mono_time=time.monotonic())

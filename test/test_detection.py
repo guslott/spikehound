@@ -173,7 +173,7 @@ def test_dispatcher_integration_with_detection():
     
     # Create pointer
     from shared.models import ChunkPointer
-    ptr = ChunkPointer(start_index=0, length=1000, render_time=0.0)
+    ptr = ChunkPointer(start_index=0, length=1000, render_time=0.0, seq=0, start_sample=0)
     
     raw_queue.put(ptr)
     raw_queue.put(EndOfStream)

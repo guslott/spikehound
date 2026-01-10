@@ -19,9 +19,6 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from analysis.analysis_worker import AnalysisWorker
     from analysis.settings import AnalysisSettingsStore
     from shared.event_buffer import EventRingBuffer
-else:  # pragma: no cover - runtime fallback
-    PipelineController = Any
-    AnalysisWorker = Any
 
 
 class SpikeHoundRuntime:
@@ -31,8 +28,10 @@ class SpikeHoundRuntime:
     This will evolve into the headless controller that replaces direct MainWindow
     ownership of pipeline pieces.
     
-    Both device_registry and device_manager can be injected for GUI integration.
-    When running headless, omit device_manager to avoid Qt dependencies.
+    The core runtime is fully Qt-free. GUI adapters (dispatcher_adapter,
+    qsettings_adapter) provide Qt integration when needed. Both device_registry
+    and device_manager can be injected for GUI integration; omit device_manager
+    for headless operation.
     """
 
     def __init__(
@@ -116,9 +115,6 @@ class SpikeHoundRuntime:
             return self._pipeline.event_buffer
         return None
 
-    def open_device(self, driver: BaseDevice, sample_rate: float, channels: Sequence[object]) -> None:
-        """Open and prepare the requested DAQ backend/device."""
-        self.attach_source(driver, sample_rate, channels)
 
     def scan_devices(self) -> None:
         """Scan for available DAQ devices."""
@@ -145,9 +141,7 @@ class SpikeHoundRuntime:
     def configure_acquisition(
         self,
         *,
-        sample_rate: Optional[int] = None,
         channels: Optional[list[int]] = None,
-        chunk_size: Optional[int] = None,
         filter_settings: Optional[FilterSettings] = None,
         trigger_cfg: Optional[TriggerConfig] = None,
     ) -> None:
@@ -158,9 +152,7 @@ class SpikeHoundRuntime:
         only provided values are applied.
         
         Args:
-            sample_rate: Target sample rate in Hz (currently unused, set at device level).
             channels: List of channel IDs to enable. Empty list clears all channels.
-            chunk_size: Samples per chunk (currently unused, set at device level).
             filter_settings: Signal conditioning parameters (high-pass, low-pass, notch).
             trigger_cfg: Trigger configuration (threshold, mode, pretrigger, window).
         """
@@ -216,13 +208,6 @@ class SpikeHoundRuntime:
             self.logger.warning("Failed to start acquisition: %s", exc)
             return
 
-    def start(self) -> None:
-        """Alias for start_acquisition."""
-        self.start_acquisition()
-
-    def stop(self) -> None:
-        """Alias for stop_acquisition."""
-        self.stop_acquisition()
 
     def shutdown(self) -> None:
         """Shutdown the pipeline and release resources."""
@@ -230,9 +215,6 @@ class SpikeHoundRuntime:
             self._pipeline.shutdown()
         self._acquisition_start_time = None
 
-    def release(self) -> None:
-        """Alias for shutdown."""
-        self.shutdown()
 
     def switch_backend(self, source_cls: Type[BaseDevice], **kwargs) -> None:
         """Swap in a new DAQ backend/source."""

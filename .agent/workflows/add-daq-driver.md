@@ -37,8 +37,8 @@ Follow these steps to add support for a new data acquisition device.
 4. **Emit data using `emit_array()`**
    ```python
    # In your producer loop:
-   data = np.zeros((chunk_size, n_channels), dtype=np.float32)
-   self.emit_array(data, device_time=optional_hw_timestamp)
+   # block = SDK.read() (float32 array, shape: frames x channels)
+   self.emit_array(block, device_time=None)  # stamps seq/start_sample/mono_time
    ```
 
 5. **Register the driver in `daq/registry.py`**

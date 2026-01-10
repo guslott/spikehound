@@ -111,7 +111,7 @@ def test_dispatcher_filters_dc_and_notch_at_target_frequency():
     start_index = source_buffer.write(samples)
     
     # Create ChunkPointer referencing the written data
-    pointer = ChunkPointer(start_index=start_index, length=frames, render_time=0.0)
+    pointer = ChunkPointer(start_index=start_index, length=frames, render_time=0.0, seq=0, start_sample=0)
     
     dispatcher.start()
     queues["raw"].put(pointer)
@@ -178,12 +178,12 @@ def test_dispatcher_preserves_filter_state_across_chunks():
     # Write first chunk
     chunk1_samples = impulse[:first_len].reshape(1, -1)
     start1 = source_buffer.write(chunk1_samples)
-    pointer1 = ChunkPointer(start_index=start1, length=first_len, render_time=0.0)
+    pointer1 = ChunkPointer(start_index=start1, length=first_len, render_time=0.0, seq=0, start_sample=0)
     
     # Write second chunk
     chunk2_samples = impulse[first_len:].reshape(1, -1)
     start2 = source_buffer.write(chunk2_samples)
-    pointer2 = ChunkPointer(start_index=start2, length=second_len, render_time=first_len * dt)
+    pointer2 = ChunkPointer(start_index=start2, length=second_len, render_time=first_len * dt, seq=1, start_sample=first_len)
     
     dispatcher.start()
     queues["raw"].put(pointer1)
@@ -254,7 +254,7 @@ def test_dispatcher_fan_out_and_backpressure_tracking():
         value = float(seq + 1)
         samples = np.ones((1, frames), dtype=np.float32) * value
         start = source_buffer.write(samples)
-        pointer = ChunkPointer(start_index=start, length=frames, render_time=seq * frames / fs)
+        pointer = ChunkPointer(start_index=start, length=frames, render_time=seq * frames / fs, seq=seq, start_sample=seq * frames)
         pointers.append(pointer)
         raw_queue.put(pointer)
     
@@ -266,18 +266,19 @@ def test_dispatcher_fan_out_and_backpressure_tracking():
     assert stats["processed"] == n_chunks
     
     forwarded = stats["forwarded"]
-    evicted = stats["evicted"]
+    dropped = stats["dropped"]
     
     # With small queues (maxsize=1), we expect:
     # - Some chunks to be forwarded
-    # - Some chunks to be evicted (the point of backpressure testing)
+    # - Some chunks to be dropped (visualization uses drop-newest policy)
     assert forwarded.get("visualization", 0) >= 1, "Should forward at least 1 viz chunk"
-    assert evicted.get("visualization", 0) >= 1, "Should evict at least 1 viz chunk (backpressure)"
+    assert dropped.get("visualization", 0) >= 1, "Should drop at least 1 viz chunk (backpressure)"
     
-    # Analysis queue receives all chunks (processed sequentially)
-    assert forwarded.get("analysis") == n_chunks
+    # Analysis queue receives all data chunks + EOS (EOS forwarded via drop-oldest)
+    # n_chunks data items + 1 EOS = n_chunks + 1 forwarded
+    assert forwarded.get("analysis") == n_chunks + 1
     
-    # Verify data was received by analysis (at least 1 chunk - queue may evict with maxsize=1)
+    # Verify data was received by analysis (at least 1 chunk - queue may evict with maxsize=2)
     analysis_received = _drain_chunks(analysis_queue)
     assert len(analysis_received) >= 1, "Should receive at least the last chunk"
     assert isinstance(analysis_received[0], Chunk), "Analysis queue should receive Chunk objects, not Pointers"

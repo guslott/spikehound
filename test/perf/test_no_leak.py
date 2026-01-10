@@ -70,16 +70,14 @@ class TestMemoryStability:
 
         try:
             devices = SimulatedPhysiologySource.list_available_devices()
-            runtime.switch_backend(SimulatedPhysiologySource)
+            runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
             runtime.configure_acquisition(
-                sample_rate=10000,
                 channels=[0],
-                chunk_size=256,
             )
 
             # Start and run for initial period
-            runtime.start()
+            runtime.start_acquisition()
             time.sleep(1.0)
 
             gc.collect()
@@ -93,7 +91,7 @@ class TestMemoryStability:
             final = tracemalloc.take_snapshot()
             tracemalloc.stop()
 
-            runtime.stop()
+            runtime.stop_acquisition()
 
             # Check memory growth
             stats = final.compare_to(initial, 'lineno')
@@ -103,8 +101,8 @@ class TestMemoryStability:
             assert total_growth < 5_000_000, \
                 f"Pipeline leaked {total_growth / 1024 / 1024:.1f} MB over 5 seconds"
         finally:
-            runtime.stop()
-            runtime.release()
+            runtime.stop_acquisition()
+            runtime.shutdown()
 
 
 @pytest.mark.slow
@@ -119,19 +117,17 @@ class TestThreadStability:
 
         try:
             devices = SimulatedPhysiologySource.list_available_devices()
-            runtime.switch_backend(SimulatedPhysiologySource)
+            runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
             runtime.configure_acquisition(
-                sample_rate=10000,
                 channels=[0],
-                chunk_size=256,
             )
 
             # Multiple start/stop cycles
             for cycle in range(10):
-                runtime.start()
+                runtime.start_acquisition()
                 time.sleep(0.1)
-                runtime.stop()
+                runtime.stop_acquisition()
                 time.sleep(0.1)
 
                 current_threads = threading.active_count()
@@ -140,7 +136,7 @@ class TestThreadStability:
                 assert current_threads <= initial_threads + 5, \
                     f"Thread leak at cycle {cycle}: {current_threads} threads"
         finally:
-            runtime.release()
+            runtime.shutdown()
             time.sleep(0.2)
 
         final_threads = threading.active_count()
@@ -158,15 +154,13 @@ class TestQueueStability:
 
         try:
             devices = SimulatedPhysiologySource.list_available_devices()
-            runtime.switch_backend(SimulatedPhysiologySource)
+            runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
             runtime.configure_acquisition(
-                sample_rate=10000,
                 channels=[0],
-                chunk_size=256,
             )
 
-            runtime.start()
+            runtime.start_acquisition()
 
             max_depth = 0
             for _ in range(50):  # Check over 5 seconds
@@ -174,13 +168,13 @@ class TestQueueStability:
                 depth = runtime.visualization_queue.qsize()
                 max_depth = max(max_depth, depth)
 
-            runtime.stop()
+            runtime.stop_acquisition()
 
             # Queue should have bounded depth
             # (depends on queue maxsize configuration which is 1024)
             assert max_depth < 800, f"Queue grew too large: {max_depth}"
         finally:
-            runtime.release()
+            runtime.shutdown()
 
 
 @pytest.mark.slow
@@ -193,20 +187,18 @@ class TestTimingStability:
 
         try:
             devices = SimulatedPhysiologySource.list_available_devices()
-            runtime.switch_backend(SimulatedPhysiologySource)
-            runtime.select_device(devices[0].id)
-
             chunk_size = 256
             sample_rate = 10000
             expected_interval = chunk_size / sample_rate
 
+            runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": sample_rate, "chunk_size": chunk_size})
+            runtime.select_device(devices[0].id)
+
             runtime.configure_acquisition(
-                sample_rate=sample_rate,
                 channels=[0],
-                chunk_size=chunk_size,
             )
 
-            runtime.start()
+            runtime.start_acquisition()
             time.sleep(0.5)  # Let it stabilize
 
             # Measure chunk arrival times
@@ -218,7 +210,7 @@ class TestTimingStability:
                 except:
                     break
 
-            runtime.stop()
+            runtime.stop_acquisition()
 
             if len(arrival_times) >= 10:
                 intervals = np.diff(arrival_times)
@@ -233,7 +225,7 @@ class TestTimingStability:
                 cv = std_interval / mean_interval if mean_interval > 0 else float('inf')
                 assert cv < 1.5, f"Timing too variable: CV = {cv:.2f}"
         finally:
-            runtime.release()
+            runtime.shutdown()
 
 
 @pytest.mark.slow
@@ -246,15 +238,13 @@ class TestLongRunStability:
 
         try:
             devices = SimulatedPhysiologySource.list_available_devices()
-            runtime.switch_backend(SimulatedPhysiologySource)
+            runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
             runtime.configure_acquisition(
-                sample_rate=10000,
                 channels=[0, 1],  # Multiple channels
-                chunk_size=256,
             )
 
-            runtime.start()
+            runtime.start_acquisition()
 
             errors = []
             chunks_received = 0
@@ -268,7 +258,7 @@ class TestLongRunStability:
                     errors.append(str(e))
                     break
 
-            runtime.stop()
+            runtime.stop_acquisition()
 
             # Should have received many chunks
             # Allow for slow simulation (at least 40% of real-time)
@@ -278,4 +268,4 @@ class TestLongRunStability:
 
             assert not errors, f"Errors during run: {errors}"
         finally:
-            runtime.release()
+            runtime.shutdown()

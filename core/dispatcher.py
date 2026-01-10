@@ -5,30 +5,29 @@ import queue
 import threading
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
-from PySide6 import QtCore
 
 from .conditioning import FilterSettings, SignalConditioner
 from .detection import DETECTOR_REGISTRY, EventDetector
-from shared.models import Chunk, ChunkPointer, EndOfStream, TriggerConfig, DetectionEvent
+from shared.models import (
+    Chunk,
+    ChunkPointer,
+    EndOfStream,
+    TriggerConfig,
+    DetectionEvent,
+    enqueue_with_policy,
+)
 from shared.ring_buffer import SharedRingBuffer
+
+# Callback type for tick notifications (replaces Qt signal for headless compatibility)
+TickCallback = Callable[[dict], None]
 
 logger = logging.getLogger(__name__)
 
 
-# Explicit backpressure policies for each queue.
-# - "lossless": blocks until space available (fail loudly if timeout)
-# - "drop-newest": drops incoming item if queue is full
-# - "drop-oldest": evicts oldest item to make room for new one
-QUEUE_POLICIES: Dict[str, str] = {
-    "visualization": "drop-newest",
-    "audio": "drop-newest",
-    "logging": "lossless",
-    "analysis": "drop-oldest",
-    "events": "drop-newest",
-}
+from shared.models import QUEUE_POLICIES
 
 
 @dataclass
@@ -54,10 +53,6 @@ class DispatcherStats:
         }
 
 
-class DispatcherSignals(QtCore.QObject):
-    tick = QtCore.Signal(dict)
-
-
 class Dispatcher:
     """Router thread that conditions incoming samples from ChunkPointers and fans them out to consumers."""
 
@@ -81,7 +76,7 @@ class Dispatcher:
         self._logging_queue = logging_queue
         self._conditioner = SignalConditioner(filter_settings)
         self._poll_timeout = poll_timeout
-        self.signals = DispatcherSignals()
+        self._tick_callbacks: List[TickCallback] = []
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -105,8 +100,6 @@ class Dispatcher:
         self._channel_index_map: Dict[int, int] = {}
         self._current_trigger: Optional[TriggerConfig] = None
         self._active_channel_ids: list[int] = []
-        self._next_start_sample: int = 0
-        self._next_seq: int = 0
         self._analysis_lock = threading.Lock()
         self._analysis_queues: Dict[int, queue.Queue] = {}
         self._next_analysis_id = 1
@@ -116,6 +109,9 @@ class Dispatcher:
         self._detectors: list[EventDetector] = []
         self._detectors_lock = threading.Lock()
 
+        # EOS broadcast flag - ensures idempotent broadcasting
+        self._eos_sent: bool = False
+
         # Recording state - only enqueue to logging when True
         self._recording_enabled: bool = False
 
@@ -123,6 +119,7 @@ class Dispatcher:
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
+        self._eos_sent = False  # Reset for reuse
         self._thread = threading.Thread(target=self._run, name="DispatcherThread", daemon=True)
         self._thread.start()
         self._start_tick_thread()
@@ -265,7 +262,23 @@ class Dispatcher:
             self._reset_viz_counters_locked()
 
     def emit_empty_tick(self) -> None:
-        self.signals.tick.emit(self._empty_payload())
+        self._emit_tick(self._empty_payload())
+
+    def add_tick_callback(self, callback: TickCallback) -> Callable[[], None]:
+        """Register a callback for tick events. Returns an unsubscribe function."""
+        self._tick_callbacks.append(callback)
+        def unsubscribe() -> None:
+            if callback in self._tick_callbacks:
+                self._tick_callbacks.remove(callback)
+        return unsubscribe
+
+    def _emit_tick(self, payload: dict) -> None:
+        """Invoke all registered tick callbacks."""
+        for cb in list(self._tick_callbacks):
+            try:
+                cb(payload)
+            except Exception as exc:
+                logger.warning("Tick callback error: %s", exc)
 
     # Analysis registration ----------------------------------------------------
 
@@ -280,7 +293,7 @@ class Dispatcher:
         with self._analysis_lock:
             queue_obj = self._analysis_queues.pop(token, None)
         if queue_obj is not None:
-            self._force_put(queue_obj, EndOfStream, "analysis")
+            self._enqueue_with_policy("analysis", queue_obj, EndOfStream)
 
     # Trigger configuration stubs -------------------------------------
 
@@ -334,6 +347,7 @@ class Dispatcher:
             try:
                 if item is EndOfStream:
                     self._broadcast_end_of_stream()
+                    self._stop_event.set()  # Ensure tick thread also exits
                     break
 
                 if not isinstance(item, ChunkPointer):
@@ -392,10 +406,9 @@ class Dispatcher:
                  pass
         dt = 1.0 / float(sample_rate)
 
-        start_sample = self._next_start_sample
-        seq = self._next_seq
-        self._next_start_sample += raw.shape[1]
-        self._next_seq += 1
+        # Use sequencing from pointer (source of truth from DAQ layer)
+        start_sample = ptr.start_sample
+        seq = ptr.seq
 
         meta: Dict[str, object] = {"start_sample": start_sample}
         raw_chunk = Chunk(
@@ -430,7 +443,7 @@ class Dispatcher:
                     try:
                         events = detector.process_chunk(filtered_chunk)
                         for event in events:
-                            self._enqueue(self._output_queues["events"], event, "events")
+                            self._enqueue_with_policy("events", self._output_queues["events"], event)
                     except Exception as e:
                         logger.error(f"Detector {detector.name} failed: {e}")
 
@@ -447,19 +460,22 @@ class Dispatcher:
             start_index=viz_start,
             length=ptr.length,
             render_time=ptr.render_time,
+            seq=ptr.seq,
+            start_sample=ptr.start_sample,
+            device_time=ptr.device_time,
         )
         return raw_chunk, filtered_chunk, viz_pointer
 
     def _fan_out(self, raw_chunk: Chunk, filtered_chunk: Chunk, viz_pointer: ChunkPointer) -> None:
         if self._recording_enabled:
-            self._enqueue(self._logging_queue, raw_chunk, "logging")
+            self._enqueue_with_policy("logging", self._logging_queue, raw_chunk)
         for name, out_queue in self._output_queues.items():
             if name == "events":
-                continue # Handled in _process_pointer
+                continue  # Handled in _process_pointer
             if name in ("visualization", "audio"):
-                self._enqueue(out_queue, viz_pointer, name)
+                self._enqueue_with_policy(name, out_queue, viz_pointer)
             else:
-                self._enqueue(out_queue, filtered_chunk, name)
+                self._enqueue_with_policy(name, out_queue, filtered_chunk)
         self._dispatch_to_analysis(filtered_chunk)
 
     def _dispatch_to_analysis(self, filtered_chunk: Chunk) -> None:
@@ -468,109 +484,51 @@ class Dispatcher:
         if not targets:
             return
         for token, queue_obj in targets:
-            try:
-                queue_obj.put_nowait(filtered_chunk)
-            except queue.Full:
-                try:
-                    _ = queue_obj.get_nowait()
-                    with self._stats_lock:
-                        self._stats.evicted["analysis"] += 1
-                except queue.Empty:
-                    pass
-                try:
-                    queue_obj.put_nowait(filtered_chunk)
-                except queue.Full:
-                    with self._stats_lock:
-                        self._stats.dropped["analysis"] += 1
-                else:
-                    with self._stats_lock:
-                        self._stats.forwarded["analysis"] += 1
-            else:
-                with self._stats_lock:
-                    self._stats.forwarded["analysis"] += 1
+            self._enqueue_with_policy("analysis", queue_obj, filtered_chunk)
 
-    def _enqueue(self, target_queue: queue.Queue, item: object, queue_name: str) -> None:
-        """Enqueue with blocking for critical queues (logging), non-blocking for visualization."""
-        # Visualization is lossy - drop if full to prevent DAQ blocking
-        if queue_name == "visualization":
-            try:
-                target_queue.put_nowait(item)
-            except queue.Full:
-                with self._stats_lock:
-                    self._stats.dropped[queue_name] += 1
-            else:
-                with self._stats_lock:
-                    self._stats.forwarded[queue_name] += 1
+    def _enqueue_with_policy(self, queue_name: str, target_queue: queue.Queue, item: object) -> None:
+        """Unified enqueue method that dispatches on shared QUEUE_POLICIES."""
+        def stats_cb(q_name: str, action: str) -> None:
+            with self._stats_lock:
+                if action == "forwarded":
+                    self._stats.forwarded[q_name] += 1
+                elif action == "dropped":
+                    self._stats.dropped[q_name] += 1
+                elif action == "evicted":
+                    self._stats.evicted[q_name] += 1
 
-        # Logging is critical/lossless - block until space available
-        elif queue_name == "logging":
-            try:
-                # BLOCKING MODE: Wait up to 10 seconds. If still full, fatal error.
-                target_queue.put(item, block=True, timeout=10.0)
-            except queue.Full:
-                # This indicates disk I/O is too slow for too long
-                logger.critical(
-                    "Dispatcher queue BLOCKED for 10+ seconds - disk I/O too slow",
-                    extra={"queue_name": queue_name, "timeout_sec": 10.0}
-                )
-                with self._stats_lock:
-                    self._stats.evicted[queue_name] += 1
-                raise RuntimeError(f"Dispatcher queue '{queue_name}' blocked - lossless constraint violated")
-            else:
-                with self._stats_lock:
-                    self._stats.forwarded[queue_name] += 1
+        enqueue_with_policy(queue_name, target_queue, item, stats_callback=stats_cb)
 
-        # Audio and others - keep as critical (blocking) for now, or lossy?
-        # User said "Only the Logging/Recording queue needs to be lossless."
-        # So Audio should probably be lossy too to avoid XRuns.
-        elif queue_name == "audio":
-            try:
-                target_queue.put_nowait(item)
-            except queue.Full:
-                with self._stats_lock:
-                    self._stats.dropped[queue_name] += 1
-            else:
-                with self._stats_lock:
-                    self._stats.forwarded[queue_name] += 1
-        
-        else:
-            # Default fallback (e.g. analysis if it used this method, but it doesn't)
-            try:
-                target_queue.put_nowait(item)
-            except queue.Full:
-                with self._stats_lock:
-                    self._stats.dropped[queue_name] += 1
-            else:
-                with self._stats_lock:
-                    self._stats.forwarded[queue_name] += 1
-
-    def _force_put(self, target_queue: queue.Queue, item: object, stat_key: str) -> None:
-        """Force enqueue an item, evicting oldest items if necessary until it fits."""
-        placed = False
-        while not placed:
-            try:
-                target_queue.put_nowait(item)
-                placed = True
-            except queue.Full:
-                try:
-                    _ = target_queue.get_nowait()
-                    with self._stats_lock:
-                        self._stats.evicted[stat_key] += 1
-                except queue.Empty:
-                    pass
+    def _enqueue_lossless(self, target_queue: queue.Queue, item: object, queue_name: str) -> None:
+        """DEPRECATED: Use _enqueue_with_policy."""
+        self._enqueue_with_policy(queue_name, target_queue, item)
+    
+    def _enqueue_drop_newest(self, target_queue: queue.Queue, item: object, queue_name: str) -> None:
+        """DEPRECATED: Use _enqueue_with_policy."""
+        self._enqueue_with_policy(queue_name, target_queue, item)
+    
+    def _enqueue_drop_oldest(self, target_queue: queue.Queue, item: object, queue_name: str) -> None:
+        """DEPRECATED: Use _enqueue_with_policy."""
+        self._enqueue_with_policy(queue_name, target_queue, item)
 
     def _broadcast_end_of_stream(self) -> None:
+        # Idempotent: only broadcast once to avoid duplicate sentinels
+        if self._eos_sent:
+            return
+        self._eos_sent = True
+        
         # Deliver sentinel to all downstream queues, draining oldest entries if needed
+        # Use drop-oldest for EOS to ensure delivery even if queues are full
         targets = {"logging": self._logging_queue, **self._output_queues}
         for name, target in targets.items():
             if target is None:
                 continue
-            self._force_put(target, EndOfStream, name)
+            self._enqueue_drop_oldest(target, EndOfStream, name)
             
         with self._analysis_lock:
             queues = list(self._analysis_queues.values())
         for q in queues:
-            self._force_put(q, EndOfStream, "analysis")
+            self._enqueue_drop_oldest(q, EndOfStream, "analysis")
 
     def _start_tick_thread(self) -> None:
         if self._tick_thread is not None and self._tick_thread.is_alive():
@@ -583,7 +541,7 @@ class Dispatcher:
             try:
                 payload = self._collect_window_payload()
                 if payload is not None:
-                    self.signals.tick.emit(payload)
+                    self._emit_tick(payload)
             except Exception as exc:
                 logger.error("Dispatcher tick error: %s", exc)
             self._stop_event.wait(self._tick_interval)
@@ -604,9 +562,8 @@ class Dispatcher:
                 return self._empty_payload(status)
             mode = "continuous"
             if self._current_trigger is not None:
-                mode = str(self._current_trigger.mode)
-            if mode not in ("continuous", "stream", "single"):
-                return self._empty_payload(status)
+                mode = self._current_trigger.mode
+            # Note: mode is already validated in TriggerConfig.__post_init__
 
             capacity = self.viz_buffer.capacity
             window_samples = int(max(1, min(capacity, self._window_sec * sample_rate)))
