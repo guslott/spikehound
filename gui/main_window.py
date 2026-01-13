@@ -10,6 +10,9 @@ from pathlib import Path
 from dataclasses import dataclass, field, replace
 from typing import Callable, Dict, List, Optional, Sequence
 
+__all__ = ["MainWindow"]
+
+
 import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -335,13 +338,35 @@ class ChannelViewBox(pg.ViewBox):
         self._drag_button: Optional[QtCore.Qt.MouseButton] = None
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
-        event.ignore()
+        # We only care about left-clicks for channel selection/drag
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            pos = self.mapSceneToView(event.scenePos())
+            y = float(pos.y())
+            self._dragging = True
+            self._drag_button = event.button()
+            self.channelClicked.emit(y, event.button())
+            event.accept()
+        else:
+            # Let the base class handle other buttons if needed
+            super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
-        event.ignore()
+        if self._dragging and self._drag_button == QtCore.Qt.MouseButton.LeftButton:
+            pos = self.mapSceneToView(event.scenePos())
+            y = float(pos.y())
+            self.channelDragged.emit(y)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
-        event.ignore()
+        if self._dragging and event.button() == self._drag_button:
+            self._dragging = False
+            self._drag_button = None
+            self.channelDragFinished.emit()
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -353,6 +378,52 @@ class MainWindow(QtWidgets.QMainWindow):
     startRecording = QtCore.Signal(str, bool)
     stopRecording = QtCore.Signal()
     triggerConfigChanged = QtCore.Signal(dict)
+
+    def _open_spectrogram_tab(self) -> None:
+        """Open a spectrogram tab for one of the active channels."""
+        try:
+            # When running as a package: python -m gui.main_window
+            from .spectrogram_tab import SpectrogramTab
+        except ImportError:
+            # When running as a script: python gui/main_window.py
+            from spectrogram_tab import SpectrogramTab
+
+        # 1) Use the active channel if available
+        channel_id = getattr(self, "_active_channel_id", None)
+
+        # 2) If not, fall back to the first active channel ID
+        if channel_id is None:
+            ids = getattr(self, "_channel_ids_current", [])
+            if ids:
+                channel_id = ids[0]
+
+        # 3) If still nothing, show message
+        if channel_id is None:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Spectrogram",
+                (
+                    "I can't find any channel to show yet.\n\n"
+                    "Try this:\n"
+                    "1. Connect a device or open a file.\n"
+                    "2. Add a channel in the Channels section.\n"
+                    "3. Start the scope so you can see a waveform.\n"
+                    "Then click 'Open Spectrogram (test)' again."
+                ),
+            )
+            return
+
+        # 4) Determine channel name from config
+        cfg = self._channel_configs.get(channel_id)
+        channel_name = cfg.channel_name if cfg and cfg.channel_name else f"Channel {channel_id}"
+
+        # 5) Create and add the tab
+        tab = SpectrogramTab(self, channel_id, channel_name, parent=self._analysis_dock)
+
+        tabs = self._analysis_dock._tabs
+        tabs.addTab(tab, f"Spectrogram - {channel_name}")
+        tabs.setCurrentWidget(tab)
+
 
     def __init__(self, controller: Optional[PipelineController] = None) -> None:
         super().__init__()
@@ -532,6 +603,12 @@ class MainWindow(QtWidgets.QMainWindow):
         plot_item.showGrid(x=True, y=True, alpha=0.4)
         plot_item.vb.setBorder(pg.mkPen((0, 0, 139)))
         grid.addWidget(self.plot_widget, 0, 0)
+        
+         # Connect plot interaction signals for channel selection and vertical dragging
+        self._view_box.channelClicked.connect(self._on_plot_channel_clicked)
+        self._view_box.channelDragged.connect(self._on_plot_channel_dragged)
+        self._view_box.channelDragFinished.connect(self._on_plot_drag_finished)
+
 
         self.threshold_line = pg.InfiniteLine(angle=0, pen=pg.mkPen((178, 34, 34), width=3), movable=True)
         self.threshold_line.setVisible(False)
@@ -606,6 +683,17 @@ class MainWindow(QtWidgets.QMainWindow):
         trigger_layout.setContentsMargins(8, 8, 8, 8)
         trigger_layout.setVerticalSpacing(4)
         trigger_layout.setHorizontalSpacing(6)
+
+        # --- Spectrogram (temporary test button) ---
+        self.spectrogram_group = QtWidgets.QGroupBox("Spectrogram")
+        spectro_layout = QtWidgets.QVBoxLayout(self.spectrogram_group)
+
+        self.open_spectro_btn = QtWidgets.QPushButton("Open Spectrogram (test)")
+        self.open_spectro_btn.clicked.connect(self._open_spectrogram_tab)
+        spectro_layout.addWidget(self.open_spectro_btn)
+
+        spectro_layout.addStretch(1)
+        side_layout.addWidget(self.spectrogram_group)
 
         row = 0
         trigger_layout.addWidget(self._label("Channel"), row, 0)
@@ -2077,37 +2165,22 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._active_channel_id is not None:
             config = self._channel_configs.get(self._active_channel_id)
             if config is not None:
-                try:
-                    axis.set_scaling(config.vertical_span_v, config.screen_offset)
-                except AttributeError:
-                    pass
-                # Fixed ticks based on the channel span; values move with the screen offset.
-                try:
-                    span = max(float(config.vertical_span_v), 1e-9)
-                    offset = float(config.screen_offset)
-                    step = span / 10.0
-                    vals: list[tuple[float, Optional[str]]] = []
-                    start = int(np.floor(((0.0 - offset) * span) / step) - 2)
-                    end = int(np.ceil(((1.0 - offset) * span) / step) + 2)
-                    for n in range(start, end + 1):
-                        v = n * step
-                        pos = (v / span) + offset
-                        if 0.0 <= pos <= 1.0:
-                            vals.append((pos, f"{v:.3g}"))
-                    axis.setTicks([vals])
-                except Exception:
-                    pass
-                name = config.channel_name or f"Ch {self._active_channel_id}"
-                axis_color = QtGui.QColor(config.color)
-                rgb = axis_color.getRgb()[:3]
-                pen = pg.mkPen(rgb, width=2)
-                axis.setPen(pen)
-                axis.setTextPen(pen)
-                axis.setLabel(
-                    text=f"{name} Amplitude (±{config.vertical_span_v:.3g} V)",
-                    units="V",
-                )
-                return
+                span = max(float(config.vertical_span_v), 1e-9)
+                offset = float(config.screen_offset)
+
+                step = span / 10.0
+                vals = []
+                start = int(np.floor(((0.0 - offset) * span) / step) - 2)
+                end = int(np.ceil(((1.0 - offset) * span) / step) + 2)
+                for n in range(start, end + 1):
+                    v = n * step
+                    pos = (v / span) + offset
+                    if 0.0 <= pos <= 1.0:
+                        vals.append((pos, f"{v:.3g}"))
+
+            axis.setTicks([vals])  # ❌ can be called very often
+            axis.setLabel(text=f"{config.channel_name} ...", units="V")
+            return
         pen = pg.mkPen((0, 0, 139), width=1)
         axis.setPen(pen)
         axis.setTextPen(pen)
