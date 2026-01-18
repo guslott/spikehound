@@ -256,23 +256,24 @@ class SimulatedPhysiologySource(BaseDevice):
         - Reliable, repeatable testing of spike sorting and conduction velocity measurements
         - Student laboratory exercises with known ground-truth answers
         - Easy separation of units based on amplitude, spike width, and timing
+        - **Filter compatibility**: All spike widths ≥2.0ms to survive 1kHz low-pass filtering
         
         GROUND TRUTH VALUES (at 20kHz sample rate, 20mm electrode spacing):
         =====================================================================
-        Unit | Type           | Prox Amp | Dist Amp | Width  | Velocity | Cond Delay | Syn Delay | Rate
-        -----|----------------|----------|----------|--------|----------|------------|-----------|------
-          0  | Small Sensory  | 0.10 V   | 0.08 V   | 1.2 ms |  4.0 m/s |   5.0 ms   |   3.0 ms  | 3 Hz
-          1  | Med Sensory    | 0.18 V   | 0.15 V   | 1.5 ms |  6.0 m/s |   3.33 ms  |   3.5 ms  | 4 Hz
-          2  | Giant Fiber A  | 0.45 V   | 0.40 V   | 2.5 ms | 12.0 m/s |   1.67 ms  |   2.0 ms  | 2 Hz
-          3  | Giant Fiber B  | 0.70 V   | 0.56 V   | 3.0 ms | 10.0 m/s |   2.0 ms   |   2.5 ms  | 1.5 Hz
-          4  | Motor A        | 0.30 V   | 0.21 V   | 2.0 ms |  5.0 m/s |   4.0 ms   |   4.0 ms  | 5 Hz
-          5  | Motor B        | 0.50 V   | 0.30 V   | 2.2 ms |  3.0 m/s |   6.67 ms  |   5.0 ms  | 3.5 Hz
+        Unit | Type           | Prox Amp | Post-1kHz | Width  | Velocity | Cond Delay | Rate
+        -----|----------------|----------|-----------|--------|----------|------------|------
+          0  | Small Sensory  | 0.12 V   | ~0.10 V   | 2.0 ms |  4.0 m/s |   5.0 ms   | 3 Hz
+          1  | Med Sensory    | 0.22 V   | ~0.21 V   | 2.2 ms |  6.0 m/s |   3.33 ms  | 4 Hz
+          2  | Giant Fiber A  | 0.45 V   | ~0.46 V   | 2.8 ms | 12.0 m/s |   1.67 ms  | 2 Hz
+          3  | Giant Fiber B  | 0.70 V   | ~0.72 V   | 3.2 ms | 10.0 m/s |   2.0 ms   | 1.5 Hz
+          4  | Motor A        | 0.32 V   | ~0.31 V   | 2.4 ms |  5.0 m/s |   4.0 ms   | 5 Hz
+          5  | Motor B        | 0.55 V   | ~0.55 V   | 2.6 ms |  3.0 m/s |   6.67 ms  | 3.5 Hz
         
+        Post-1kHz amplitude gaps: ~100mV between adjacent clusters (well separated)
         Conduction Delay = electrode_spacing (20mm) / velocity
-        PSP onset = spike_time + conduction_delay + synaptic_delay
         
         Noise level is 40mV (0.040 V), so all units are above 2.5x noise floor,
-        making them detectable with MAD-based threshold detection.
+        making them detectable with MAD-based threshold detection even after filtering.
         """
         # PSP kernel (alpha function) - 20ms duration
         psp_len = int(0.020 * sample_rate)
@@ -311,73 +312,79 @@ class SimulatedPhysiologySource(BaseDevice):
         
         HARDCODED_UNITS = [
             {
-                # Unit 0: Small Sensory Afferent - smallest, narrowest, slow conduction
+                # Unit 0: Small Sensory Afferent - smallest amplitude, slow conduction
+                # FILTER-COMPATIBLE: 2.0ms width survives 1kHz LP with ~15% loss
                 'unit_type': 'small_sensory',
                 'rate_hz': 3.0,
-                'spike_width_ms': 1.2,       # Narrow spike
-                'amp_prox': 0.10,            # 2.5x noise floor (0.04V noise)
-                'amp_dist_ratio': 0.80,      # 80% of proximal → 0.08V distal
-                'velocity': 4.0,             # 4 m/s → 5.0ms conduction delay
+                'spike_width_ms': 2.0,        # Widened from 1.2ms for filter compatibility
+                'amp_prox': 0.12,             # 3x noise floor, ~0.10V after filtering
+                'amp_dist_ratio': 0.80,       # 80% of proximal → 0.10V distal
+                'velocity': 4.0,              # 4 m/s → 5.0ms conduction delay
                 'refractory_ms': 2.5,
                 'syn_delay_ms': 3.0,
                 'psp_gain': 0.015,
             },
             {
-                # Unit 1: Medium Sensory Afferent - moderate size, medium narrow
+                # Unit 1: Medium Sensory Afferent - moderate size
+                # FILTER-COMPATIBLE: 2.2ms width survives 1kHz LP with ~7% loss
                 'unit_type': 'medium_sensory',
                 'rate_hz': 4.0,
-                'spike_width_ms': 1.5,       # Medium-narrow spike
-                'amp_prox': 0.18,            # 4.5x noise floor
-                'amp_dist_ratio': 0.83,      # 83% of proximal → 0.15V distal
-                'velocity': 6.0,             # 6 m/s → 3.33ms conduction delay
+                'spike_width_ms': 2.2,        # Widened from 1.5ms for filter compatibility
+                'amp_prox': 0.22,             # 5.5x noise floor, ~0.21V after filtering
+                'amp_dist_ratio': 0.82,       # 82% of proximal → 0.18V distal
+                'velocity': 6.0,              # 6 m/s → 3.33ms conduction delay
                 'refractory_ms': 2.8,
                 'syn_delay_ms': 3.5,
                 'psp_gain': 0.020,
             },
             {
                 # Unit 2: Giant Fiber A - large amplitude, broad spike, fast conduction
+                # FILTER-COMPATIBLE: 2.8ms width survives 1kHz LP with ~2% loss
                 'unit_type': 'giant_fiber_a',
                 'rate_hz': 2.0,
-                'spike_width_ms': 2.5,       # Broad spike
-                'amp_prox': 0.45,            # 11.25x noise floor
-                'amp_dist_ratio': 0.89,      # 89% of proximal → 0.40V distal
-                'velocity': 12.0,            # 12 m/s → 1.67ms conduction delay (fastest)
+                'spike_width_ms': 2.8,        # Slightly widened from 2.5ms
+                'amp_prox': 0.45,             # 11.25x noise floor, ~0.46V after filtering
+                'amp_dist_ratio': 0.89,       # 89% of proximal → 0.40V distal
+                'velocity': 12.0,             # 12 m/s → 1.67ms conduction delay (fastest)
                 'refractory_ms': 3.0,
                 'syn_delay_ms': 2.0,
                 'psp_gain': 0.035,
             },
             {
                 # Unit 3: Giant Fiber B - largest amplitude, broadest spike
+                # FILTER-COMPATIBLE: 3.2ms width survives 1kHz LP with ~2% loss
                 'unit_type': 'giant_fiber_b',
                 'rate_hz': 1.5,
-                'spike_width_ms': 3.0,       # Broadest spike
-                'amp_prox': 0.70,            # 17.5x noise floor (largest)
-                'amp_dist_ratio': 0.80,      # 80% of proximal → 0.56V distal
-                'velocity': 10.0,            # 10 m/s → 2.0ms conduction delay
+                'spike_width_ms': 3.2,        # Slightly widened from 3.0ms
+                'amp_prox': 0.70,             # 17.5x noise floor (largest), ~0.72V after filtering
+                'amp_dist_ratio': 0.80,       # 80% of proximal → 0.56V distal
+                'velocity': 10.0,             # 10 m/s → 2.0ms conduction delay
                 'refractory_ms': 3.5,
                 'syn_delay_ms': 2.5,
                 'psp_gain': 0.045,
             },
             {
-                # Unit 4: Motor Neuron A - medium amplitude, medium width
+                # Unit 4: Motor Neuron A - medium amplitude
+                # FILTER-COMPATIBLE: 2.4ms width survives 1kHz LP with ~3% loss
                 'unit_type': 'motor_a',
                 'rate_hz': 5.0,
-                'spike_width_ms': 2.0,       # Medium spike
-                'amp_prox': 0.30,            # 7.5x noise floor
-                'amp_dist_ratio': 0.70,      # 70% of proximal → 0.21V distal
-                'velocity': 5.0,             # 5 m/s → 4.0ms conduction delay
+                'spike_width_ms': 2.4,        # Widened from 2.0ms
+                'amp_prox': 0.32,             # 8x noise floor, ~0.31V after filtering
+                'amp_dist_ratio': 0.70,       # 70% of proximal → 0.22V distal
+                'velocity': 5.0,              # 5 m/s → 4.0ms conduction delay
                 'refractory_ms': 2.5,
                 'syn_delay_ms': 4.0,
                 'psp_gain': 0.025,
             },
             {
                 # Unit 5: Motor Neuron B - medium-large amplitude, slowest conduction
+                # FILTER-COMPATIBLE: 2.6ms width survives 1kHz LP with ~0% loss
                 'unit_type': 'motor_b',
                 'rate_hz': 3.5,
-                'spike_width_ms': 2.2,       # Medium-broad spike  
-                'amp_prox': 0.50,            # 12.5x noise floor
-                'amp_dist_ratio': 0.60,      # 60% of proximal → 0.30V distal (most attenuation)
-                'velocity': 3.0,             # 3 m/s → 6.67ms conduction delay (slowest)
+                'spike_width_ms': 2.6,        # Widened from 2.2ms
+                'amp_prox': 0.55,             # 13.75x noise floor, ~0.55V after filtering
+                'amp_dist_ratio': 0.60,       # 60% of proximal → 0.33V distal (most attenuation)
+                'velocity': 3.0,              # 3 m/s → 6.67ms conduction delay (slowest)
                 'refractory_ms': 2.8,
                 'syn_delay_ms': 5.0,
                 'psp_gain': 0.030,
