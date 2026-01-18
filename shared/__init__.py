@@ -3,6 +3,7 @@ Shared data structures available to both the analysis back end and the GUI.
 """
 
 from .event_buffer import AnalysisEvents, EventRingBuffer
-from .types import Event
+from .ring_buffer import SharedRingBuffer
+from .types import AnalysisEvent
 
-__all__ = ["AnalysisEvents", "Event", "EventRingBuffer"]
+__all__ = ["AnalysisEvents", "AnalysisEvent", "EventRingBuffer", "SharedRingBuffer"]

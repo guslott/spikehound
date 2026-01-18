@@ -5,7 +5,7 @@ Designed “scope-first”: a GUI can treat every hardware backend the same—co
 
 * Minimal, boring contract
 * Clean lifecycle: `open → configure → start/stop → close`
-* Bounded queue with **drop-oldest** backpressure
+* **Lossless** backpressure (blocking)
 * Uniform **float32 (frames, channels)** data
 * Dual time bases: host `mono_time` and optional hardware `device_time`
 * A base class that centralizes the tricky bits so drivers stay tiny
@@ -19,22 +19,27 @@ Designed “scope-first”: a GUI can treat every hardware backend the same—co
 ### Simulated input
 
 ```python
-from simulated_source import SimulatedSource
+from daq.simulated_source import SimulatedPhysiologySource
 
-src = SimulatedSource()
+src = SimulatedPhysiologySource()
 devs = src.list_available_devices()
 src.open(devs[0].id)
-src.configure(sample_rate=20_000, channels=None, chunk_size=1024)  # channels=None => all
+src.configure(sample_rate=20_000, channels=None, chunk_size=1024)
 src.start()
 
-# Consume chunks (e.g., in your GUI thread)
+# Consume data (e.g., in your processing thread)
 while some_condition:
     try:
-        ch = src.data_queue.get(timeout=0.050)  # ch is a Chunk
-        # ch.data shape: (frames, channels), dtype=float32
-        # use ch.mono_time, ch.device_time (optional), ch.seq, ch.start_sample
-    except Exception:
-        pass
+        # 1. Get pointer from queue (ChunkPointer | EndOfStream)
+        ptr = src.data_queue.get(timeout=1.0)
+        
+        # 2. Access data from shared ring buffer
+        # Shape: (channels, frames), dtype: float32
+        samples = src.get_buffer().read(ptr.start_index, ptr.length)
+        
+        print(f"Got {ptr.length} frames at t={ptr.render_time}")
+    except:
+        break
 
 src.stop()
 src.close()
@@ -43,22 +48,24 @@ src.close()
 ### Sound card input (cross-platform)
 
 ```python
-from soundcard_source import SoundCardSource
+from daq.soundcard_source import SoundCardSource
 
 src = SoundCardSource()
+print("Devices:")
 for d in src.list_available_devices():
-    print(d.id, d.name)
+    print(f" - {d.id}: {d.name}")
 
-src.open(device_id="default")  # or choose an ID from the printed list
+src.open(device_id="default")
 caps = src.get_capabilities("default")
 chans = src.list_available_channels("default")
 
 # pick first two channels
-src.configure(sample_rate=48_000, channels=[chans[0].id, chans[1].id], chunk_size=1024)
-src.start()
-
-# drain chunks as above...
-src.stop()
+if len(chans) >= 2:
+    src.configure(sample_rate=48_000, channels=[chans[0].id, chans[1].id], chunk_size=1024)
+    src.start()
+    
+    # consume data as shown above...
+    src.stop()
 src.close()
 ```
 
@@ -66,7 +73,7 @@ src.close()
 
 ## Architecture & lifecycle
 
-Every input source is a subclass of `BaseSource` and obeys the same lifecycle:
+Every input source is a subclass of `BaseDevice` and obeys the same lifecycle:
 
 ```
 list_available_devices()
@@ -75,7 +82,7 @@ open(device_id)
   └─ list_available_channels(device_id)
 configure(sample_rate, channels, chunk_size, **options) -> ActualConfig
 start()
-  [ driver thread/callback emits Chunk -> BaseSource.data_queue ]
+  [ driver thread emits array -> BaseDevice writes Buffer + emits ChunkPointer ]
 stop()
 close()
 ```
@@ -86,6 +93,10 @@ Illegal transitions raise `RuntimeError` early (e.g., `start()` without `configu
 ---
 
 ## Data model
+
+The DAQ system uses standard data types defined in `shared.models`.
+
+### Device Metadata
 
 ```python
 @dataclass(frozen=True)
@@ -101,47 +112,70 @@ class ChannelInfo:
     name: str
     units: str = "V"
     range: tuple[float, float] | None = None
+```
 
+### Config & Capabilities
+
+```python
 @dataclass(frozen=True)
 class Capabilities:
     max_channels_in: int
     sample_rates: list[int] | None  # None => continuous range
     dtype: str = "float32"
-    notes: str | None = None
 
 @dataclass(frozen=True)
 class ActualConfig:
     sample_rate: int
     channels: list[ChannelInfo]
     chunk_size: int
-    latency_s: float | None = None
     dtype: str = "float32"
-
-@dataclass(frozen=True)
-class Chunk:
-    start_sample: int            # 0-based from start()
-    mono_time: float             # host monotonic time (seconds)
-    seq: int                     # chunk sequence (0,1,2,…)
-    data: np.ndarray             # shape: (frames, channels), dtype=float32 by default
-    device_time: float | None = None  # hardware ADC clock time (if available)
 ```
 
-**Timebases**
+### Streaming Data
 
-* `mono_time`: host‐side `_time.monotonic()` at the first sample of the chunk.
-* `device_time`: (optional) ADC/driver timestamp for the first sample (e.g., PortAudio’s `input_buffer_adc_time`). Use this to align cross-device streams or estimate drift/jitter. If absent, treat as `None`.
+Drivers produce `Chunk` objects internally (or write directly to the buffer), but consumers receive `ChunkPointer`s to zero-copy data in the ring buffer.
+
+```python
+@dataclass(frozen=True)
+class Chunk:
+    """Atomic unit of streaming data passed between threads."""
+    samples: np.ndarray          # Shape: (channels, frames)
+    start_time: float            # Host monotonic time
+    dt: float                    # Sample period (1/rate)
+    seq: int                     # Monotonically increasing sequence number
+    channel_names: tuple[str, ...]
+    units: str
+    meta: Optional[Mapping[str, Any]] = None
+
+@dataclass(frozen=True)
+class ChunkPointer:
+    """Lightweight pointer to data stored in a SharedRingBuffer.
+    
+    Carries sequencing metadata from the DAQ layer:
+    - seq: Monotonically increasing sequence number (reset per run)
+    - start_sample: Global sample index for the first sample in this chunk
+    - device_time: Optional hardware timestamp (seconds) if provided by driver
+    """
+    start_index: int             # Index in ring buffer
+    length: int                  # Number of frames
+    render_time: float           # Approximate time for visualization
+    seq: int                     # Monotonically increasing sequence number
+    start_sample: int            # Global sample index for first sample
+    device_time: float | None = None
+```
 
 **Shape & dtype**
 
-* All drivers emit **float32** by default.
-* `Chunk.data` is always `(frames, channels)` in the **user-selected channel order**.
+* **Ring Buffer**: Stores `float32` data as `(channels, frames)`.
+* **Drivers**: Emit `float32` arrays to the buffer.
+
 
 ---
 
-## BaseSource API (for consumers)
+## BaseDevice API (for consumers)
 
 ```python
-class BaseSource(ABC):
+class BaseDevice(ABC):
     # Device discovery
     def list_available_devices(self) -> list[DeviceInfo]: ...
     def get_capabilities(self, device_id: str) -> Capabilities: ...
@@ -158,8 +192,8 @@ class BaseSource(ABC):
     def set_active_channels(self, channel_ids: Sequence[int]) -> None: ...
     def get_active_channels(self) -> list[ChannelInfo]: ...
 
-    # Queue of data to consume (non-blocking producer)
-    data_queue: "queue.Queue[Chunk]"
+    # Queue of pointers to consume (ChunkPointer | EndOfStream)
+    data_queue: "queue.Queue[ChunkPointer | EndOfStream]"
 
     # Introspection
     @property
@@ -167,13 +201,15 @@ class BaseSource(ABC):
     @property
     def running(self) -> bool: ...
     def stats(self) -> dict[str, Any]: ...
+    def get_buffer(self) -> SharedRingBuffer: ...
 ```
 
 **Backpressure policy**
 
-* `data_queue` is bounded (default size 64).
-* On overflow, the **oldest** chunk is evicted and a counter increments (`"drops"` in `stats()`).
-* This keeps the UI responsive and memory bounded.
+* `data_queue` uses **blocking backpressure** (not drop-oldest).
+* The driver writes to a `SharedRingBuffer` and enqueues a pointer.
+* If the queue fills up, the driver blocks (up to 10s) to enforce lossless transmission.
+* Drop-oldest behavior is implemented downstream (in the Dispatcher) if the visualization/analysis threads cannot keep up, but the core acquisition pipeline remains lossless.
 
 **Threading model**
 
@@ -233,11 +269,11 @@ Implement a subclass with five driver hooks and use the base utilities to emit d
 
 ```python
 # mydevice_source.py
-from base_source import BaseSource, DeviceInfo, ChannelInfo, Capabilities, ActualConfig
+from base_device import BaseDevice, DeviceInfo, ChannelInfo, Capabilities, ActualConfig
 import numpy as np
 import threading
 
-class MyDeviceSource(BaseSource):
+class MyDeviceSource(BaseDevice):
     def __init__(self, queue_maxsize: int = 64):
         super().__init__(queue_maxsize)
         self._thread = None
@@ -284,7 +320,7 @@ class MyDeviceSource(BaseSource):
         self._thread.start()
 
     def _stop_impl(self) -> None:
-        # Cooperatively stop; BaseSource.stop_event has already been set
+        # Cooperatively stop; BaseDevice.stop_event has already been set
         if self._thread:
             self._thread.join(timeout=2.0)
             self._thread = None
@@ -308,10 +344,8 @@ class MyDeviceSource(BaseSource):
 * Emit **float32** arrays shaped `(frames, channels)` in the **active channel order**.
 * Call `self.emit_array(...)` for each produced chunk. It:
 
-  * validates shape and dtype,
-  * slices a superset down to the active channels (when possible),
-  * stamps `seq`, `start_sample`, `mono_time` (+ optional `device_time`),
-  * enqueues with the module’s **drop-oldest** backpressure policy.
+  * **automatically stamps** `seq`, `start_sample`, and `mono_time` (+ optional `device_time`),
+  * writes to the `SharedRingBuffer` and enqueues a pointer (blocking if full).
 
 ### Timestamps
 
@@ -346,9 +380,9 @@ class MyDeviceSource(BaseSource):
 * [ ] `start()/_start_impl()`: producer runs; emits via `emit_array(...)`
 * [ ] `stop()/_stop_impl()`: producer stops within \~2s
 * [ ] `close()/_close_impl()`: resources released; state is `"closed"`
-* [ ] Emits **float32**, `(frames, channels)`, correct channel order
+* [ ] Emits **float32** (frames, channels) via `emit_array`
 * [ ] Optional `device_time` passed when available
-* [ ] Handles backpressure implicitly via base class
+* [ ] Helper `emit_array` takes care of ring buffer writes and queueing
 
 ---
 
@@ -385,8 +419,8 @@ Use this sparingly (e.g., once per second) to drive a small “health” indicat
 
 ## FAQ
 
-**Q: Why do I see “drops” in `stats()`?**
-Your consumer isn’t draining fast enough for bursts. That’s OK for live scope use—the policy drops the **oldest** chunk to keep latency low. If you need lossless capture, attach a file writer thread behind the queue with a larger buffer and disk I/O.
+**Q: What happens if the consumer is too slow?**
+The source will block (up to 10s) and then raise an error. We enforce **lossless** transmission for the core pipeline. If you see high latency or errors, ensure your consumer drains the queue faster than real-time. Drop-oldest policies are applied downstream (e.g. in the `Dispatcher` visualization queues) to protect the UI, but the raw data acquisition is never compromised.
 
 **Q: What chunk size should I start with?**
 Start at `1024` frames. Go smaller (`256–512`) if you want snappier interactivity (at the cost of more callbacks), or larger (`2048–4096`) if you want fewer calls and can tolerate extra latency.
@@ -400,22 +434,22 @@ Use `device_time` if both devices supply accurate hardware timestamps. Otherwise
 
 ```
 daq/
-  base_source.py          # (this contract)
+  base_device.py          # (this contract)
   simulated_source.py     # reference implementation
-  soundcard_source.py     # PortAudio/sounddevice-based driver
+  soundcard_source.py     # miniaudio-based driver
   __init__.py             # re-exports public classes for convenience
 ```
 
 `__init__.py` example:
 
 ```python
-from .base_source import BaseSource, DeviceInfo, ChannelInfo, Capabilities, ActualConfig, Chunk
-from .simulated_source import SimulatedSource
+from .base_device import BaseDevice, DeviceInfo, ChannelInfo, Capabilities, ActualConfig, Chunk
+from .simulated_source import SimulatedPhysiologySource
 from .soundcard_source import SoundCardSource
 
 __all__ = [
-    "BaseSource", "DeviceInfo", "ChannelInfo", "Capabilities", "ActualConfig", "Chunk",
-    "SimulatedSource", "SoundCardSource",
+    "BaseDevice", "DeviceInfo", "ChannelInfo", "Capabilities", "ActualConfig", "Chunk",
+    "SimulatedPhysiologySource", "SoundCardSource",
 ]
 ```
 
@@ -423,11 +457,7 @@ __all__ = [
 
 ## Compatibility notes
 
-* **SoundCardSource** uses PortAudio via `sounddevice`; it supports macOS, Windows, and Linux.
+* **SoundCardSource** uses `miniaudio`; it supports macOS, Windows, and Linux.
 
   * Prefer `sample_rate` of `44_100` or `48_000` unless you’ve verified others on the target OS/driver.
   * When available, the driver stamps `device_time` with PortAudio’s `input_buffer_adc_time`.
-
----
-
-If you want, I can also save this as a `README.md` in your project so you can version it alongside the code.

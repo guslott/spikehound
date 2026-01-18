@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from scipy import signal
 
-from .models import Chunk
+from shared.models import Chunk
 
 
 @dataclass(frozen=True)
@@ -35,26 +35,38 @@ class ChannelFilterSettings:
         )
 
     def validate(self, sample_rate: float) -> None:
+        if sample_rate <= 0 or not np.isfinite(sample_rate):
+            raise ValueError("sample_rate must be positive and finite")
         nyquist = sample_rate / 2.0
-        if sample_rate <= 0:
-            raise ValueError("sample_rate must be positive")
-        if self.ac_couple and not (0 < self.ac_cutoff_hz < nyquist):
-            raise ValueError("ac_cutoff_hz must be between 0 and Nyquist")
+        if self.ac_couple and not (0 < self.ac_cutoff_hz < nyquist and np.isfinite(self.ac_cutoff_hz)):
+            raise ValueError("ac_cutoff_hz must be between 0 and Nyquist (finite)")
         if self.notch_enabled:
-            if not (0 < self.notch_freq_hz < nyquist):
-                raise ValueError("notch_freq_hz must be between 0 and Nyquist")
-            if self.notch_q <= 0:
-                raise ValueError("notch_q must be positive")
+            if not (0 < self.notch_freq_hz < nyquist and np.isfinite(self.notch_freq_hz)):
+                raise ValueError("notch_freq_hz must be between 0 and Nyquist (finite)")
+            if self.notch_q <= 0 or not np.isfinite(self.notch_q):
+                raise ValueError("notch_q must be positive and finite")
         if self.lowpass_hz is not None:
-            if not (0 < self.lowpass_hz < nyquist):
-                raise ValueError("lowpass_hz must be between 0 and Nyquist")
+            if not (0 < self.lowpass_hz < nyquist and np.isfinite(self.lowpass_hz)):
+                raise ValueError("lowpass_hz must be between 0 and Nyquist (finite)")
             if self.lowpass_order <= 0:
                 raise ValueError("lowpass_order must be positive")
         if self.highpass_hz is not None:
-            if not (0 < self.highpass_hz < nyquist):
-                raise ValueError("highpass_hz must be between 0 and Nyquist")
+            if not (0 < self.highpass_hz < nyquist and np.isfinite(self.highpass_hz)):
+                raise ValueError("highpass_hz must be between 0 and Nyquist (finite)")
             if self.highpass_order <= 0:
                 raise ValueError("highpass_order must be positive")
+
+    def describe(self) -> str:
+        parts = []
+        if self.ac_couple:
+            parts.append(f"AC({self.ac_cutoff_hz}Hz)")
+        if self.notch_enabled:
+            parts.append(f"Notch({self.notch_freq_hz}Hz)")
+        if self.highpass_hz is not None:
+            parts.append(f"HP({self.highpass_hz}Hz)")
+        if self.lowpass_hz is not None:
+            parts.append(f"LP({self.lowpass_hz}Hz)")
+        return ", ".join(parts) if parts else "None"
 
 
 @dataclass
@@ -189,8 +201,10 @@ class SignalConditioner:
         self._channel_filters = []
         self._channel_specs = None
 
-    def describe(self) -> Dict[str, object]:
-        return self._settings.as_dict()
+    def describe(self) -> Dict[str, str]:
+        if not self._channel_names or not self._channel_specs:
+            return {}
+        return {name: spec.describe() for name, spec in zip(self._channel_names, self._channel_specs)}
 
     def _ensure_filters(self, chunk: Chunk) -> bool:
         sample_rate = 1.0 / chunk.dt

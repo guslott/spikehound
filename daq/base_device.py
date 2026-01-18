@@ -4,7 +4,7 @@ from __future__ import annotations
 Base classes and datamodels for streaming DAQ sources.
 
 Goals:
-- Simple, stable contract for GUI/consumers (chunks over a queue).
+- Simple, stable contract for GUI/consumers (ChunkPointers over a queue).
 - Clean lifecycle: open → configure → start/stop → close.
 - Capability discovery for device pickers and validation.
 - Consistent timebase and sequencing across all drivers.
@@ -14,16 +14,36 @@ Subclasses implement the *_impl() methods to integrate real hardware
 (or simulators) while relying on the shared utilities here.
 """
 
+import logging
 import queue
 import threading
 import time as _time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Any, Iterable, List, Literal, Optional, Sequence
+from typing import Any, Iterable, List, Literal, Optional, Sequence, Union
 
 import numpy as np
 
-from shared.models import Chunk, ActualConfig, Capabilities, ChannelInfo, DeviceInfo
+logger = logging.getLogger(__name__)
+
+from shared.models import (
+    ActualConfig,
+    Capabilities,
+    ChannelInfo,
+    Chunk,
+    ChunkPointer,
+    DeviceInfo,
+    EndOfStream,
+    QueueName,
+    enqueue_with_policy,
+)
+from shared.ring_buffer import SharedRingBuffer
+
+
+# Default ring buffer duration in seconds. The buffer must be large enough that
+# consumers can read pointers before the buffer wraps. 30 seconds provides ample
+# headroom for typical visualization/analysis latencies. Increase if observing
+# "wrap risk" warnings in the Health Metrics panel.
+RING_BUFFER_DURATION_SEC: float = 30.0
 
 
 # ----------------------------
@@ -37,7 +57,7 @@ from shared.models import Chunk, ActualConfig, Capabilities, ChannelInfo, Device
 State = Literal["closed", "open", "running"]
 
 
-class BaseSource(ABC):
+class BaseDevice(ABC):
     """
     Abstract base for all DAQ input sources.
 
@@ -49,7 +69,7 @@ class BaseSource(ABC):
         chans = source.list_available_channels(devs[0].id)
         source.configure(sample_rate=20_000, channels=[c.id for c in chans[:2]], chunk_size=1024)
         source.start()
-        # Consume source.data_queue (Chunk objects) in the GUI thread
+        # Consume source.data_queue (ChunkPointer objects) in the GUI thread
         source.stop()
         source.close()
     """
@@ -63,7 +83,7 @@ class BaseSource(ABC):
     # ---- Lifecycle ---------------------------------------------------------
 
     def __init__(self, queue_maxsize: int = 64) -> None:
-        self.data_queue: "queue.Queue[Chunk]" = queue.Queue(maxsize=queue_maxsize)
+        self.data_queue: "queue.Queue[ChunkPointer | EndOfStream]" = queue.Queue(maxsize=queue_maxsize)
         self._stop_event = threading.Event()
         self._state_lock = threading.RLock()
         self._channel_lock = threading.RLock()
@@ -83,6 +103,8 @@ class BaseSource(ABC):
 
         # Dtype contract: drivers should deliver float32 unless otherwise negotiated
         self._dtype: str = "float32"
+        self.config: Optional[ActualConfig] = None
+        self.ring_buffer: Optional[SharedRingBuffer] = None
 
     # ------------------------
     # Device enumeration APIs
@@ -134,6 +156,7 @@ class BaseSource(ABC):
             self._available_channels = []
             self._active_channel_ids = []
             self.config = None
+            self.ring_buffer = None
             self._state = "closed"
             self._xruns = 0
             self._drops = 0
@@ -165,6 +188,17 @@ class BaseSource(ABC):
                 channels = [ch.id for ch in self._available_channels]
             self.set_active_channels(channels)
 
+            # Validate requested sample rate against capabilities when provided
+            if self._device_id is not None:
+                try:
+                    caps = self.get_capabilities(self._device_id)
+                except Exception as exc:
+                    logger.debug("Failed to get capabilities for %s: %s", self._device_id, exc)
+                    caps = None
+                if caps is not None and caps.sample_rates:
+                    if int(sample_rate) not in [int(sr) for sr in caps.sample_rates]:
+                        raise ValueError(f"sample_rate {sample_rate} not in supported set {caps.sample_rates}")
+
             # Clamp or normalize chunk_size minimally (positive int)
             if not isinstance(chunk_size, int) or chunk_size <= 0:
                 raise ValueError("chunk_size must be a positive integer")
@@ -179,6 +213,17 @@ class BaseSource(ABC):
             self._dtype = actual.dtype
             # Store the echo so GUI can query it directly
             self.config = actual
+            # Allocate a shared ring buffer sized for RING_BUFFER_DURATION_SEC seconds
+            capacity = max(int(actual.sample_rate * RING_BUFFER_DURATION_SEC), actual.chunk_size)
+            if capacity <= 0:
+                raise ValueError("computed ring buffer capacity must be positive")
+            n_channels = len(self._active_channel_ids)
+            if n_channels <= 0:
+                raise ValueError("configuration must include at least one channel")
+            self.ring_buffer = SharedRingBuffer(
+                shape=(n_channels, capacity),
+                dtype=actual.dtype,
+            )
             return actual
 
     @abstractmethod
@@ -197,6 +242,8 @@ class BaseSource(ABC):
     def start(self) -> None:
         """Begin streaming. Resets run counters and queue timing origin."""
         with self._state_lock:
+            if self._state == "running":
+                return
             self._assert_state(expected=("open",))
             if self.config is None:
                 raise RuntimeError("configure() must be called before start().")
@@ -251,6 +298,22 @@ class BaseSource(ABC):
                 if cid not in uniq:
                     uniq.append(cid)
             self._active_channel_ids = uniq
+            # If a ring buffer already exists and the channel count changed, rebuild it
+            rb = self.ring_buffer
+            desired_channels = len(self._active_channel_ids)
+            if rb is not None and desired_channels > 0 and rb.shape[0] != desired_channels:
+                capacity = rb.capacity
+                dtype = rb.dtype
+                self.ring_buffer = SharedRingBuffer(shape=(desired_channels, capacity), dtype=dtype)
+                
+                # Clear the queue of any pointers to the old buffer
+                # This prevents the consumer from trying to read from a replaced/closed buffer
+                # Use public API (get_nowait drain) instead of internal queue.mutex/queue.clear()
+                try:
+                    while True:
+                        self.data_queue.get_nowait()
+                except queue.Empty:
+                    pass
 
     def get_active_channels(self) -> List[ChannelInfo]:
         with self._channel_lock:
@@ -269,29 +332,19 @@ class BaseSource(ABC):
         *,
         device_time: Optional[float] = None,
         mono_time: Optional[float] = None,
-        meta: Optional[dict[str, Any]] = None,
-    ) -> Chunk:
-        """
-        Build and enqueue a Chunk from a (frames, channels) array.
-
-        Parameters
-        ----------
-        data : np.ndarray
-            Samples shaped (frames, channels) as produced by the driver callback.
-        device_time : float | None
-            Optional hardware clock reference for the first frame.
-        mono_time : float | None
-            Override for the host monotonic timestamp; defaults to `time.monotonic()`.
-        meta : dict[str, Any] | None
-            Additional metadata to attach to the chunk (copied before storage).
-
-        Returns
-        -------
-        Chunk
-            The enqueued chunk (useful for testing/logging).
+    ) -> ChunkPointer:
+        """Helper for simple drivers to emit a 2D float32 array.
+        
+        Args:
+            data: np.ndarray of shape (frames, channels) or (channels, frames).
+                  If (frames, channels) and channels matches config, it is transposed.
+            device_time: Optional hardware timestamp (seconds)
+            mono_time: Optional host monotonic time (recommended if available)
         """
         if self.config is None:
             raise RuntimeError("emit_array() called before configure().")
+        if self.ring_buffer is None:
+            raise RuntimeError("ring buffer not initialized; call configure() first.")
 
         # Validate/normalize dtype
         desired_dtype = np.float32 if self._dtype == "float32" else np.dtype(self._dtype)
@@ -299,93 +352,105 @@ class BaseSource(ABC):
             # Conservative: convert but avoid copy if possible
             data = np.asarray(data, dtype=desired_dtype)
 
-        # Validate shape
-        if data.ndim != 2:
-            raise ValueError("data must be 2D array shaped (frames, channels).")
-        frames, chans = data.shape
-        expected_chans = len(self._active_channel_ids)
-        if expected_chans != chans:
-            # Allow drivers to deliver superset and slice here as a fallback.
-            with self._channel_lock:
-                if chans >= expected_chans and chans == len(self._available_channels):
-                    # Slice by active channel order
-                    idx = [self._index_of_channel_id(cid) for cid in self._active_channel_ids]
-                    data = data[:, idx]
-                    frames, chans = data.shape
-                elif chans < expected_chans:
-                    actual_ids = None
-                    if meta is not None:
-                        actual_ids = meta.get("active_channel_ids")
-                    if isinstance(actual_ids, Sequence):
-                        out = np.zeros((frames, expected_chans), dtype=data.dtype)
-                        id_to_col = {cid: i for i, cid in enumerate(actual_ids)}
-                        for out_idx, cid in enumerate(self._active_channel_ids):
-                            src_idx = id_to_col.get(cid)
-                            if src_idx is not None and src_idx < chans:
-                                out[:, out_idx] = data[:, src_idx]
-                        data = out
-                        chans = data.shape[1]
-                    else:
-                        raise ValueError(
-                            f"data has {chans} channels, expected {expected_chans}."
-                        )
-                else:
-                    raise ValueError(
-                        f"data has {chans} channels, expected {expected_chans}."
-                    )
-
-        if frames == 0:
-            raise ValueError("data must contain at least one frame")
-
         # Stamp times/counters
         mono = _time.monotonic() if mono_time is None else mono_time
+        
         with self._state_lock:
-            start_sample = self._next_start_sample
+            # Validate shape (and possibly adapt) within the lock to ensure synchronization 
+            # with active_channel_ids and ring_buffer updates from configure().
+            if data.ndim != 2:
+                raise ValueError("data must be 2D array shaped (frames, channels).")
+            frames, chans = data.shape
+            expected_chans = len(self._active_channel_ids)
+            
+            if expected_chans != chans:
+                # Allow drivers to deliver superset and slice here as a fallback.
+                with self._channel_lock:
+                    expected_chans_now = len(self._active_channel_ids)
+                    # Re-check in case channel lock revealed a change (though state_lock should prevent it)
+                    if chans >= expected_chans_now and chans == len(self._available_channels):
+                        # Slice by active channel order
+                        idx = [self._index_of_channel_id(cid) for cid in self._active_channel_ids]
+                        data = data[:, idx]
+                        frames, chans = data.shape
+                    elif chans < expected_chans_now:
+                        # If the incoming data has fewer channels than expected,
+                        # we assume the driver is providing a subset and we need to
+                        # map it to the full expected channel set.
+                        # This path is less common and requires more context,
+                        # for now, we raise an error if we can't infer the mapping.
+                        raise ValueError(
+                            f"data has {chans} channels, expected {expected_chans_now}. "
+                            "Cannot automatically map subset of channels without metadata."
+                        )
+                    else:
+                        raise ValueError(
+                            f"data has {chans} channels, expected {expected_chans_now}."
+                        )
+
+            if frames == 0:
+                raise ValueError("data must contain at least one frame")
+
+            # Capture current counters BEFORE incrementing for the pointer
             seq = self._next_seq
-            # Advance counters for the *next* chunk
+            start_sample = self._next_start_sample
             self._next_start_sample += frames
             self._next_seq += 1
 
-        active_infos = self.get_active_channels()
-        if not active_infos:
-            raise RuntimeError("No active channels configured; cannot emit data.")
-        channel_names = tuple(ch.name for ch in active_infos)
-        unit_candidates = [ch.units for ch in active_infos if ch.units]
-        if unit_candidates:
-            first_unit = unit_candidates[0]
-            units = first_unit if all(u == first_unit for u in unit_candidates) else "mixed"
-        else:
-            units = "unknown"
+            # Write channel-major data into the ring buffer
+            channel_major = np.ascontiguousarray(data.T)
+            rb = self.ring_buffer
+            if rb is None:
+                raise RuntimeError("ring buffer not initialized; call configure() first.")
+            if rb.shape[0] != channel_major.shape[0]:
+                raise ValueError(
+                    f"ring buffer channel dimension {rb.shape[0]} does not match incoming data {channel_major.shape[0]}"
+                )
+            start_index = rb.write(channel_major)
 
-        samples = np.ascontiguousarray(data.T)
-        samples.setflags(write=False)
-
-        dt = 1.0 / float(self.config.sample_rate)
-        chunk_meta = dict(meta or {})
-        if device_time is not None:
-            chunk_meta.setdefault("device_time", device_time)
-        chunk_meta["start_sample"] = start_sample
-        if not chunk_meta:
-            chunk_meta = None
-
-        chunk = Chunk(
-            samples=samples,
-            start_time=mono,
-            dt=dt,
-            seq=seq,
-            channel_names=channel_names,
-            units=units,
-            meta=chunk_meta,
-        )
-        self._safe_put(chunk)
-        return chunk
+            pointer = ChunkPointer(
+                start_index=start_index,
+                length=frames,
+                render_time=mono,
+                seq=seq,
+                start_sample=start_sample,
+                device_time=device_time,
+            )
+            self._safe_put(pointer)
+            
+        return pointer
 
     def emit_chunk(self, chunk: Chunk) -> None:
         """
-        Enqueue a pre-built Chunk. Use emit_array() when possible to keep counters consistent.
-        If you call emit_chunk() directly, you are responsible for start_sample/seq monotonicity.
+        Adapt a pre-built Chunk into the ring buffer and enqueue a ChunkPointer.
         """
-        self._safe_put(chunk)
+        if self.ring_buffer is None:
+            raise RuntimeError("ring buffer not initialized; call configure() first.")
+        frames = chunk.samples.shape[1]
+        if frames == 0:
+            raise ValueError("chunk must contain at least one frame")
+        with self._state_lock:
+            # Capture current counters BEFORE incrementing for the pointer
+            seq = self._next_seq
+            start_sample = self._next_start_sample
+            self._next_start_sample += frames
+            self._next_seq += 1
+            if self.ring_buffer is None:
+                raise RuntimeError("ring buffer not initialized; call configure() first.")
+            start_index = self.ring_buffer.write(np.ascontiguousarray(chunk.samples))
+            # Extract device_time from chunk meta if available
+            device_time = None
+            if chunk.meta is not None:
+                device_time = chunk.meta.get("device_time")
+            pointer = ChunkPointer(
+                start_index=start_index,
+                length=frames,
+                render_time=chunk.start_time,
+                seq=seq,
+                start_sample=start_sample,
+                device_time=device_time,
+            )
+            self._safe_put(pointer)
 
     def note_xrun(self, count: int = 1) -> None:
         """Drivers can call this when the backend reports over/underruns."""
@@ -423,6 +488,12 @@ class BaseSource(ABC):
             "active_channels": [ch.id for ch in self.get_active_channels()],
         }
 
+    def get_buffer(self) -> SharedRingBuffer:
+        """Expose the shared ring buffer for downstream consumers."""
+        if self.ring_buffer is None:
+            raise RuntimeError("ring buffer not initialized; call configure() first.")
+        return self.ring_buffer
+
     # -------------
     # Base helpers
     # -------------
@@ -434,33 +505,21 @@ class BaseSource(ABC):
             self._next_start_sample = 0
             self._xruns = 0
             self._drops = 0
-            # Drain any stale data before starting a new run
             try:
                 while True:
                     self.data_queue.get_nowait()
             except queue.Empty:
                 pass
 
-    def _safe_put(self, item: Chunk) -> None:
-        """
-        Central backpressure policy: drop-oldest, then try once more.
-        Keeps memory bounded and UI responsive under bursts.
-        """
+    def _safe_put(self, item: Union[ChunkPointer, type[EndOfStream]]) -> None:
+        """Put item into data_queue using the canonical 'daq' lossless policy."""
         try:
-            self.data_queue.put_nowait(item)
-        except queue.Full:
-            # Drop the oldest and try once more
-            try:
-                _ = self.data_queue.get_nowait()
-                self._drops += 1
-            except queue.Empty:
-                # Race: became empty; ignore
-                pass
-            try:
-                self.data_queue.put_nowait(item)
-            except queue.Full:
-                # If still full, give up silently (we already counted a drop for the eviction).
-                pass
+            enqueue_with_policy("daq", self.data_queue, item)
+        except Exception as exc:
+            # If we fail lossless constraint, it's usually a critical error
+            # but we log it here since it might be during shutdown.
+            logger.error("DAQ _safe_put failed: %s", exc)
+            raise
 
     def _assert_state(self, expected: Iterable[State]) -> None:
         if self._state not in expected:

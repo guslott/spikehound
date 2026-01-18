@@ -1,3 +1,25 @@
+"""Analysis-layer event types for GUI and worker communication.
+
+This module defines the detailed AnalysisEvent type used by the analysis worker and GUI.
+
+IMPORTANT: AnalysisEvent is ALWAYS derived from DetectionEvent
+============================================================
+
+AnalysisEvent is created exclusively in the analysis layer by enriching a DetectionEvent
+with timing metadata and computed metrics. Detectors should NEVER emit AnalysisEvent
+directly—they emit the simpler DetectionEvent.
+
+Conversion Contract:
+- Detectors (core/detection/) emit → DetectionEvent
+- AnalysisWorker converts DetectionEvent → AnalysisEvent via `detection_to_analysis_event()`
+- GUI/EventBuffer receives → AnalysisEvent
+
+This explicit conversion makes the data flow clear for both humans and AI tools.
+
+See Also:
+    shared.models.DetectionEvent: The canonical detection-layer event type
+    analysis.analysis_worker.detection_to_analysis_event: The conversion function
+"""
 from __future__ import annotations
 
 import math
@@ -8,10 +30,32 @@ import numpy as np
 
 
 @dataclass(frozen=True)
-class Event:
-    """
-    Lightweight description of a single threshold crossing that both the
-    analysis worker and GUI can exchange without additional translation.
+class AnalysisEvent:
+    """Detailed threshold crossing event for analysis and GUI display.
+    
+    This Event type contains comprehensive timing and sampling metadata needed
+    for accurate event visualization and metric computation. It is exchanged
+    between the analysis worker and GUI without additional translation.
+    
+    For the simpler detection-layer type, see `shared.models.DetectionEvent`.
+    
+    Attributes:
+        id: Unique event identifier
+        channelId: Channel where the crossing occurred
+        thresholdValue: Threshold value that was crossed
+        crossingIndex: Absolute sample index of the crossing
+        crossingTimeSec: Timestamp of the crossing (seconds)
+        firstSampleTimeSec: Timestamp of the first sample in the window
+        sampleRateHz: Sample rate for time conversions
+        windowMs: Total event window duration in milliseconds
+        preMs: Pre-crossing window duration in milliseconds
+        postMs: Post-crossing window duration in milliseconds
+        samples: Waveform samples around the crossing
+        properties: Computed metrics (e.g., energy, frequency)
+        intervalSinceLastSec: Time since previous event on this channel
+    
+    See Also:
+        shared.models.DetectionEvent: Simpler detection-layer Event type
     """
 
     id: int
@@ -49,3 +93,7 @@ class Event:
         object.__setattr__(self, "samples", np.array(arr, copy=True, order="C"))
         object.__setattr__(self, "properties", dict(self.properties))
         object.__setattr__(self, "intervalSinceLastSec", interval)
+
+
+
+

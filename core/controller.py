@@ -2,27 +2,24 @@ from __future__ import annotations
 
 import queue
 import threading
+import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Type
 
 import numpy as np
-from PySide6 import QtCore
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from daq.base_source import ActualConfig, BaseSource, ChannelInfo
+    from daq.base_device import ActualConfig, BaseDevice, ChannelInfo
     from daq.registry import DeviceDescriptor
-else:  # pragma: no cover - runtime fallback
-    ActualConfig = Any
-    BaseSource = Any
-    ChannelInfo = Any
-    DeviceDescriptor = Any
 
 from .conditioning import FilterSettings
 from .dispatcher import Dispatcher
+from .audio_manager import AudioManager
 from shared.models import Chunk, EndOfStream, TriggerConfig
+from shared.ring_buffer import SharedRingBuffer
 from analysis.settings import AnalysisSettingsStore
 from shared.app_settings import AppSettings, AppSettingsStore
 from shared.event_buffer import AnalysisEvents, EventRingBuffer
-from shared.types import Event as SharedEvent
+from shared.types import AnalysisEvent
 
 
 def _registry():
@@ -31,185 +28,7 @@ def _registry():
     return reg
 
 
-class DeviceManager(QtCore.QObject):
-    """Tracks available DAQ drivers and manages a single active connection."""
-
-    devicesChanged = QtCore.Signal(list)
-    deviceConnected = QtCore.Signal(str)
-    deviceDisconnected = QtCore.Signal()
-    availableChannelsChanged = QtCore.Signal(list)
-
-    def __init__(self, parent: Optional[QtCore.QObject] = None) -> None:
-        super().__init__(parent)
-        self._descriptors: Dict[str, DeviceDescriptor] = {}
-        self._device_entries: Dict[str, Dict[str, object]] = {}
-        self._active_key: Optional[str] = None
-        self._driver: Optional[BaseSource] = None
-        self._channels: List[ChannelInfo] = []
-        self.refresh_devices()
-
-    def refresh_devices(self) -> None:
-        reg = _registry()
-        reg.scan_devices(force=True)
-        descriptors = reg.list_devices()
-        self._descriptors = {d.key: d for d in descriptors}
-        self._device_entries = {}
-        payload: List[Dict[str, object]] = []
-        for descriptor in descriptors:
-            try:
-                available = descriptor.cls.list_available_devices()
-            except Exception as exc:  # pragma: no cover - discovery errors shown in UI
-                entry_key = f"{descriptor.key}::unavailable"
-                self._device_entries[entry_key] = {
-                    "descriptor_key": descriptor.key,
-                    "device_id": None,
-                    "error": str(exc),
-                }
-                payload.append(
-                    {
-                        "key": entry_key,
-                        "name": f"{descriptor.name} (unavailable)",
-                        "module": descriptor.module,
-                        "capabilities": descriptor.capabilities,
-                        "driver_key": descriptor.key,
-                        "driver_name": descriptor.name,
-                        "device_id": None,
-                        "device_name": None,
-                        "error": str(exc),
-                    }
-                )
-                continue
-
-            if not available:
-                entry_key = f"{descriptor.key}::none"
-                self._device_entries[entry_key] = {
-                    "descriptor_key": descriptor.key,
-                    "device_id": None,
-                    "error": "No hardware devices detected.",
-                }
-                payload.append(
-                    {
-                        "key": entry_key,
-                        "name": f"{descriptor.name} (no devices detected)",
-                        "module": descriptor.module,
-                        "capabilities": descriptor.capabilities,
-                        "driver_key": descriptor.key,
-                        "driver_name": descriptor.name,
-                        "device_id": None,
-                        "device_name": None,
-                        "error": "No hardware devices detected.",
-                    }
-                )
-                continue
-
-            for device in sorted(available, key=lambda info: info.name.lower()):
-                entry_key = f"{descriptor.key}::{device.id}"
-                self._device_entries[entry_key] = {
-                    "descriptor_key": descriptor.key,
-                    "device_id": device.id,
-                }
-                entry: Dict[str, object] = {
-                    "key": entry_key,
-                    "name": f"{descriptor.name} - {device.name}",
-                    "module": descriptor.module,
-                    "capabilities": descriptor.capabilities,
-                    "driver_key": descriptor.key,
-                    "driver_name": descriptor.name,
-                    "device_id": device.id,
-                    "device_name": device.name,
-                }
-                vendor = getattr(device, "vendor", None)
-                if vendor:
-                    entry["device_vendor"] = vendor
-                details = getattr(device, "details", None)
-                if details:
-                    entry["device_details"] = details
-                payload.append(entry)
-
-        payload.sort(key=lambda item: (item.get("driver_name", ""), item.get("device_name", "") or item["name"]))
-        self.devicesChanged.emit(payload)
-
-    def get_device_list(self) -> List[DeviceDescriptor]:
-        return list(self._descriptors.values())
-
-    def connect_device(self, device_key: str, sample_rate: float, *, chunk_size: int = 1024, **driver_kwargs) -> BaseSource:
-        self.disconnect_device()
-
-        entry = self._device_entries.get(device_key)
-        if entry is None:
-            raise KeyError(f"Unknown device key: {device_key!r}")
-
-        descriptor_key = entry.get("descriptor_key")
-        device_id = entry.get("device_id")
-        if descriptor_key is None or not isinstance(descriptor_key, str):
-            raise KeyError(f"Invalid descriptor for key: {device_key!r}")
-
-        descriptor = self._descriptors.get(descriptor_key)
-        if descriptor is None:
-            raise KeyError(f"Unknown descriptor key: {descriptor_key!r}")
-
-        if device_id is None or device_id == "":
-            error_message = entry.get("error") or "No hardware devices detected for this driver."
-            raise RuntimeError(error_message)
-
-        reg = _registry()
-        driver = reg.create_device(descriptor_key, **driver_kwargs)
-        available = descriptor.cls.list_available_devices()
-        target = next((dev for dev in available if str(dev.id) == str(device_id)), None)
-        if target is None:
-            raise RuntimeError(f"Selected device is no longer available: {device_id!r}")
-
-        driver.open(target.id)
-        channels = driver.list_available_channels(target.id)
-
-        configure_kwargs = {
-            "sample_rate": int(sample_rate),
-            "channels": [ch.id for ch in channels] if channels else None,
-            "chunk_size": chunk_size,
-        }
-        configure_kwargs = {k: v for k, v in configure_kwargs.items() if v is not None}
-
-        try:
-            driver.configure(**configure_kwargs)
-        except Exception:
-            driver.close()
-            raise
-
-        self._driver = driver
-        self._active_key = device_key
-        self._channels = list(channels)
-        self.availableChannelsChanged.emit(list(self._channels))
-        self.deviceConnected.emit(device_key)
-        return driver
-
-    def disconnect_device(self) -> None:
-        if self._driver is None:
-            return
-        try:
-            if getattr(self._driver, "running", False):
-                try:
-                    self._driver.stop()
-                except Exception:
-                    pass
-            try:
-                self._driver.close()
-            except Exception:
-                pass
-        finally:
-            self._driver = None
-            self._active_key = None
-            self._channels = []
-            self.availableChannelsChanged.emit([])
-            self.deviceDisconnected.emit()
-
-    def get_available_channels(self) -> List[ChannelInfo]:
-        return list(self._channels)
-
-    def active_key(self) -> Optional[str]:
-        return self._active_key
-
-    def current_driver(self) -> Optional[BaseSource]:
-        return self._driver
+logger = logging.getLogger(__name__)
 
 
 class PipelineController:
@@ -219,23 +38,25 @@ class PipelineController:
         self,
         *,
         filter_settings: Optional[FilterSettings] = None,
-        visualization_queue_size: int = 256,
+        visualization_queue_size: int = 1024,
         audio_queue_size: int = 256,
         logging_queue_size: int = 512,
         dispatcher_poll_timeout: float = 0.05,
+        app_settings_store: Optional[AppSettingsStore] = None,
     ) -> None:
         self._filter_settings = filter_settings or FilterSettings()
         self.visualization_queue: "queue.Queue" = queue.Queue(maxsize=visualization_queue_size)
         self.audio_queue: "queue.Queue" = queue.Queue(maxsize=audio_queue_size)
         self.logging_queue: "queue.Queue" = queue.Queue(maxsize=logging_queue_size)
+        self.event_queue: "queue.Queue" = queue.Queue(maxsize=1024)
         self._analysis_settings = AnalysisSettingsStore()
-        self._app_settings_store = AppSettingsStore()
+        self._app_settings_store = app_settings_store if app_settings_store is not None else AppSettingsStore()
         self._event_buffer = EventRingBuffer(capacity=1000)
         self._analysis_events = AnalysisEvents(self._event_buffer)
 
         self._dispatcher_timeout = dispatcher_poll_timeout
         self._dispatcher: Optional[Dispatcher] = None
-        self._source: Optional[BaseSource] = None
+        self._source: Optional[BaseDevice] = None
         self._actual_config: Optional[ActualConfig] = None
         self._device_id: Optional[str] = None
         self._configure_kwargs: Dict[str, Any] = {}
@@ -245,6 +66,13 @@ class PipelineController:
         self._streaming: bool = False
         self._active_channel_ids: List[int] = []
         self._channel_infos: List[ChannelInfo] = []
+        self._list_all_audio_devices: bool = False
+        
+        # Audio management (will be initialized by Runtime)
+        self._audio_manager: Optional[AudioManager] = None
+        
+        # WAV recording
+        self._wav_logger: Optional["WavLoggerThread"] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -255,7 +83,7 @@ class PipelineController:
         return self._running
 
     @property
-    def source(self) -> Optional[BaseSource]:
+    def source(self) -> Optional[BaseDevice]:
         return self._source
 
     @property
@@ -287,18 +115,63 @@ class PipelineController:
         return self._app_settings_store.get()
 
     def update_app_settings(self, **kwargs) -> AppSettings:
+        """Update application settings and return the updated settings."""
         return self._app_settings_store.update(**kwargs)
+
+    # Audio control API (delegates to AudioManager)
+    
+    def set_audio_monitoring(self, channel_id: Optional[int]) -> None:
+        """Enable or disable audio monitoring for a channel.
+        
+        Args:
+            channel_id: Channel ID to monitor, or None to stop
+        """
+        if self._audio_manager is not None:
+            self._audio_manager.set_listen_channel(channel_id)
+    
+    def set_audio_device(self, device_id: Optional[int]) -> None:
+        """Set audio output device.
+        
+        Args:
+            device_id: Device ID for output, or None for default
+        """
+        if self._audio_manager is not None:
+            self._audio_manager.set_output_device(device_id)
+    
+    def set_audio_gain(self, gain: float) -> None:
+        """Set audio output gain.
+        
+        Args:
+            gain: Gain value (0.0 to 1.0)
+        """
+        if self._audio_manager is not None:
+            self._audio_manager.set_gain(gain)
+
+    def set_list_all_audio_devices(self, enabled: bool) -> None:
+        self._list_all_audio_devices = bool(enabled)
 
     @property
     def sample_rate(self) -> Optional[float]:
         return None if self._actual_config is None else float(self._actual_config.sample_rate)
+
+    @property
+    def is_recording(self) -> bool:
+        """Return True if currently recording to a WAV file."""
+        return self._wav_logger is not None
+
+    @property
+    def recording_duration_seconds(self) -> float:
+        """Return the actual duration of recorded audio based on frames written."""
+        if self._wav_logger is None:
+            return 0.0
+        return self._wav_logger.duration_seconds
 
     def active_channels(self) -> Sequence[ChannelInfo]:
         return [] if self._actual_config is None else list(self._actual_config.channels)
 
     def switch_source(
         self,
-        source_cls: Type[BaseSource],
+        source_cls: Type[BaseDevice],
         *,
         device_id: Optional[str] = None,
         configure_kwargs: Optional[Dict[str, Any]] = None,
@@ -306,6 +179,8 @@ class PipelineController:
         """Swap in a new source; keeps queues and filter settings intact."""
 
         configure_kwargs = dict(configure_kwargs or {})
+        if "sample_rate" not in configure_kwargs:
+            configure_kwargs["sample_rate"] = self.sample_rate or 20000
 
         with self._lock:
             self.stop(join=True)
@@ -353,14 +228,24 @@ class PipelineController:
                 visualization_queue=self.visualization_queue,
                 audio_queue=self.audio_queue,
                 logging_queue=self.logging_queue,
+                event_queue=self.event_queue,
                 filter_settings=self._filter_settings,
                 poll_timeout=self._dispatcher_timeout,
             )
+            try:
+                self._dispatcher.set_source_buffer(source.get_buffer(), sample_rate=actual.sample_rate)
+            except Exception:
+                pass
             self._running = False
             self._reset_output_queues()
             return actual
 
     def start(self) -> None:
+        """Start the acquisition pipeline.
+        
+        Delegates to _start_streaming_locked() for the actual startup logic.
+        This is the public API; internal callers use _start_streaming_locked().
+        """
         with self._lock:
             if self._source is None or self._dispatcher is None:
                 raise RuntimeError("No source configured. Call switch_source() first.")
@@ -368,26 +253,23 @@ class PipelineController:
                 return
 
             self._reset_output_queues()
-            self._dispatcher.start()
-            self._source.start()
+            self._start_streaming_locked()
             self._running = True
 
     def stop(self, *, join: bool = True) -> None:
-        """Stop the pipeline; currently always blocks until threads exit."""
+        """Stop the acquisition pipeline.
+        
+        Delegates to _stop_streaming_locked() for the actual shutdown logic.
+        This is the public API; internal callers use _stop_streaming_locked().
+        """
         with self._lock:
             if self._source is None:
                 return
+            if not self._running:
+                return
 
-            if self._source.running:
-                try:
-                    self._source.stop()
-                except Exception:
-                    pass
-
-            if self._dispatcher is not None:
-                self._push_end_of_stream()
-                self._dispatcher.stop()
-
+            self._push_end_of_stream()
+            self._stop_streaming_locked()
             self._running = False
 
             if join:
@@ -396,6 +278,18 @@ class PipelineController:
     def shutdown(self) -> None:
         """Stop everything and close the active source."""
         with self._lock:
+            # Stop recording first
+            if self._wav_logger is not None:
+                try:
+                    self._wav_logger.stop()
+                except Exception:
+                    pass
+                self._wav_logger = None
+            
+            # Stop audio manager
+            if self._audio_manager is not None:
+                self._audio_manager.stop()
+            
             self.stop(join=True)
             self._destroy_dispatcher()
             self._close_source()
@@ -423,30 +317,20 @@ class PipelineController:
     def pull_analysis_events(self, last_event_id: Optional[int] = None):
         return self._analysis_events.pull_events(last_event_id)
 
-    # Trigger configuration placeholder ---------------------------------
+    # Trigger configuration ---------------------------------------------
 
-    def update_trigger_config(self, config: Dict[str, Any]) -> None:
+    def update_trigger_config(self, config: TriggerConfig) -> None:
         """Receive trigger configuration updates from the GUI and forward them."""
         with self._lock:
             if self._dispatcher is None:
                 return
 
-            channel_index = int(config.get("channel_index", -1))
-            trigger_conf = TriggerConfig(
-                channel_index=channel_index,
-                threshold=float(config.get("threshold", 0.0)),
-                hysteresis=float(config.get("hysteresis", 0.0)),
-                pretrigger_frac=float(config.get("pretrigger_frac", 0.0)),
-                window_sec=float(config.get("window_sec", 0.0)),
-                mode=str(config.get("mode", "continuous")),
-            )
-
-            self._window_sec = trigger_conf.window_sec or self._window_sec
+            self._window_sec = config.window_sec or self._window_sec
             sample_rate = self.sample_rate or 0.0
-            self._dispatcher.set_trigger_config(trigger_conf, sample_rate)
-            self._dispatcher.set_window_duration(trigger_conf.window_sec)
+            self._dispatcher.set_trigger_config(config, sample_rate)
+            self._dispatcher.set_window_duration(config.window_sec)
 
-    def attach_source(self, driver: BaseSource, sample_rate: float, channels: Sequence[ChannelInfo]) -> None:
+    def attach_source(self, driver: BaseDevice, sample_rate: float, channels: Sequence[ChannelInfo]) -> None:
         with self._lock:
             self._stop_streaming_locked()
             self._destroy_dispatcher()
@@ -465,14 +349,40 @@ class PipelineController:
                 visualization_queue=self.visualization_queue,
                 audio_queue=self.audio_queue,
                 logging_queue=self.logging_queue,
+                event_queue=self.event_queue,
                 filter_settings=self._filter_settings,
                 poll_timeout=self._dispatcher_timeout,
             )
+            effective_sr = float(sample_rate) if sample_rate is not None else 0.0
+            if effective_sr <= 0:
+                try:
+                    cfg = getattr(driver, "config", None)
+                    effective_sr = float(getattr(cfg, "sample_rate", 0.0))
+                except Exception:
+                    effective_sr = 0.0
+            if effective_sr <= 0:
+                logger.error("Invalid sample rate for dispatcher wiring (driver=%s)", driver)
+                raise ValueError("Sample rate must be positive to attach source")
+            if getattr(driver, "ring_buffer", None) is None:
+                try:
+                    channel_ids_cfg = [info.id for info in channels] if channels else None
+                    driver.configure(sample_rate=int(round(effective_sr)), channels=channel_ids_cfg)
+                except Exception as exc:
+                    logger.error("Failed to configure driver before wiring dispatcher: %s", exc)
+                    raise
+            try:
+                self._dispatcher.set_source_buffer(driver.get_buffer(), sample_rate=effective_sr)
+                logger.info("Attached source buffer to dispatcher. SR=%s", effective_sr)
+            except Exception as exc:
+                logger.error("Failed to link source buffer: %s", exc)
+                raise
             channel_ids = [info.id for info in channels]
             channel_names = [info.name for info in channels]
-            self._dispatcher.set_channel_layout(channel_ids, channel_names)
+            channel_units = [info.units for info in channels]
+            self._dispatcher.set_channel_layout(channel_ids, channel_names, channel_units)
             self._dispatcher.set_window_duration(self._window_sec)
             self._dispatcher.clear_active_channels()
+            logger.info("Source attached successfully (sr=%s, channels=%s)", effective_sr, channel_ids)
 
     def detach_device(self) -> None:
         with self._lock:
@@ -485,35 +395,114 @@ class PipelineController:
     def set_active_channels(self, channel_ids: Sequence[int]) -> None:
         with self._lock:
             self._active_channel_ids = list(channel_ids)
-            if self._dispatcher is not None:
-                info_map = {info.id: info for info in self._channel_infos}
-                ordered_infos = [info_map[cid] for cid in self._active_channel_ids if cid in info_map]
-                names = [info.name for info in ordered_infos]
-                self._dispatcher.set_channel_layout(self._active_channel_ids, names)
-                self._dispatcher.set_active_channels(self._active_channel_ids)
+
             if self._source is not None:
+                # Stop source to ensure clean reconfiguration
+                was_running = self._source.running
+                if was_running:
+                    self._source.stop()
+                    
                 try:
+                    # STRICT: Only enable the requested channels at the source level
+                    # This ensures the source only emits data for what we want
                     self._source.set_active_channels(self._active_channel_ids)
                 except Exception:
                     pass
+                    
+                # Rewire dispatcher to the source buffer (it may have been replaced/resized)
+                if self._dispatcher is not None and hasattr(self._source, 'ring_buffer') and self._source.ring_buffer is not None:
+                    try:
+                        sr = self._actual_config.sample_rate if self._actual_config is not None else None
+                        self._dispatcher.set_source_buffer(self._source.get_buffer(), sample_rate=sr)
+                    except Exception as exc:
+                        logger.debug("Could not re-link source buffer on channel change: %s", exc)
+                
+                # Restart if it was running
+                if was_running:
+                    self._source.start()
+                    self._start_streaming_locked() # Ensure dispatcher is also running/ready
 
-            if self._active_channel_ids and self._dispatcher is not None and self._source is not None:
-                if not self._streaming:
-                    self._start_streaming_locked()
-            else:
-                if self._streaming:
-                    self._stop_streaming_locked()
+            # CRITICAL: Call set_channel_layout AFTER the source and buffer are configured
+            # This ensures the Dispatcher's channel IDs match the actual buffer shape
+            if self._dispatcher is not None:
+                # Build name lookup, then create names list in the SAME ORDER as _active_channel_ids
+                # This is critical - previously we iterated _channel_infos which is in device order,
+                # not the user-added order stored in _active_channel_ids
+                id_to_name = {info.id: info.name for info in self._channel_infos}
+                id_to_info = {info.id: info for info in self._channel_infos}
+                active_names = [id_to_name.get(cid, f"Channel {cid}") for cid in self._active_channel_ids]
+                active_units = [id_to_info[cid].units for cid in self._active_channel_ids if cid in id_to_info]
+                self._dispatcher.set_channel_layout(self._active_channel_ids, active_names, active_units)
+                self._dispatcher.set_active_channels(self._active_channel_ids)
+
+            # If we weren't running but have channels, ensure streaming state is correct
+            if self._active_channel_ids and not self._streaming and self._source and self._source.running:
+                 self._start_streaming_locked()
+            elif not self._active_channel_ids and self._streaming:
+                 self._stop_streaming_locked()
 
     def clear_active_channels(self) -> None:
         self.set_active_channels([])
 
-    def start_recording(self, path: str, rollover: bool) -> None:
-        """Placeholder for future recording start logic."""
-        _ = (path, rollover)
+    def start_recording(self, path: str, rollover: bool = False) -> None:
+        """
+        Start recording to a WAV file.
+        
+        Args:
+            path: Output file path for the WAV file
+            rollover: Reserved for future segment/rollover support
+        """
+        with self._lock:
+            if self._wav_logger is not None:
+                logger.warning("Recording already in progress")
+                return
+            
+            if self._actual_config is None:
+                raise RuntimeError("Cannot start recording: no device configured")
+            
+            sample_rate = int(self._actual_config.sample_rate)
+            channels = len(self._active_channel_ids) if self._active_channel_ids else len(self._actual_config.channels)
+            
+            if channels <= 0:
+                raise RuntimeError("Cannot start recording: no active channels")
+            
+            from recording.wav_logger import WavLoggerThread
+            
+            # Read format preference from settings default False (16-bit)
+            use_float32 = bool(self.app_settings.recording_use_float32)
+
+            self._wav_logger = WavLoggerThread(
+                data_queue=self.logging_queue,
+                out_path=path,
+                sample_rate=sample_rate,
+                channels=channels,
+                use_float32=use_float32,
+            )
+            self._wav_logger.start()
+            
+            # Enable data flow to logging queue
+            if self._dispatcher is not None:
+                self._dispatcher.set_recording_enabled(True)
+            
+            logger.info("Recording started: %s", path)
 
     def stop_recording(self) -> None:
-        """Placeholder for future recording stop logic."""
-        pass
+        """Stop recording and finalize the WAV file."""
+        with self._lock:
+            # Disable data flow first to prevent queue backup
+            if self._dispatcher is not None:
+                self._dispatcher.set_recording_enabled(False)
+            
+            if self._wav_logger is None:
+                return
+            
+            try:
+                self._wav_logger.stop()
+                logger.info("Recording stopped")
+            except Exception as exc:
+                logger.error("Error stopping recording: %s", exc)
+            finally:
+                self._wav_logger = None
 
     def update_window_span(self, window_sec: float) -> None:
         with self._lock:
@@ -528,8 +517,20 @@ class PipelineController:
             return self._dispatcher.snapshot()
 
     def dispatcher_signals(self):
+        """DEPRECATED: Use dispatcher.add_tick_callback() instead.
+        
+        Returns the dispatcher for callback registration. GUI layer should use
+        gui.dispatcher_adapter.connect_dispatcher_signals() to get Qt signals.
+        """
         with self._lock:
-            return None if self._dispatcher is None else self._dispatcher.signals
+            return self._dispatcher
+
+    def viz_buffer(self) -> Optional[SharedRingBuffer]:
+        with self._lock:
+            dispatcher = self._dispatcher
+        if dispatcher is None:
+            return None
+        return dispatcher.viz_buffer
 
     def queue_depths(self) -> Dict[str, dict]:
         """Return per-queue health metrics for visualization, analysis, audio, and logging."""
@@ -556,7 +557,7 @@ class PipelineController:
 
     def collect_trigger_window(
         self,
-        event: SharedEvent,
+        event: AnalysisEvent,
         target_channel_id: int,
         window_ms: float,
     ) -> tuple[np.ndarray, int, int]:
@@ -632,7 +633,7 @@ class PipelineController:
 
     def _reset_output_queues(self) -> None:
         """Clear downstream queues so the next start() begins fresh."""
-        for q in (self.visualization_queue, self.audio_queue, self.logging_queue):
+        for q in (self.visualization_queue, self.audio_queue, self.logging_queue, self.event_queue):
             self._flush_queue(q)
         self._event_buffer.clear()
 
@@ -642,8 +643,8 @@ class PipelineController:
         try:
             self._dispatcher.stop()
             self._dispatcher.emit_empty_tick()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to stop dispatcher: %s", exc)
         self._dispatcher = None
 
     def _close_source(self) -> None:
@@ -653,8 +654,8 @@ class PipelineController:
             if self._source.running:
                 self._source.stop()
             self._source.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to close source: %s", exc)
         self._source = None
         self._streaming = False
         self._active_channel_ids = []
@@ -663,19 +664,32 @@ class PipelineController:
         if self._dispatcher is None or self._source is None:
             return
         try:
-            info_map = {info.id: info for info in self._channel_infos}
-            ordered_infos = [info_map[cid] for cid in self._active_channel_ids if cid in info_map]
-            names = [info.name for info in ordered_infos]
-            self._dispatcher.set_channel_layout(self._active_channel_ids, names)
+            # Respect the currently selected active channels and their names
+            if self._active_channel_ids:
+                id_to_name = {info.id: info.name for info in self._channel_infos}
+                id_to_info = {info.id: info for info in self._channel_infos}
+                active_names = [id_to_name.get(cid, f"Channel {cid}") for cid in self._active_channel_ids]
+                active_units = [id_to_info[cid].units for cid in self._active_channel_ids if cid in id_to_info]
+                self._dispatcher.set_channel_layout(self._active_channel_ids, active_names, active_units)
+            else:
+                # Fallback to full layout if no specific channels are active
+                full_ids = [info.id for info in self._channel_infos]
+                full_names = [info.name for info in self._channel_infos]
+                full_units = [info.units for info in self._channel_infos]
+                self._dispatcher.set_channel_layout(full_ids, full_names, full_units)
+
             self._dispatcher.set_active_channels(self._active_channel_ids)
             self._dispatcher.start()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to start dispatcher: %s", exc)
         try:
-            self._source.start()
-        except Exception:
-            pass
+            # Only start if not already running
+            if not self._source.running:
+                self._source.start()
+        except Exception as exc:
+            logger.warning("Failed to start source: %s", exc)
         self._streaming = True
+
 
     def _stop_streaming_locked(self) -> None:
         if not self._streaming:
@@ -684,14 +698,14 @@ class PipelineController:
             try:
                 if self._source.running:
                     self._source.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to stop source: %s", exc)
         if self._dispatcher is not None:
             try:
                 self._dispatcher.clear_active_channels()
                 self._dispatcher.reset_buffers()
                 self._dispatcher.emit_empty_tick()
                 self._dispatcher.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to stop dispatcher during stream stop: %s", exc)
         self._streaming = False

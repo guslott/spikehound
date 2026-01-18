@@ -1,0 +1,81 @@
+name: Build and Release
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  build-installers:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            # Mac-specific variables
+            upload_path: dist/SpikeHound-Installer.dmg
+            asset_name: SpikeHound-macOS.dmg
+            content_type: application/x-apple-diskimage
+          - os: windows-latest
+            # Windows-specific variables
+            upload_path: dist/SpikeHound_Windows_Installer.exe
+            asset_name: SpikeHound-Windows-Setup.exe
+            content_type: application/vnd.microsoft.portable-executable
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12' 
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+
+    # --- MAC SPECIFIC SETUP ---
+    - name: Install Mac Tools
+      if: runner.os == 'macOS'
+      run: brew install create-dmg
+
+    # --- BUILD APPLICATION ---
+    - name: Build with PyInstaller
+      run: pyinstaller --clean --noconfirm SpikeHound.spec
+
+    # --- WINDOWS PACKAGING (Inno Setup) ---
+    - name: Build Windows Installer
+      if: runner.os == 'Windows'
+      uses: Minionguyjpro/Inno-Setup-Action@v1.2.2
+      with:
+        path: setup.iss
+
+    # --- MAC PACKAGING (DMG) ---
+    - name: Build Mac DMG
+      if: runner.os == 'macOS'
+      run: |
+        # Clean up any previous attempts
+        rm -f dist/SpikeHound-Installer.dmg
+        
+        # Create the DMG
+        create-dmg \
+          --volname "SpikeHound Installer" \
+          --volicon "media/SpikeHound.icns" \
+          --window-pos 200 120 \
+          --window-size 600 400 \
+          --icon-size 128 \
+          --icon "SpikeHound.app" 150 200 \
+          --app-drop-link 450 200 \
+          "dist/SpikeHound-Installer.dmg" \
+          "dist/SpikeHound.app"
+
+    # --- UPLOAD FINAL INSTALLER ---
+    - name: Upload Installer Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.asset_name }}
+        path: ${{ matrix.upload_path }}

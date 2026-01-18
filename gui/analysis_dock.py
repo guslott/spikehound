@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Dict, Optional, Sequence, TYPE_CHECKING
 
 from PySide6 import QtCore, QtWidgets
@@ -7,8 +8,10 @@ from PySide6 import QtCore, QtWidgets
 from .analysis_tab import AnalysisTab
 from analysis.analysis_worker import AnalysisWorker
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
-    from daq.base_source import ChannelInfo
+    from daq.base_device import ChannelInfo
 
 
 class AnalysisDock(QtWidgets.QDockWidget):
@@ -41,6 +44,10 @@ class AnalysisDock(QtWidgets.QDockWidget):
         self._settings_widget: Optional[QtWidgets.QWidget] = None
         self._active_channels: list["ChannelInfo"] = []
 
+    @property
+    def settings_tab(self) -> Optional[QtWidgets.QWidget]:
+        return self._settings_widget
+
     # ------------------------------------------------------------------
     # Scope management
     # ------------------------------------------------------------------
@@ -57,7 +64,27 @@ class AnalysisDock(QtWidgets.QDockWidget):
         tab_bar = self._tabs.tabBar()
         tab_bar.setTabButton(0, QtWidgets.QTabBar.RightSide, None)
 
+    def set_settings_widget(self, widget: QtWidgets.QWidget, title: str = "Settings") -> None:
+        """
+        Add a permanent Settings tab (non-closable) next to Scope.
+        
+        This replaces the toggle-based settings panel with a permanent tab.
+        """
+        if self._settings_widget is not None:
+            idx = self._tabs.indexOf(self._settings_widget)
+            if idx >= 0:
+                self._tabs.removeTab(idx)
+        self._settings_widget = widget
+        widget.setParent(self._tabs)
+        # Insert after Scope (index 1)
+        insert_index = 1 if self._scope_widget is not None else 0
+        self._tabs.insertTab(insert_index, widget, title)
+        # Remove close button from this tab
+        tab_bar = self._tabs.tabBar()
+        tab_bar.setTabButton(insert_index, QtWidgets.QTabBar.RightSide, None)
+
     def select_scope(self) -> None:
+
         if self._scope_widget is None:
             return
         idx = self._tabs.indexOf(self._scope_widget)
@@ -70,16 +97,22 @@ class AnalysisDock(QtWidgets.QDockWidget):
 
     def open_analysis(self, channel_name: str, sample_rate: float) -> AnalysisTab:
         worker: Optional[AnalysisWorker] = None
+        output_queue = None
         if self._controller is not None:
-            worker = AnalysisWorker(self._controller, channel_name, sample_rate)
-            worker.start()
+            try:
+                output_queue, worker = self._controller.open_analysis_stream(channel_name, sample_rate)
+            except Exception as e:
+                logger.debug("Failed to open analysis stream: %s", e)
+                output_queue = None
+                worker = None
         count = self._analysis_count.get(channel_name, 0) + 1
         self._analysis_count[channel_name] = count
         title = f"Analysis - {channel_name}" if count == 1 else f"Analysis - {channel_name} #{count}"
 
         widget = AnalysisTab(channel_name, sample_rate, self._tabs, controller=self._controller)
+        if output_queue is not None:
+            widget.set_analysis_queue(output_queue)
         if worker is not None:
-            widget.set_analysis_queue(worker.output_queue)
             widget.set_worker(worker)
         widget.set_sta_channels(self._active_channels)
         insert_index = 1 if self._scope_widget is not None else self._tabs.count()
@@ -109,6 +142,28 @@ class AnalysisDock(QtWidgets.QDockWidget):
             if isinstance(worker, AnalysisWorker):
                 worker.update_sample_rate(sample_rate)
 
+    def update_scales(self, window_sec: float, channel_configs: dict) -> None:
+        """Update all Analysis tabs with scope scale settings.
+        
+        Args:
+            window_sec: Global window width in seconds (from scope)
+            channel_configs: Dict mapping channel_id -> ChannelConfig with vertical_span_v
+        """
+        # Build a name -> vertical_span_v lookup
+        vertical_spans: dict[str, float] = {}
+        for config in channel_configs.values():
+            name = config.channel_name
+            span = config.vertical_span_v
+            if name:
+                vertical_spans[name] = float(span)
+        
+        for widget in list(self._tab_info.keys()):
+            if not isinstance(widget, AnalysisTab):
+                continue
+            channel_name = widget.channel_name
+            vertical_span = vertical_spans.get(channel_name, 1.0)
+            widget.update_scale(window_sec, vertical_span)
+
     def close_tab(self, channel_name: str) -> None:
         removed = False
         for widget, info in list(self._tab_info.items()):
@@ -118,7 +173,7 @@ class AnalysisDock(QtWidgets.QDockWidget):
             index = self._tabs.indexOf(widget)
             if index >= 0:
                 self._tabs.removeTab(index)
-            if hasattr(widget, "_release_metrics"):
+            if isinstance(widget, AnalysisTab):
                 widget._release_metrics()
             widget.deleteLater()
             worker = info.get("worker") if isinstance(info, dict) else None
@@ -140,14 +195,15 @@ class AnalysisDock(QtWidgets.QDockWidget):
         widget = self._tabs.widget(index)
         if widget is None:
             return
+        # Don't allow closing the permanent Scope or Settings tabs
         if widget is self._scope_widget:
             self._tabs.setCurrentIndex(index)
             return
         if widget is self._settings_widget:
-            self.close_settings()
-            if not self._tab_info:
-                self.select_scope()
+            # Settings is now permanent; just switch to it
+            self._tabs.setCurrentIndex(index)
             return
+
         self._tabs.removeTab(index)
         info = self._tab_info.pop(widget, None)
         worker = None
@@ -163,7 +219,7 @@ class AnalysisDock(QtWidgets.QDockWidget):
                 self._analysis_count[mapped_name] = current
             else:
                 self._analysis_count.pop(mapped_name, None)
-        if hasattr(widget, "_release_metrics"):
+        if isinstance(widget, AnalysisTab):
             widget._release_metrics()
         widget.deleteLater()
         if not self._tab_info:
@@ -176,11 +232,11 @@ class AnalysisDock(QtWidgets.QDockWidget):
             worker = info.get("worker") if isinstance(info, dict) else None
             if isinstance(worker, AnalysisWorker):
                 worker.stop()
-            if hasattr(widget, "_release_metrics"):
+            if isinstance(widget, AnalysisTab):
                 try:
                     widget._release_metrics()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to release metrics during shutdown: %s", e)
             if self._tabs.indexOf(widget) >= 0:
                 self._tabs.removeTab(self._tabs.indexOf(widget))
             widget.deleteLater()
@@ -189,6 +245,15 @@ class AnalysisDock(QtWidgets.QDockWidget):
         if self._settings_widget is not None:
             self.close_settings()
         self.select_scope()
+
+    def add_plugin_tab(self, widget: QtWidgets.QWidget, title: str) -> None:
+        """Add a custom plugin tab to the workspace."""
+        if widget is None:
+            return
+        widget.setParent(self._tabs)
+        self._tabs.addTab(widget, title)
+        # We don't track these in _tab_info for now unless they need active channel updates
+        # If they inherit from BaseTab they can access runtime themselves.
 
     def open_settings(self, widget: QtWidgets.QWidget, title: str = "Settings & Debug") -> None:
         if widget is None:
@@ -214,5 +279,4 @@ class AnalysisDock(QtWidgets.QDockWidget):
             self._tabs.removeTab(idx)
         widget.setParent(None)
         self._settings_widget = None
-        self.settingsClosed.emit()
         self.settingsClosed.emit()

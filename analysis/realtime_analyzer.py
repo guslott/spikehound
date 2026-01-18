@@ -1,6 +1,7 @@
 # analysis/realtime_analyzer.py
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -9,8 +10,10 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+logger = logging.getLogger(__name__)
+
 from shared.event_buffer import EventRingBuffer
-from shared.types import Event
+from shared.types import AnalysisEvent
 
 from .models import ThresholdConfig
 
@@ -52,7 +55,7 @@ def _as_chunk_view(obj) -> Optional[_ChunkView]:
 class RealTimeAnalyzer:
     """
     Consumes filtered chunks from `analysis_queue`, runs a simple threshold detector,
-    and emits Event objects to `event_queue` (for GUI markers) and `logging_queue`
+    and emits AnalysisEvent objects to `event_queue` (for GUI markers) and `event_log_queue`
     (for persistence by the writer thread later).
     """
 
@@ -60,15 +63,15 @@ class RealTimeAnalyzer:
         self,
         analysis_queue: "queue.Queue",
         event_queue: "queue.Queue",
-        logging_queue: "queue.Queue",
-        event_buffer: Optional[EventRingBuffer] = None,
+        event_log_queue: "queue.Queue",
         sample_rate: float,
         n_channels: int,
         config: ThresholdConfig,
+        event_buffer: Optional[EventRingBuffer] = None,
     ) -> None:
         self.analysis_queue = analysis_queue
         self.event_queue = event_queue
-        self.logging_queue = logging_queue
+        self.event_log_queue = event_log_queue
         self._event_buffer = event_buffer
         self.sr = float(sample_rate)
         self.nch = int(n_channels)
@@ -156,7 +159,7 @@ class RealTimeAnalyzer:
     def _detect_in_chunk(self, ch_view: _ChunkView) -> None:
         """
         Run threshold detector on a normalized chunk (channels, frames).
-        Emits Event objects for each detection.
+        Emits AnalysisEvent objects for each detection.
         """
         X = ch_view.arr  # (C, F)
         C, F = X.shape
@@ -212,7 +215,7 @@ class RealTimeAnalyzer:
                 post_ms = 1000.0 * (self._post / sr)
                 crossing_value = float(sig[idx])
                 threshold_value = -float(th[c]) if crossing_value < 0 else float(th[c])
-                ev = Event(
+                ev = AnalysisEvent(
                     id=self._next_event_id(),
                     channelId=int(c),
                     thresholdValue=threshold_value,
@@ -235,7 +238,7 @@ class RealTimeAnalyzer:
                 except queue.Full:
                     pass
                 try:
-                    self.logging_queue.put_nowait(ev)
+                    self.event_log_queue.put_nowait(ev)
                 except queue.Full:
                     pass
 
@@ -260,6 +263,7 @@ class RealTimeAnalyzer:
 
             try:
                 self._detect_in_chunk(view)
-            except Exception:
+            except Exception as e:
                 # Keep going even if one chunk is problematic.
+                logger.debug("Failed to detect in chunk: %s", e)
                 continue

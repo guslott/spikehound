@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import queue
 import threading
@@ -7,18 +8,132 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from shared.models import Chunk, EndOfStream
+logger = logging.getLogger(__name__)
+
+from shared.models import Chunk, DetectionEvent, EndOfStream
 from shared.event_buffer import EventRingBuffer
-from shared.types import Event
+from shared.types import AnalysisEvent
 
 from .models import AnalysisBatch
 from .settings import AnalysisSettings, AnalysisSettingsStore
+from .metrics import envelope, peak_frequency_sinc, event_width
+from core.detection import AmpThresholdDetector, DETECTOR_REGISTRY
+
+
+def detection_to_analysis_event(
+    de: DetectionEvent,
+    chunk: Chunk,
+    event_id: int,
+    sample_rate: float,
+    window_ms: float,
+    last_crossing_time: float | None,
+    noise_mad: float,
+    noise_initialized: bool,
+) -> tuple[AnalysisEvent, int, float]:
+    """Convert DetectionEvent to AnalysisEvent with computed metrics.
+    
+    This is the ONLY place where AnalysisEvent should be created from
+    detection output. All enrichment (timing metadata, metrics) happens here.
+    
+    Args:
+        de: DetectionEvent from detector
+        chunk: Source chunk for timing context
+        event_id: Unique event identifier
+        sample_rate: Sample rate in Hz
+        window_ms: Event window duration in ms
+        last_crossing_time: Previous event crossing time for interval calculation
+        noise_mad: Median absolute deviation for noise estimation
+        noise_initialized: Whether noise estimate is valid
+    
+    Returns:
+        Tuple of (AnalysisEvent, event_end_sample, crossing_time)
+    """
+    dt = float(chunk.dt)
+    sr = (1.0 / dt) if dt > 0 else sample_rate
+    wf = de.window
+    
+    if wf.size == 0:
+        raise ValueError("DetectionEvent has empty window")
+    
+    # Calculate metrics
+    baseline_val = float(np.median(wf))
+    centered_wf = wf.astype(np.float64) - baseline_val
+    
+    # Envelope (max - min)
+    env = envelope(wf)
+    
+    # Peak Freq
+    peak_freq = peak_frequency_sinc(centered_wf, sr)
+    peak_wavelength = 1.0 / peak_freq if peak_freq > 1e-9 else 0.0
+    
+    # Interval since last event
+    crossing_time = de.t
+    interval_sec = float("nan")
+    if last_crossing_time is not None:
+        delta = crossing_time - last_crossing_time
+        if delta >= 0:
+            interval_sec = delta
+    
+    # Map timestamp to sample index
+    rel_time = de.t - chunk.start_time
+    rel_idx = int(round(rel_time / dt))
+    
+    start_sample = -1
+    if chunk.meta:
+        try:
+            start_sample = int(chunk.meta.get("start_sample", -1))
+        except (TypeError, ValueError):
+            pass
+    
+    abs_idx = rel_idx if start_sample < 0 else start_sample + rel_idx
+    
+    # Calculate pre/post samples
+    pre_samples = de.params.get("pre_samples")
+    if pre_samples is None:
+        pre_samples = wf.size // 2
+    else:
+        pre_samples = int(pre_samples)
+    
+    first_time_sec = de.t - (pre_samples * dt)
+    
+    event = AnalysisEvent(
+        id=event_id,
+        channelId=de.chan,
+        thresholdValue=de.params.get("threshold", 0.0),
+        crossingIndex=abs_idx,
+        crossingTimeSec=de.t,
+        firstSampleTimeSec=first_time_sec,
+        sampleRateHz=sr,
+        windowMs=float(window_ms),
+        preMs=float(pre_samples * dt * 1000.0),
+        postMs=float((wf.size - pre_samples) * dt * 1000.0),
+        samples=wf,
+        intervalSinceLastSec=interval_sec,
+    )
+    
+    # Add computed properties
+    props = getattr(event, "properties", None)
+    if isinstance(props, dict):
+        props["envelope"] = env
+        props["peak_freq_hz"] = peak_freq
+        props["peak_wavelength_s"] = peak_wavelength
+        if np.isfinite(interval_sec):
+            props["interval_sec"] = float(interval_sec)
+        # Event Width
+        width_th = float(6.0 * 1.4826 * noise_mad) if noise_initialized else None
+        width_ms_val = event_width(wf, sr, threshold=width_th, sigma=6.0, pre_samples=pre_samples)
+        props["event_width_ms"] = width_ms_val
+    
+    # Calculate event end sample
+    event_end = abs_idx + wf.size
+    
+    return event, event_end, crossing_time
 
 
 class AnalysisWorker(threading.Thread):
     """Background worker that receives filtered chunks and forwards them to an output queue."""
 
-    def __init__(self, controller, channel_name: str, sample_rate: float, *, queue_size: int = 64) -> None:
+    def __init__(self, controller, channel_name: str, sample_rate: float, *, queue_size: int = 512) -> None:
         super().__init__(name=f"AnalysisWorker-{channel_name}", daemon=True)
         self._controller = controller
         self.channel_name = channel_name
@@ -43,8 +158,12 @@ class AnalysisWorker(threading.Thread):
         self._last_crossing_time_sec: Optional[float] = None
         self._event_id = 0
         self._channel_id: Optional[int] = None
+        self._auto_detect_enabled = False
+        self._auto_detector: Optional[AmpThresholdDetector] = None
         if isinstance(self._settings_store, AnalysisSettingsStore):
             self._settings_unsub = self._settings_store.subscribe(self._on_settings_changed)
+        self._noise_mad: float = 0.0
+        self._noise_initialized: bool = False
 
     def start(self) -> None:  # type: ignore[override]
         if self._controller is None:
@@ -68,10 +187,8 @@ class AnalysisWorker(threading.Thread):
         idx = self._resolve_channel_index(chunk)
         if idx is None:
             return
-        try:
-            samples = np.array(chunk.samples[idx : idx + 1], dtype=np.float32)
-        except Exception:
-            return
+        # Zero-copy optimization: sample is already float32 and read-only, slice returns a view
+        samples = chunk.samples[idx : idx + 1]
         if samples.size == 0:
             return
         channel_names: tuple[str, ...]
@@ -103,7 +220,8 @@ class AnalysisWorker(threading.Thread):
                 units=chunk.units,
                 meta=meta,
             )
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to create routed chunk: %s", e)
             return
         events = self._detect_events(routed_chunk)
         events_tuple = tuple(events)
@@ -120,8 +238,8 @@ class AnalysisWorker(threading.Thread):
                     units=routed_chunk.units,
                     meta=meta_with_events,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to add events meta to chunk: %s", e)
         batch = AnalysisBatch(chunk=routed_chunk, events=events_tuple)
         try:
             self.output_queue.put_nowait(batch)
@@ -139,22 +257,17 @@ class AnalysisWorker(threading.Thread):
         if self._channel_index is not None:
             if 0 <= self._channel_index < chunk.samples.shape[0]:
                 name = None
-                try:
+                if self._channel_index < len(chunk.channel_names):
                     name = chunk.channel_names[self._channel_index]
-                except (IndexError, TypeError):
-                    name = None
                 if name == self.channel_name:
                     return self._channel_index
         try:
+            # Type ignore because tuple has index method but mypy might be confused by protocol
             idx = chunk.channel_names.index(self.channel_name)  # type: ignore[attr-defined]
+            self._channel_index = int(idx)
+            return self._channel_index
         except ValueError:
-            idx = None
-        except AttributeError:
-            idx = None
-        if idx is None:
             return None
-        self._channel_index = int(idx)
-        return self._channel_index
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -162,32 +275,18 @@ class AnalysisWorker(threading.Thread):
             self.input_queue.put_nowait(EndOfStream)
         except queue.Full:
             pass
-        removed_stop_attr = False
-        cached_stop_attr = None
-        if hasattr(self, "_stop"):
-            cached_stop_attr = getattr(self, "_stop")
-            if not callable(cached_stop_attr):
-                try:
-                    delattr(self, "_stop")
-                    removed_stop_attr = True
-                except AttributeError:
-                    removed_stop_attr = False
-        try:
-            self.join(timeout=1.0)
-        finally:
-            if removed_stop_attr:
-                setattr(self, "_stop", cached_stop_attr)
+        self.join(timeout=1.0)
         if self._registration_token is not None:
             try:
                 self._controller.unregister_analysis_queue(self._registration_token)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to unregister analysis queue: %s", e)
             self._registration_token = None
         if self._settings_unsub:
             self._settings_unsub()
             self._settings_unsub = None
 
-    def publish_event(self, event: Event) -> None:
+    def publish_event(self, event: AnalysisEvent) -> None:
         if self._event_buffer is not None:
             self._event_buffer.push(event)
 
@@ -196,7 +295,8 @@ class AnalysisWorker(threading.Thread):
             return
         try:
             infos = self._controller.active_channels()
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to get active channels: %s", e)
             return
         for info in infos or []:
             name = getattr(info, "name", None)
@@ -217,7 +317,8 @@ class AnalysisWorker(threading.Thread):
                 int(self._channel_id),
                 return_info=True,
             )
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to collect waveform window: %s", e)
             return np.empty(0, dtype=np.float32)
         if miss_pre > 0 or miss_post > 0:
             # Avoid splicing truncated windows; fall back to the local chunk data.
@@ -227,6 +328,8 @@ class AnalysisWorker(threading.Thread):
     def _on_settings_changed(self, settings: AnalysisSettings) -> None:
         with self._state_lock:
             self._event_window_ms = float(settings.event_window_ms)
+            if self._auto_detector is not None:
+                self._auto_detector.configure(window_ms=self._event_window_ms)
 
     def configure_threshold(
         self,
@@ -235,6 +338,7 @@ class AnalysisWorker(threading.Thread):
         *,
         secondary_enabled: Optional[bool] = None,
         secondary_value: Optional[float] = None,
+        auto_detect: bool = False,
     ) -> None:
         numeric_value = float(value)
         direction = "above" if numeric_value >= 0 else "below"
@@ -248,6 +352,18 @@ class AnalysisWorker(threading.Thread):
             self._threshold_direction = direction
             self._secondary_threshold_enabled = secondary_flag
             self._secondary_threshold_value = secondary_numeric
+            self._auto_detect_enabled = bool(auto_detect)
+            if self._auto_detect_enabled and self._auto_detector is None:
+                # Use registry to instantiate detector
+                det_cls = DETECTOR_REGISTRY["amp_threshold"]
+                self._auto_detector = det_cls()
+                # Configure for 5*sigma, bidirectional
+                self._auto_detector.configure(factor=5.0, sign=0, window_ms=self._event_window_ms)
+                if self.sample_rate > 0:
+                    self._auto_detector.reset(self.sample_rate, 1)
+            elif self._auto_detect_enabled and self._auto_detector is not None:
+                # Update window if needed
+                self._auto_detector.configure(window_ms=self._event_window_ms)
 
     def update_sample_rate(self, sample_rate: float) -> None:
         """Refresh fallback sample rate and drop stale refractory state when it changes."""
@@ -260,6 +376,25 @@ class AnalysisWorker(threading.Thread):
             self.sample_rate = sample_rate
             self._last_window_end_sample = -10**12
 
+    def _update_noise_level(self, chunk: Chunk) -> None:
+        if chunk.samples.size == 0:
+            return
+        sig = np.asarray(chunk.samples[0], dtype=np.float32)
+        if sig.size == 0:
+            return
+        
+        # Calculate MAD for global noise estimation
+        med = float(np.median(sig))
+        mad = float(np.median(np.abs(sig - med)))
+        
+        with self._state_lock:
+            if not self._noise_initialized:
+                self._noise_mad = mad
+                self._noise_initialized = True
+            else:
+                alpha = 0.05
+                self._noise_mad = alpha * mad + (1.0 - alpha) * self._noise_mad
+
     # ------------------------------------------------------------------
     # Event detection
     # ------------------------------------------------------------------
@@ -268,7 +403,8 @@ class AnalysisWorker(threading.Thread):
         self._event_id += 1
         return self._event_id
 
-    def _detect_events(self, chunk: Chunk) -> list[Event]:
+    def _detect_events(self, chunk: Chunk) -> list[AnalysisEvent]:
+        self._update_noise_level(chunk)
         with self._state_lock:
             event_window_ms = float(self._event_window_ms)
             threshold_enabled = bool(self._threshold_enabled)
@@ -278,6 +414,50 @@ class AnalysisWorker(threading.Thread):
             secondary_value = float(self._secondary_threshold_value)
             last_window_end = self._last_window_end_sample
             last_crossing_time = self._last_crossing_time_sec
+            auto_detect = self._auto_detect_enabled
+            detector = self._auto_detector
+        
+        if auto_detect and detector is not None:
+            # Use modular detector to process chunk and convert DetectionEvents to AnalysisEvents
+            detected_events = detector.process_chunk(chunk)
+            if not detected_events:
+                return []
+            
+            events: list[tuple[AnalysisEvent, int, float]] = []
+            
+            for de in detected_events:
+                # Convert DetectionEvent to AnalysisEvent via canonical conversion function
+                if de.window.size == 0:
+                    continue
+                
+                try:
+                    event, this_end, crossing_time = detection_to_analysis_event(
+                        de=de,
+                        chunk=chunk,
+                        event_id=self._next_event_id(),
+                        sample_rate=self.sample_rate,
+                        window_ms=self._event_window_ms,
+                        last_crossing_time=self._last_crossing_time_sec,
+                        noise_mad=self._noise_mad,
+                        noise_initialized=self._noise_initialized,
+                    )
+                    events.append((event, this_end, crossing_time))
+                    # Update internal state for interval calculation in loop
+                    self._last_crossing_time_sec = crossing_time
+                except ValueError:
+                    continue
+            
+            # Return collected events
+            collected: list[AnalysisEvent] = []
+            for event, new_last_end, crossing_time in events:
+                self.publish_event(event)
+                with self._state_lock:
+                    if new_last_end > self._last_window_end_sample:
+                        self._last_window_end_sample = new_last_end
+                    self._last_crossing_time_sec = float(crossing_time)
+                collected.append(event)
+            return collected
+
         if not threshold_enabled or threshold_value == 0.0 or event_window_ms <= 0:
             return []
         if chunk.samples.size == 0:
@@ -292,10 +472,11 @@ class AnalysisWorker(threading.Thread):
         if sr <= 0:
             return []
 
-        half_samples = int(round((event_window_ms / 2.0) * sr / 1000.0))
-        if half_samples <= 0:
-            half_samples = 1
-        window_samples = max(1, half_samples * 2)
+        window_samples = int(round(event_window_ms * sr / 1000.0))
+        if window_samples <= 0:
+            window_samples = 1
+        pre_samples = window_samples // 3
+        post_samples = window_samples - pre_samples
 
         if threshold_value > 0:
             idxs = np.flatnonzero(sig >= threshold_value)
@@ -320,17 +501,17 @@ class AnalysisWorker(threading.Thread):
 
         use_secondary = threshold_enabled and secondary_enabled
 
-        events: list[tuple[Event, int, float]] = []
+        events: list[tuple[AnalysisEvent, int, float]] = []
         last_end = last_window_end
         prev_crossing_time = last_crossing_time
-        target_len = (half_samples * 2) + 1
+        target_len = window_samples
         for idx in idxs:
             abs_idx = idx if start_sample < 0 else start_sample + int(idx)
             if abs_idx < last_end:
                 continue
 
-            i0 = max(0, int(idx) - half_samples)
-            i1 = min(n, int(idx) + half_samples + 1)
+            i0 = max(0, int(idx) - pre_samples)
+            i1 = min(n, int(idx) + post_samples)
             if i1 <= i0:
                 continue
             wf = sig[i0:i1].astype(np.float32, copy=True)
@@ -344,16 +525,16 @@ class AnalysisWorker(threading.Thread):
             first_abs = crossing_index - pre_count
             candidate_last_end = first_abs + window_samples
             first_time = float(chunk.start_time) + i0 * dt_sec
-            has_full_pre = pre_count >= half_samples
-            has_full_post = post_count >= half_samples
+            has_full_pre = pre_count >= pre_samples
+            has_full_post = post_count >= post_samples
             if (not has_full_pre or not has_full_post) and self._controller is not None:
-                desired_start = crossing_index - half_samples
+                desired_start = crossing_index - pre_samples
                 if desired_start < 0:
                     desired_start = 0
                 extended = self._collect_waveform_samples(desired_start, target_len)
                 if extended.size == target_len:
                     wf = extended.astype(np.float32, copy=True)
-                    pre_count = min(half_samples, crossing_index - desired_start)
+                    pre_count = min(pre_samples, crossing_index - desired_start)
                     post_count = target_len - pre_count - 1
                     pre_ms = pre_count * dt_sec * 1000.0
                     post_ms = post_count * dt_sec * 1000.0
@@ -363,64 +544,37 @@ class AnalysisWorker(threading.Thread):
 
             if use_secondary and self._waveform_crosses_threshold(wf, secondary_value):
                 continue
-            interval_sec = float("nan")
-            if prev_crossing_time is not None:
-                delta = float(crossing_time) - float(prev_crossing_time)
-                if delta < 0:
-                    delta = 0.0
-                interval_sec = delta
-            if pre_count > 0:
-                baseline = float(np.median(wf[:pre_count]))
-            else:
-                baseline = float(np.median(wf))
-            centered_wf = wf.astype(np.float64) - baseline
-            search_radius = max(1, int(round(0.001 * sr)))
-            peak_window_start = max(0, pre_count - search_radius)
-            peak_window_end = min(wf.size, pre_count + search_radius + 1)
-            if peak_window_end <= peak_window_start:
-                peak_window_end = min(wf.size, peak_window_start + 1)
-            window_slice = centered_wf[peak_window_start:peak_window_end]
-            if window_slice.size:
-                local_idx = int(np.argmax(np.abs(window_slice)))
-                peak_idx = peak_window_start + local_idx
-            else:
-                peak_idx = pre_count
-            energy = float(np.sum(wf.astype(np.float32) ** 2))
-            window_sec = max(1e-12, wf.size * dt_sec)
-            energy_density = energy / window_sec
-            peak_freq = _peak_frequency_sinc(centered_wf, sr, center_index=peak_idx)
-            peak_wavelength = 1.0 / peak_freq if peak_freq > 1e-9 else 0.0
-            event = Event(
-                id=self._next_event_id(),
-                channelId=int(channel_id) if channel_id is not None else 0,
-                thresholdValue=threshold_value,
-                crossingIndex=int(crossing_index),
-                crossingTimeSec=float(crossing_time),
-                firstSampleTimeSec=float(first_time),
-                sampleRateHz=float(sr),
-                windowMs=float(event_window_ms),
-                preMs=float(pre_ms),
-                postMs=float(post_ms),
-                samples=wf,
-                intervalSinceLastSec=float(interval_sec),
+
+            # Create transient DetectionEvent for processing
+            de = DetectionEvent(
+                t=float(crossing_time),
+                chan=int(channel_id) if channel_id is not None else 0,
+                window=wf,
+                properties={},
+                params={"threshold": float(threshold_value), "pre_samples": int(pre_count)}
             )
-            props = getattr(event, "properties", None)
-            if isinstance(props, dict):
-                props["energy"] = energy
-                props["window_sec"] = window_sec
-                props["energy_density"] = energy_density
-                props["peak_freq_hz"] = peak_freq
-                props["peak_wavelength_s"] = peak_wavelength
-                if np.isfinite(interval_sec):
-                    props["interval_sec"] = float(interval_sec)
-            last_end = candidate_last_end
-            events.append((event, last_end, float(crossing_time)))
-            prev_crossing_time = float(crossing_time)
+
+            try:
+                event, last_end_val, crossing_time_val = detection_to_analysis_event(
+                    de=de,
+                    chunk=chunk,
+                    event_id=self._next_event_id(),
+                    sample_rate=self.sample_rate,
+                    window_ms=float(event_window_ms),
+                    last_crossing_time=prev_crossing_time,
+                    noise_mad=self._noise_mad,
+                    noise_initialized=self._noise_initialized,
+                )
+                last_end = last_end_val
+                events.append((event, last_end, float(crossing_time_val)))
+                prev_crossing_time = float(crossing_time_val)
+            except ValueError:
+                continue
 
         if not events:
             return []
 
-        collected: list[Event] = []
+        collected: list[AnalysisEvent] = []
         for event, new_last_end, crossing_time in events:
             self.publish_event(event)
             with self._state_lock:
@@ -437,125 +591,3 @@ class AnalysisWorker(threading.Thread):
         if threshold >= 0:
             return bool(np.nanmax(waveform) >= threshold)
         return bool(np.nanmin(waveform) <= threshold)
-
-def _peak_frequency_sinc(
-    samples: np.ndarray,
-    sr: float,
-    *,
-    min_hz: float = 50.0,
-    center_index: Optional[int] = None,
-) -> float:
-    if sr <= 0:
-        return 0.0
-    data = np.asarray(samples, dtype=np.float64)
-    if data.size < 8:
-        return 0.0
-    if not np.any(np.isfinite(data)):
-        return 0.0
-
-    data = np.nan_to_num(data, nan=0.0, copy=False)
-    center = (
-        int(center_index)
-        if center_index is not None and 0 <= int(center_index) < data.size
-        else int(np.argmax(np.abs(data)))
-    )
-
-    span = max(64, int(round(sr * 0.008)))  # ~8 ms window
-    half = span // 2
-    start = max(0, center - half)
-    end = min(data.size, start + span)
-    if end - start < 32:
-        return 0.0
-    segment = data[start:end].copy()
-
-    # Remove mean and linear trend to suppress low-frequency energy
-    segment -= np.mean(segment)
-    idxs = np.arange(segment.size, dtype=np.float64)
-    centered = idxs - idxs.mean()
-    denom = float(np.dot(centered, centered))
-    if denom > 0:
-        slope = float(np.dot(centered, segment) / denom)
-        segment -= slope * centered
-
-    if not np.any(segment):
-        return 0.0
-
-    window = np.hanning(segment.size)
-    tapered = segment * window
-    target = max(4096, segment.size * 8)
-    n_fft = 1 << int(math.ceil(math.log2(target)))
-    spectrum = np.fft.rfft(tapered, n=n_fft)
-    mags = np.abs(spectrum)
-    freqs = np.fft.rfftfreq(n_fft, d=1.0 / sr)
-    if freqs.size != mags.size or mags.size <= 1:
-        return 0.0
-
-    max_freq = min(sr / 6.0, 1000.0)
-    valid = (freqs >= max(min_hz, 1.0)) & (freqs <= max_freq)
-    if not np.any(valid):
-        return 0.0
-    mags = mags[valid]
-    freqs = freqs[valid]
-    if not np.any(np.isfinite(mags)):
-        return 0.0
-    power = mags * mags
-    if power.size >= 3:
-        kernel = np.array([0.25, 0.5, 0.25], dtype=np.float64)
-        power = np.convolve(power, kernel, mode="same")
-    peak_idx = int(np.argmax(power))
-    peak_freq = freqs[peak_idx]
-
-    # Quadratic interpolation for sub-bin precision when neighbors exist
-    if 0 < peak_idx < mags.size - 1:
-        alpha, beta, gamma = mags[peak_idx - 1 : peak_idx + 2]
-        denom = alpha - 2 * beta + gamma
-        if abs(denom) > 1e-12:
-            delta = 0.5 * (alpha - gamma) / denom
-            delta = float(np.clip(delta, -1.0, 1.0))
-            bin_width = freqs[1] - freqs[0]
-            peak_freq += delta * bin_width
-
-    peak_freq = float(max(0.0, peak_freq))
-    if peak_freq >= max_freq * 0.98 or peak_freq <= min_hz * 1.02:
-        return _autocorr_frequency(segment, sr, min_hz, max_hz=max_freq)
-    auto_freq = _autocorr_frequency(segment, sr, min_hz, max_hz=max_freq)
-    if auto_freq <= 0.0:
-        return peak_freq
-    if peak_freq < min_hz:
-        return auto_freq
-    rel_diff = abs(auto_freq - peak_freq) / max(min(auto_freq, peak_freq), 1e-6)
-    if rel_diff > 0.25:
-        return auto_freq
-    return peak_freq
-
-
-def _autocorr_frequency(segment: np.ndarray, sr: float, min_hz: float, max_hz: float) -> float:
-    if sr <= 0 or segment.size < 2 or max_hz <= min_hz:
-        return 0.0
-    data = np.asarray(segment, dtype=np.float64)
-    if not np.any(np.isfinite(data)):
-        return 0.0
-    corr = np.correlate(data, data, mode="full")
-    corr = corr[corr.size // 2 :]
-    if corr.size <= 1:
-        return 0.0
-    counts = np.arange(corr.size, 0, -1, dtype=np.float64)
-    corr = corr / counts
-    corr[0] = 0.0
-    max_period = min(int(sr / max(min_hz, 1e-6)), corr.size - 1)
-    min_period = max(1, int(sr / max(max_hz, 1e-6)))
-    if max_period <= min_period:
-        return 0.0
-    segment_corr = corr[min_period : max_period + 1]
-    lags = np.arange(min_period, max_period + 1, dtype=np.float64)
-    if segment_corr.size != lags.size or not np.any(np.isfinite(segment_corr)):
-        return 0.0
-    scores = segment_corr * np.sqrt(np.maximum(1.0, lags))
-    best_idx = int(np.argmax(scores))
-    if best_idx <= 0 or best_idx >= segment_corr.size - 1:
-        return 0.0
-    lag = int(lags[best_idx])
-    if lag <= 0:
-        return 0.0
-    freq = sr / lag
-    return float(freq if freq >= min_hz else 0.0)

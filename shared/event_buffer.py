@@ -4,12 +4,12 @@ from collections import deque
 from threading import Lock
 from typing import Deque, List, Optional, Sequence, Tuple
 
-from .types import Event
+from .types import AnalysisEvent
 
 
 class EventRingBuffer:
     """
-    Thread-safe, bounded ring buffer for Event objects.
+    Thread-safe, bounded ring buffer for AnalysisEvent objects.
 
     Analysis workers push into the buffer, while visualization code can either
     peek at the most recent events or drain the buffer entirely.
@@ -19,10 +19,10 @@ class EventRingBuffer:
         if capacity <= 0:
             raise ValueError("capacity must be positive")
         self._capacity = int(capacity)
-        self._buffer: Deque[Event] = deque(maxlen=self._capacity)
+        self._buffer: Deque[AnalysisEvent] = deque(maxlen=self._capacity)
         self._lock = Lock()
 
-    def push(self, event: Event) -> None:
+    def push(self, event: AnalysisEvent) -> None:
         """
         Append an event to the buffer, dropping the oldest entry if the buffer
         is full.
@@ -32,7 +32,7 @@ class EventRingBuffer:
                 self._buffer.popleft()
             self._buffer.append(event)
 
-    def drain(self) -> List[Event]:
+    def drain(self) -> List[AnalysisEvent]:
         """
         Remove and return all buffered events in chronological order.
         """
@@ -41,14 +41,14 @@ class EventRingBuffer:
             self._buffer.clear()
             return events
 
-    def peek_all(self) -> List[Event]:
+    def peek_all(self) -> List[AnalysisEvent]:
         """
         Return a snapshot of the buffered events without clearing the buffer.
         """
         with self._lock:
             return list(self._buffer)
 
-    def extend(self, events: Sequence[Event]) -> None:
+    def extend(self, events: Sequence[AnalysisEvent]) -> None:
         """
         Convenience helper to push a batch of events.
         """
@@ -73,7 +73,7 @@ class AnalysisEvents:
     def __init__(self, buffer: EventRingBuffer) -> None:
         self._buffer = buffer
 
-    def pull_events(self, last_event_id: Optional[int] = None) -> Tuple[List[Event], Optional[int]]:
+    def pull_events(self, last_event_id: Optional[int] = None) -> Tuple[List[AnalysisEvent], Optional[int]]:
         events = self._buffer.peek_all()
         if last_event_id is not None:
             events = [ev for ev in events if ev.id > last_event_id]

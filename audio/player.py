@@ -1,64 +1,71 @@
 from __future__ import annotations
 
+import logging
 import threading
 import queue
 from dataclasses import dataclass
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 
 import numpy as np
 
+logger = logging.getLogger(__name__)
+
 try:
-    import sounddevice as sd
-except Exception as e:  # pragma: no cover
-    sd = None
-    _SD_IMPORT_ERR = e
+    import miniaudio
+except ImportError as e:  # pragma: no cover
+    miniaudio = None
+    _IMPORT_ERR = e
+
+from shared.models import ChunkPointer
+from shared.ring_buffer import SharedRingBuffer
 
 
 @dataclass
 class AudioConfig:
     out_samplerate: int = 44_100   # soundcard output Hz
     out_channels: int = 1          # 1=mono (start simple)
-    device: Optional[int | str] = None  # None = default output device
+    device: Any = None             # None = default output device
     gain: float = 0.35             # careful: spikes can be loud
-    blocksize: int = 512           # PortAudio block size (latency knob)
-    ring_seconds: float = 0.75      # size of the output ring buffer (seconds)
+    blocksize: int = 256           # miniaudio buffer size (frames)
+    ring_seconds: float = 0.2      # size of the output ring buffer (seconds)
 
 
-def list_output_devices() -> List[Dict[str, object]]:
-    """Return a list of available output devices using sounddevice."""
-    if sd is None:
+def list_output_devices(list_all: bool = False) -> List[Dict[str, object]]:
+    """Return a list of available output devices using miniaudio."""
+    if miniaudio is None:
         return []
     devices: List[Dict[str, object]] = []
     try:
-        all_devices = sd.query_devices()
-        hostapis = {}
-        for idx, info in enumerate(all_devices):
-            if info.get("max_output_channels", 0) <= 0:
-                continue
-            hostapi_idx = info.get("hostapi")
-            if isinstance(hostapi_idx, int):
-                if hostapi_idx not in hostapis:
-                    try:
-                        hostapis[hostapi_idx] = sd.query_hostapis(hostapi_idx).get("name", "")
-                    except Exception:
-                        hostapis[hostapi_idx] = ""
-                host_name = hostapis[hostapi_idx]
+        playback_devices = miniaudio.Devices().get_playbacks()
+        for idx, dev in enumerate(playback_devices):
+            # Handle both object attributes and dict access (miniaudio version differences)
+            if isinstance(dev, dict):
+                dev_id = dev.get("id", idx)
+                dev_name = dev.get("name", f"Device {idx}")
             else:
-                host_name = ""
-            label = info.get("name", f"Device {idx}")
-            if host_name:
-                label = f"{label} ({host_name})"
-            devices.append({"id": idx, "label": label, "name": info.get("name", label)})
-    except Exception:
+                dev_id = getattr(dev, "id", idx)
+                dev_name = getattr(dev, "name", f"Device {idx}")
+            
+            devices.append({"id": dev_id, "label": dev_name, "name": dev_name})
+            
+            if not list_all:
+                # Just return the first one (default)
+                break
+    except Exception as exc:
+        logger.warning("Failed to list output devices: %s", exc)
         return []
     return devices
 
 
+
 class AudioPlayer(threading.Thread):
     """
-    Consumes Chunk-like objects from an audio_queue. Each chunk must have a
-    .data shaped (frames, channels) at input_sr. We select one channel, resample
-    to out_sr (linear interpolation), and play via sounddevice.OutputStream.
+    Consumes Chunk/ChunkPointer-like objects from an audio_queue. Each item must
+    resolve to samples shaped (frames, channels) at input_sr. We select one
+    channel and play via miniaudio.PlaybackDevice.
+    
+    OPTIMIZATION: miniaudio handles resampling from input_sr to the hardware
+    rate in C, which is significantly faster and lower latency than Python.
     """
 
     def __init__(
@@ -68,33 +75,37 @@ class AudioPlayer(threading.Thread):
         input_samplerate: int,
         config: AudioConfig = AudioConfig(),
         selected_channel: Optional[int] = 0,  # 0 by default; None = mute
+        ring_buffer: Optional[SharedRingBuffer] = None,
     ) -> None:
         super().__init__(name="AudioPlayer", daemon=True)
-        if sd is None:
-            raise RuntimeError(f"`sounddevice` is not available: {_SD_IMPORT_ERR!r}")
+        if miniaudio is None:
+            raise RuntimeError(f"`miniaudio` is not available: {_IMPORT_ERR!r}")
 
         self.q = audio_queue
         self.in_sr = int(input_samplerate)
         self.cfg = config
         self._selected: Optional[int] = selected_channel
+        self._ring_buffer = ring_buffer
 
-        # --- Output ring buffer (mono at out_sr) ---
-        ring_len = max(self.cfg.blocksize * 4, int(self.cfg.out_samplerate * self.cfg.ring_seconds))
+        # --- Output ring buffer (mono at INPUT rate - miniaudio handles resampling) ---
+        # OPTIMIZATION: Store data at input rate, not output rate.
+        # This uses less memory (e.g., 10kHz vs 44.1kHz) and reduces latency.
+        ring_len = max(self.cfg.blocksize * 4, int(self.in_sr * self.cfg.ring_seconds))
         self._ring = np.zeros(ring_len, dtype=np.float32)
         self._r_head = 0  # write index
         self._r_tail = 0  # read index
         self._r_lock = threading.Lock()
 
-        # For interpolation time tracking
-        self._t_in_cursor = 0.0  # seconds in input timebase
-
         self._stop_evt = threading.Event()
-        self._stream = None
+        self._device: Optional[miniaudio.PlaybackDevice] = None
 
     # ---- Public control ------------------------------------------------------
 
     def set_selected_channel(self, idx: Optional[int]) -> None:
         self._selected = None if idx is None else int(idx)
+
+    def set_ring_buffer(self, ring_buffer: Optional[SharedRingBuffer]) -> None:
+        self._ring_buffer = ring_buffer
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -117,6 +128,13 @@ class AudioPlayer(threading.Thread):
         n = int(x.size)
         if n == 0:
             return
+            
+        # Handle case where input is larger than the entire buffer
+        if n > self._ring.size:
+            # Just take the last self._ring.size samples
+            x = x[-self._ring.size:]
+            n = self._ring.size
+            
         with self._r_lock:
             space = self._ring_space()
             if n > space:
@@ -144,7 +162,8 @@ class AudioPlayer(threading.Thread):
                 out[end:] = self._ring[:rem]
             self._r_tail = (self._r_tail + n) % self._ring.size
             return out
-        # ---- Input chunk extraction -----------------------------------------
+
+    # ---- Input chunk extraction -----------------------------------------
     def _extract_frames(self, ch) -> Optional[np.ndarray]:
         """
         Accepts a variety of 'chunk-like' objects and returns a float32 array
@@ -153,7 +172,16 @@ class AudioPlayer(threading.Thread):
         arr = None
 
         # Common possibilities:
-        if hasattr(ch, "data"):
+        if isinstance(ch, ChunkPointer):
+            if self._ring_buffer is None:
+                return None
+            try:
+                block = self._ring_buffer.read(ch.start_index, ch.length)
+            except Exception as exc:
+                logger.debug("Failed to read from ring buffer: %s", exc)
+                return None
+            arr = np.asarray(block, dtype=np.float32, order="C").T
+        elif hasattr(ch, "data"):
             arr = getattr(ch, "data")
         elif hasattr(ch, "frames"):
             arr = getattr(ch, "frames")
@@ -167,7 +195,8 @@ class AudioPlayer(threading.Thread):
             # e.g., list/tuple of samples or per-channel arrays
             try:
                 arr = np.asarray(ch)
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to convert chunk to array: %s", exc)
                 arr = None
 
         if arr is None:
@@ -184,66 +213,64 @@ class AudioPlayer(threading.Thread):
 
         return data
 
-    # ---- Resampling (linear interpolation) -----------------------------------
+    # ---- Resampling removed ---------------------------------------------------
+    # OPTIMIZATION: miniaudio handles resampling from in_sr to hardware rate in C.
+    # This eliminates Python overhead from np.interp and reduces latency.
 
-    def _resample_block(self, mono_in: np.ndarray) -> np.ndarray:
+    # ---- Miniaudio generator -------------------------------------------------
+
+    def _audio_generator(self):
         """
-        Convert mono_in at in_sr -> out_sr using linear interpolation.
-        Keeps a rolling input-time cursor so blocks stitch together.
+        Generator that yields audio data for miniaudio.
         """
-        if mono_in.size == 0:
-            return mono_in.astype(np.float32)
-
-        # Input times for this block (seconds)
-        N = mono_in.size
-        t0 = self._t_in_cursor
-        dt_in = 1.0 / self.in_sr
-        t = t0 + np.arange(N, dtype=np.float64) * dt_in
-        self._t_in_cursor = t[-1] + dt_in  # advance cursor to "just after" this block
-
-        # Output times covering [t[0], t[-1]] at out_sr
-        dt_out = 1.0 / self.cfg.out_samplerate
-        n_out = int(np.floor((t[-1] - t[0]) / dt_out)) + 1
-        if n_out <= 1:
-            return np.zeros(0, dtype=np.float32)
-        t_out = np.linspace(t[0], t[0] + (n_out - 1) * dt_out, num=n_out, dtype=np.float64)
-
-        # Interpolate
-        y = np.interp(t_out, t, mono_in.astype(np.float64, copy=False)).astype(np.float32, copy=False)
-        return y
-
-    # ---- PortAudio callback --------------------------------------------------
-
-    def _callback(self, outdata, frames, time_info, status):
-        if status:
-            # xruns/underruns may be reported here; we just keep streaming
-            pass
-        wanted = int(frames)
-        mono = self._ring_read(wanted)
-        if mono.size < wanted:
-            mono = np.pad(mono, (0, wanted - mono.size))  # underrun -> silence
-        mono *= self.cfg.gain
-
-        # map mono -> (frames,channels) as required by PortAudio/sounddevice
-        if self.cfg.out_channels == 1:
-            out = mono[:, None] #shape (frames, 1)
-        else:
-            out = np.tile(mono[:, None], (1, self.cfg.out_channels)) #(frames, C)
-        outdata[:] = out
+        required_frames = yield b""  # Initial yield
+        
+        while True:
+            wanted = required_frames
+            mono = self._ring_read(wanted)
+            
+            # Underrun handling: pad with silence
+            if mono.size < wanted:
+                mono = np.pad(mono, (0, wanted - mono.size))
+                
+            mono *= self.cfg.gain
+            
+            # Convert to bytes (float32)
+            data_bytes = mono.tobytes()
+            
+            required_frames = yield data_bytes
 
     # ---- Thread body ---------------------------------------------------------
 
     def run(self) -> None:
-        # Open the soundcard stream
-        self._stream = sd.OutputStream(
-            device=self.cfg.device,
-            samplerate=self.cfg.out_samplerate,
-            channels=self.cfg.out_channels,
-            dtype="float32",
-            blocksize=self.cfg.blocksize,
-            callback=self._callback,
-        )
-        self._stream.start()
+        # OPTIMIZATION: Use a strict 20ms hardware buffer for low latency.
+        # Miniaudio handles resampling, so we don't need to bloat the buffer 
+        # based on input rate (which was punishing low-sr devices).
+        # We ensure at least 5ms to avoid underruns on busy systems.
+        buf_msec = 20
+        
+        # Configure miniaudio device with INPUT sample rate.
+        # miniaudio handles resampling to hardware rate (e.g., 44.1kHz) in C,
+        # which is significantly faster and lower latency than Python.
+        try:
+            self._device = miniaudio.PlaybackDevice(
+                device_id=self.cfg.device,
+                nchannels=self.cfg.out_channels,
+                # OPTIMIZATION: Use input rate. Miniaudio handles resampling to hardware rate.
+                sample_rate=self.in_sr,
+                output_format=miniaudio.SampleFormat.FLOAT32,
+                buffersize_msec=buf_msec,
+            )
+            
+            # Start playback with our generator
+            # Generator must be started (primed) before passing to start()
+            gen = self._audio_generator()
+            next(gen)
+            self._device.start(gen)
+            
+        except Exception as e:
+            logger.error(f"Error starting miniaudio device: {e}")
+            return
 
         try:
             while not self._stop_evt.is_set():
@@ -255,24 +282,26 @@ class AudioPlayer(threading.Thread):
 
                 data = self._extract_frames(ch)
                 if data is None:
-                    #Unknown message type - ignore but keep draining.
+                    # Unknown message type - ignore but keep draining.
                     continue
                 if self._selected is None or self._selected >= data.shape[1]:
-                    #muted or invalid selection
+                    # Muted or invalid selection
                     continue
+                
+                # Extract mono channel
                 mono_in = data[:, self._selected]
-                mono_out = self._resample_block(mono_in)
-
-                if mono_out.size:
-                    # very soft limiter to avoid clipping if spikes are tall
-                    peak = float(np.max(np.abs(mono_out)))
+                
+                # OPTIMIZATION: Removed _resample_block() call.
+                # Write raw input samples directly to ring buffer.
+                # miniaudio handles resampling to hardware rate in C.
+                if mono_in.size:
+                    # Very soft limiter to avoid clipping if spikes are tall
+                    peak = float(np.max(np.abs(mono_in)))
                     if peak > 1.5:
-                        mono_out = mono_out / peak
-                    self._ring_write(mono_out)
+                        mono_in = mono_in / peak
+                    self._ring_write(mono_in)
         finally:
-            try:
-                if self._stream:
-                    self._stream.stop()
-                    self._stream.close()
-            finally:
-                self._stream = None
+            if self._device and self._device.running:
+                self._device.stop()
+                self._device.close()
+            self._device = None
