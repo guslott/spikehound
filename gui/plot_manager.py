@@ -57,7 +57,8 @@ class PlotManager(QtCore.QObject):
         self._channel_display_buffers: Dict[int, np.ndarray] = {}
         self._last_times: np.ndarray = np.zeros(0, dtype=np.float32)
         self._active_channel_id: Optional[int] = None
-        
+        self._last_styled_active_id: Optional[int] = None  # Track last styled channel to skip redundant updates
+
         # Display state
         self._current_sample_rate: float = 0.0
         self._current_window_sec: float = 1.0
@@ -162,6 +163,7 @@ class PlotManager(QtCore.QObject):
             self._channel_names = []
             self._channel_ids_current = []
             self._active_channel_id = None
+            self._last_styled_active_id = None  # Reset so styling is applied on next update
             self._update_plot_y_range()
             return
 
@@ -200,6 +202,7 @@ class PlotManager(QtCore.QObject):
             for renderer in self._renderers.values():
                 renderer.cleanup()
             self._renderers.clear()
+            self._last_styled_active_id = None  # Reset so styling is applied on next update
             self._update_plot_y_range()
             return
 
@@ -256,12 +259,12 @@ class PlotManager(QtCore.QObject):
         for renderer in self._renderers.values():
             renderer.cleanup()
         self._renderers.clear()
-        
+
         self._channel_display_buffers.clear()
         self._channel_ids_current = []
         self._channel_names = []
         self._active_channel_id = None
-        self._apply_active_channel_style()
+        self._last_styled_active_id = None  # Reset so styling is applied on next update
         self._update_plot_y_range()
         self._current_sample_rate = 0.0
         self._chunk_rate = 0.0
@@ -533,7 +536,14 @@ class PlotManager(QtCore.QObject):
         plot_item.setYRange(0.0, 1.0, padding=0.0)
     
     def _apply_active_channel_style(self) -> None:
-        """Update visual styles based on active channel."""
+        """Update visual styles based on active channel.
+
+        Skips update if active channel hasn't changed since last call,
+        reducing redundant style operations during high-frequency redraws.
+        """
+        if self._active_channel_id == self._last_styled_active_id:
+            return  # No change, skip redundant styling
+        self._last_styled_active_id = self._active_channel_id
         for cid, renderer in self._renderers.items():
             is_active = cid == self._active_channel_id
             renderer.set_active(is_active)

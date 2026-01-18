@@ -206,6 +206,9 @@ class SimulatedPhysiologySource(BaseDevice):
     def device_class_name(cls) -> str:
         return "Simulated"
 
+    # Fixed seed for repeatable simulations - change this to get different but still repeatable patterns
+    RANDOM_SEED = 42
+    
     def __init__(self, queue_maxsize: int = 4) -> None:
         super().__init__(queue_maxsize=queue_maxsize)
         self._noise_level = 0.040  # Increased: ~10mV broadband noise
@@ -227,6 +230,8 @@ class SimulatedPhysiologySource(BaseDevice):
         self._line_hum_phase = 0.0
         self._line_hum_omega = 0.0
         self._chunk_buffer: np.ndarray | None = None
+        # Seeded RNG for repeatable spike timing and noise patterns
+        self._rng = np.random.default_rng(self.RANDOM_SEED)
 
     # ---- Discovery ------------------------------------------------------------
     @classmethod
@@ -245,21 +250,29 @@ class SimulatedPhysiologySource(BaseDevice):
 
     def _initialize_units(self, sample_rate: int, num_units: int) -> None:
         """
-        Initialize simulated neural units with physiologically-based parameters.
+        Initialize simulated neural units with FIXED, REPEATABLE parameters.
 
-        This method defines the population of neurons using unit type presets
-        (sensory_fast, motor_large, interneuron). Each unit is assigned:
+        This method creates a deterministic population of 6 neural units designed for:
+        - Reliable, repeatable testing of spike sorting and conduction velocity measurements
+        - Student laboratory exercises with known ground-truth answers
+        - Easy separation of units based on amplitude, spike width, and timing
         
-        -   **Unit Type**: Determines parameter ranges and characteristics.
-        -   **Spike Template**: Triphasic waveform (realistic extracellular shape).
-        -   **Firing Rate**: Type-specific Hz range for Poisson spike generation.
-        -   **Amplitudes**: Type-specific amplitude at the proximal electrode.
-        -   **Conduction Velocity**: Type-specific speed (m/s) for distal delay.
-        -   **Refractory Period**: Absolute refractory period preventing rapid re-firing.
-        -   **Synaptic Properties**: Delay (ms) and Gain (V) for generating PSPs.
-
-        It also pre-calculates the PSP template (alpha function) used for the 
-        intracellular channel.
+        GROUND TRUTH VALUES (at 20kHz sample rate, 20mm electrode spacing):
+        =====================================================================
+        Unit | Type           | Prox Amp | Dist Amp | Width  | Velocity | Cond Delay | Syn Delay | Rate
+        -----|----------------|----------|----------|--------|----------|------------|-----------|------
+          0  | Small Sensory  | 0.10 V   | 0.08 V   | 1.2 ms |  4.0 m/s |   5.0 ms   |   3.0 ms  | 3 Hz
+          1  | Med Sensory    | 0.18 V   | 0.15 V   | 1.5 ms |  6.0 m/s |   3.33 ms  |   3.5 ms  | 4 Hz
+          2  | Giant Fiber A  | 0.45 V   | 0.40 V   | 2.5 ms | 12.0 m/s |   1.67 ms  |   2.0 ms  | 2 Hz
+          3  | Giant Fiber B  | 0.70 V   | 0.56 V   | 3.0 ms | 10.0 m/s |   2.0 ms   |   2.5 ms  | 1.5 Hz
+          4  | Motor A        | 0.30 V   | 0.21 V   | 2.0 ms |  5.0 m/s |   4.0 ms   |   4.0 ms  | 5 Hz
+          5  | Motor B        | 0.50 V   | 0.30 V   | 2.2 ms |  3.0 m/s |   6.67 ms  |   5.0 ms  | 3.5 Hz
+        
+        Conduction Delay = electrode_spacing (20mm) / velocity
+        PSP onset = spike_time + conduction_delay + synaptic_delay
+        
+        Noise level is 40mV (0.040 V), so all units are above 2.5x noise floor,
+        making them detectable with MAD-based threshold detection.
         """
         # PSP kernel (alpha function) - 20ms duration
         psp_len = int(0.020 * sample_rate)
@@ -284,63 +297,142 @@ class SimulatedPhysiologySource(BaseDevice):
         self._psp_template = self._psp_template.astype(np.float32, copy=False)
         self._psp_len = len(self._psp_template)
 
-        self._units.clear()
-        rng = np.random.default_rng()  # independent RNG per session
+        # =============================================================================
+        # HARDCODED UNIT DEFINITIONS - Designed for repeatability and separability
+        # =============================================================================
+        # Each unit has distinct characteristics to ensure easy classification:
+        # - Amplitudes span from just above noise floor (~2.5x) to large (~17.5x)
+        # - Spike widths vary from narrow (1.2ms) to broad (3.0ms)
+        # - Conduction velocities produce clearly different delays (1.67ms to 6.67ms)
+        # - Different distal/proximal ratios simulate electrode placement variation
+        #
+        # All values are deterministic - no random number generation.
+        # =============================================================================
         
-        def _sample_range(range_tuple: Tuple[float, float]) -> float:
-            """Sample uniformly from a (min, max) range tuple."""
-            return range_tuple[0] + rng.random() * (range_tuple[1] - range_tuple[0])
-
-        # Assign unit types from the default distribution, cycling if needed
-        for i in range(num_units):
-            unit_type_name = DEFAULT_UNIT_DISTRIBUTION[i % len(DEFAULT_UNIT_DISTRIBUTION)]
-            preset = UNIT_TYPE_PRESETS[unit_type_name]
+        HARDCODED_UNITS = [
+            {
+                # Unit 0: Small Sensory Afferent - smallest, narrowest, slow conduction
+                'unit_type': 'small_sensory',
+                'rate_hz': 3.0,
+                'spike_width_ms': 1.2,       # Narrow spike
+                'amp_prox': 0.10,            # 2.5x noise floor (0.04V noise)
+                'amp_dist_ratio': 0.80,      # 80% of proximal → 0.08V distal
+                'velocity': 4.0,             # 4 m/s → 5.0ms conduction delay
+                'refractory_ms': 2.5,
+                'syn_delay_ms': 3.0,
+                'psp_gain': 0.015,
+            },
+            {
+                # Unit 1: Medium Sensory Afferent - moderate size, medium narrow
+                'unit_type': 'medium_sensory',
+                'rate_hz': 4.0,
+                'spike_width_ms': 1.5,       # Medium-narrow spike
+                'amp_prox': 0.18,            # 4.5x noise floor
+                'amp_dist_ratio': 0.83,      # 83% of proximal → 0.15V distal
+                'velocity': 6.0,             # 6 m/s → 3.33ms conduction delay
+                'refractory_ms': 2.8,
+                'syn_delay_ms': 3.5,
+                'psp_gain': 0.020,
+            },
+            {
+                # Unit 2: Giant Fiber A - large amplitude, broad spike, fast conduction
+                'unit_type': 'giant_fiber_a',
+                'rate_hz': 2.0,
+                'spike_width_ms': 2.5,       # Broad spike
+                'amp_prox': 0.45,            # 11.25x noise floor
+                'amp_dist_ratio': 0.89,      # 89% of proximal → 0.40V distal
+                'velocity': 12.0,            # 12 m/s → 1.67ms conduction delay (fastest)
+                'refractory_ms': 3.0,
+                'syn_delay_ms': 2.0,
+                'psp_gain': 0.035,
+            },
+            {
+                # Unit 3: Giant Fiber B - largest amplitude, broadest spike
+                'unit_type': 'giant_fiber_b',
+                'rate_hz': 1.5,
+                'spike_width_ms': 3.0,       # Broadest spike
+                'amp_prox': 0.70,            # 17.5x noise floor (largest)
+                'amp_dist_ratio': 0.80,      # 80% of proximal → 0.56V distal
+                'velocity': 10.0,            # 10 m/s → 2.0ms conduction delay
+                'refractory_ms': 3.5,
+                'syn_delay_ms': 2.5,
+                'psp_gain': 0.045,
+            },
+            {
+                # Unit 4: Motor Neuron A - medium amplitude, medium width
+                'unit_type': 'motor_a',
+                'rate_hz': 5.0,
+                'spike_width_ms': 2.0,       # Medium spike
+                'amp_prox': 0.30,            # 7.5x noise floor
+                'amp_dist_ratio': 0.70,      # 70% of proximal → 0.21V distal
+                'velocity': 5.0,             # 5 m/s → 4.0ms conduction delay
+                'refractory_ms': 2.5,
+                'syn_delay_ms': 4.0,
+                'psp_gain': 0.025,
+            },
+            {
+                # Unit 5: Motor Neuron B - medium-large amplitude, slowest conduction
+                'unit_type': 'motor_b',
+                'rate_hz': 3.5,
+                'spike_width_ms': 2.2,       # Medium-broad spike  
+                'amp_prox': 0.50,            # 12.5x noise floor
+                'amp_dist_ratio': 0.60,      # 60% of proximal → 0.30V distal (most attenuation)
+                'velocity': 3.0,             # 3 m/s → 6.67ms conduction delay (slowest)
+                'refractory_ms': 2.8,
+                'syn_delay_ms': 5.0,
+                'psp_gain': 0.030,
+            },
+        ]
+        
+        self._units.clear()
+        
+        # Use only the number of units requested (default 6)
+        units_to_create = min(num_units, len(HARDCODED_UNITS))
+        
+        for i in range(units_to_create):
+            params = HARDCODED_UNITS[i]
             
-            # Sample parameters from type-specific ranges
-            spike_width_ms = _sample_range(preset['spike_width_ms'])
+            # Calculate spike template length from width
+            spike_width_ms = params['spike_width_ms']
             spike_width_s = spike_width_ms / 1000.0
             spike_len = max(16, int(spike_width_s * sample_rate))
             
-            # Generate triphasic spike template with type-specific width
-            # Width factor scales the template: >1 = broader (motor), <1 = narrower (interneuron)
+            # Generate triphasic spike template with fixed width
             width_factor = spike_width_ms / 1.0  # Normalize to 1.0ms reference
             template = generate_triphasic_template(spike_len, width_factor)
             
-            # Sample other parameters from preset ranges
-            rate_hz = _sample_range(preset['rate_hz'])
-            amplitude = _sample_range(preset['amplitude_v'])
-            velocity = _sample_range(preset['velocity_m_s'])
-            refractory_ms = _sample_range(preset['refractory_ms'])
-            distal_ratio = _sample_range(preset['distal_ratio'])
-            psp_gain = _sample_range(preset['psp_gain'])
-            syn_delay_ms = _sample_range(preset['syn_delay_ms'])
-            
-            # Ensure amplitude is above noise floor
-            amplitude = max(amplitude, self._noise_level * 5.0 + 0.03)
-            
             # Convert time-based parameters to samples
-            refractory_samples = int(round(refractory_ms / 1000.0 * sample_rate))
-            syn_delay_samples = int(round(syn_delay_ms / 1000.0 * sample_rate))
+            refractory_samples = int(round(params['refractory_ms'] / 1000.0 * sample_rate))
+            syn_delay_samples = int(round(params['syn_delay_ms'] / 1000.0 * sample_rate))
             
             self._units.append({
-                'unit_type': unit_type_name,
+                'unit_type': params['unit_type'],
                 'template': template,
                 'templ_len': len(template),
-                'rate_hz': rate_hz,
-                'amp_prox': amplitude,
-                'amp_dist_ratio': distal_ratio,
-                'velocity': velocity,
+                'rate_hz': params['rate_hz'],
+                'amp_prox': params['amp_prox'],
+                'amp_dist_ratio': params['amp_dist_ratio'],
+                'velocity': params['velocity'],
                 'refractory_samples': refractory_samples,
                 'last_spike_sample': -100000,  # Initialize far in the past
                 'syn_delay_samples': syn_delay_samples,
-                'psp_gain': psp_gain,
+                'psp_gain': params['psp_gain'],
             })
             
-            logger.debug(
-                "Initialized unit %d: type=%s, rate=%.1f Hz, amp=%.3f V, "
-                "velocity=%.1f m/s, refractory=%.1f ms, spike_width=%.2f ms",
-                i, unit_type_name, rate_hz, amplitude, velocity, 
-                refractory_ms, spike_width_ms
+            # Calculate expected conduction delay for logging
+            cond_delay_ms = (self._distance_m / params['velocity']) * 1000.0
+            
+            logger.info(
+                "Unit %d [%s]: prox=%.2fV, dist=%.2fV, width=%.1fms, "
+                "vel=%.1fm/s, cond_delay=%.2fms, syn_delay=%.1fms, rate=%.1fHz",
+                i, params['unit_type'], 
+                params['amp_prox'], 
+                params['amp_prox'] * params['amp_dist_ratio'],
+                spike_width_ms, 
+                params['velocity'],
+                cond_delay_ms,
+                params['syn_delay_ms'],
+                params['rate_hz']
             )
 
         # Calculate buffer size for extracellular wave buffers
@@ -403,6 +495,8 @@ class SimulatedPhysiologySource(BaseDevice):
             u['last_spike_sample'] = -100000
         # Clear any lingering PSPs from previous run
         self._active_psps.clear()
+        # Reset RNG to ensure repeatable spike patterns on each start
+        self._rng = np.random.default_rng(self.RANDOM_SEED)
         if self._worker and self._worker.is_alive():
             return
 
@@ -464,7 +558,7 @@ class SimulatedPhysiologySource(BaseDevice):
                 
                 for ui, u in enumerate(self._units):
                     p_spike = u['rate_hz'] / sr
-                    events = np.random.rand(chunk_size) < p_spike
+                    events = self._rng.random(chunk_size) < p_spike
                     candidate_offs = np.where(events)[0]
                     templ = u['template']
                     templ_len = u['templ_len']
@@ -518,21 +612,13 @@ class SimulatedPhysiologySource(BaseDevice):
                 for col, cid in enumerate(active_ids):
                     ch_type = id_to_type.get(cid, 'extracellular_prox')
                     if ch_type == 'extracellular_prox':
+                        # PROXIMAL: Signal arrives FIRST (from CNS toward muscle)
+                        # Read from the delayed portion of the buffer - this makes spikes
+                        # appear at earlier output sample positions (first in time)
                         sig = np.zeros(chunk_size, dtype=np.float32)
                         for ui, u in enumerate(self._units):
                             wave = wave_buffers[ui]
-                            seg = wave[:chunk_size]
-                            if seg.shape[0] < chunk_size:
-                                padded = np.zeros(chunk_size, dtype=np.float32)
-                                padded[: seg.shape[0]] = seg
-                                seg = padded
-                            sig += seg  # Wave buffer already contains amplitude-scaled spikes
-                        sig += np.random.normal(0.0, self._noise_level, size=chunk_size).astype(np.float32)
-                        data_chunk[:, col] = sig
-                    elif ch_type == 'extracellular_dist':
-                        sig = np.zeros(chunk_size, dtype=np.float32)
-                        for ui, u in enumerate(self._units):
-                            wave = wave_buffers[ui]
+                            # Apply conduction delay offset so proximal appears first
                             delay_s = self._distance_m / max(1e-6, u['velocity'])
                             delay = int(round(delay_s * sr))
                             start = delay
@@ -544,9 +630,24 @@ class SimulatedPhysiologySource(BaseDevice):
                                 padded = np.zeros(chunk_size, dtype=np.float32)
                                 padded[: seg.shape[0]] = seg
                                 seg = padded
-                            # TEST: Force 0.5V amplitude on distal too (ignore ratio)
+                            sig += seg  # Wave buffer already contains amplitude-scaled spikes
+                        sig += self._rng.normal(0.0, self._noise_level, size=chunk_size).astype(np.float32)
+                        data_chunk[:, col] = sig
+                    elif ch_type == 'extracellular_dist':
+                        # DISTAL: Signal arrives AFTER proximal (delayed by conduction time)
+                        # Read from the immediate portion of the buffer - spikes appear at
+                        # later output sample positions relative to proximal
+                        sig = np.zeros(chunk_size, dtype=np.float32)
+                        for ui, u in enumerate(self._units):
+                            wave = wave_buffers[ui]
+                            # No offset - read immediate buffer position
+                            seg = wave[:chunk_size]
+                            if seg.shape[0] < chunk_size:
+                                padded = np.zeros(chunk_size, dtype=np.float32)
+                                padded[: seg.shape[0]] = seg
+                                seg = padded
                             sig += seg * u['amp_dist_ratio']
-                        sig += np.random.normal(0.0, self._noise_level, size=chunk_size).astype(np.float32)
+                        sig += self._rng.normal(0.0, self._noise_level, size=chunk_size).astype(np.float32)
                         data_chunk[:, col] = sig
                     else:  # intracellular - render PSPs
                         # STEP 3: INTRACELLULAR PSPs (event-based, can span multiple chunks)
@@ -591,7 +692,7 @@ class SimulatedPhysiologySource(BaseDevice):
                                 ic_signal[chunk_start_idx:chunk_start_idx + overlap_len] += template_slice * psp.gain
                         
                         # Apply baseline and noise to the intracellular signal
-                        ic_signal = -0.070 + ic_signal + np.random.normal(0.0, self._noise_level * 0.1, size=chunk_size).astype(np.float32)
+                        ic_signal = -0.070 + ic_signal + self._rng.normal(0.0, self._noise_level * 0.1, size=chunk_size).astype(np.float32)
                         data_chunk[:, col] = ic_signal
 
                 # Add line hum if enabled

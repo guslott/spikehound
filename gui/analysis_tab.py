@@ -94,6 +94,13 @@ class AnalysisTab(QtWidgets.QWidget):
         self._last_scatter_count: int = 0
         self._cluster_membership_dirty: bool = True  # Recompute classification on ROI change only
         self._brush_cache: dict[int, object] = {}  # cluster_id -> cached brush object
+        # Scatter plot coordinate caching to avoid rebuilding on every update
+        self._cached_scatter_xs: list[float] | None = None
+        self._cached_scatter_ys: list[float] | None = None
+        self._cached_scatter_event_ids: list[int | None] | None = None
+        self._cached_scatter_visible_count: int = 0
+        self._cached_scatter_y_key: str | None = None
+        self._cached_scatter_x_key: str | None = None
         self._last_event_id: Optional[int] = None
         self._viz_paused = False
         self._cached_raw_times: Optional[np.ndarray] = None
@@ -521,18 +528,17 @@ class AnalysisTab(QtWidgets.QWidget):
         self.threshold2_line.sigPositionChanged.connect(lambda _: self._update_spin_from_line(self.threshold2_line, self.threshold2_spin))
         self.event_window_combo.currentIndexChanged.connect(self._on_event_window_changed)
 
-        self._timer = QtCore.QTimer(self)
-        self._timer.setInterval(30)
-        self._timer.timeout.connect(self._on_timer)
-        self._timer.start()
-        self._metrics_timer = QtCore.QTimer(self)
-        self._metrics_timer.setInterval(100)
-        self._metrics_timer.timeout.connect(self._on_metrics_timer)
-        self._metrics_timer.start()
-        self._sta_timer = QtCore.QTimer(self)
-        self._sta_timer.setInterval(self._sta_update_interval_ms)
-        self._sta_timer.timeout.connect(self._on_sta_timer)
-        self._sta_timer.start()
+        # Consolidated update timer: single timer reduces scheduling overhead and
+        # prevents clustered work bursts from multiple independent timers firing
+        # in rapid succession. Runs at 30ms (~33Hz) for raw trace responsiveness.
+        self._update_timer = QtCore.QTimer(self)
+        self._update_timer.setInterval(30)
+        self._update_timer.timeout.connect(self._on_unified_timer)
+        self._update_timer.start()
+        # Tick counter for throttling slower updates (metrics at ~10Hz, STA at ~10Hz)
+        self._timer_tick_count: int = 0
+        self._METRICS_UPDATE_TICKS: int = 3  # Every 3rd tick = ~90ms (~11Hz)
+        self._STA_UPDATE_TICKS: int = 3      # Every 3rd tick = ~90ms (~11Hz)
         self._in_threshold_update = False
         self._on_axis_metric_changed()
         self._apply_ranges()
@@ -697,8 +703,33 @@ class AnalysisTab(QtWidgets.QWidget):
         if spin in (self.threshold1_spin, self.threshold2_spin):
             self._notify_threshold_change()
 
-    def _on_timer(self) -> None:
-        """Timer callback: drain analysis queue and render batches."""
+    def _on_unified_timer(self) -> None:
+        """Unified timer callback: process queue, then conditionally update metrics/STA.
+
+        This consolidates three separate timers into one to:
+        1. Reduce Qt timer scheduling overhead
+        2. Prevent clustered work bursts from timers firing in rapid succession
+        3. Ensure predictable frame timing for smoother updates
+        """
+        self._timer_tick_count += 1
+
+        # Always process analysis queue (every tick, ~33Hz)
+        self._process_analysis_queue()
+
+        # Update metrics less frequently (every 3rd tick, ~11Hz)
+        if self._timer_tick_count % self._METRICS_UPDATE_TICKS == 0:
+            if self._metrics_dirty:
+                self._update_metric_points()
+                self._metrics_dirty = False
+
+        # Update STA less frequently (every 3rd tick, ~11Hz)
+        if self._timer_tick_count % self._STA_UPDATE_TICKS == 0:
+            if self._sta_enabled and self._sta_dirty:
+                self._refresh_sta_plot()
+                self._sta_dirty = False
+
+    def _process_analysis_queue(self) -> None:
+        """Drain analysis queue and render batches."""
         if self._analysis_queue is None:
             return
         max_batches = 100
@@ -729,19 +760,6 @@ class AnalysisTab(QtWidgets.QWidget):
                 width = self._last_window_width or self._scope_window_sec
                 self._handle_batch_events(new_events, window_start, width, self._window_start_index)
                 self._last_event_id = new_last_id
-
-    def _on_metrics_timer(self) -> None:
-        """Timer callback: refresh metric scatter plots if dirty."""
-        if not self._metrics_dirty:
-            return
-        self._update_metric_points()
-        self._metrics_dirty = False
-    def _on_sta_timer(self) -> None:
-        """Timer callback: refresh STA plot if enabled and dirty."""
-        if not self._sta_enabled or not self._sta_dirty:
-            return
-        self._refresh_sta_plot()
-        self._sta_dirty = False
 
     def _apply_ranges(self) -> None:
         """Apply scope-linked settings to the plot axes."""
@@ -1280,6 +1298,15 @@ class AnalysisTab(QtWidgets.QWidget):
             item.hide()
             item.setData([], [], skipFiniteCheck=True)
 
+    def _invalidate_scatter_cache(self) -> None:
+        """Invalidate the scatter plot coordinate cache."""
+        self._cached_scatter_xs = None
+        self._cached_scatter_ys = None
+        self._cached_scatter_event_ids = None
+        self._cached_scatter_visible_count = 0
+        self._cached_scatter_y_key = None
+        self._cached_scatter_x_key = None
+
     def _clear_metrics(self) -> None:
         """Reset all metric data, scatter plots, and cluster counts."""
         self._metric_events.clear()
@@ -1288,6 +1315,7 @@ class AnalysisTab(QtWidgets.QWidget):
         # Reset optimization tracking
         self._last_scatter_count = 0
         self._cluster_membership_dirty = True
+        self._invalidate_scatter_cache()
         # Note: overlay colors are set at creation time, not refreshed
         self._t0_event = None
         for cluster in self._clusters:
@@ -1442,6 +1470,8 @@ class AnalysisTab(QtWidgets.QWidget):
         else:
             self.energy_scatter.hide()
             self.energy_scatter.setData([], [], skipFiniteCheck=True)
+        # Invalidate cache when axis selection changes
+        self._invalidate_scatter_cache()
         self._recompute_cluster_membership()
         self._update_metric_points()
 
@@ -2067,10 +2097,10 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def _update_metric_points(self) -> None:
         """Refresh the scatter plot with current metric data.
-        
+
         Performance optimizations:
-        - Skip update if event count unchanged since last call
-        - Cache brush objects instead of creating fresh ones per event  
+        - Cache coordinates and only rebuild when event count or axis selection changes
+        - Cache brush objects instead of creating fresh ones per event
         - Only recompute cluster membership when ROI changes (dirty flag)
         """
         y_key = self._selected_y_metric()
@@ -2082,56 +2112,79 @@ class AnalysisTab(QtWidgets.QWidget):
         if not events:
             self.energy_scatter.hide()
             self._last_scatter_count = 0
+            self._invalidate_scatter_cache()
             return
-        
+
         current_count = len(events)
-        
-        # Determine visible events based on time window or max count
-        visible_events = list(events)  # Convert deque to list for slicing
-        if x_key == "time" and visible_events:
-            # Find the last valid time
-            last_time: float | None = None
-            for event in reversed(visible_events):
-                t_val = event.get("time")
-                if t_val is not None:
-                    try:
-                        last_time = float(t_val)
-                        break
-                    except (TypeError, ValueError):
-                        continue
-            if last_time is not None:
-                min_time = last_time - METRIC_TIME_WINDOW_SEC
-                if min_time > 0:
-                    # Binary search would be more efficient, but this is called infrequently now
-                    for idx, event in enumerate(visible_events):
-                        t_val = event.get("time")
-                        if t_val is not None:
-                            try:
-                                if float(t_val) >= min_time:
-                                    visible_events = visible_events[idx:]
-                                    break
-                            except (TypeError, ValueError):
-                                continue
-        
-        if len(visible_events) > MAX_VISIBLE_METRIC_EVENTS:
-            visible_events = visible_events[-MAX_VISIBLE_METRIC_EVENTS:]
-        
-        # Build coordinate and event_id lists
-        xs: list[float] = []
-        ys: list[float] = []
-        event_ids: list[Optional[int]] = []
-        for event in visible_events:
-            x_val = event.get(x_key)
-            y_val = event.get(y_key)
-            if x_val is None or y_val is None:
-                continue
-            if not (np.isfinite(x_val) and np.isfinite(y_val)):
-                continue
-            xs.append(float(x_val))
-            ys.append(float(y_val))
-            event_id = event.get("event_id")
-            event_ids.append(event_id if isinstance(event_id, int) else None)
-        
+
+        # Check if we can reuse cached coordinates
+        cache_valid = (
+            self._cached_scatter_xs is not None
+            and self._cached_scatter_visible_count == current_count
+            and self._cached_scatter_y_key == y_key
+            and self._cached_scatter_x_key == x_key
+        )
+
+        if cache_valid:
+            # Reuse cached coordinates
+            xs = self._cached_scatter_xs
+            ys = self._cached_scatter_ys
+            event_ids = self._cached_scatter_event_ids
+        else:
+            # Rebuild coordinates - cache is invalid
+            # Determine visible events based on time window or max count
+            visible_events = list(events)  # Convert deque to list for slicing
+            if x_key == "time" and visible_events:
+                # Find the last valid time
+                last_time: float | None = None
+                for event in reversed(visible_events):
+                    t_val = event.get("time")
+                    if t_val is not None:
+                        try:
+                            last_time = float(t_val)
+                            break
+                        except (TypeError, ValueError):
+                            continue
+                if last_time is not None:
+                    min_time = last_time - METRIC_TIME_WINDOW_SEC
+                    if min_time > 0:
+                        for idx, event in enumerate(visible_events):
+                            t_val = event.get("time")
+                            if t_val is not None:
+                                try:
+                                    if float(t_val) >= min_time:
+                                        visible_events = visible_events[idx:]
+                                        break
+                                except (TypeError, ValueError):
+                                    continue
+
+            if len(visible_events) > MAX_VISIBLE_METRIC_EVENTS:
+                visible_events = visible_events[-MAX_VISIBLE_METRIC_EVENTS:]
+
+            # Build coordinate and event_id lists
+            xs = []
+            ys = []
+            event_ids = []
+            for event in visible_events:
+                x_val = event.get(x_key)
+                y_val = event.get(y_key)
+                if x_val is None or y_val is None:
+                    continue
+                if not (np.isfinite(x_val) and np.isfinite(y_val)):
+                    continue
+                xs.append(float(x_val))
+                ys.append(float(y_val))
+                event_id = event.get("event_id")
+                event_ids.append(event_id if isinstance(event_id, int) else None)
+
+            # Update cache
+            self._cached_scatter_xs = xs
+            self._cached_scatter_ys = ys
+            self._cached_scatter_event_ids = event_ids
+            self._cached_scatter_visible_count = current_count
+            self._cached_scatter_y_key = y_key
+            self._cached_scatter_x_key = x_key
+
         if not xs:
             self.energy_scatter.hide()
             return
