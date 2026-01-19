@@ -392,25 +392,18 @@ class PlotManager(QtCore.QObject):
         if chunk_samples.ndim != 2 or chunk_samples.size == 0:
             self.process_streaming(data, times_arr, sample_rate, window_sec, channel_ids, now)
             return
-        
-        # Append to trigger history
-        self._append_trigger_history(chunk_samples)
+
+        # Append to trigger history (TriggerController manages its own history)
+        tc.push_samples(chunk_samples, sample_rate, window_sec)
 
         monitor_idx = None
         if trigger_channel_id is not None and trigger_channel_id in channel_ids:
             monitor_idx = channel_ids.index(trigger_channel_id)
 
-        # Check for hold expiry
-        if (
-            tc.display_data is not None
-            and trigger_mode != "single"
-            and now >= tc._hold_until
-        ):
-            tc._display = None
-            tc._display_times = None
+        # Check for hold expiry using TriggerController method
+        if tc.check_hold_expiry(now, trigger_mode == "single"):
             if pretrigger_line is not None:
                 pretrigger_line.setVisible(False)
-            tc._hold_until = 0.0
 
         # Detect trigger crossing
         if monitor_idx is not None and tc.should_arm(now) and tc.display_data is None:
@@ -430,33 +423,29 @@ class PlotManager(QtCore.QObject):
             self._render_trigger_display(channel_ids, window_sec, pretrigger_line)
             return
 
+        # If no captured display and in trigger mode, clear renderers to avoid stale data flash
         if trigger_mode == "single":
+            # Clear display when armed but no capture yet
+            for renderer in self._renderers.values():
+                renderer.clear()
+            if pretrigger_line is not None:
+                pretrigger_line.setVisible(False)
             self._current_sample_rate = sample_rate
             self._current_window_sec = window_sec
             return
 
         if trigger_mode == "continuous":
+            # Clear display when waiting for next trigger
+            for renderer in self._renderers.values():
+                renderer.clear()
+            if pretrigger_line is not None:
+                pretrigger_line.setVisible(False)
             self._current_sample_rate = sample_rate
             self._current_window_sec = window_sec
             return
 
         self.process_streaming(data, times_arr, sample_rate, window_sec, channel_ids, now)
-    
-    def _append_trigger_history(self, chunk_samples: np.ndarray) -> None:
-        """Append samples to trigger history."""
-        if chunk_samples.size == 0:
-            return
-        tc = self._trigger_controller
-        tc._history.append(chunk_samples)
-        tc._history_length += chunk_samples.shape[0]
-        tc._history_total += chunk_samples.shape[0]
-        tc._max_chunk = max(tc._max_chunk, chunk_samples.shape[0])
-        # Keep 3x window to prevent evicting tails before capture
-        max_keep = tc._window_samples * 3
-        while tc._history_length > max_keep and tc._history:
-            left = tc._history.popleft()
-            tc._history_length -= left.shape[0]
-    
+
     def _render_trigger_display(
         self,
         channel_ids: List[int],

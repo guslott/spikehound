@@ -56,10 +56,6 @@ class TriggerController(QtCore.QObject):
         self._window_samples: int = 1
         self._last_sample_rate: float = 0.0
         
-        # Alignment config
-        self._alignment_mode: str = "simple"  # "simple" or "peak"
-        self._alignment_search_window_sec: float = 0.002
-        
         # History buffer for pretrigger
         self._history: Deque[np.ndarray] = deque()
         self._history_length: int = 0
@@ -106,15 +102,7 @@ class TriggerController(QtCore.QObject):
     def is_triggered_mode(self) -> bool:
         """True if in single or continuous trigger mode (not stream)."""
         return self._mode in ("single", "continuous")
-    
-    @property
-    def alignment_mode(self) -> str:
-        return self._alignment_mode
-    
-    @alignment_mode.setter
-    def alignment_mode(self, value: str) -> None:
-        self._alignment_mode = value
-    
+
     @property
     def display_data(self) -> Optional[np.ndarray]:
         """Currently captured triggered waveform, or None."""
@@ -265,33 +253,43 @@ class TriggerController(QtCore.QObject):
 
     def detect_crossing(self, samples: np.ndarray) -> Optional[int]:
         """
-        Detect rising threshold crossing in samples.
-        
+        Detect rising threshold crossing in samples using vectorized numpy operations.
+
         Args:
             samples: 1D array of samples to check
-            
+
         Returns:
             Index of first crossing, or None if no crossing detected
         """
+        if samples.size == 0:
+            return None
+
         threshold = self._threshold
-        prev = self._prev_value
-        
-        for idx, sample in enumerate(samples):
-            if prev < threshold <= sample:
-                self._prev_value = float(samples[-1])
-                return idx
-            prev = sample
-            
+
+        # Create extended array with previous value prepended for shifted comparison
+        extended = np.empty(samples.size + 1, dtype=np.float32)
+        extended[0] = self._prev_value
+        extended[1:] = samples
+
+        # Vectorized crossing detection: prev < threshold <= current
+        below = extended[:-1] < threshold
+        above_eq = extended[1:] >= threshold
+        crossings = np.where(below & above_eq)[0]
+
+        # Update previous value for next chunk
         self._prev_value = float(samples[-1])
+
+        if crossings.size > 0:
+            return int(crossings[0])
         return None
 
     def should_arm(self, now: float) -> bool:
         """
         Check if trigger detection should be active.
-        
+
         Args:
             now: Current time from time.perf_counter()
-            
+
         Returns:
             True if should check for trigger crossings
         """
@@ -308,10 +306,30 @@ class TriggerController(QtCore.QObject):
             return self._single_armed
         return False
 
+    def check_hold_expiry(self, now: float, is_single_mode: bool) -> bool:
+        """
+        Check if hold period has expired and clear display if needed.
+
+        Args:
+            now: Current time from time.perf_counter()
+            is_single_mode: True if in single trigger mode
+
+        Returns:
+            True if display was cleared due to expiry, False otherwise
+        """
+        if self._display is None or is_single_mode:
+            return False
+        if now >= self._hold_until:
+            self._display = None
+            self._display_times = None
+            self._hold_until = 0.0
+            return True
+        return False
+
     def start_capture(self, chunk_start_abs: int, trigger_idx: int) -> None:
         """
         Start a trigger capture at the given position.
-        
+
         Args:
             chunk_start_abs: Absolute sample index where current chunk starts
             trigger_idx: Index within chunk where crossing occurred
@@ -319,31 +337,25 @@ class TriggerController(QtCore.QObject):
         window = self._window_samples
         if window <= 0:
             return
-            
+
         pre = self._pre_samples
-        
-        # Add alignment padding if needed
-        align_pad = 0
-        if self._alignment_mode == "peak":
-            align_pad = int(self._alignment_search_window_sec * self._last_sample_rate)
-            # Ensure at least a few samples for search
-            align_pad = max(align_pad, 5)
 
         earliest_abs = self._history_total - self._history_length
-        # Request data starting earlier to allow for alignment search
-        start_abs = max(chunk_start_abs + trigger_idx - pre - align_pad, earliest_abs)
-        
+        # Trigger point is at chunk_start_abs + trigger_idx
+        # We want to capture 'pre' samples before this and 'window - pre' after
+        start_abs = max(chunk_start_abs + trigger_idx - pre, earliest_abs)
+
         self._capture_start_abs = start_abs
-        # Capture enough for window + 2*padding (search left and right)
-        self._capture_end_abs = start_abs + window + 2 * align_pad
-        
+        # Capture exactly the window duration
+        self._capture_end_abs = start_abs + window
+
         if self._mode == "single":
             self._single_armed = False
 
     def finalize_capture(self) -> bool:
         """
         Finalize a pending capture if enough samples have arrived.
-        
+
         Returns:
             True if capture was finalized, False otherwise
         """
@@ -353,33 +365,44 @@ class TriggerController(QtCore.QObject):
             return False
         if not self._history:
             return False
-        
+
         # Calculate absolute range
         earliest_abs = self._history_total - self._history_length
         start_abs = max(self._capture_start_abs, earliest_abs)
         end_abs = start_abs + self._window_samples
-        
+
         # Collect relevant chunks
         relevant_chunks: List[np.ndarray] = []
         current_abs = earliest_abs
-        
+
         for chunk in self._history:
             chunk_len = chunk.shape[0]
             chunk_end = current_abs + chunk_len
-            
+
             if chunk_end > start_abs and current_abs < end_abs:
                 relevant_chunks.append(chunk)
-                
+
             current_abs += chunk_len
             if current_abs >= end_abs:
                 break
-        
+
         if not relevant_chunks:
             return False
-        
-        # Concatenate relevant chunks
-        data = np.concatenate(relevant_chunks, axis=0)
-        
+
+        # Optimized concatenation with pre-allocation
+        total_len = sum(chunk.shape[0] for chunk in relevant_chunks)
+        if relevant_chunks[0].ndim == 1:
+            data = np.empty(total_len, dtype=np.float32)
+        else:
+            data = np.empty((total_len, relevant_chunks[0].shape[1]), dtype=np.float32)
+
+        # Copy chunks in-place
+        offset = 0
+        for chunk in relevant_chunks:
+            chunk_len = chunk.shape[0]
+            data[offset:offset+chunk_len] = chunk
+            offset += chunk_len
+
         # Find absolute start of first chunk
         scan_abs = earliest_abs
         data_start_abs = earliest_abs
@@ -388,59 +411,29 @@ class TriggerController(QtCore.QObject):
                 data_start_abs = scan_abs
                 break
             scan_abs += chunk.shape[0]
-        
-        # Slice to get the window
-        start_idx = start_abs - data_start_abs
-        
-        # Perform alignment if requested
-        if self._alignment_mode == "peak":
-            align_pad = int(self._alignment_search_window_sec * self._last_sample_rate)
-            align_pad = max(align_pad, 5)
-            
-            # The nominal trigger point is at start_idx + align_pad + pre_samples
-            nominal_trigger = start_idx + align_pad + self._pre_samples
-            
-            # Search window around nominal trigger
-            # We look +/- align_pad
-            s_start = max(0, nominal_trigger - align_pad)
-            s_end = min(data.shape[0], nominal_trigger + align_pad)
-            
-            search_region = data[s_start:s_end]
-            if search_region.size > 0:
-                # Find peak offset relative to start of search region
-                peak_offset = np.argmax(np.abs(search_region))
-                
-                # Absolute index of the peak in data
-                peak_abs_idx = s_start + peak_offset
-                
-                # We want peak_abs_idx to end up at index 'pre_samples' in the final snippet
-                # snippet = data[start:end]
-                # peak_abs_idx - start = pre_samples
-                # start = peak_abs_idx - pre_samples
-                
-                final_start = peak_abs_idx - self._pre_samples
-                start_idx = final_start
 
+        # Slice to get the window (trigger at threshold crossing, no alignment)
+        start_idx = start_abs - data_start_abs
         end_idx = start_idx + self._window_samples
-        
-        # Handle start before available data (if peak shifted left past start)
+
+        # Handle start before available data
         pad_front = 0
         if start_idx < 0:
             pad_front = -start_idx
             start_idx = 0
-            
+
         if end_idx > data.shape[0]:
             end_idx = data.shape[0]
-            
+
         snippet = data[start_idx:end_idx]
-        
+
         if pad_front > 0:
             if snippet.ndim == 1:
                 padding = np.zeros(pad_front, dtype=snippet.dtype)
             else:
                 padding = np.zeros((pad_front, snippet.shape[1]), dtype=snippet.dtype)
             snippet = np.concatenate([padding, snippet], axis=0)
-        
+
         # Pad if needed
         if snippet.shape[0] < self._window_samples:
             pad = self._window_samples - snippet.shape[0]
@@ -453,29 +446,29 @@ class TriggerController(QtCore.QObject):
                 else:
                     last_row = np.zeros((1, data.shape[1]), dtype=np.float32)
             snippet = np.concatenate([snippet, np.repeat(last_row, pad, axis=0)], axis=0)
-            
+
         if snippet.shape[0] == 0:
             ndim = data.ndim
             if ndim == 1:
                 snippet = np.zeros(self._window_samples, dtype=np.float32)
             else:
                 snippet = np.zeros((self._window_samples, data.shape[1]), dtype=np.float32)
-        
+
         self._display = snippet
         self._display_times = None
         self._display_pre_samples = min(self._pre_samples, max(snippet.shape[0] - 1, 0))
-        
+
         # Hold display for duration of window
         if self._last_sample_rate > 0:
             duration = self._window_samples / self._last_sample_rate
         else:
             duration = self._window_sec
         self._hold_until = time.perf_counter() + max(duration, 1e-3)
-        
+
         # Reset capture pointers
         self._capture_start_abs = None
         self._capture_end_abs = None
-        
+
         self.captureReady.emit()
         return True
 

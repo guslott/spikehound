@@ -563,6 +563,13 @@ class SimulatedPhysiologySource(BaseDevice):
                 # For PSPs: create ActivePSP events instead of writing to buffers.
                 chunk_start_sample = self._global_sample_counter
                 
+                # Calculate maximum conduction delay across all units
+                max_delay = 0
+                for u in self._units:
+                    delay_s = self._distance_m / max(1e-6, u['velocity'])
+                    delay_samples = int(round(delay_s * sr))
+                    max_delay = max(max_delay, delay_samples)
+
                 for ui, u in enumerate(self._units):
                     p_spike = u['rate_hz'] / sr
                     events = self._rng.random(chunk_size) < p_spike
@@ -572,32 +579,52 @@ class SimulatedPhysiologySource(BaseDevice):
                     wave_buf = wave_buffers[ui]
                     psp_gain = u['psp_gain']
                     refractory_samples = u['refractory_samples']
-                    
+
+                    # Calculate conduction delay for this unit
+                    delay_s = self._distance_m / max(1e-6, u['velocity'])
+                    conduction_delay_samples = int(round(delay_s * sr))
+
                     # Filter candidate spikes by refractory period
                     # last_spike_sample is the global sample index of the last spike
                     for off in candidate_offs:
                         global_sample = chunk_start_sample + off
-                        
+
                         # Check refractory period: skip if too soon after last spike
                         if global_sample - u['last_spike_sample'] < refractory_samples:
                             continue  # Still in refractory period, skip this spike
-                        
+
                         # Record this spike time for future refractory checks
                         u['last_spike_sample'] = global_sample
-                        
-                        # Add extracellular spike to wave buffer
+
+                        # Insert spike with offset to ensure both channels can read it
+                        # Adding max_delay ensures proximal (reading from delay:delay+chunk) can see it
+                        insert_pos = off + max_delay
                         amp = u['amp_prox']
                         scaled = templ * amp
-                        end = off + templ_len
+                        end = insert_pos + templ_len
                         if end > buf_len:
                             end = buf_len
-                        wave_buf[off:end] += scaled[: end - off]
-                        
+                        if insert_pos < buf_len:
+                            wave_buf[insert_pos:end] += scaled[: end - insert_pos]
+
                         # Create PSP event (will be rendered in step 3)
+                        # CRITICAL TIMING CORRECTION:
+                        # The buffer insertion adds max_delay offset, but proximal reads from wave[delay:]
+                        # This means proximal spike appears in output at: chunk_start + off
+                        # Distal reads from wave[0:], so distal spike appears at: chunk_start + off + max_delay
+                        # We need to calculate when the distal spike actually appears in the output stream
+                        # and add synaptic delay from there.
+                        #
+                        # Actual output timing:
+                        # - Proximal in output: chunk_start_sample + off (because it reads from offset position)
+                        # - Distal in output: chunk_start_sample + off + max_delay (because it reads from start)
+                        # - PSP should appear AFTER distal by synaptic delay
+                        #
+                        # Therefore: PSP_start = (chunk_start + off + max_delay) + synaptic_delay
                         psp_delay_samples = u['syn_delay_samples']
                         # Skip template[0] which is forced to 0.0 for baseline correction
                         new_psp = ActivePSP(
-                            start_sample=global_sample + psp_delay_samples + 1,
+                            start_sample=global_sample + max_delay + psp_delay_samples + 1,
                             template=self._psp_template[1:],  # Skip the forced-zero first sample
                             gain=psp_gain,
                             unit_index=ui,
