@@ -34,6 +34,7 @@ class AudioManager:
         
         # Audio routing state
         self._listen_channel_id: Optional[int] = None
+        self._listen_channel_idx: Optional[int] = None  # Cached index for performance
         self._channel_ids_current: list[int] = []
         
         # AudioPlayer state
@@ -87,13 +88,14 @@ class AudioManager:
 
     def set_listen_channel(self, channel_id: Optional[int]) -> None:
         """Set which channel to monitor for audio playback.
-        
+
         Args:
             channel_id: Channel ID to monitor, or None to stop monitoring
         """
         with self._audio_lock:
             self._listen_channel_id = channel_id
-        
+            self._listen_channel_idx = None  # Will be computed on next chunk
+
         if channel_id is None:
             self._stop_audio_player()
             logger.debug("Audio monitoring stopped")
@@ -123,11 +125,14 @@ class AudioManager:
 
     def update_active_channels(self, channel_ids: list[int]) -> None:
         """Update the list of active channels.
-        
+
         Args:
             channel_ids: List of currently active channel IDs
         """
-        self._channel_ids_current = list(channel_ids)
+        with self._audio_lock:
+            self._channel_ids_current = list(channel_ids)
+            # Invalidate cached index since channel list changed
+            self._listen_channel_idx = None
 
     def is_monitoring(self) -> bool:
         """Check if currently monitoring a channel.
@@ -157,51 +162,62 @@ class AudioManager:
                 try:
                     aq = getattr(self.runtime, "audio_queue", None)
                     if aq is None:
-                        self._audio_router_stop.wait(0.1)
+                        self._audio_router_stop.wait(0.01)
                         continue
-                    item = aq.get(timeout=0.1)
+                    item = aq.get(timeout=0.01)
                 except queue.Empty:
                     continue
-                
-                # Check if we have a listen channel selected
-                with self._audio_lock:
-                    listen_id = self._listen_channel_id
 
-                if listen_id is not None:
-                     pass
-                     # logger.debug(f"AudioRouter: Item received. Type: {type(item)}, ListenID: {listen_id}, Active: {self._channel_ids_current}")
-                
                 # Skip end-of-stream markers
                 if item is EndOfStream:
                     continue
-                
-                # Check if we have a listen channel selected
+
+                # Check if we have a listen channel selected and get cached index
                 with self._audio_lock:
                     listen_id = self._listen_channel_id
-                
-                if listen_id is None or listen_id not in self._channel_ids_current:
+                    cached_idx = self._listen_channel_idx
+                    channel_ids = self._channel_ids_current
+
+                if listen_id is None:
                     continue
-                
+
+                # Compute index if not cached or validate cached index
+                if cached_idx is None:
+                    try:
+                        idx = channel_ids.index(listen_id)
+                        with self._audio_lock:
+                            self._listen_channel_idx = idx  # Cache for next iteration
+                    except ValueError:
+                        continue
+                else:
+                    # Validate cached index is still correct
+                    if cached_idx >= len(channel_ids) or channel_ids[cached_idx] != listen_id:
+                        # Channel list changed, recompute
+                        try:
+                            idx = channel_ids.index(listen_id)
+                            with self._audio_lock:
+                                self._listen_channel_idx = idx
+                        except ValueError:
+                            with self._audio_lock:
+                                self._listen_channel_idx = None
+                            continue
+                    else:
+                        idx = cached_idx
+
                 # Get viz buffer for chunk pointer resolution
                 viz_buffer = controller.viz_buffer() if controller else None
                 if isinstance(item, ChunkPointer) and viz_buffer is None:
                     continue
-                
+
                 # Ensure audio player is running
                 if not self._ensure_audio_player():
                     continue
-                
-                # Find channel index
-                try:
-                    idx = self._channel_ids_current.index(listen_id)
-                except ValueError:
-                    continue
-                
+
                 # Route to audio player
                 with self._audio_lock:
                     player = self._audio_player
                     player_queue = self._audio_player_queue
-                
+
                 if player is not None and player_queue is not None:
                     player.set_selected_channel(idx)
                     try:
@@ -256,14 +272,14 @@ class AudioManager:
                 pass
         
         # Create new player
-        queue_obj: queue.Queue = queue.Queue(maxsize=4)
+        queue_obj: queue.Queue = queue.Queue(maxsize=1)
         config = AudioConfig(
             out_samplerate=44_100,
             out_channels=1,
             device=device_id,
             gain=self._audio_gain,
-            blocksize=128,
-            ring_seconds=0.1,
+            blocksize=64,
+            ring_seconds=0.03,
         )
         
         try:

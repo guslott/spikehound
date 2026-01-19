@@ -224,20 +224,21 @@ class AudioPlayer(threading.Thread):
         Generator that yields audio data for miniaudio.
         """
         required_frames = yield b""  # Initial yield
-        
+
         while True:
             wanted = required_frames
             mono = self._ring_read(wanted)
-            
+
             # Underrun handling: pad with silence
             if mono.size < wanted:
                 mono = np.pad(mono, (0, wanted - mono.size))
-                
-            mono *= self.cfg.gain
-            
+
+            # OPTIMIZATION: Gain is now applied before ring write (see run method)
+            # This reduces work in the audio callback for lower latency
+
             # Convert to bytes (float32)
             data_bytes = mono.tobytes()
-            
+
             required_frames = yield data_bytes
 
     # ---- Thread body ---------------------------------------------------------
@@ -276,7 +277,7 @@ class AudioPlayer(threading.Thread):
             while not self._stop_evt.is_set():
                 # Drain upstream queue
                 try:
-                    ch = self.q.get(timeout=0.05)
+                    ch = self.q.get(timeout=0.01)
                 except queue.Empty:
                     continue
 
@@ -290,15 +291,16 @@ class AudioPlayer(threading.Thread):
                 
                 # Extract mono channel
                 mono_in = data[:, self._selected]
-                
+
                 # OPTIMIZATION: Removed _resample_block() call.
                 # Write raw input samples directly to ring buffer.
                 # miniaudio handles resampling to hardware rate in C.
                 if mono_in.size:
-                    # Very soft limiter to avoid clipping if spikes are tall
-                    peak = float(np.max(np.abs(mono_in)))
-                    if peak > 1.5:
-                        mono_in = mono_in / peak
+                    # OPTIMIZATION: Apply gain and fast clip before ring write
+                    # This moves work out of the audio callback (generator)
+                    mono_in = mono_in * self.cfg.gain
+                    # Fast limiter: hard clip instead of normalize for lower latency
+                    np.clip(mono_in, -1.5, 1.5, out=mono_in)
                     self._ring_write(mono_in)
         finally:
             if self._device and self._device.running:

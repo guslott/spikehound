@@ -39,7 +39,7 @@ class PipelineController:
         *,
         filter_settings: Optional[FilterSettings] = None,
         visualization_queue_size: int = 1024,
-        audio_queue_size: int = 256,
+        audio_queue_size: int = 2,
         logging_queue_size: int = 512,
         dispatcher_poll_timeout: float = 0.05,
         app_settings_store: Optional[AppSettingsStore] = None,
