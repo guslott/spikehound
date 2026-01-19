@@ -1121,6 +1121,22 @@ class MainWindow(QtWidgets.QMainWindow):
             sample_rate = 1.0
         dock.open_analysis(channel_name, sample_rate)
 
+    def _open_spectrogram_for_channel(self, channel_id: int) -> None:
+        """Open or focus a spectrogram tab for the specified channel."""
+        dock = self._analysis_dock
+        if dock is None:
+            return
+        config = self._channel_configs.get(channel_id)
+        if config is None:
+            self._logger.warning("No config for channel %s, cannot open spectrogram", channel_id)
+            return
+        channel_name = config.channel_name or f"Channel {channel_id}"
+        dock.open_spectrogram(
+            main_window=self,
+            channel_id=channel_id,
+            channel_name=channel_name,
+        )
+
     def _set_listen_channel(self, channel_id: int) -> None:
         """Delegate to AudioListenManager."""
         self._audio_listen_manager.set_listen_channel(channel_id)

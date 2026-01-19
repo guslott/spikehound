@@ -6,6 +6,7 @@ from typing import Dict, Optional, Sequence, TYPE_CHECKING
 from PySide6 import QtCore, QtWidgets
 
 from .analysis_tab import AnalysisTab
+from .spectrogram_tab import SpectrogramTab
 from analysis.analysis_worker import AnalysisWorker
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,7 @@ class AnalysisDock(QtWidgets.QDockWidget):
         self._last_sample_rate: float = 0.0
         self._settings_widget: Optional[QtWidgets.QWidget] = None
         self._active_channels: list["ChannelInfo"] = []
+        self._spectrogram_tabs: Dict[int, SpectrogramTab] = {}  # channel_id -> tab
 
     @property
     def settings_tab(self) -> Optional[QtWidgets.QWidget]:
@@ -121,6 +123,57 @@ class AnalysisDock(QtWidgets.QDockWidget):
         self._tab_info[widget] = {"channel": channel_name, "worker": worker}
         if sample_rate > 0:
             self._last_sample_rate = float(sample_rate)
+        return widget
+
+    def open_spectrogram(
+        self,
+        main_window: QtWidgets.QMainWindow,
+        channel_id: int,
+        channel_name: str,
+    ) -> SpectrogramTab:
+        """Open or focus a spectrogram tab for the given channel.
+        
+        Args:
+            main_window: Reference to MainWindow for data access
+            channel_id: Channel ID to show spectrogram for
+            channel_name: Human-readable channel name for title
+            
+        Returns:
+            The SpectrogramTab widget
+        """
+        # Check if tab already exists for this channel
+        existing = self._spectrogram_tabs.get(channel_id)
+        if existing is not None:
+            idx = self._tabs.indexOf(existing)
+            if idx >= 0:
+                # Tab still exists, just focus it
+                self._tabs.setCurrentWidget(existing)
+                return existing
+            else:
+                # Tab was closed, remove from tracking
+                del self._spectrogram_tabs[channel_id]
+        
+        # Create new spectrogram tab
+        title = f"Spectrogram - {channel_name}"
+        widget = SpectrogramTab(
+            main_window=main_window,
+            channel_id=channel_id,
+            channel_name=channel_name,
+            parent=self._tabs,
+        )
+        
+        # Insert after Settings tab if present (index 2), else after Scope (index 1)
+        insert_index = 2 if self._settings_widget is not None else 1
+        if self._scope_widget is None:
+            insert_index = self._tabs.count()
+        
+        self._tabs.insertTab(insert_index, widget, title)
+        self._tabs.setCurrentWidget(widget)
+        
+        # Track the tab
+        self._spectrogram_tabs[channel_id] = widget
+        self._tab_info[widget] = {"channel": channel_name, "type": "spectrogram", "channel_id": channel_id}
+        
         return widget
 
     def update_active_channels(self, channels: Sequence["ChannelInfo"]) -> None:
@@ -221,6 +274,11 @@ class AnalysisDock(QtWidgets.QDockWidget):
                 self._analysis_count.pop(mapped_name, None)
         if isinstance(widget, AnalysisTab):
             widget._release_metrics()
+        # Clean up spectrogram tab tracking
+        if isinstance(widget, SpectrogramTab):
+            channel_id = info.get("channel_id") if isinstance(info, dict) else None
+            if channel_id is not None and channel_id in self._spectrogram_tabs:
+                del self._spectrogram_tabs[channel_id]
         widget.deleteLater()
         if not self._tab_info:
             self.select_scope()

@@ -11,6 +11,7 @@ class ChannelDetailPanel(QtWidgets.QWidget):
 
     configChanged = QtCore.Signal(ChannelConfig)
     analysisRequested = QtCore.Signal()
+    spectrogramRequested = QtCore.Signal()
 
     def __init__(self, channel_id: int, channel_name: str, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -152,7 +153,6 @@ QPushButton:checked {
         col3.addWidget(self.analyze_btn)
 
         self.spectrogram_btn = QtWidgets.QPushButton("Spectrogram")
-        self._apply_toggle_style(self.spectrogram_btn)
         col3.addWidget(self.spectrogram_btn)
 
         col3.addStretch(1)
@@ -170,7 +170,7 @@ QPushButton:checked {
         self.listen_btn.toggled.connect(self._on_widgets_changed)
         self.display_check.toggled.connect(self._on_display_toggled)
         self.analyze_btn.clicked.connect(self._on_analyze_clicked)
-        # Spectrogram button is not connected yet as per requirements
+        self.spectrogram_btn.clicked.connect(self._on_spectrogram_clicked)
 
     def set_config(self, config: ChannelConfig) -> None:
         self._config = replace(config)
@@ -260,6 +260,9 @@ QPushButton:checked {
 
     def _on_analyze_clicked(self) -> None:
         self.analysisRequested.emit()
+
+    def _on_spectrogram_clicked(self) -> None:
+        self.spectrogramRequested.emit()
 
 
 class ChannelControlsWidget(QtWidgets.QGroupBox):

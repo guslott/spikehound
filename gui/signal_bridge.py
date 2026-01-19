@@ -41,6 +41,7 @@ class SignalBridge:
         mw._channel_manager.channelsUpdated.connect(mw._on_channel_manager_channels_updated)
         mw._channel_manager.listenChannelRequested.connect(mw._audio_listen_manager.handle_listen_change)
         mw._channel_manager.analysisRequested.connect(mw._open_analysis_for_channel)
+        mw._channel_manager.spectrogramRequested.connect(mw._open_spectrogram_for_channel)
         mw._channel_manager.filterSettingsChanged.connect(mw._sync_filter_settings)
 
         # Device Control Widget

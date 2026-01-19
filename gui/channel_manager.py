@@ -38,6 +38,7 @@ class ChannelManager(QtCore.QObject):
     channelsUpdated = QtCore.Signal(list, list)  # List[int] channel_ids, List[str] channel_names
     listenChannelRequested = QtCore.Signal(int, bool)  # channel_id, enabled
     analysisRequested = QtCore.Signal(int)  # channel_id
+    spectrogramRequested = QtCore.Signal(int)  # channel_id
     filterSettingsChanged = QtCore.Signal()  # Signal to trigger filter sync
     
     def __init__(
@@ -198,6 +199,7 @@ class ChannelManager(QtCore.QObject):
                 panel = ChannelDetailPanel(cid, name, self._channel_controls.stack)
                 panel.configChanged.connect(lambda cfg, cid=cid: self._on_channel_config_changed(cid, cfg))
                 panel.analysisRequested.connect(lambda cid=cid: self.analysisRequested.emit(cid))
+                panel.spectrogramRequested.connect(lambda cid=cid: self.spectrogramRequested.emit(cid))
                 self._channel_controls.add_panel(cid, panel)
                 self._channel_panels[cid] = panel
             panel.set_config(config)
