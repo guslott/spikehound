@@ -425,7 +425,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._controller is None:
             return
 
-        dispatcher = self._controller.dispatcher_signals()  # Returns dispatcher or None
+        dispatcher = self._controller.dispatcher  # Returns dispatcher or None
         if dispatcher is None:
             return
 

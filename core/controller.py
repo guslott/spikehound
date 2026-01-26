@@ -516,12 +516,9 @@ class PipelineController:
                 return {}
             return self._dispatcher.snapshot()
 
-    def dispatcher_signals(self):
-        """DEPRECATED: Use dispatcher.add_tick_callback() instead.
-        
-        Returns the dispatcher for callback registration. GUI layer should use
-        gui.dispatcher_adapter.connect_dispatcher_signals() to get Qt signals.
-        """
+    @property
+    def dispatcher(self) -> Optional[Dispatcher]:
+        """Return the dispatcher instance (for signal connection)."""
         with self._lock:
             return self._dispatcher
 

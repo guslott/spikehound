@@ -13,10 +13,6 @@ import scipy.io.wavfile as wavfile
 
 import numpy as np
 
-import numpy as np
-
-from PySide6 import QtCore, QtWidgets
-
 from .base_device import (
     BaseDevice,
     DeviceInfo,
@@ -70,12 +66,12 @@ class FileSource(BaseDevice):
 
     @classmethod
     def list_available_devices(cls) -> List[DeviceInfo]:
-        """Return a single virtual device representing file playback."""
+        """Return placeholder device; actual path provided at open() time."""
         return [
             DeviceInfo(
                 id="file",
                 name="File Playback",
-                details={"type": "virtual", "description": "Play back recorded WAV files"},
+                details={"type": "virtual", "description": "Pass file path as device_id to open()"},
             )
         ]
 
@@ -114,18 +110,17 @@ class FileSource(BaseDevice):
 
     def _open_impl(self, device_id: str) -> None:
         """
-        Open a file dialog to select a WAV file, then read it via scipy.io.wavfile.
-        """
-        # Show file dialog
-        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            None,
-            "Select WAV File",
-            "",
-            "WAV Files (*.wav);;All Files (*)",
-        )
+        Open a WAV file specified by device_id (file path).
         
-        if not file_path:
-            raise RuntimeError("No file selected")
+        The GUI layer is responsible for showing a file dialog; this method
+        just opens the file at the given path. Pass the file path as device_id.
+        """
+        file_path = device_id
+        if not file_path or file_path == "file":
+            raise RuntimeError(
+                "file_path must be provided as device_id. "
+                "Use FileSource.open('/path/to/recording.wav')"
+            )
         
         path = Path(file_path)
         if not path.exists():

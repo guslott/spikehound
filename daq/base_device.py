@@ -337,7 +337,7 @@ class BaseDevice(ABC):
         
         Args:
             data: np.ndarray of shape (frames, channels) or (channels, frames).
-                  If (frames, channels) and channels matches config, it is transposed.
+                  Shape is auto-detected by comparing dimensions to expected channel count.
             device_time: Optional hardware timestamp (seconds)
             mono_time: Optional host monotonic time (recommended if available)
         """
@@ -359,33 +359,49 @@ class BaseDevice(ABC):
             # Validate shape (and possibly adapt) within the lock to ensure synchronization 
             # with active_channel_ids and ring_buffer updates from configure().
             if data.ndim != 2:
-                raise ValueError("data must be 2D array shaped (frames, channels).")
-            frames, chans = data.shape
+                raise ValueError("data must be 2D array.")
+            
+            dim0, dim1 = data.shape
             expected_chans = len(self._active_channel_ids)
             
-            if expected_chans != chans:
-                # Allow drivers to deliver superset and slice here as a fallback.
+            # Guard: if no active channels, cannot emit
+            if expected_chans == 0:
+                raise RuntimeError("No active channels configured; cannot emit data.")
+            
+            # Detect orientation: (frames, channels) vs (channels, frames)
+            # We use expected_chans to disambiguate when possible
+            if dim1 == expected_chans and dim0 != expected_chans:
+                # Unambiguously (frames, channels) - row-major frames
+                frames, chans = dim0, dim1
+                channel_major = np.ascontiguousarray(data.T)
+            elif dim0 == expected_chans and dim1 != expected_chans:
+                # Unambiguously (channels, frames) - already channel-major
+                chans, frames = dim0, dim1
+                channel_major = np.ascontiguousarray(data)
+            elif dim0 == expected_chans and dim1 == expected_chans:
+                # Ambiguous square case: assume (frames, channels) for backward compat
+                frames, chans = dim0, dim1
+                channel_major = np.ascontiguousarray(data.T)
+            else:
+                # Neither dimension matches expected channels
+                # Check if this is a superset we can slice from
                 with self._channel_lock:
-                    expected_chans_now = len(self._active_channel_ids)
-                    # Re-check in case channel lock revealed a change (though state_lock should prevent it)
-                    if chans >= expected_chans_now and chans == len(self._available_channels):
-                        # Slice by active channel order
+                    if dim1 >= expected_chans and dim1 == len(self._available_channels):
+                        # (frames, all_channels) - slice by active channel order
                         idx = [self._index_of_channel_id(cid) for cid in self._active_channel_ids]
                         data = data[:, idx]
                         frames, chans = data.shape
-                    elif chans < expected_chans_now:
-                        # If the incoming data has fewer channels than expected,
-                        # we assume the driver is providing a subset and we need to
-                        # map it to the full expected channel set.
-                        # This path is less common and requires more context,
-                        # for now, we raise an error if we can't infer the mapping.
-                        raise ValueError(
-                            f"data has {chans} channels, expected {expected_chans_now}. "
-                            "Cannot automatically map subset of channels without metadata."
-                        )
+                        channel_major = np.ascontiguousarray(data.T)
+                    elif dim0 >= expected_chans and dim0 == len(self._available_channels):
+                        # (all_channels, frames) - slice by active channel order
+                        idx = [self._index_of_channel_id(cid) for cid in self._active_channel_ids]
+                        data = data[idx, :]
+                        chans, frames = data.shape
+                        channel_major = np.ascontiguousarray(data)
                     else:
                         raise ValueError(
-                            f"data has {chans} channels, expected {expected_chans_now}."
+                            f"data shape {(dim0, dim1)} does not match expected {expected_chans} channels. "
+                            "Provide shape (frames, channels) or (channels, frames)."
                         )
 
             if frames == 0:
@@ -398,7 +414,6 @@ class BaseDevice(ABC):
             self._next_seq += 1
 
             # Write channel-major data into the ring buffer
-            channel_major = np.ascontiguousarray(data.T)
             rb = self.ring_buffer
             if rb is None:
                 raise RuntimeError("ring buffer not initialized; call configure() first.")

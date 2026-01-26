@@ -739,7 +739,7 @@ class SimulatedPhysiologySource(BaseDevice):
                 chunk_meta = {"active_channel_ids": active_ids}
                 
                 # Emit the chunk
-                self.emit_array(data_chunk, mono_time=loop_start)
+                self.emit_array(data_chunk, mono_time=time.monotonic())
 
                 # ============================================================
                 # STEP 4: CLEANUP

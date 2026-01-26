@@ -512,17 +512,7 @@ class Dispatcher:
 
         enqueue_with_policy(queue_name, target_queue, item, stats_callback=stats_cb)
 
-    def _enqueue_lossless(self, target_queue: queue.Queue, item: object, queue_name: str) -> None:
-        """DEPRECATED: Use _enqueue_with_policy."""
-        self._enqueue_with_policy(queue_name, target_queue, item)
-    
-    def _enqueue_drop_newest(self, target_queue: queue.Queue, item: object, queue_name: str) -> None:
-        """DEPRECATED: Use _enqueue_with_policy."""
-        self._enqueue_with_policy(queue_name, target_queue, item)
-    
-    def _enqueue_drop_oldest(self, target_queue: queue.Queue, item: object, queue_name: str) -> None:
-        """DEPRECATED: Use _enqueue_with_policy."""
-        self._enqueue_with_policy(queue_name, target_queue, item)
+
 
     def _broadcast_end_of_stream(self) -> None:
         # Idempotent: only broadcast once to avoid duplicate sentinels

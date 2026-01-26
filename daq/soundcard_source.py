@@ -204,6 +204,8 @@ class SoundCardSource(BaseDevice):
         self._residual_buffer: Optional[LocalRingBuffer] = None
         self._device: Optional[miniaudio.CaptureDevice] = None
         self._stop_evt = threading.Event()
+        self._data_available = threading.Event()  # Signal for emitter thread
+        self._emitter_thread: Optional[threading.Thread] = None
 
     # ---------- Required interface --------------------------------------------
 
@@ -300,13 +302,43 @@ class SoundCardSource(BaseDevice):
         cfg = ActualConfig(sample_rate=sample_rate, channels=selected, chunk_size=chunk_size, dtype=self.dtype)
         return cfg
 
+    def _emitter_loop(self) -> None:
+        """Emitter thread: drains local buffer and calls emit_array.
+        
+        This decouples the miniaudio callback from queue operations to prevent
+        blocking in the audio callback path, which could cause XRUNs or glitches.
+        """
+        while not self._stop_evt.is_set():
+            # Wait for signal that data is available
+            if not self._data_available.wait(timeout=0.01):
+                continue
+            
+            with self._buf_lock:
+                if self._residual_buffer is None or self.config is None:
+                    self._data_available.clear()
+                    continue
+                    
+                # Drain buffer in chunks
+                while self._residual_buffer.filled >= self.config.chunk_size:
+                    data_chunk = self._residual_buffer.read(self.config.chunk_size)
+                    
+                    idxs = [c.id for c in self.get_active_channels()]
+                    if not idxs:
+                        continue
+                    data_chunk = data_chunk[:, idxs]
+                    # Emit via base to stamp counters
+                    self.emit_array(data_chunk, mono_time=_time.monotonic())
+                
+                self._data_available.clear()
+
     def _start_impl(self) -> None:
         if self._device is not None:
             return
 
         self._stop_evt.clear()
+        self._data_available.clear()
 
-        # Miniaudio capture callback generator
+        # Miniaudio capture callback generator - MUST NOT BLOCK
         def capture_generator():
             while True:
                 # Yield nothing to receive data
@@ -322,21 +354,21 @@ class SoundCardSource(BaseDevice):
                 if frames > 0:
                     data = data.reshape((frames, self._n_in))
                     
+                    # Non-blocking write to local ring buffer
                     with self._buf_lock:
-                        if self._residual_buffer is None:
-                            continue
-                        
-                        self._residual_buffer.write(data)
-                        
-                        while self._residual_buffer.filled >= self.config.chunk_size:
-                            data_chunk = self._residual_buffer.read(self.config.chunk_size)
-                            
-                            idxs = [c.id for c in self.get_active_channels()]
-                            if not idxs:
-                                continue
-                            data_chunk = data_chunk[:, idxs]
-                            # Emit via base to stamp counters
-                            self.emit_array(data_chunk, mono_time=_time.monotonic())
+                        if self._residual_buffer is not None:
+                            self._residual_buffer.write(data)
+                    
+                    # Signal emitter thread (non-blocking)
+                    self._data_available.set()
+
+        # Start emitter thread FIRST
+        self._emitter_thread = threading.Thread(
+            target=self._emitter_loop,
+            name="SoundCard-Emitter",
+            daemon=True,
+        )
+        self._emitter_thread.start()
 
         try:
             # We request FLOAT32 to match our pipeline
@@ -354,14 +386,25 @@ class SoundCardSource(BaseDevice):
             
         except Exception as e:
             logger.error("Error starting miniaudio capture", exc_info=e)
+            self._stop_evt.set()  # Signal emitter thread to stop
+            if self._emitter_thread is not None:
+                self._emitter_thread.join(timeout=1.0)
+                self._emitter_thread = None
             self._device = None
 
     def _stop_impl(self) -> None:
         self._stop_evt.set()
+        self._data_available.set()  # Wake up emitter thread so it can exit
+        
         if self._device and self._device.running:
             self._device.stop()
             self._device.close()
         self._device = None
+        
+        # Wait for emitter thread to finish
+        if self._emitter_thread is not None:
+            self._emitter_thread.join(timeout=1.0)
+            self._emitter_thread = None
         
         with self._buf_lock:
             if self._residual_buffer is not None:
@@ -369,3 +412,4 @@ class SoundCardSource(BaseDevice):
 
     # ---------- Internals ------------------------------------------------------
     # No longer needed as we use index-based resolution
+
