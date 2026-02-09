@@ -208,6 +208,8 @@ class SimulatedPhysiologySource(BaseDevice):
 
     # Fixed seed for repeatable simulations - change this to get different but still repeatable patterns
     RANDOM_SEED = 42
+    SUPPORTED_SAMPLE_RATES: tuple[int, int] = (10_000, 20_000)
+    DEFAULT_SAMPLE_RATE: int = 10_000
     
     def __init__(self, queue_maxsize: int = 4) -> None:
         super().__init__(queue_maxsize=queue_maxsize)
@@ -239,7 +241,11 @@ class SimulatedPhysiologySource(BaseDevice):
         return [DeviceInfo(id="sim0", name="Simulated Physiology (virtual)")]
 
     def get_capabilities(self, device_id: str) -> Capabilities:
-        return Capabilities(max_channels_in=3, sample_rates=[20_000], dtype="float32")
+        return Capabilities(
+            max_channels_in=3,
+            sample_rates=list(self.SUPPORTED_SAMPLE_RATES),
+            dtype="float32",
+        )
 
     def list_available_channels(self, device_id: str):
         return [
@@ -476,9 +482,8 @@ class SimulatedPhysiologySource(BaseDevice):
 
     def _configure_impl(self, sample_rate: int, channels, chunk_size: int, **options) -> ActualConfig:
         # Validate sample rate
-        supported = [10000, 20000]
-        if int(sample_rate) not in supported:
-            sample_rate = 20000
+        if int(sample_rate) not in self.SUPPORTED_SAMPLE_RATES:
+            sample_rate = self.DEFAULT_SAMPLE_RATE
         # Generate random units
         # Multiple units with variable amplitudes for realistic simulation
         n_units = int(options.get('num_units', 6))
@@ -739,7 +744,23 @@ class SimulatedPhysiologySource(BaseDevice):
                 chunk_meta = {"active_channel_ids": active_ids}
                 
                 # Emit the chunk
-                self.emit_array(data_chunk, mono_time=time.monotonic())
+                try:
+                    self.emit_array(data_chunk, mono_time=time.monotonic())
+                except RuntimeError as exc:
+                    msg = str(exc)
+                    if "No active channels configured" in msg:
+                        # Channel selection changed between generation and emit; retry next loop.
+                        next_deadline = time.perf_counter() + chunk_duration
+                        time.sleep(0.01)
+                        continue
+                    if "lossless constraint violated" in msg:
+                        # Backpressure can temporarily happen when no consumer is active.
+                        # Avoid crashing the worker thread; wait and retry.
+                        logger.warning("Simulator backpressure detected; retrying emit: %s", exc)
+                        next_deadline = time.perf_counter() + chunk_duration
+                        time.sleep(0.05)
+                        continue
+                    raise
 
                 # ============================================================
                 # STEP 4: CLEANUP

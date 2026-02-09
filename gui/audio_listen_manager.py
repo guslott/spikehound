@@ -152,9 +152,8 @@ class AudioListenManager(QtCore.QObject):
         if self._controller:
             self._controller.set_audio_monitoring(channel_id)
             # Update active channels so AudioManager knows about them
-            if self._controller._audio_manager is not None:
-                active_ids = self._get_active_channel_ids() if self._get_active_channel_ids else []
-                self._controller._audio_manager.update_active_channels(active_ids)
+            active_ids = self._get_active_channel_ids() if self._get_active_channel_ids else []
+            self._controller.update_audio_active_channels(active_ids)
         
         self.listenChannelChanged.emit(channel_id)
     

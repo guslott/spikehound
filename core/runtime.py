@@ -72,7 +72,7 @@ class SpikeHoundRuntime:
         # Initialize AudioManager and wire it to pipeline
         from .audio_manager import AudioManager
         audio_manager = AudioManager(runtime=self)
-        pipeline._audio_manager = audio_manager
+        pipeline.attach_audio_manager(audio_manager)
         audio_manager.start()  # Start audio routing thread
 
     def set_pipeline(self, controller: Optional["PipelineController"]) -> None:
@@ -223,7 +223,8 @@ class SpikeHoundRuntime:
             if "configure_kwargs" not in kwargs:
                 kwargs["configure_kwargs"] = {}
             if "sample_rate" not in kwargs["configure_kwargs"]:
-                kwargs["configure_kwargs"]["sample_rate"] = int(self.sample_rate or 20000)
+                default_sr = int(getattr(source_cls, "DEFAULT_SAMPLE_RATE", 20_000))
+                kwargs["configure_kwargs"]["sample_rate"] = int(self.sample_rate or default_sr)
             
             self._pipeline.switch_source(source_cls, **kwargs)
             # Re-sync attributes
@@ -394,6 +395,12 @@ class SpikeHoundRuntime:
         if controller is not None:
             controller.set_audio_monitoring(channel_id)
 
+    def update_audio_active_channels(self, channel_ids: Sequence[int]) -> None:
+        """Update active channel ordering used by audio monitoring."""
+        controller = self._pipeline
+        if controller is not None:
+            controller.update_audio_active_channels(channel_ids)
+
     def set_audio_gain(self, gain: float) -> None:
         """Set output volume gain (0.0 - 1.0)."""
         controller = self._pipeline
@@ -460,4 +467,3 @@ class SpikeHoundRuntime:
             target_channel_id=target_channel_id,
             window_ms=window_ms,
         )
-

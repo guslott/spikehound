@@ -4,7 +4,7 @@ description: Add a new tab to the main application window
 
 # Add a New GUI Tab
 
-Follow these steps to add a new tab to the application's tab widget.
+Follow these steps to add a new plugin tab to the workspace dock.
 
 ## Prerequisites
 - Review `gui/gui_readme.md` for widget patterns
@@ -14,7 +14,7 @@ Follow these steps to add a new tab to the application's tab widget.
 
 1. **Create the tab widget file**
    ```
-   gui/my_new_tab.py
+   gui/tabs/my_new_tab.py
    ```
 
 2. **Implement the tab class**
@@ -22,18 +22,20 @@ Follow these steps to add a new tab to the application's tab widget.
    """MyNewTab - Description of what the tab does."""
    from __future__ import annotations
    
-   from typing import Optional
    from PySide6 import QtCore, QtWidgets
+   from gui.tab_plugin_manager import BaseTab
    
    
-   class MyNewTab(QtWidgets.QWidget):
+   class MyNewTab(BaseTab):
        """Tab for [feature description]."""
        
+       TAB_TITLE = "My Tab"
+
        # Define signals for external communication
        someAction = QtCore.Signal(object)
        
-       def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
-           super().__init__(parent)
+       def __init__(self, runtime, parent: QtWidgets.QWidget | None = None) -> None:
+           super().__init__(runtime, parent)
            self._setup_ui()
            self._connect_signals()
        
@@ -63,34 +65,10 @@ Follow these steps to add a new tab to the application's tab widget.
            pass
    ```
 
-3. **Register in MainWindow**
+3. **Load the plugin tab**
    
-   In `gui/main_window.py`:
-   
-   a. Add import at top:
-   ```python
-   from .my_new_tab import MyNewTab
-   ```
-   
-   b. Create and add tab in `_init_ui()`:
-   ```python
-   # Find where other tabs are added (look for addTab calls)
-   self.my_tab = MyNewTab()
-   self.tab_widget.addTab(self.my_tab, "My Tab")
-   ```
-   
-   c. Connect signals if needed:
-   ```python
-   self.my_tab.someAction.connect(self._on_my_tab_action)
-   ```
-   
-   d. Add handler method:
-   ```python
-   def _on_my_tab_action(self, data: object) -> None:
-       """Handle action from my tab."""
-       # Process the action
-       pass
-   ```
+   Tabs in `gui/tabs/` that subclass `BaseTab` are auto-discovered by `TabPluginManager`.
+   Restart the app and your tab will be added to `AnalysisDock` using `TAB_TITLE`.
 
 4. **Test the tab**
    - Run the application

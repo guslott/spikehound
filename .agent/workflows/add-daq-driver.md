@@ -41,12 +41,10 @@ Follow these steps to add support for a new data acquisition device.
    self.emit_array(block, device_time=None)  # stamps seq/start_sample/mono_time
    ```
 
-5. **Register the driver in `daq/registry.py`**
-   ```python
-   from .my_device_source import MyDeviceSource
+5. **Place the driver in the `daq/` package (auto-discovery)**
    
-   DRIVER_CLASSES.append(MyDeviceSource)
-   ```
+   `daq/registry.py` auto-discovers concrete `BaseDevice` subclasses in `daq/*.py`.
+   No manual registration step is required.
 
 6. **Update `SpikeHound.spec` for binary builds**
    

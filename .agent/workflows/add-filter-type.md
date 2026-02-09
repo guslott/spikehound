@@ -30,35 +30,22 @@ Follow these steps to add a new filter type to the signal conditioning pipeline.
 
 2. **Add filter computation in `SignalConditioner`**
    
-   In `core/conditioning.py`, find `_apply_channel_filters()`:
+   In `core/conditioning.py`, update the filter-chain build in `_ensure_filters()` and apply path in `process()`:
    ```python
-   def _apply_channel_filters(self, data: np.ndarray, settings: ChannelFilterSettings) -> np.ndarray:
-       # Existing filters...
-       
-       # Add your filter:
-       if settings.myfilter_enabled:
-           data = self._apply_myfilter(data, settings.myfilter_param1, settings.myfilter_param2)
-       
-       return data
-   
-   def _apply_myfilter(self, data: np.ndarray, param1: float, param2: float) -> np.ndarray:
-       """Apply my custom filter.
-       
-       Args:
-           data: Input signal array (samples,)
-           param1: First parameter
-           param2: Second parameter
-           
-       Returns:
-           Filtered signal
-       """
-       # Design filter (cache if possible)
-       # sos = scipy.signal.butter(order, freq, btype, fs=self._sample_rate, output='sos')
-       
-       # Apply filter
-       # return scipy.signal.sosfiltfilt(sos, data)
-       
-       return data  # Replace with actual implementation
+   def _ensure_filters(self, chunk: Chunk) -> bool:
+       ...
+       if spec.myfilter_enabled:
+           chain.append(_MyFilter(sample_rate, spec.myfilter_param1, spec.myfilter_param2, 1))
+       ...
+
+   def process(self, chunk: Chunk) -> np.ndarray:
+       ...
+       for idx, chain in enumerate(self._channel_filters):
+           row = filtered[idx : idx + 1]
+           for filt in chain:
+               row = filt.apply(row)
+           filtered[idx, :] = row[0]
+       return filtered
    ```
 
 3. **Add UI controls in `ChannelDetailPanel`**

@@ -38,7 +38,7 @@ class PipelineController:
         self,
         *,
         filter_settings: Optional[FilterSettings] = None,
-        visualization_queue_size: int = 1024,
+        visualization_queue_size: int = 8,
         audio_queue_size: int = 2,
         logging_queue_size: int = 512,
         dispatcher_poll_timeout: float = 0.05,
@@ -119,6 +119,10 @@ class PipelineController:
         return self._app_settings_store.update(**kwargs)
 
     # Audio control API (delegates to AudioManager)
+
+    def attach_audio_manager(self, audio_manager: Optional[AudioManager]) -> None:
+        """Attach or detach the runtime-managed AudioManager."""
+        self._audio_manager = audio_manager
     
     def set_audio_monitoring(self, channel_id: Optional[int]) -> None:
         """Enable or disable audio monitoring for a channel.
@@ -146,6 +150,11 @@ class PipelineController:
         """
         if self._audio_manager is not None:
             self._audio_manager.set_gain(gain)
+
+    def update_audio_active_channels(self, channel_ids: Sequence[int]) -> None:
+        """Update active channel ordering used by audio monitoring."""
+        if self._audio_manager is not None:
+            self._audio_manager.update_active_channels([int(cid) for cid in channel_ids])
 
     def set_list_all_audio_devices(self, enabled: bool) -> None:
         self._list_all_audio_devices = bool(enabled)
@@ -178,9 +187,12 @@ class PipelineController:
     ) -> ActualConfig:
         """Swap in a new source; keeps queues and filter settings intact."""
 
-        configure_kwargs = dict(configure_kwargs or {})
+        # Preserve prior source configuration when callers only change device_id.
+        base_config = self._configure_kwargs if configure_kwargs is None else configure_kwargs
+        configure_kwargs = dict(base_config or {})
         if "sample_rate" not in configure_kwargs:
-            configure_kwargs["sample_rate"] = self.sample_rate or 20000
+            default_sr = int(getattr(source_cls, "DEFAULT_SAMPLE_RATE", 20_000))
+            configure_kwargs["sample_rate"] = int(self.sample_rate or default_sr)
 
         with self._lock:
             self.stop(join=True)

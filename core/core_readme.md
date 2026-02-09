@@ -12,7 +12,7 @@ The pipeline orchestration layer for SpikeHound. Manages data flow from DAQ sour
 │              (Headless Orchestrator - runtime.py)               │
 │                                                                 │
 │  Responsibilities:                                              │
-│  • Device attachment (open_device)                              │
+│  • Device attachment (attach_source)                            │
 │  • Acquisition lifecycle (start/stop)                           │
 │  • Analysis worker management                                   │
 │  • Health metrics & settings persistence                        │
@@ -62,7 +62,7 @@ from core.runtime import SpikeHoundRuntime
 runtime = SpikeHoundRuntime()
 
 # Attach device and start
-runtime.open_device(driver, sample_rate=20000, channels=channels)
+runtime.attach_source(driver, sample_rate=20000, channels=channels)
 runtime.start_acquisition()
 
 # Get health metrics
@@ -75,7 +75,7 @@ runtime.stop_acquisition()
 **Public API:**
 | Method | Purpose |
 |--------|---------|
-| `open_device(driver, sample_rate, channels)` | Attach DAQ driver |
+| `attach_source(driver, sample_rate, channels)` | Attach DAQ driver |
 | `configure_acquisition(...)` | Update filters, triggers, channels |
 | `start_acquisition()` / `stop_acquisition()` | Control streaming |
 | `health_snapshot()` | Get dispatcher stats, queue depths |
@@ -187,7 +187,7 @@ controller.update_filter_settings(settings)
 ### Adding a New Filter Type
 
 1. Add parameters to `ChannelFilterSettings` in `conditioning.py`
-2. Implement filter in `SignalConditioner._apply_channel_filters()`
+2. Implement filter construction/application in `SignalConditioner._ensure_filters()` and `SignalConditioner.process()`
 3. See `/.agent/workflows/add-filter-type.md` for complete steps
 
 ### Adding a New Consumer

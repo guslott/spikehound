@@ -32,7 +32,7 @@ SpikeHound **democratizes neurophysiology** by removing financial and technical 
 |---------|---------------------|
 | Expensive hardware | Works with low-cost hardware or free sound cards |
 | MATLAB licenses ($$$) | No licenses required—100% free |
-| Windows-only software | Runs on Windows, macOS, and Linux |
+| Windows-only software | Runs on Windows/macOS via installers; Linux is supported from source |
 | Complex setup | Single Python script, simple installation |
 | Proprietary formats | Standard open formats (WAV, CSV, NumPy) |
 | Black-box software | Fully inspection-ready Python codebase |
@@ -86,15 +86,15 @@ Pre-built installers are available for **Windows** and **macOS**—no programmin
 
 ---
 
-### Option 2: Run from Source (Advanced)
+### Option 2: Run from Source (Advanced, required on Linux)
 
 For developers or those who want to modify the code:
 
 #### Requirements
 - **Python 3.12+**
-- Any supported operating system (Windows, macOS, Linux)
+- Source checkout and terminal access (Windows, macOS, Linux)
 
-#### Quick Start
+#### Quick Start (Linux source-level support)
 ```bash
 # Clone the repository
 git clone https://github.com/guslott/spikehound.git
@@ -247,7 +247,7 @@ spikehound/
 │   ├── add-gui-tab.md
 │   └── add-filter-type.md
 │
-└── test/                   # Unit tests (28 tests)
+└── test/                   # Automated tests (200+)
 ```
 
 ---
@@ -259,6 +259,10 @@ spikehound/
 2. Clone SpikeHound and install dependencies
 3. Connect acquisition hardware (or use simulation mode)
 4. Launch with `python main.py`
+
+### Classroom Safety Note
+- SpikeHound is for education and research demonstrations, not medical diagnosis or treatment.
+- Follow your institution's lab safety and consent policies for any human-participant activities.
 
 ### Lab Exercise Ideas
 - **Action Potential Recording**: Record from earthworm giant fibers

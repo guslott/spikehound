@@ -911,6 +911,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _publish_active_channels(self) -> None:
         """Publish active channel list to all listeners."""
         # Delegate channel collection to ChannelManager
+        previous_ids = list(self._channel_ids_current)
         ids, names = self._channel_manager.publish_active_channels()
         
         # Sync local state from ChannelManager
@@ -921,7 +922,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_channel_buttons()
         
         # Check if channels changed for trigger reset
-        if list(ids) != self._channel_ids_current:
+        if list(ids) != previous_ids:
             self._reset_trigger_state()
         
         # Sync panels via ChannelManager
@@ -971,9 +972,8 @@ class MainWindow(QtWidgets.QMainWindow):
             except AttributeError:
                 pass
         
-        # Ensure AudioManager knows about the current active channels
-        if self._controller and self._controller._audio_manager:
-            self._controller._audio_manager.update_active_channels(ids)
+        # Ensure audio monitoring logic has up-to-date channel ordering.
+        self.runtime.update_audio_active_channels(ids)
 
 
     def _ensure_channel_config(self, channel_id: int, channel_name: str) -> ChannelConfig:
@@ -1463,7 +1463,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         cid = self._plot_manager.get_channel_at_y(y)
         if cid is not None:
-            self._select_channel_by_id(cid)
+            self._select_active_channel_by_id(cid)
             self._on_scope_dragged(y) # Start drag implicitly
 
     def _on_scope_dragged(self, y: float) -> None:

@@ -66,16 +66,14 @@ class MyControlWidget(QtWidgets.QWidget):
 
 ```
 MainWindow (QMainWindow)
-├── Scope (ScopeWidget)                    # Oscilloscope display
-├── Right Panel (QWidget)
-│   ├── DeviceControlWidget                # Device & channel selection
-│   ├── TriggerControlWidget               # Trigger configuration
-│   ├── ChannelControlsWidget              # Per-channel settings
-│   └── RecordingControlWidget             # WAV recording
-├── Tabs (QTabWidget)  
-│   ├── SettingsTab                        # App settings & health
-│   └── AnalysisTab                        # Spike analysis view
-└── AnalysisDock (QDockWidget)             # Optional docked analysis
+├── Central placeholder widget             # Layout anchor
+├── Scope + control panels                 # Oscilloscope + controls
+└── AnalysisDock (QDockWidget)
+    └── Internal QTabWidget
+        ├── Scope tab                      # Primary scope view
+        ├── Settings tab                   # App settings & health
+        ├── Analysis tabs                  # Opened per channel
+        └── Plugin tabs                    # Loaded by TabPluginManager
 ```
 
 ### Managers (Business Logic)
@@ -349,13 +347,15 @@ class MyNewTab(QtWidgets.QWidget):
 ### Step 2: Register in MainWindow
 
 ```python
-# In gui/main_window.py _init_ui()
+# Save your file under gui/tabs/, subclassing BaseTab:
+from gui.tab_plugin_manager import BaseTab
 
-from .my_new_tab import MyNewTab
+class MyNewTab(BaseTab):
+    TAB_TITLE = "My Tab"
+    ...
 
-# Create and add to tab widget
-self.my_tab = MyNewTab()
-self.tab_widget.addTab(self.my_tab, "My Tab")
+# TabPluginManager auto-discovers gui/tabs/*.py and
+# AnalysisDock adds discovered tabs at startup.
 ```
 
 ---
