@@ -132,7 +132,7 @@ class TriggerConfig:
     hysteresis: float
     pretrigger_frac: float
     window_sec: float
-    mode: str  # "stream", "single", "continuous"
+    mode: str  # "stream", "single", "repeated"
 ```
 
 ---

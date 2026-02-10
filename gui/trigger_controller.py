@@ -100,8 +100,8 @@ class TriggerController(QtCore.QObject):
     
     @property
     def is_triggered_mode(self) -> bool:
-        """True if in single or continuous trigger mode (not stream)."""
-        return self._mode in ("single", "continuous")
+        """True if in single or repeated trigger mode (not stream)."""
+        return self._mode in ("single", "repeated")
 
     @property
     def display_data(self) -> Optional[np.ndarray]:
@@ -132,26 +132,31 @@ class TriggerController(QtCore.QObject):
         pre_seconds: float = 0.01,
         window_sec: float = 1.0,
         reset_state: bool = True,
+        preserve_display_on_reset: bool = False,
     ) -> None:
         """
         Update trigger configuration.
         
         Args:
-            mode: "stream", "single", or "continuous"
+            mode: "stream", "single", or "repeated"
             channel_id: ID of the channel to trigger on
             threshold: Trigger threshold in volts
             pre_seconds: Pretrigger window in seconds
             window_sec: Total capture window in seconds
             reset_state: If True, reset capture state (history, display)
+            preserve_display_on_reset: If True and reset_state=True, keep the
+                currently displayed capture while resetting trigger internals.
         """
-        self._mode = mode
+        # Backward compatibility: accept legacy "continuous" and canonicalize.
+        canonical_mode = "repeated" if mode == "continuous" else mode
+        self._mode = canonical_mode
         self._channel_id = channel_id
         self._threshold = threshold
         self._pre_seconds = pre_seconds
         self._window_sec = window_sec
         
         if reset_state:
-            self.reset_state()
+            self.reset_state(clear_display=not preserve_display_on_reset)
         
         config = TriggerConfig(
             channel_index=channel_id,
@@ -159,7 +164,7 @@ class TriggerController(QtCore.QObject):
             hysteresis=0.0,
             pretrigger_frac=pre_seconds,
             window_sec=window_sec,
-            mode=mode,
+            mode=canonical_mode,
         )
         self.configChanged.emit(config)
 
@@ -184,8 +189,13 @@ class TriggerController(QtCore.QObject):
     # State management
     # -------------------------------------------------------------------------
 
-    def reset_state(self) -> None:
-        """Reset all capture state (history, display, etc.)."""
+    def reset_state(self, *, clear_display: bool = True) -> None:
+        """Reset trigger internals.
+
+        Args:
+            clear_display: If False, preserve the currently displayed capture
+                so UI interactions can continue to reference it.
+        """
         self._history.clear()
         self._history_length = 0
         self._history_total = 0
@@ -194,10 +204,11 @@ class TriggerController(QtCore.QObject):
         self._prev_value = 0.0
         self._capture_start_abs = None
         self._capture_end_abs = None
-        self._display = None
-        self._display_times = None
-        self._hold_until = 0.0
-        self._display_pre_samples = 0
+        if clear_display:
+            self._display = None
+            self._display_times = None
+            self._hold_until = 0.0
+            self._display_pre_samples = 0
         if self._mode != "single":
             self._single_armed = False
 
@@ -300,7 +311,7 @@ class TriggerController(QtCore.QObject):
         if self._capture_start_abs is not None:
             return False
         # Mode-specific arming
-        if self._mode == "continuous":
+        if self._mode == "repeated":
             return True
         if self._mode == "single":
             return self._single_armed

@@ -313,7 +313,7 @@ class TestTriggerConfigValidation:
                 hysteresis=hysteresis,
                 pretrigger_frac=pretrigger_frac,
                 window_sec=window_sec,
-                mode="continuous",
+                mode="repeated",
             )
             # If construction succeeded, values should be stored
             assert config.channel_index == channel_index

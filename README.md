@@ -45,7 +45,7 @@ SpikeHound **democratizes neurophysiology** by removing financial and technical 
 - **Multi-channel visualization** with independent color, scaling, and offset
 - **Live signal conditioning**: Notch (50/60Hz), high-pass, and low-pass filters
 - **Audio monitoring**: "Hear the neuron"—route any channel to speakers
-- **Triggered capture**: Single-shot or continuous threshold triggering
+- **Triggered capture**: Single-shot or repeated threshold triggering
 
 ### Spike Detection & Analysis
 - **Threshold detection** with configurable polarity and refractory period

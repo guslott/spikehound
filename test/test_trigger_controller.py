@@ -9,7 +9,7 @@ class TestTriggerController:
         ctrl = TriggerController()
         # Setup basic config
         ctrl.configure(
-            mode="continuous",
+            mode="repeated",
             threshold=0.5,
             pre_seconds=0.002,     # 2ms pre
             window_sec=0.010,      # 10ms total
@@ -123,3 +123,56 @@ class TestTriggerController:
         peak_idx_in_display = np.argmax(display)
         assert peak_idx_in_display == 20
         assert np.isclose(display[20], 1.0)
+
+    def _make_capture(self, controller):
+        """Helper: create a deterministic captured display."""
+        y = np.zeros(200, dtype=np.float32)
+        y[20:] = 1.0
+        controller.push_samples(y, 10000.0, 0.01)
+        trigger_idx = controller.detect_crossing(y)
+        assert trigger_idx == 20
+        controller.start_capture(0, trigger_idx)
+        assert controller.finalize_capture()
+        assert controller.display_data is not None
+
+    def test_configure_preserve_display_on_reset(self, controller):
+        """UI config changes should preserve the visible capture for visual tuning."""
+        self._make_capture(controller)
+        before = np.array(controller.display_data, copy=True)
+
+        controller.configure(
+            mode="repeated",
+            threshold=0.6,
+            pre_seconds=0.003,
+            window_sec=0.02,
+            channel_id=0,
+            reset_state=True,
+            preserve_display_on_reset=True,
+        )
+
+        after = controller.display_data
+        assert after is not None
+        np.testing.assert_allclose(after, before)
+
+    def test_reset_state_can_keep_display(self, controller):
+        """Resetting trigger internals should optionally keep displayed waveform."""
+        self._make_capture(controller)
+        before = np.array(controller.display_data, copy=True)
+
+        controller.reset_state(clear_display=False)
+
+        after = controller.display_data
+        assert after is not None
+        np.testing.assert_allclose(after, before)
+
+    def test_legacy_continuous_mode_is_canonicalized(self):
+        """Legacy mode name should map to canonical repeated mode."""
+        ctrl = TriggerController()
+        ctrl.configure(
+            mode="continuous",
+            threshold=0.5,
+            pre_seconds=0.01,
+            window_sec=0.2,
+            channel_id=0,
+        )
+        assert ctrl.mode == "repeated"

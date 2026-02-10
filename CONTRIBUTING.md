@@ -50,29 +50,25 @@ Point your AI assistant to these workflow files:
 
 ## 🧪 Creating Custom Experiment Tabs
 
-The tab system is the primary extension point for custom experiments. Each tab can receive real-time data from the pipeline and provide specialized visualization, analysis, or control interfaces.
+The plugin tab system is the primary extension point for custom experiments. Tabs are loaded from `gui/tabs/` and can receive real-time payloads from the dispatcher while also pushing config changes back through the runtime.
 
 ### Architecture: How Tabs Connect to Data
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│                     MainWindow                              │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │                    TabWidget                          │  │
-│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌────────────┐ │  │
-│  │  │  Scope  │ │Analysis │ │Settings │ │ YOUR TAB   │ │  │
-│  │  └────┬────┘ └────┬────┘ └─────────┘ └─────┬──────┘ │  │
-│  └───────│───────────│────────────────────────│────────┘  │
-│          │           │                        │            │
-│          ▼           ▼                        ▼            │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │         PipelineController (via MainWindow)          │  │
-│  │  ┌────────────────┐  ┌────────────────┐             │  │
-│  │  │ Visualization  │  │    Analysis    │             │  │
-│  │  │    Queue       │  │     Queue      │             │  │
-│  │  └────────────────┘  └────────────────┘             │  │
-│  └──────────────────────────────────────────────────────┘  │
-└────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│                            MainWindow                              │
+│  ┌──────────────────────────┐   ┌───────────────────────────────┐ │
+│  │     TabPluginManager     │──▶│         AnalysisDock          │ │
+│  │  (discovers gui/tabs/*)  │   │ QTabWidget: Scope/Settings/...│ │
+│  └──────────────────────────┘   │ + YOUR PLUGIN TAB             │ │
+│                                 └──────────────┬────────────────┘ │
+│                                                │                  │
+│                                                ▼                  │
+│                              SpikeHoundRuntime / PipelineController│
+│                                                │                  │
+│                                                ▼                  │
+│                         Dispatcher tick payloads (`samples`, etc.) │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Step-by-Step: Create an Experiment Tab
@@ -80,183 +76,125 @@ The tab system is the primary extension point for custom experiments. Each tab c
 #### 1. Create Your Tab File
 
 ```python
-# gui/my_experiment_tab.py
+# gui/tabs/my_experiment_tab.py
 """Custom experiment control tab."""
 from __future__ import annotations
 
 from typing import Optional
-from PySide6 import QtCore, QtWidgets, QtGui
+from PySide6 import QtCore, QtWidgets
 import numpy as np
 import pyqtgraph as pg
 
+from gui.dispatcher_adapter import connect_dispatcher_signals
+from gui.tab_plugin_manager import BaseTab
+from shared.models import TriggerConfig
 
-class MyExperimentTab(QtWidgets.QWidget):
+class MyExperimentTab(BaseTab):
     """Tab for [your experiment description].
     
-    This tab receives real-time data from the pipeline and provides
+    This tab receives real-time data from dispatcher tick payloads and provides
     custom visualization and control for your specific experiment.
-    
-    Signals:
-        triggerRequested: Emitted when user wants to trigger an event
-        parameterChanged: Emitted when experiment parameters change
     """
-    
-    # Qt signals for communicating with MainWindow
-    triggerRequested = QtCore.Signal()
-    parameterChanged = QtCore.Signal(dict)  # {param_name: value}
-    
-    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
-        super().__init__(parent)
+
+    TAB_TITLE = "My Experiment"
+
+    def __init__(self, runtime, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(runtime, parent)
+        self._dispatcher_signals = None
+        self._dispatcher_unsubscribe = None
         self._data_buffer: list[np.ndarray] = []
-        self._sample_rate: float = 20000.0
+        self._sample_rate: float = 10_000.0
         self._setup_ui()
-        self._connect_signals()
-        self._setup_timers()
-    
-    def _setup_ui(self) -> None:
-        """Build the tab layout."""
+        self._bind_dispatcher_if_available()
+
+    def _setup_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
-        
-        # --- Control Panel ---
-        controls = QtWidgets.QHBoxLayout()
-        
-        self.start_btn = QtWidgets.QPushButton("Start Experiment")
-        self.start_btn.setCheckable(True)
-        controls.addWidget(self.start_btn)
-        
+
         self.param_spin = QtWidgets.QDoubleSpinBox()
-        self.param_spin.setRange(0.0, 100.0)
-        self.param_spin.setValue(50.0)
+        self.param_spin.setRange(-10.0, 10.0)
+        self.param_spin.setValue(0.0)
         self.param_spin.setPrefix("Threshold: ")
-        controls.addWidget(self.param_spin)
-        
-        controls.addStretch()
-        layout.addLayout(controls)
-        
-        # --- Visualization Area ---
+        self.param_spin.valueChanged.connect(self._on_threshold_changed)
+        layout.addWidget(self.param_spin)
+
         self.plot_widget = pg.PlotWidget()
-        self.plot_widget.setLabel('left', 'Amplitude', units='V')
-        self.plot_widget.setLabel('bottom', 'Time', units='s')
-        self.curve = self.plot_widget.plot(pen='y')
+        self.curve = self.plot_widget.plot(pen="y")
         layout.addWidget(self.plot_widget)
-        
-        # --- Results Panel ---
-        results = QtWidgets.QGroupBox("Results")
-        results_layout = QtWidgets.QFormLayout(results)
-        self.count_label = QtWidgets.QLabel("0")
-        self.rate_label = QtWidgets.QLabel("0.0 Hz")
-        results_layout.addRow("Events:", self.count_label)
-        results_layout.addRow("Rate:", self.rate_label)
-        layout.addWidget(results)
-    
-    def _connect_signals(self) -> None:
-        """Wire internal signals to handlers."""
-        self.start_btn.toggled.connect(self._on_start_toggled)
-        self.param_spin.valueChanged.connect(self._on_param_changed)
-    
-    def _setup_timers(self) -> None:
-        """Set up periodic update timers."""
-        self._update_timer = QtCore.QTimer(self)
-        self._update_timer.timeout.connect(self._update_display)
-        self._update_timer.setInterval(50)  # 20 Hz update
-    
-    # --- Public API (called by MainWindow) ---
-    
-    def set_sample_rate(self, rate: float) -> None:
-        """Update the sample rate for time calculations."""
-        self._sample_rate = rate
-    
-    def handle_chunk(self, chunk) -> None:
-        """Process incoming data chunk from pipeline.
-        
-        Called by MainWindow when new data arrives.
-        The chunk contains:
-          - chunk.samples: numpy array of shape (channels, samples)
-          - chunk.dt: sample interval in seconds
-          - chunk.channel_names: tuple of channel names
-        """
-        # Buffer recent data for display
-        self._data_buffer.append(chunk.samples[0])  # First channel
-        # Keep last N seconds
+
+    def _bind_dispatcher_if_available(self) -> None:
+        dispatcher = self.runtime.dispatcher
+        if dispatcher is None:
+            return
+        self._dispatcher_signals, self._dispatcher_unsubscribe = connect_dispatcher_signals(dispatcher)
+        self._dispatcher_signals.tick.connect(self._on_tick)
+
+    @QtCore.Slot(dict)
+    def _on_tick(self, payload: dict) -> None:
+        samples = payload.get("samples")
+        status = payload.get("status", {})
+        if status.get("sample_rate", 0.0) > 0:
+            self._sample_rate = float(status["sample_rate"])
+        if samples is None or samples.size == 0:
+            return
+
+        self._data_buffer.append(samples[0].astype(np.float32))
         max_samples = int(2.0 * self._sample_rate)
         while sum(len(d) for d in self._data_buffer) > max_samples:
             self._data_buffer.pop(0)
-    
-    def handle_event(self, event) -> None:
-        """Process detected events from analysis.
-        
-        Called by MainWindow when events are detected.
-        """
-        # Update event count
-        count = int(self.count_label.text()) + 1
-        self.count_label.setText(str(count))
-    
-    # --- Private handlers ---
-    
-    def _on_start_toggled(self, checked: bool) -> None:
-        """Handle experiment start/stop."""
-        if checked:
-            self.start_btn.setText("Stop Experiment")
-            self._update_timer.start()
-            self._data_buffer.clear()
-        else:
-            self.start_btn.setText("Start Experiment")
-            self._update_timer.stop()
-    
-    def _on_param_changed(self, value: float) -> None:
-        """Handle parameter changes."""
-        self.parameterChanged.emit({"threshold": value})
-    
-    def _update_display(self) -> None:
-        """Periodic display update."""
-        if not self._data_buffer:
-            return
-        
-        # Concatenate buffered data
+
         data = np.concatenate(self._data_buffer)
-        time = np.arange(len(data)) / self._sample_rate
-        
-        # Update plot
-        self.curve.setData(time, data)
+        times = np.arange(data.size, dtype=np.float32) / max(self._sample_rate, 1.0)
+        self.curve.setData(times, data)
+
+    def _on_threshold_changed(self, value: float) -> None:
+        trigger_cfg = TriggerConfig(
+            channel_index=0,       # Replace with selected channel id
+            threshold=float(value),
+            hysteresis=0.0,
+            pretrigger_frac=0.01,
+            window_sec=1.0,
+            mode="repeated",       # "stream", "single", "repeated"
+        )
+        self.runtime.configure_acquisition(trigger_cfg=trigger_cfg)
+
+    def closeEvent(self, event):
+        if self._dispatcher_unsubscribe is not None:
+            self._dispatcher_unsubscribe()
+            self._dispatcher_unsubscribe = None
+        super().closeEvent(event)
 ```
 
-#### 2. Register in MainWindow
+#### 2. Register via Auto-Discovery
 
-In `gui/main_window.py`:
+No manual `MainWindow` edits are needed when you use plugin tabs.
+
+Place your file in `gui/tabs/`, subclass `BaseTab`, and set `TAB_TITLE`. Startup code in `gui/main_window.py` already handles discovery:
 
 ```python
-# At top of file
-from .my_experiment_tab import MyExperimentTab
-
-# In _init_ui(), where tabs are created
-self.experiment_tab = MyExperimentTab()
-self.tab_widget.addTab(self.experiment_tab, "My Experiment")
-
-# Wire up signals
-self.experiment_tab.parameterChanged.connect(self._on_experiment_param_changed)
-
-# Add handler method
-def _on_experiment_param_changed(self, params: dict) -> None:
-    """Handle parameter changes from experiment tab."""
-    # Apply parameters to pipeline, trigger, etc.
-    if "threshold" in params:
-        self._pipeline.update_trigger_config(
-            threshold=params["threshold"]
-        )
+self._tab_manager = TabPluginManager(self.runtime)
+plugin_tabs = self._tab_manager.discover_and_instantiate()
+for tab in plugin_tabs:
+    title = getattr(tab, "TAB_TITLE", "Plugin Tab")
+    self._analysis_dock.add_plugin_tab(tab, title)
 ```
 
 #### 3. Connect to Data Flow
 
-To receive real-time data in your tab, subscribe to the dispatcher:
+To receive real-time data in your tab, subscribe to dispatcher tick payloads. The payload includes:
+- `samples`: `np.ndarray` of shape `(channels, samples)`
+- `times`: `np.ndarray` time axis for the window
+- `channel_ids` / `channel_names`
+- `status`: includes `sample_rate` and `window_sec`
 
 ```python
-# In MainWindow._bind_dispatcher_signals() or similar
-def _on_visualization_chunk(self, chunk) -> None:
-    # Forward to experiment tab
-    self.experiment_tab.handle_chunk(chunk)
-    
-# Or use QTimer to poll the queue directly in your tab
+from gui.dispatcher_adapter import connect_dispatcher_signals
+
+if self.runtime.dispatcher is not None:
+    signals, unsubscribe = connect_dispatcher_signals(self.runtime.dispatcher)
+    signals.tick.connect(self._on_tick)
 ```
+
+For trigger updates, use canonical modes: `"stream"`, `"single"`, and `"repeated"` (`"continuous"` is accepted only as a legacy alias and normalized internally).
 
 ---
 
@@ -280,8 +218,12 @@ SpikeHound's DAQ layer is designed for easy extension. Each device driver follow
 """DAQ driver with digital I/O support."""
 from __future__ import annotations
 
+import threading
+import time
+from typing import Callable, Optional, Sequence
+
 import numpy as np
-from .base_device import BaseDevice
+from .base_device import BaseDevice, DeviceInfo, ChannelInfo, Capabilities, ActualConfig
 
 class MyDAQWithDIO(BaseDevice):
     """DAQ device with digital input/output capabilities.
@@ -291,10 +233,25 @@ class MyDAQWithDIO(BaseDevice):
     - Digital input for external triggers
     """
     
-    def __init__(self) -> None:
-        super().__init__("My DAQ", "My DAQ with Digital I/O")
+    @classmethod
+    def device_class_name(cls) -> str:
+        return "My DAQ"
+
+    @classmethod
+    def list_available_devices(cls) -> list[DeviceInfo]:
+        return [DeviceInfo(id="dev0", name="My DAQ USB", vendor="ACME")]
+
+    def get_capabilities(self, device_id: str) -> Capabilities:
+        return Capabilities(max_channels_in=4, sample_rates=[10_000, 20_000], dtype="float32")
+
+    def list_available_channels(self, device_id: str) -> list[ChannelInfo]:
+        return [ChannelInfo(id=i, name=f"AI{i}", units="V", range=(-10.0, 10.0)) for i in range(4)]
+
+    def __init__(self, queue_maxsize: int = 64) -> None:
+        super().__init__(queue_maxsize=queue_maxsize)
+        self._worker: Optional[threading.Thread] = None
         self._dio_state: int = 0
-        self._trigger_callback = None
+        self._trigger_callback: Optional[Callable[[float], None]] = None
     
     # --- Standard DAQ hooks ---
     
@@ -302,25 +259,43 @@ class MyDAQWithDIO(BaseDevice):
         # Open device handle
         self._handle = my_sdk.open(device_id)
     
-    def _configure_impl(self, sample_rate, channels, chunk_size, **opts):
+    def _configure_impl(
+        self,
+        sample_rate: int,
+        channels: Sequence[int],
+        chunk_size: int,
+        **opts,
+    ) -> ActualConfig:
         # Configure analog input
         my_sdk.configure_ai(self._handle, sample_rate, channels, chunk_size)
         # Configure digital lines
         my_sdk.configure_dio(self._handle, lines=[0, 1, 2, 3])
-        return sample_rate
+        configured = [c for c in self._available_channels if c.id in channels]
+        return ActualConfig(
+            sample_rate=int(sample_rate),
+            channels=configured,
+            chunk_size=int(chunk_size),
+            latency_s=None,
+            dtype="float32",
+        )
     
     def _start_impl(self) -> None:
-        # Start streaming thread
-        self._running = True
-        self._thread = threading.Thread(target=self._producer_loop)
-        self._thread.start()
+        self._worker = threading.Thread(target=self._producer_loop, daemon=True)
+        self._worker.start()
     
     def _stop_impl(self) -> None:
-        self._running = False
-        self._thread.join()
+        if self._worker is not None:
+            self._worker.join(timeout=2.0)
+            self._worker = None
     
     def _close_impl(self) -> None:
         my_sdk.close(self._handle)
+
+    def _producer_loop(self) -> None:
+        while not self.stop_event.is_set():
+            # SDK returns (frames, channels) float32
+            block = my_sdk.read_ai(self._handle, self.config.chunk_size).astype(np.float32)
+            self.emit_array(block, device_time=None)
     
     # --- Digital I/O Extensions ---
     
@@ -587,7 +562,7 @@ class ActionPotentialLesson(QtWidgets.QWidget):
    ```bash
    git clone https://github.com/guslott/spikehound.git
    cd spikehound
-   pip install numpy scipy PySide6 pyqtgraph miniaudio pyserial
+   pip install -r requirements.txt
    ```
 
 2. **Configure your AI assistant** (Claude, Cursor, Copilot, etc.):
@@ -617,9 +592,13 @@ See `test/test_integration.py` for patterns on:
 |-------|--------|---------|
 | `MainWindow` | `gui/main_window.py` | Central UI orchestrator |
 | `PipelineController` | `core/controller.py` | Pipeline lifecycle |
+| `SpikeHoundRuntime` | `core/runtime.py` | Runtime orchestration and configuration API |
 | `Dispatcher` | `core/dispatcher.py` | Data routing |
 | `SignalConditioner` | `core/conditioning.py` | Filter processing |
 | `AnalysisWorker` | `analysis/analysis_worker.py` | Spike detection |
+| `TriggerController` | `gui/trigger_controller.py` | Trigger state and capture logic |
+| `AnalysisDock` | `gui/analysis_dock.py` | Workspace tabs (Scope, Settings, plugins) |
+| `TabPluginManager` | `gui/tab_plugin_manager.py` | Plugin tab discovery (`gui/tabs/`) |
 | `BaseDevice` | `daq/base_device.py` | Hardware interface |
 
 | Data Type | Module | Purpose |
@@ -639,10 +618,10 @@ See `test/test_integration.py` for patterns on:
 spikehound/
 ├── gui/
 │   ├── [core files]
-│   └── my_experiments/     # Your custom tabs
+│   └── tabs/               # Auto-discovered BaseTab plugins
 │       ├── __init__.py
-│       ├── burst_lesson.py
-│       └── muscle_fatigue.py
+│       ├── burst_lesson_tab.py
+│       └── muscle_fatigue_tab.py
 ├── daq/
 │   ├── [core files]
 │   └── my_hardware/        # Your custom drivers

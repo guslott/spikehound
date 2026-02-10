@@ -1333,7 +1333,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tc.window_combo.setEnabled(True)  # Always enabled
         # Trigger mode affects which data is captured - disable during recording
         tc.trigger_mode_single.setEnabled(enabled)
-        tc.trigger_mode_repeating.setEnabled(enabled)
+        tc.trigger_mode_repeated.setEnabled(enabled)
         self.trigger_control.threshold_spin.setEnabled(enabled)
         self.trigger_control.trigger_channel_combo.setEnabled(enabled)
         self.trigger_control.trigger_single_button.setEnabled(enabled)
@@ -1433,6 +1433,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_trigger_sample_parameters(self._trigger_controller.sample_rate)
         # Sync Analysis tab scaling when window width changes
         self._sync_analysis_scales()
+
+    def _update_trigger_sample_parameters(self, sample_rate: float) -> None:
+        """Refresh trigger sample counts when timing controls change."""
+        if sample_rate <= 0:
+            return
+        self._trigger_controller.update_sample_rate(float(sample_rate))
 
     def _on_window_changed(self) -> None:
         value = float(self.trigger_control.window_combo.currentData() or 0.0)
@@ -1704,7 +1710,7 @@ class MainWindow(QtWidgets.QMainWindow):
         has_samples = samples is not None and not (isinstance(samples, np.ndarray) and samples.size == 0)
         
         # Logic to decide source:
-        # 1. If in Trigger Mode (single/continuous), we MUST use queue_pointers (chunks) to build history correctly.
+        # 1. If in Trigger Mode (single/repeated), we MUST use queue_pointers (chunks) to build history correctly.
         #    We must NEVER use the window payload (samples) because it's a snapshot, not a stream, and will cause
         #    overlaps, duplicates, and channel count mismatches (oscillation).
         # 2. If in Stream Mode, we prefer the payload (window) for smooth display, unless it's missing.

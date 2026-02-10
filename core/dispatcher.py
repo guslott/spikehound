@@ -566,7 +566,7 @@ class Dispatcher:
             sample_rate = float(self._sample_rate or 0.0)
             if sample_rate <= 0 or self._filled == 0:
                 return self._empty_payload(status)
-            mode = "continuous"
+            mode = "repeated"
             if self._current_trigger is not None:
                 mode = self._current_trigger.mode
             # Note: mode is already validated in TriggerConfig.__post_init__

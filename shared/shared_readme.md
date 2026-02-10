@@ -137,7 +137,7 @@ config = TriggerConfig(
     hysteresis=0.0,
     pretrigger_frac=0.2,
     window_sec=1.0,
-    mode="continuous",  # "stream", "single", "continuous"
+    mode="repeated",  # "stream", "single", "repeated"
 )
 ```
 

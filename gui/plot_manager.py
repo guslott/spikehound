@@ -369,18 +369,19 @@ class PlotManager(QtCore.QObject):
         trigger_channel_id: Optional[int],
         pretrigger_line: object,
     ) -> None:
-        """Process data in triggered mode (single or continuous)."""
+        """Process data in triggered mode (single or repeated).
+
+        While waiting for the next trigger, keep the most recent rendered
+        waveform on screen so users can adjust threshold/pretrigger/window
+        settings visually.
+        """
         if data.ndim != 2 or data.size == 0:
-            # If we represent a triggered state with existing display data,
-            # we should update the display regardless of new input.
+            # In trigger mode, keep the currently visible waveform when no new
+            # chunk is available (e.g. during UI interactions).
+            self._current_sample_rate = sample_rate
+            self._current_window_sec = window_sec
             if self._trigger_controller.display_data is not None:
-                self._current_sample_rate = sample_rate
-                self._current_window_sec = window_sec
                 self._render_trigger_display(channel_ids, window_sec, pretrigger_line)
-                return
-            
-            # Otherwise fall back to streaming (which clears/resets)
-            self.process_streaming(data, times_arr, sample_rate, window_sec, channel_ids, now)
             return
             
         tc = self._trigger_controller
@@ -423,23 +424,14 @@ class PlotManager(QtCore.QObject):
             self._render_trigger_display(channel_ids, window_sec, pretrigger_line)
             return
 
-        # If no captured display and in trigger mode, clear renderers to avoid stale data flash
+        # If no captured display in trigger mode, hold the last rendered waveform
+        # instead of clearing the scope. This allows visual threshold tuning.
         if trigger_mode == "single":
-            # Clear display when armed but no capture yet
-            for renderer in self._renderers.values():
-                renderer.clear()
-            if pretrigger_line is not None:
-                pretrigger_line.setVisible(False)
             self._current_sample_rate = sample_rate
             self._current_window_sec = window_sec
             return
 
-        if trigger_mode == "continuous":
-            # Clear display when waiting for next trigger
-            for renderer in self._renderers.values():
-                renderer.clear()
-            if pretrigger_line is not None:
-                pretrigger_line.setVisible(False)
+        if trigger_mode == "repeated":
             self._current_sample_rate = sample_rate
             self._current_window_sec = window_sec
             return

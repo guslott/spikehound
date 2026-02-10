@@ -1,7 +1,7 @@
 """TriggerControlWidget - UI wrapper for oscilloscope trigger settings.
 
 This widget provides controls for configuring the trigger subsystem:
-- Mode selection: Stream (no trigger), Single, or Continuous Trigger
+- Mode selection: Stream (no trigger), Single, or Repeated Trigger
 - Channel selection: Which channel to monitor for trigger events
 - Threshold: Voltage level that initiates a capture
 - Pre-trigger: Amount of data to capture before the trigger event
@@ -73,24 +73,24 @@ class TriggerControlWidget(QtWidgets.QWidget):
         mode_layout = QtWidgets.QVBoxLayout()
         mode_layout.setSpacing(2)
         
-        self.trigger_mode_continuous = QtWidgets.QRadioButton("No Trigger (Stream)")
+        self.trigger_mode_stream = QtWidgets.QRadioButton("No Trigger (Stream)")
         self.trigger_mode_single = QtWidgets.QRadioButton("Single")
         # Start disabled until we have a valid channel? Original code had them enabled/disabled logic.
         # But wait, original code initialized them as disabled?
         # "self.trigger_mode_single.setEnabled(False)" in original.
         self.trigger_mode_single.setEnabled(False) 
         
-        self.trigger_mode_repeating = QtWidgets.QRadioButton("Continuous Trigger")
-        self.trigger_mode_repeating.setEnabled(False)
+        self.trigger_mode_repeated = QtWidgets.QRadioButton("Repeated Trigger")
+        self.trigger_mode_repeated.setEnabled(False)
         
         # Group radio buttons
         self.trigger_button_group = QtWidgets.QButtonGroup(self)
-        self.trigger_button_group.addButton(self.trigger_mode_continuous)
+        self.trigger_button_group.addButton(self.trigger_mode_stream)
         self.trigger_button_group.addButton(self.trigger_mode_single)
-        self.trigger_button_group.addButton(self.trigger_mode_repeating)
+        self.trigger_button_group.addButton(self.trigger_mode_repeated)
         
-        self.trigger_mode_continuous.setChecked(True)
-        mode_layout.addWidget(self.trigger_mode_continuous)
+        self.trigger_mode_stream.setChecked(True)
+        mode_layout.addWidget(self.trigger_mode_stream)
         
         single_row = QtWidgets.QHBoxLayout()
         single_row.setSpacing(3)
@@ -101,7 +101,7 @@ class TriggerControlWidget(QtWidgets.QWidget):
         single_row.addStretch(1)
         mode_layout.addLayout(single_row)
         
-        mode_layout.addWidget(self.trigger_mode_repeating)
+        mode_layout.addWidget(self.trigger_mode_repeated)
         trigger_layout.addLayout(mode_layout, row, 1)
         row += 1
 
@@ -179,12 +179,12 @@ class TriggerControlWidget(QtWidgets.QWidget):
     def _on_config_changed(self) -> None:
         """Collect UI state and configure controller."""
         # Determine mode
-        if self.trigger_mode_continuous.isChecked():
+        if self.trigger_mode_stream.isChecked():
             mode = "stream"
         elif self.trigger_mode_single.isChecked():
             mode = "single"
         else:
-            mode = "continuous"
+            mode = "repeated"
 
         # Channel
         chan_data = self.trigger_channel_combo.currentData()
@@ -194,7 +194,6 @@ class TriggerControlWidget(QtWidgets.QWidget):
         threshold = self.threshold_spin.value()
         
         # Pre-trigger
-        pre_val = self.trigger_mode_continuous # Bug check? No.
         pre_data = self.pretrigger_combo.currentData()
         pre_seconds = float(pre_data) if pre_data is not None else 0.01
 
@@ -208,7 +207,8 @@ class TriggerControlWidget(QtWidgets.QWidget):
             threshold=threshold,
             pre_seconds=pre_seconds,
             window_sec=window_sec,
-            reset_state=True # Reset whenever UI changes significantly
+            reset_state=True,
+            preserve_display_on_reset=True,
         )
 
     def set_enabled_for_scanning(self, enabled: bool) -> None:
@@ -250,12 +250,12 @@ class TriggerControlWidget(QtWidgets.QWidget):
     def _set_trigger_modes_enabled(self, enabled: bool) -> None:
         """Enable/Disable trigger radio buttons (requires valid channel)."""
         self.trigger_mode_single.setEnabled(enabled)
-        self.trigger_mode_repeating.setEnabled(enabled)
+        self.trigger_mode_repeated.setEnabled(enabled)
         # Stream mode is always enabled
         
         # If we disabled current mode, switch to stream
-        if not enabled and not self.trigger_mode_continuous.isChecked():
-            self.trigger_mode_continuous.setChecked(True)
+        if not enabled and not self.trigger_mode_stream.isChecked():
+            self.trigger_mode_stream.setChecked(True)
             self.trigger_single_button.setEnabled(False)
             # config change will happen via update_channels -> _on_config_changed
 
