@@ -20,6 +20,11 @@ jobs:
             upload_path: dist/SpikeHound_Windows_Installer.exe
             asset_name: SpikeHound-Windows-Setup.exe
             content_type: application/vnd.microsoft.portable-executable
+          - os: ubuntu-latest
+            # Linux-specific variables
+            upload_path: dist/SpikeHound-Linux-amd64.deb
+            asset_name: SpikeHound-Linux-amd64.deb
+            content_type: application/vnd.debian.binary-package
 
     runs-on: ${{ matrix.os }}
 
@@ -46,6 +51,59 @@ jobs:
     # --- BUILD APPLICATION ---
     - name: Build with PyInstaller
       run: pyinstaller --clean --noconfirm SpikeHound.spec
+
+    # --- LINUX PACKAGING (DEB) ---
+    - name: Build Linux DEB
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        PKG_ROOT="packaging/deb/root"
+        rm -rf "$PKG_ROOT"
+
+        mkdir -p "$PKG_ROOT/DEBIAN"
+        mkdir -p "$PKG_ROOT/opt/spikehound"
+        mkdir -p "$PKG_ROOT/usr/bin"
+        mkdir -p "$PKG_ROOT/usr/share/applications"
+        mkdir -p "$PKG_ROOT/usr/share/icons/hicolor/512x512/apps"
+
+        cp -R dist/SpikeHound/. "$PKG_ROOT/opt/spikehound/"
+        cp media/icon.png "$PKG_ROOT/usr/share/icons/hicolor/512x512/apps/spikehound.png"
+
+        cat > "$PKG_ROOT/usr/bin/spikehound" << 'EOF'
+        #!/usr/bin/env bash
+        exec /opt/spikehound/SpikeHound "$@"
+        EOF
+        chmod 0755 "$PKG_ROOT/usr/bin/spikehound"
+
+        cat > "$PKG_ROOT/usr/share/applications/spikehound.desktop" << 'EOF'
+        [Desktop Entry]
+        Name=SpikeHound
+        Comment=Real-time neurophysiology software for education and research
+        Exec=spikehound
+        Icon=spikehound
+        Terminal=false
+        Type=Application
+        Categories=Education;Science;
+        EOF
+
+        DEB_VERSION="0.0.${GITHUB_RUN_NUMBER}"
+
+        cat > "$PKG_ROOT/DEBIAN/control" << EOF
+        Package: spikehound
+        Version: ${DEB_VERSION}
+        Section: science
+        Priority: optional
+        Architecture: amd64
+        Maintainer: SpikeHound Maintainers
+        Depends: libc6, libstdc++6, libglib2.0-0, libx11-6, libxext6, libxrender1, libxkbcommon0, libxcb1, libegl1, libgl1, libasound2
+        Description: SpikeHound real-time neurophysiology app
+         Real-time bioelectric data acquisition, visualization, and analysis.
+        EOF
+
+        chmod 0644 "$PKG_ROOT/DEBIAN/control"
+        dpkg-deb --build "$PKG_ROOT" "dist/SpikeHound-Linux-amd64.deb"
 
     # --- WINDOWS PACKAGING (Inno Setup) ---
     - name: Build Windows Installer

@@ -75,18 +75,19 @@ SpikeHound **democratizes neurophysiology** by removing financial and technical 
 
 ### Option 1: Download Binary Installer (Recommended)
 
-Pre-built installers are available for **Windows** and **macOS**—no programming experience required!
+Pre-built installers are available for **Windows**, **macOS**, and **Linux (.deb)**.
 
 1. Visit the [latest release page](https://github.com/guslott/spikehound/releases/latest)
 2. Scroll to the **Assets** section at the bottom
 3. Download the appropriate installer:
    - **Windows:** `SpikeHound-Setup.exe`
    - **macOS:** `SpikeHound.dmg`
+   - **Linux (Debian/Ubuntu/Chromebook Linux):** `SpikeHound-Linux-amd64.deb`
 4. Run the installer and follow the prompts
 
 ---
 
-### Option 2: Run from Source (Advanced, required on Linux)
+### Option 2: Run from Source (Advanced)
 
 For developers or those who want to modify the code:
 
@@ -113,7 +114,7 @@ python main.py
 ```bash
 pip install pyinstaller
 pyinstaller SpikeHound.spec
-# Output: dist/SpikeHound.app (macOS) or dist/SpikeHound.exe (Windows)
+# Output: dist/SpikeHound.app (macOS), dist/SpikeHound.exe (Windows), or dist/SpikeHound/ (Linux)
 ```
 
 ---
