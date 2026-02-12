@@ -22,7 +22,7 @@ ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
 ; LicenseFile=LICENSE  <-- Uncomment if you want the user to agree to the license
 OutputDir=dist
-OutputBaseFilename=SpikeHound_Windows_Installer
+OutputBaseFilename=SpikeHound-Windows-Installer
 ; This uses the icon you committed to the media folder
 SetupIconFile=media\SpikeHound.ico
 Compression=lzma

@@ -80,9 +80,9 @@ Pre-built installers are available for **Windows**, **macOS**, and **Linux (.deb
 1. Visit the [latest release page](https://github.com/guslott/spikehound/releases/latest)
 2. Scroll to the **Assets** section at the bottom
 3. Download the appropriate installer:
-   - **Windows:** `SpikeHound-Setup.exe`
-   - **macOS:** `SpikeHound.dmg`
-   - **Linux (Debian/Ubuntu/Chromebook Linux):** `SpikeHound-Linux-amd64.deb`
+   - **Windows:** `SpikeHound-Windows-Installer.exe`
+   - **macOS:** `SpikeHound-Mac-Installer.dmg`
+   - **Linux (Debian/Ubuntu/Chromebook Linux):** `SpikeHound-Linux-Installer-amd64.deb`
 4. Run the installer and follow the prompts
 
 ---
