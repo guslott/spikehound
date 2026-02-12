@@ -118,15 +118,6 @@ jobs:
       run: |
         # Clean up any previous attempts
         rm -f dist/SpikeHound-Mac-Installer.dmg
-        rm -rf dist/dmg-root
-        mkdir -p dist/dmg-root
-
-        # Stage app and a clear instruction file inside the DMG window.
-        cp -R dist/SpikeHound.app dist/dmg-root/
-        cat > "dist/dmg-root/Install Instructions.txt" << 'EOF'
-        Drag SpikeHound.app onto the Applications folder to install.
-        Then open SpikeHound from Applications.
-        EOF
         
         # Create the DMG
         create-dmg \
@@ -136,10 +127,9 @@ jobs:
           --window-size 600 400 \
           --icon-size 128 \
           --icon "SpikeHound.app" 150 200 \
-          --icon "Install Instructions.txt" 300 320 \
           --app-drop-link 450 200 \
           "dist/SpikeHound-Mac-Installer.dmg" \
-          "dist/dmg-root"
+          "dist/SpikeHound.app"
 
     # --- UPLOAD FINAL INSTALLER ---
     - name: Upload Installer Artifact
