@@ -5,6 +5,7 @@ detected events, including:
 - baseline: Median-based baseline estimation from pre-event samples
 - envelope: Signal envelope (max - min) amplitude range
 - min_max: Peak amplitude extraction
+- min_to_max_width: Signed time between the minimum and maximum sample (ms)
 - peak_frequency_sinc: High-resolution frequency estimation with FFT and sinc interpolation
 - autocorr_frequency: Autocorrelation-based frequency estimation fallback
 """
@@ -44,6 +45,37 @@ def min_max(x: np.ndarray) -> Tuple[float, float]:
     if arr.size == 0:
         return 0.0, 0.0
     return float(np.max(arr)), float(np.min(arr))
+
+
+def min_to_max_width(samples: np.ndarray, sr: float) -> float:
+    """Compute the signed time between the minimum and maximum sample (ms).
+
+    The sign encodes waveform polarity:
+    - Positive value: maximum occurs *after* minimum (e.g. negative-first biphasic
+      or triphasic waveform whose positive phase follows the trough).
+    - Negative value: maximum occurs *before* minimum (positive-first waveform).
+    - Zero: min and max are at the same sample, or the waveform is flat.
+
+    This metric is meaningful for both biphasic and triphasic extracellular
+    waveforms and complements event_width(), which relies on a threshold
+    crossing and can misfire on multi-phasic shapes.
+
+    Args:
+        samples: 1D array of waveform samples around the event.
+        sr: Sample rate in Hz.
+
+    Returns:
+        Signed duration in milliseconds: (index_of_max - index_of_min) / sr * 1000.
+        Returns 0.0 for empty input or non-positive sample rate.
+    """
+    if sr <= 0:
+        return 0.0
+    arr = np.asarray(samples, dtype=np.float32)
+    if arr.size == 0:
+        return 0.0
+    idx_max = int(np.argmax(arr))
+    idx_min = int(np.argmin(arr))
+    return float((idx_max - idx_min) / sr * 1000.0)
 
 
 def peak_frequency_sinc(

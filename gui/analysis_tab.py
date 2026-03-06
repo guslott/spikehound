@@ -318,6 +318,7 @@ class AnalysisTab(QtWidgets.QWidget):
             "Peak Frequency (Hz)",
             "Interval since last event (s)",
             "Event Width (ms)",
+            "Min-to-Max Width (ms)",
         ):
             item = QtGui.QStandardItem(label)
             metric_model.appendRow(item)
@@ -340,6 +341,7 @@ class AnalysisTab(QtWidgets.QWidget):
             "Envelope (max-min)",
             "Peak Frequency (Hz)",
             "Event Width (ms)",
+            "Min-to-Max Width (ms)",
         ):
             item = QtGui.QStandardItem(label)
             metric_x_model.appendRow(item)
@@ -767,7 +769,7 @@ class AnalysisTab(QtWidgets.QWidget):
         height = self._scope_vertical_span
         plot_item = self.plot_widget.getPlotItem()
         plot_item.setXRange(0.0, width, padding=0.0)
-        if self._selected_y_metric() in {"envelope", "max", "min", "freq", "interval", "width"}:
+        if self._selected_y_metric() in {"envelope", "max", "min", "freq", "interval", "width", "min_to_max_width"}:
             # Metrics overlay controls the Y range; leave amplitude height unchanged.
             pass
         else:
@@ -1406,6 +1408,8 @@ class AnalysisTab(QtWidgets.QWidget):
             return "interval"
         if "envelope" in label:
             return "envelope"
+        if "min-to-max" in label:
+            return "min_to_max_width"
         if "max" in label:
             return "max"
         if "min" in label:
@@ -1425,6 +1429,8 @@ class AnalysisTab(QtWidgets.QWidget):
             return "envelope"
         if "frequency" in label:
             return "freq"
+        if "min-to-max" in label:
+            return "min_to_max_width"
         if "width" in label:
             return "width"
         if "max" in label:
@@ -1448,6 +1454,8 @@ class AnalysisTab(QtWidgets.QWidget):
             self.metrics_plot.setLabel("left", "Interval (s)")
         elif metric == "width":
             self.metrics_plot.setLabel("left", "Event Width (ms)")
+        elif metric == "min_to_max_width":
+            self.metrics_plot.setLabel("left", "Min-to-Max Width (ms)")
         else:
             self.metrics_plot.setLabel("left", "Value")
         x_metric = self._selected_x_metric()
@@ -1463,6 +1471,8 @@ class AnalysisTab(QtWidgets.QWidget):
             self.metrics_plot.setLabel("bottom", "Peak Frequency (Hz)")
         elif x_metric == "width":
             self.metrics_plot.setLabel("bottom", "Event Width (ms)")
+        elif x_metric == "min_to_max_width":
+            self.metrics_plot.setLabel("bottom", "Min-to-Max Width (ms)")
         else:
             self.metrics_plot.setLabel("bottom", "Envelope (V)")
         if metric in {"envelope", "max", "min", "freq", "interval"}:
@@ -2105,7 +2115,7 @@ class AnalysisTab(QtWidgets.QWidget):
         """
         y_key = self._selected_y_metric()
         x_key = self._selected_x_metric()
-        if y_key not in {"envelope", "max", "min", "freq", "interval", "width"}:
+        if y_key not in {"envelope", "max", "min", "freq", "interval", "width", "min_to_max_width"}:
             self.energy_scatter.hide()
             return
         events = self._metric_events
@@ -2294,7 +2304,7 @@ class AnalysisTab(QtWidgets.QWidget):
         rel_time = max(0.0, float(metric_time) - (self._t0_event or 0.0))
         record: dict[str, float | int] = {"time": rel_time}
         has_metric = False
-        for key in ("envelope", "max", "min", "freq", "interval", "width"):
+        for key in ("envelope", "max", "min", "freq", "interval", "width", "min_to_max_width"):
             value = metrics.get(key)
             if value is None:
                 continue
@@ -2363,6 +2373,7 @@ class AnalysisTab(QtWidgets.QWidget):
                     "min": float(mn),
                     "freq": float(pf),
                     "width": float(props.get("event_width_ms", 0.0)),
+                    "min_to_max_width": float(props.get("min_to_max_width_ms", 0.0)),
                 }
             )
         interval_val = float(event.intervalSinceLastSec)

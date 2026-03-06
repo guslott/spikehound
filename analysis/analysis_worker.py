@@ -16,7 +16,7 @@ from shared.types import AnalysisEvent
 
 from .models import AnalysisBatch
 from .settings import AnalysisSettings, AnalysisSettingsStore
-from .metrics import envelope, peak_frequency_sinc, event_width
+from .metrics import envelope, peak_frequency_sinc, event_width, min_to_max_width
 from core.detection import AmpThresholdDetector, DETECTOR_REGISTRY
 
 
@@ -123,6 +123,9 @@ def detection_to_analysis_event(
         width_th = float(6.0 * 1.4826 * noise_mad) if noise_initialized else None
         width_ms_val = event_width(wf, sr, threshold=width_th, sigma=6.0, pre_samples=pre_samples)
         props["event_width_ms"] = width_ms_val
+        # Min-to-Max Width: signed time between the minimum and maximum sample.
+        # Positive = negative-first waveform; negative = positive-first waveform.
+        props["min_to_max_width_ms"] = min_to_max_width(wf, sr)
     
     # Calculate event end sample
     event_end = abs_idx + wf.size

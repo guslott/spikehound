@@ -39,6 +39,9 @@ class SettingsTab(QtWidgets.QWidget):
         layout.setSpacing(10)
 
         layout.addWidget(self._build_global_box())
+        self._sim_source_box = self._build_sim_source_box()
+        self._sim_source_box.setVisible(False)  # hidden until a simulated source is active
+        layout.addWidget(self._sim_source_box)
         layout.addWidget(self._build_health_box())
         layout.addWidget(self._build_about_box())
         layout.addStretch(1)
@@ -110,6 +113,35 @@ class SettingsTab(QtWidgets.QWidget):
         self.audio_refresh_btn.clicked.connect(self._populate_listen_devices)
         audio_row.addWidget(self.audio_refresh_btn)
         form.addRow("\"Listen\" Output Device:", audio_row)
+
+        return box
+
+    def _build_sim_source_box(self) -> QtWidgets.QGroupBox:
+        """Build the Simulated Source configuration group box."""
+        box = QtWidgets.QGroupBox("Simulated Source")
+        outer = QtWidgets.QVBoxLayout(box)
+        outer.setContentsMargins(12, 10, 12, 10)
+        outer.setSpacing(6)
+
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
+        label = QtWidgets.QLabel("Number of Units:")
+        row.addWidget(label)
+
+        self._sim_units_combo = QtWidgets.QComboBox()
+        self._sim_units_combo.addItem("1 — Single unit")
+        for n in range(2, 7):
+            self._sim_units_combo.addItem(f"{n} units")
+        self._sim_units_combo.setCurrentIndex(0)  # default: 1 unit
+        self._sim_units_combo.setToolTip(
+            "Number of neural units in the simulation.\n"
+            "Use 1 unit for simple threshold-detection exercises,\n"
+            "or 2–6 units for spike-sorting exercises."
+        )
+        self._sim_units_combo.currentIndexChanged.connect(self._on_sim_units_changed)
+        row.addWidget(self._sim_units_combo)
+        row.addStretch(1)
+        outer.addLayout(row)
 
         return box
 
@@ -241,6 +273,7 @@ class SettingsTab(QtWidgets.QWidget):
         settings = store.get()
         self._apply_settings(settings)
         self._populate_listen_devices()
+        self._refresh_sim_source_visibility()
 
     def _apply_settings(self, settings: AppSettings) -> None:
         self.list_audio_check.blockSignals(True)
@@ -344,6 +377,30 @@ class SettingsTab(QtWidgets.QWidget):
     def _on_rec_autoinc_toggled(self, state: int) -> None:
         self._update_settings(recording_auto_increment=bool(state))
 
+    def _on_sim_units_changed(self, index: int) -> None:
+        """Called when the simulated source unit count combo changes."""
+        from daq.simulated_source import SimulatedPhysiologySource
+        n = index + 1
+        if self._controller is None:
+            return
+        source = self._controller.daq_source
+        if isinstance(source, SimulatedPhysiologySource):
+            source.set_num_units(n)
+
+    def _refresh_sim_source_visibility(self) -> None:
+        """Show or hide the simulated source box based on the active source type."""
+        from daq.simulated_source import SimulatedPhysiologySource
+        source = self._controller.daq_source if self._controller is not None else None
+        is_sim = isinstance(source, SimulatedPhysiologySource)
+        self._sim_source_box.setVisible(is_sim)
+        if is_sim:
+            # Sync the combo to the source's current active unit count
+            # (e.g. after a stop/restart so the UI stays consistent)
+            n = getattr(source, '_num_active_units', 1)
+            self._sim_units_combo.blockSignals(True)
+            self._sim_units_combo.setCurrentIndex(max(0, n - 1))
+            self._sim_units_combo.blockSignals(False)
+
     def _on_rescan_clicked(self) -> None:
         """Trigger a device scan via the controller."""
         if self._controller:
@@ -407,6 +464,7 @@ class SettingsTab(QtWidgets.QWidget):
         controller = self._controller
         if controller is None:
             return
+        self._refresh_sim_source_visibility()
         snapshot = {}
         try:
             snapshot = self._main_window.health_snapshot()

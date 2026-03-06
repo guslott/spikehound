@@ -216,6 +216,7 @@ class SimulatedPhysiologySource(BaseDevice):
         self._noise_level = 0.040  # Increased: ~10mV broadband noise
         self._distance_m = 0.02  # Prox→Dist electrode spacing for delay calc
         self._units = []
+        self._num_active_units: int = 1  # Number of units to include in simulation (live-adjustable)
         self._worker: threading.Thread | None = None
         # Event-based PSP tracking (replaces rolling buffers)
         self._global_sample_counter = 0  # Tracks absolute sample position
@@ -398,10 +399,12 @@ class SimulatedPhysiologySource(BaseDevice):
         ]
         
         self._units.clear()
-        
-        # Use only the number of units requested (default 6)
-        units_to_create = min(num_units, len(HARDCODED_UNITS))
-        
+
+        # Always create all available units so that the live unit-count selector
+        # (_num_active_units) can promote/demote units without a stop/restart.
+        # The _loop gates how many units are processed per chunk via n_active.
+        units_to_create = len(HARDCODED_UNITS)
+
         for i in range(units_to_create):
             params = HARDCODED_UNITS[i]
             
@@ -470,6 +473,10 @@ class SimulatedPhysiologySource(BaseDevice):
         # Reset PSP tracking
         self._active_psps.clear()
         self._global_sample_counter = 0
+
+        # Set the initial active unit count (can be changed live via set_num_units)
+        self._num_active_units = max(1, min(num_units, len(self._units)))
+
     # ------------- BaseSource overrides -------------
 
     def _open_impl(self, device_id: str) -> None:
@@ -486,7 +493,7 @@ class SimulatedPhysiologySource(BaseDevice):
             sample_rate = self.DEFAULT_SAMPLE_RATE
         # Generate random units
         # Multiple units with variable amplitudes for realistic simulation
-        n_units = int(options.get('num_units', 6))
+        n_units = int(options.get('num_units', 1))
         self._line_hum_amp = float(options.get('line_hum_amp', self._default_line_hum_amp))
         self._line_hum_freq = float(options.get('line_hum_freq', 60.0))
         self._line_hum_phase = 0.0
@@ -567,15 +574,19 @@ class SimulatedPhysiologySource(BaseDevice):
                 # Generate spikes into wave buffers with refractory period enforcement.
                 # For PSPs: create ActivePSP events instead of writing to buffers.
                 chunk_start_sample = self._global_sample_counter
-                
-                # Calculate maximum conduction delay across all units
+
+                # Snapshot the active unit count once per chunk so any live change
+                # from set_num_units() takes effect atomically at a chunk boundary.
+                n_active = self._num_active_units
+
+                # Calculate maximum conduction delay across all active units
                 max_delay = 0
-                for u in self._units:
+                for u in self._units[:n_active]:
                     delay_s = self._distance_m / max(1e-6, u['velocity'])
                     delay_samples = int(round(delay_s * sr))
                     max_delay = max(max_delay, delay_samples)
 
-                for ui, u in enumerate(self._units):
+                for ui, u in enumerate(self._units[:n_active]):
                     p_spike = u['rate_hz'] / sr
                     events = self._rng.random(chunk_size) < p_spike
                     candidate_offs = np.where(events)[0]
@@ -651,16 +662,19 @@ class SimulatedPhysiologySource(BaseDevice):
                 for col, cid in enumerate(active_ids):
                     ch_type = id_to_type.get(cid, 'extracellular_prox')
                     if ch_type == 'extracellular_prox':
-                        # PROXIMAL: Signal arrives FIRST (from CNS toward muscle)
-                        # Read from the delayed portion of the buffer - this makes spikes
-                        # appear at earlier output sample positions (first in time)
+                        # PROXIMAL electrode:
+                        #   Even-indexed units (0, 2, 4 → units 1, 3, 5): conduct prox→dist
+                        #     (motor/efferent direction). Prox sees the spike FIRST.
+                        #     → read from wave[delay:] (advanced position).
+                        #   Odd-indexed units (1, 3, 5 → units 2, 4, 6): conduct dist→prox
+                        #     (sensory/afferent direction). Prox sees the spike SECOND.
+                        #     → read from wave[0:] (immediate position, no advance).
                         sig = np.zeros(chunk_size, dtype=np.float32)
-                        for ui, u in enumerate(self._units):
+                        for ui, u in enumerate(self._units[:n_active]):
                             wave = wave_buffers[ui]
-                            # Apply conduction delay offset so proximal appears first
                             delay_s = self._distance_m / max(1e-6, u['velocity'])
                             delay = int(round(delay_s * sr))
-                            start = delay
+                            start = 0 if (ui % 2 == 1) else delay
                             end = start + chunk_size
                             if end > buf_len:
                                 end = buf_len
@@ -673,14 +687,23 @@ class SimulatedPhysiologySource(BaseDevice):
                         sig += self._rng.normal(0.0, self._noise_level, size=chunk_size).astype(np.float32)
                         data_chunk[:, col] = sig
                     elif ch_type == 'extracellular_dist':
-                        # DISTAL: Signal arrives AFTER proximal (delayed by conduction time)
-                        # Read from the immediate portion of the buffer - spikes appear at
-                        # later output sample positions relative to proximal
+                        # DISTAL electrode:
+                        #   Even-indexed units (0, 2, 4 → units 1, 3, 5): conduct prox→dist
+                        #     (motor/efferent direction). Dist sees the spike SECOND.
+                        #     → read from wave[0:] (immediate position, no advance).
+                        #   Odd-indexed units (1, 3, 5 → units 2, 4, 6): conduct dist→prox
+                        #     (sensory/afferent direction). Dist sees the spike FIRST.
+                        #     → read from wave[delay:] (advanced position).
                         sig = np.zeros(chunk_size, dtype=np.float32)
-                        for ui, u in enumerate(self._units):
+                        for ui, u in enumerate(self._units[:n_active]):
                             wave = wave_buffers[ui]
-                            # No offset - read immediate buffer position
-                            seg = wave[:chunk_size]
+                            delay_s = self._distance_m / max(1e-6, u['velocity'])
+                            delay = int(round(delay_s * sr))
+                            start = delay if (ui % 2 == 1) else 0
+                            end = start + chunk_size
+                            if end > buf_len:
+                                end = buf_len
+                            seg = wave[start:end]
                             if seg.shape[0] < chunk_size:
                                 padded = np.zeros(chunk_size, dtype=np.float32)
                                 padded[: seg.shape[0]] = seg
@@ -781,6 +804,34 @@ class SimulatedPhysiologySource(BaseDevice):
 
         self._worker = threading.Thread(target=_loop, name="SimPhys-Worker", daemon=True)
         self._worker.start()
+
+    def set_num_units(self, n: int) -> None:
+        """Live-update the number of active simulated units (1–6).
+
+        Safe to call while the source is running.  The change takes effect at
+        the next chunk boundary (within one ~100 ms iteration).  PSPs queued
+        for newly-deactivated units are purged immediately so the intracellular
+        channel clears cleanly without a long tail.
+
+        Parameters
+        ----------
+        n : int
+            Desired active unit count, clamped to [1, len(self._units)].
+        """
+        max_units = len(self._units) if self._units else 6
+        n = max(1, min(n, max_units))
+        old_n = self._num_active_units
+        if n == old_n:
+            return
+        self._num_active_units = n
+        # Purge PSPs belonging to units that are now deactivated
+        if n < old_n:
+            self._active_psps = [
+                psp for psp in self._active_psps if psp.unit_index < n
+            ]
+        logger.info(
+            "SimulatedPhysiologySource: active unit count %d → %d", old_n, n
+        )
 
     def _stop_impl(self) -> None:
         if self._worker and self._worker.is_alive():
