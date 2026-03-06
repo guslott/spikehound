@@ -92,8 +92,15 @@ class AudioPlayer(threading.Thread):
         # This uses less memory (e.g., 10kHz vs 44.1kHz) and reduces latency.
         ring_len = max(self.cfg.blocksize * 4, int(self.in_sr * self.cfg.ring_seconds))
         self._ring = np.zeros(ring_len, dtype=np.float32)
-        self._r_head = 0  # write index
-        self._r_tail = 0  # read index
+        self._r_head = 0   # write index
+        self._r_tail = 0   # read index
+        # Explicit fill-level counter.  Using head == tail to detect both "empty"
+        # and "full" is ambiguous; _r_count is the single authoritative source of
+        # truth.  Invariant (always held under _r_lock):
+        #   _r_count == number of unread samples in the ring
+        #   space    == _ring.size - _r_count   (never < 0)
+        #   available == _r_count               (never > _ring.size)
+        self._r_count = 0
         self._r_lock = threading.Lock()
 
         self._stop_evt = threading.Event()
@@ -111,46 +118,46 @@ class AudioPlayer(threading.Thread):
         self._stop_evt.set()
 
     # ---- Ring buffer helpers -------------------------------------------------
+    # All three methods must be called with _r_lock held (or from __init__).
+    # _r_count is the canonical fill level; head/tail track positions only.
 
     def _ring_space(self) -> int:
-        if self._r_head >= self._r_tail:
-            used = self._r_head - self._r_tail
-        else:
-            used = self._ring.size - (self._r_tail - self._r_head)
-        return self._ring.size - used - 1
+        """Writable slots.  space + _r_count == _ring.size, always."""
+        return self._ring.size - self._r_count
 
     def _ring_available(self) -> int:
-        if self._r_head >= self._r_tail:
-            return self._r_head - self._r_tail
-        return self._ring.size - (self._r_tail - self._r_head)
+        """Readable samples.  Equals _r_count directly."""
+        return self._r_count
 
     def _ring_write(self, x: np.ndarray) -> None:
         n = int(x.size)
         if n == 0:
             return
-            
-        # Handle case where input is larger than the entire buffer
+
+        # Clamp oversized writes to the ring capacity so the drop-oldest
+        # logic below can never produce a negative space result.
         if n > self._ring.size:
-            # Just take the last self._ring.size samples
             x = x[-self._ring.size:]
             n = self._ring.size
-            
+
         with self._r_lock:
-            space = self._ring_space()
+            space = self._ring_space()          # _ring.size - _r_count
             if n > space:
-                # drop-oldest to keep latency bounded
+                # Drop-oldest: advance tail to make exactly n slots available.
                 drop = n - space
                 self._r_tail = (self._r_tail + drop) % self._ring.size
+                self._r_count -= drop           # account for discarded samples
             end = min(n, self._ring.size - self._r_head)
             self._ring[self._r_head:self._r_head + end] = x[:end]
             rem = n - end
             if rem:
                 self._ring[:rem] = x[end:]
             self._r_head = (self._r_head + n) % self._ring.size
+            self._r_count += n                  # n new samples are now readable
 
     def _ring_read(self, n: int) -> np.ndarray:
         with self._r_lock:
-            avail = self._ring_available()
+            avail = self._ring_available()      # == _r_count
             n = min(n, avail)
             if n <= 0:
                 return np.zeros(0, dtype=np.float32)
@@ -161,6 +168,7 @@ class AudioPlayer(threading.Thread):
             if rem:
                 out[end:] = self._ring[:rem]
             self._r_tail = (self._r_tail + n) % self._ring.size
+            self._r_count -= n                  # samples have been consumed
             return out
 
     # ---- Input chunk extraction -----------------------------------------

@@ -286,34 +286,38 @@ class BaseDevice(ABC):
         """
         Atomically set active channels (order matters).
         Subclasses that cannot remap at the driver level may still slice before emit.
+
+        Lock ordering: _state_lock → _channel_lock (same order as emit_array)
+        to prevent ring buffer replacement while a write is in progress.
         """
-        with self._channel_lock:
-            available_ids = {c.id for c in self._available_channels}
-            missing = [cid for cid in channel_ids if cid not in available_ids]
-            if missing:
-                raise ValueError(f"Unknown channel ids: {missing}")
-            # Maintain order and uniqueness
-            uniq: List[int] = []
-            for cid in channel_ids:
-                if cid not in uniq:
-                    uniq.append(cid)
-            self._active_channel_ids = uniq
-            # If a ring buffer already exists and the channel count changed, rebuild it
-            rb = self.ring_buffer
-            desired_channels = len(self._active_channel_ids)
-            if rb is not None and desired_channels > 0 and rb.shape[0] != desired_channels:
-                capacity = rb.capacity
-                dtype = rb.dtype
-                self.ring_buffer = SharedRingBuffer(shape=(desired_channels, capacity), dtype=dtype)
-                
-                # Clear the queue of any pointers to the old buffer
-                # This prevents the consumer from trying to read from a replaced/closed buffer
-                # Use public API (get_nowait drain) instead of internal queue.mutex/queue.clear()
-                try:
-                    while True:
-                        self.data_queue.get_nowait()
-                except queue.Empty:
-                    pass
+        with self._state_lock:
+            with self._channel_lock:
+                available_ids = {c.id for c in self._available_channels}
+                missing = [cid for cid in channel_ids if cid not in available_ids]
+                if missing:
+                    raise ValueError(f"Unknown channel ids: {missing}")
+                # Maintain order and uniqueness
+                uniq: List[int] = []
+                for cid in channel_ids:
+                    if cid not in uniq:
+                        uniq.append(cid)
+                self._active_channel_ids = uniq
+                # If a ring buffer already exists and the channel count changed, rebuild it
+                rb = self.ring_buffer
+                desired_channels = len(self._active_channel_ids)
+                if rb is not None and desired_channels > 0 and rb.shape[0] != desired_channels:
+                    capacity = rb.capacity
+                    dtype = rb.dtype
+                    self.ring_buffer = SharedRingBuffer(shape=(desired_channels, capacity), dtype=dtype)
+
+                    # Clear the queue of any pointers to the old buffer
+                    # This prevents the consumer from trying to read from a replaced/closed buffer
+                    # Use public API (get_nowait drain) instead of internal queue.mutex/queue.clear()
+                    try:
+                        while True:
+                            self.data_queue.get_nowait()
+                    except queue.Empty:
+                        pass
 
     def get_active_channels(self) -> List[ChannelInfo]:
         with self._channel_lock:

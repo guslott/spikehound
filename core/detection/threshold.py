@@ -10,12 +10,19 @@ class AmpThresholdDetector:
     name = "amp_threshold"
     display_name = "Amplitude Threshold (Auto)"
 
+    # Per-chunk weight for the noise EWMA.  alpha=0.1 gives a ~10-chunk time
+    # constant, matching RealTimeAnalyzer._maybe_update_auto_thresholds().
+    # At a typical 100 ms/chunk delivery rate that is ~1 s of adaptation,
+    # which is fast enough to recover from an electrode-insertion transient
+    # yet slow enough not to be thrown by a single large spike.
+    _NOISE_EWMA_ALPHA: float = 0.1
+
     def __init__(self):
         self._factor: float = 5.0
         self._sign: int = -1  # -1 for negative peaks, 1 for positive
         self._sample_rate: float = 0.0
         self._n_channels: int = 0
-        self._noise_levels: Optional[np.ndarray] = None
+        self._noise_levels: Optional[np.ndarray] = None  # running σ estimate (EWMA of MAD/0.6745)
         self._refractory_samples: int = 0
         self._last_event_samples: Optional[np.ndarray] = None
         self._residue: Optional[np.ndarray] = None
@@ -109,15 +116,32 @@ class AmpThresholdDetector:
             full_start_time = chunk.start_time
             residue_len = 0
 
-        # Estimate noise if not yet done (simple one-shot for now, could be sliding)
+        # EWMA noise estimation — updated every chunk so that startup transients
+        # (e.g., electrode insertion while the scope is already running) decay
+        # out over ~10 chunks rather than permanently skewing the threshold.
+        #
+        #   MAD = median(|x - median(x)|)   — robust to DC offsets
+        #   σ̂  = MAD / 0.6745               — consistent estimator of Gaussian σ
+        #   _noise_levels ← α·σ̂_new + (1−α)·_noise_levels   (EWMA)
+        #
+        # On the very first chunk _noise_levels is None and is initialized
+        # directly; subsequent chunks blend in with weight _NOISE_EWMA_ALPHA.
+        med = np.median(full_samples, axis=1, keepdims=True)
+        mad = np.median(np.abs(full_samples - med), axis=1)
+        new_sigma = mad / 0.6745
         if self._noise_levels is None:
-            # MAD = median(|x - median(x)|)
-            # Robust to DC offsets
-            med = np.median(full_samples, axis=1, keepdims=True)
-            mad = np.median(np.abs(full_samples - med), axis=1)
-            self._noise_levels = mad / 0.6745
-            # Avoid zero threshold
-            self._noise_levels[self._noise_levels == 0] = 1.0
+            self._noise_levels = new_sigma.copy()
+        else:
+            self._noise_levels = (
+                self._NOISE_EWMA_ALPHA * new_sigma
+                + (1.0 - self._NOISE_EWMA_ALPHA) * self._noise_levels
+            )
+        # Guard: a flat-line input (disconnected electrode) can produce σ̂ = 0.
+        # Replace zeros with 1.0 so the threshold is non-zero and the user sees
+        # no events rather than all events.
+        self._noise_levels = np.where(
+            self._noise_levels < 1e-10, 1.0, self._noise_levels
+        )
 
         # Scan the full buffer for events.
         # Duplicate detection is prevented by filtering against `_last_event_time`.

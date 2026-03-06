@@ -61,6 +61,13 @@ class BackyardBrainsSource(BaseDevice):
     - Embedded ASCII messages wrapped in escape sequences.
     """
 
+    # If no valid frames are decoded for this many seconds the decoder assumes
+    # the byte stream has lost sync (e.g. the USB cable was jostled).  The
+    # accumulation buffers are cleared, an xrun is counted, and a WARNING is
+    # logged so any GUI status bar / log panel can surface it to the student.
+    # The flag is cleared automatically once a valid frame is emitted again.
+    _SYNC_TIMEOUT_S: float = 0.5
+
     @classmethod
     def device_class_name(cls) -> str:
         return "Backyard Brains"
@@ -337,21 +344,29 @@ class BackyardBrainsSource(BaseDevice):
         stream_channels = max(1, stream_channels)
         bits = max(8, min(self._bits, 16))
         center_val = float(1 << (bits - 1))
-        
+
         # We want to emit `chunk_size` samples.
-        # We need to collect `chunk_size` raw samples.
         target_chunk_size = self.config.chunk_size
         raw_chunk_size = target_chunk_size
-        
+
         # Buffers
         raw_buffer = bytearray()
-        # Buffer for unpacked raw samples
         sample_buffer = np.zeros((raw_chunk_size, stream_channels), dtype=np.float32)
         sample_idx = 0
-        
+
         # For un-escaping logic
         msg_start_seq = list(_MSG_START)
         msg_end_seq = list(_MSG_END)
+
+        # --- Frame-sync watchdog state ---
+        # Tracks the wall-clock time of the last successfully emitted chunk.
+        # If no chunk is emitted for _SYNC_TIMEOUT_S seconds the decoder logs a
+        # WARNING, increments the xrun counter (observable in stats()), and
+        # resets its accumulation buffers so it re-synchronises on the next
+        # valid MSB=1 byte rather than staying permanently confused.
+        _last_emit_time: float = time.monotonic()
+        _sync_lost: bool = False
+        _sync_lost_time: float = 0.0
 
         while not self.stop_event.is_set():
             try:
@@ -360,9 +375,10 @@ class BackyardBrainsSource(BaseDevice):
                     data = self._ser.read(self._ser.in_waiting)
                     raw_buffer.extend(data)
                 else:
-                    # Sleep briefly to yield if no data
+                    # No data right now — sleep briefly but do NOT continue.
+                    # We fall through to the frame-sync watchdog below so the
+                    # timeout fires even when the cable is completely unplugged.
                     time.sleep(0.001)
-                    continue
             except Exception as e:
                 _LOGGER.error("Serial read error: %s", e)
                 break
@@ -371,7 +387,7 @@ class BackyardBrainsSource(BaseDevice):
             # Simple scan: we look for start sequence.
             # If found, we look for end sequence.
             # If found, we extract message and remove from buffer.
-            
+
             while True:
                 try:
                     start_idx = raw_buffer.find(_MSG_START)
@@ -387,17 +403,17 @@ class BackyardBrainsSource(BaseDevice):
                                     _LOGGER.info("SpikerBox Message: %s", msg_str)
                             except Exception as exc:
                                 _LOGGER.debug("Failed to decode SpikerBox message: %s", exc)
-                            
+
                             # Remove message from buffer
                             del raw_buffer[start_idx : end_idx + len(_MSG_END)]
-                            continue # Check for more messages
+                            continue  # Check for more messages
                 except Exception as exc:
                     _LOGGER.debug("Failed to process escape sequences: %s", exc)
                 break
 
             # 2. Process frames using vectorization
             frame_size = stream_channels * 2
-            
+
             # Align to start of a frame (first byte must have MSB=1)
             if len(raw_buffer) > 0 and not (raw_buffer[0] & 0x80):
                 start_idx = -1
@@ -413,42 +429,68 @@ class BackyardBrainsSource(BaseDevice):
             num_frames = len(raw_buffer) // frame_size
             if num_frames > 0:
                 byte_count = num_frames * frame_size
-                
+
                 # Vectorized decoding
-                # Create a numpy view of the bytes
                 raw_bytes = np.frombuffer(raw_buffer[:byte_count], dtype=np.uint8)
-                
+
                 # Reshape to (num_frames, channels, 2 bytes)
                 frames_bytes = raw_bytes.reshape(num_frames, stream_channels, 2)
-                
+
                 # Extract high and low bytes
                 highs = frames_bytes[:, :, 0].astype(np.int32)
                 lows = frames_bytes[:, :, 1].astype(np.int32)
-                
+
                 # Combine 7 bits from each: ((hi & 0x7F) << 7) | (lo & 0x7F)
                 raw_vals = ((highs & 0x7F) << 7) | (lows & 0x7F)
-                
+
                 # Normalize
                 decoded = (raw_vals - center_val) / center_val
-                
+
                 # Fill sample buffer and emit chunks
                 source_idx = 0
                 while source_idx < num_frames:
                     needed = raw_chunk_size - sample_idx
                     available = num_frames - source_idx
                     to_copy = min(needed, available)
-                    
+
                     sample_buffer[sample_idx : sample_idx + to_copy] = decoded[source_idx : source_idx + to_copy]
-                    
+
                     sample_idx += to_copy
                     source_idx += to_copy
-                    
+
                     if sample_idx >= raw_chunk_size:
                         self._emit_active(sample_buffer, sample_idx)
                         sample_idx = 0
-                
+                        # Watchdog: a successful emit resets the sync clock.
+                        _last_emit_time = time.monotonic()
+                        if _sync_lost:
+                            _LOGGER.info(
+                                "BYB frame sync recovered after %.1f s.",
+                                _last_emit_time - _sync_lost_time,
+                            )
+                            _sync_lost = False
+
                 # Remove processed bytes
                 del raw_buffer[:byte_count]
+
+            # --- Frame-sync watchdog -----------------------------------------
+            # If no chunk has been emitted for _SYNC_TIMEOUT_S seconds, the
+            # byte stream is likely mis-aligned or the cable is unplugged.
+            # Reset the decoder so it re-synchronises on the next valid frame
+            # rather than accumulating garbage indefinitely.
+            elapsed = time.monotonic() - _last_emit_time
+            if elapsed > self._SYNC_TIMEOUT_S and not _sync_lost:
+                _sync_lost = True
+                _sync_lost_time = time.monotonic()
+                _LOGGER.warning(
+                    "BYB frame sync lost: no valid frames for %.1f s. "
+                    "Resetting decoder — check USB cable and electrode connection.",
+                    elapsed,
+                )
+                self.note_xrun()
+                raw_buffer.clear()
+                sample_idx = 0
+            # -----------------------------------------------------------------
 
     def _emit_active(self, sample_buffer: np.ndarray, frames: int) -> None:
         """
