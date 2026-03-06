@@ -1,3 +1,5 @@
+import threading
+
 import numpy as np
 from typing import Iterable, Mapping, Dict, Optional
 
@@ -18,6 +20,7 @@ class AmpThresholdDetector:
     _NOISE_EWMA_ALPHA: float = 0.1
 
     def __init__(self):
+        self._lock = threading.Lock()
         self._factor: float = 5.0
         self._sign: int = -1  # -1 for negative peaks, 1 for positive
         self._sample_rate: float = 0.0
@@ -69,29 +72,35 @@ class AmpThresholdDetector:
         return params
 
     def configure(self, **params) -> None:
-        if "factor" in params:
-            self._factor = float(params["factor"])
-        if "sign" in params:
-            self._sign = int(params["sign"])
-        if "refractory_ms" in params:
-            self._refractory_ms = float(params["refractory_ms"])
-            if self._sample_rate > 0:
-                self._refractory_samples = int(self._refractory_ms * 1e-3 * self._sample_rate)
-        if "window_ms" in params:
-            self._window_ms = float(params["window_ms"])
+        with self._lock:
+            if "factor" in params:
+                self._factor = float(params["factor"])
+            if "sign" in params:
+                self._sign = int(params["sign"])
+            if "refractory_ms" in params:
+                self._refractory_ms = float(params["refractory_ms"])
+                if self._sample_rate > 0:
+                    self._refractory_samples = int(self._refractory_ms * 1e-3 * self._sample_rate)
+            if "window_ms" in params:
+                self._window_ms = float(params["window_ms"])
 
     def reset(self, sample_rate: float, n_channels: int) -> None:
-        self._sample_rate = sample_rate
-        self._n_channels = n_channels
-        self._noise_levels = None  # Will be estimated from first chunk(s) or running average
-        self._refractory_samples = int(self._refractory_ms * 1e-3 * sample_rate) if sample_rate > 0 else 0
-        self._last_event_time = np.zeros(n_channels, dtype=np.float64) - 1000.0
-        self._residue = None # Reset residue buffer
+        with self._lock:
+            self._sample_rate = sample_rate
+            self._n_channels = n_channels
+            self._noise_levels = None  # Will be estimated from first chunk(s) or running average
+            self._refractory_samples = int(self._refractory_ms * 1e-3 * sample_rate) if sample_rate > 0 else 0
+            self._last_event_time = np.zeros(n_channels, dtype=np.float64) - 1000.0
+            self._residue = None  # Reset residue buffer
 
     def process_chunk(self, chunk: Chunk) -> Iterable[DetectionEvent]:
+        with self._lock:
+            return self._process_chunk_locked(chunk)
+
+    def _process_chunk_locked(self, chunk: Chunk) -> Iterable[DetectionEvent]:
         if self._sample_rate <= 0:
             return []
-        
+
         samples = chunk.samples # (n_channels, n_samples)
         if samples.shape[1] == 0:
             # If the current chunk is empty, preserve existing residue.
@@ -103,7 +112,7 @@ class AmpThresholdDetector:
         window_samples = int(self._window_ms * 1e-3 * self._sample_rate)
         pre_samples = window_samples // 3
         post_samples = window_samples - pre_samples
-        
+
         # Stitch residue
         if self._residue is not None and self._residue.shape[1] > 0:
             full_samples = np.concatenate([self._residue, samples], axis=1)
@@ -223,7 +232,7 @@ class AmpThresholdDetector:
                 w_start = real_idx - pre_samples
                 w_end = real_idx + post_samples
                 waveform = ch_data[w_start:w_end]
-                
+
                 # Create event
                 event = DetectionEvent(
                     t=real_t,

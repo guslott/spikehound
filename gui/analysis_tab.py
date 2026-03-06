@@ -829,10 +829,18 @@ class AnalysisTab(QtWidgets.QWidget):
         self._event_window_ms = float(value)
         controller = self._controller
         if controller is not None:
-            try:
-                controller.update_analysis_settings(event_window_ms=self._event_window_ms)
-            except AttributeError:
-                pass
+            controller.update_analysis_settings(event_window_ms=self._event_window_ms)
+        # Flush stale events from the output queue so old-window-size events
+        # don't refill _event_details immediately after _clear_metrics wipes it.
+        # Without this, View Waveforms shows the old window width because the
+        # most-common-length heuristic in _prepare_waveform_data picks the old size.
+        if self._analysis_queue is not None:
+            while True:
+                try:
+                    self._analysis_queue.get_nowait()
+                except queue.Empty:
+                    break
+        self._clear_event_overlays()
         self._notify_threshold_change()
 
     def _on_threshold1_toggled(self, checked: bool) -> None:
@@ -1314,6 +1322,16 @@ class AnalysisTab(QtWidgets.QWidget):
         self._metric_events.clear()
         self._event_details.clear()
         self._event_cluster_labels.clear()
+        # Advance _last_event_id past all events currently in the ring buffer
+        # so that stale events (from a previous window configuration) are not
+        # re-delivered on the next pull_events() call.
+        if self._analysis_events is not None:
+            try:
+                all_buf = self._analysis_events._buffer.peek_all()
+                if all_buf:
+                    self._last_event_id = max(ev.id for ev in all_buf)
+            except Exception:
+                pass
         # Reset optimization tracking
         self._last_scatter_count = 0
         self._cluster_membership_dirty = True
@@ -2504,7 +2522,8 @@ class AnalysisTab(QtWidgets.QWidget):
         arr_samples = np.asarray(samples, dtype=np.float32)
         relative: Optional[np.ndarray] = None
         first_index = overlay.get("first_index")
-        sample_dt = float(self._dt) if self._dt > 0 else float(overlay.get("sr") or 0.0)
+        sr_fallback = float(overlay.get("sr") or 0.0)
+        sample_dt = float(self._dt) if self._dt > 0 else (1.0 / sr_fallback if sr_fallback > 0 else 0.0)
         if (
             window_start_idx is not None
             and first_index is not None

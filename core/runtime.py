@@ -116,6 +116,11 @@ class SpikeHoundRuntime:
         return None
 
 
+    def update_analysis_settings(self, **kwargs) -> None:
+        """Delegate analysis-settings updates to the PipelineController."""
+        if self._pipeline is not None:
+            self._pipeline.update_analysis_settings(**kwargs)
+
     def scan_devices(self) -> None:
         """Scan for available DAQ devices."""
         if self.device_manager is not None:

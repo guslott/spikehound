@@ -330,9 +330,14 @@ class AnalysisWorker(threading.Thread):
 
     def _on_settings_changed(self, settings: AnalysisSettings) -> None:
         with self._state_lock:
+            old_window = self._event_window_ms
             self._event_window_ms = float(settings.event_window_ms)
             if self._auto_detector is not None:
                 self._auto_detector.configure(window_ms=self._event_window_ms)
+                # Reset detector state (residue, noise, refractory) when window changes
+                # to prevent stale residue from causing missed or malformed events.
+                if old_window != self._event_window_ms and self.sample_rate > 0:
+                    self._auto_detector.reset(self.sample_rate, 1)
 
     def configure_threshold(
         self,
@@ -365,8 +370,10 @@ class AnalysisWorker(threading.Thread):
                 if self.sample_rate > 0:
                     self._auto_detector.reset(self.sample_rate, 1)
             elif self._auto_detect_enabled and self._auto_detector is not None:
-                # Update window if needed
+                # Update window and reset detector state to clear stale residue
                 self._auto_detector.configure(window_ms=self._event_window_ms)
+                if self.sample_rate > 0:
+                    self._auto_detector.reset(self.sample_rate, 1)
 
     def update_sample_rate(self, sample_rate: float) -> None:
         """Refresh fallback sample rate and drop stale refractory state when it changes."""
@@ -425,7 +432,7 @@ class AnalysisWorker(threading.Thread):
             detected_events = detector.process_chunk(chunk)
             if not detected_events:
                 return []
-            
+
             events: list[tuple[AnalysisEvent, int, float]] = []
             
             for de in detected_events:
@@ -439,7 +446,7 @@ class AnalysisWorker(threading.Thread):
                         chunk=chunk,
                         event_id=self._next_event_id(),
                         sample_rate=self.sample_rate,
-                        window_ms=self._event_window_ms,
+                        window_ms=event_window_ms,
                         last_crossing_time=self._last_crossing_time_sec,
                         noise_mad=self._noise_mad,
                         noise_initialized=self._noise_initialized,
