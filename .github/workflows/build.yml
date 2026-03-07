@@ -105,6 +105,20 @@ jobs:
 
         DEB_VERSION="0.0.${GITHUB_RUN_NUMBER}"
 
+        mkdir -p debian
+        cat > debian/control << EOF
+        Source: spikehound
+        Section: science
+        Priority: optional
+        Maintainer: SpikeHound Maintainers
+        Standards-Version: 4.6.0
+
+        Package: spikehound
+        Architecture: ${{ matrix.deb_arch || 'all' }}
+        Description: SpikeHound real-time neurophysiology app
+         Real-time bioelectric data acquisition, visualization, and analysis.
+        EOF
+
         mapfile -t ELF_FILES < <(
           find "$PKG_ROOT/opt/spikehound" -type f -print0 \
             | xargs -0 file \

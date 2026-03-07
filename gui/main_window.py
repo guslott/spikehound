@@ -127,7 +127,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.attach_controller(controller)
         self._signal_bridge.wire_runtime_signals()
         self._apply_device_state(False)
-        self.runtime.device_manager.refresh_devices()
+        self.runtime.scan_devices()
         app_settings = controller.app_settings if controller is not None else None
         if app_settings is not None:
             self.set_plot_refresh_hz(float(app_settings.plot_refresh_hz))
@@ -216,55 +216,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.runtime.update_metrics(plot_refresh_hz=hz)
         except Exception as exc:
             self._logger.debug("Failed to update plot refresh metrics: %s", exc)
-
-    # ------------------------------------------------------------------
-    # Runtime delegation
-    # ------------------------------------------------------------------
-
-    def open_device(self, driver: object, sample_rate: float, channels: Sequence[object]) -> None:
-        """Delegate device attachment to the runtime/pipeline controller."""
-        try:
-            self.runtime.attach_source(driver, sample_rate, channels)
-        except Exception as exc:
-            self._logger.warning("Failed to open device: %s", exc)
-            return
-        self._bind_dispatcher_signals()
-        self._bind_app_settings_store()
-
-    def configure_acquisition(
-        self,
-        *,
-        channels: Optional[list[int]] = None,
-        filter_settings: Optional[FilterSettings] = None,
-        trigger_cfg: Optional[TriggerConfig] = None,
-    ) -> None:
-        """Push filter/trigger/channel updates to the runtime."""
-        cfg_trigger = trigger_cfg
-        try:
-            self.runtime.configure_acquisition(
-                channels=channels,
-                filter_settings=filter_settings,
-                trigger_cfg=cfg_trigger,
-            )
-        except Exception as exc:
-            self._logger.warning("Failed to configure acquisition: %s", exc)
-            return
-
-    def start_acquisition(self) -> None:
-        """Start streaming via the runtime."""
-        try:
-            self.runtime.start_acquisition()
-        except Exception as exc:
-            self._logger.warning("Failed to start acquisition: %s", exc)
-            return
-
-    def stop_acquisition(self) -> None:
-        """Stop streaming via the runtime."""
-        try:
-            self.runtime.stop_acquisition()
-        except Exception as exc:
-            self._logger.warning("Failed to stop acquisition: %s", exc)
-            return
 
     def set_default_window_sec(self, value: float) -> None:
         """Set default time window duration before device connection."""
@@ -471,8 +422,11 @@ class MainWindow(QtWidgets.QMainWindow):
             pre = float(config.pretrigger_frac)
             self.scope.set_pretrigger_position(pre, visible=True)
         
-        if self._device_connected:
-            self.configure_acquisition(trigger_cfg=config)
+        if self._device_connected and self._controller is not None:
+            try:
+                self._controller.update_trigger_config(config)
+            except Exception as exc:
+                self._logger.warning("Failed to update trigger config: %s", exc)
         
         self._update_trigger_visuals(config)
 
@@ -550,11 +504,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_device_button_clicked(self) -> None:
         """Handle device connect/disconnect button toggle."""
-        dm = self.runtime.device_manager
-        if dm is None:
-            return
         if self._device_connected:
-            dm.disconnect_device()
+            self.runtime.disconnect_device()
             return
         key = self.device_control.device_combo.currentData()
         if not key:
@@ -591,9 +542,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_device_disconnect_requested(self) -> None:
         """Handle disconnection request from DeviceControlWidget."""
         if self._device_connected:
-            dm = self.runtime.device_manager
-            if dm is not None:
-                dm.disconnect_device()
+            self.runtime.disconnect_device()
 
     def _on_channel_add_requested(self, channel_id: int) -> None:
         """Handle add channel request from DeviceControlWidget."""
@@ -645,9 +594,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # Sync local state
         self._channel_ids_current = list(channel_ids)
         self._channel_names = list(channel_names)
-        
-        # This is handled by _publish_active_channels for now, 
-        # but will eventually be fully managed by ChannelManager
 
 
     def _on_devices_changed(self, entries: List[dict]) -> None:
@@ -682,8 +628,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.device_control.device_combo.setItemData(idx, tooltip, QtCore.Qt.ToolTipRole)
         self.device_control.device_combo.blockSignals(False)
         if self._device_connected:
-            dm = self.runtime.device_manager
-            active_key = dm.active_key() if dm is not None else None
+            active_key = self.runtime.active_device_key()
             if active_key is not None:
                 idx = self.device_control.device_combo.findData(active_key)
                 if idx >= 0:
@@ -837,7 +782,10 @@ class MainWindow(QtWidgets.QMainWindow):
         
         self._device_connected = False
         self._apply_device_state(False)
-        self.stop_acquisition()
+        try:
+            self.runtime.stop_acquisition()
+        except Exception as exc:
+            self._logger.warning("Failed to stop acquisition: %s", exc)
         self._drain_visualization_queue()
         self._clear_scope_display()
         # Don't clear sample_rate_combo - preserve rates for reconnection
@@ -866,11 +814,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_scan_hardware(self) -> None:
         """Handle hardware rescan request."""
-        dm = self.runtime.device_manager
-        if dm is None:
-            return
         try:
-            dm.refresh_devices()
+            self.runtime.scan_devices()
         except Exception as exc:
             self._logger.debug("Failed to refresh devices: %s", exc)
         self._publish_active_channels()
@@ -922,8 +867,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ids, names,
             analysis_dock=self._analysis_dock,
         )
-        # CRITICAL: Sync configs and panels back to MainWindow BEFORE resetting scope
-        # This ensures PlotManager gets the correct configs for creating renderers
+        # Sync panel/config state before resetting the scope so the plot
+        # manager sees the current renderer configuration.
         self._channel_panels = self._channel_manager.channel_panels
         self._channel_configs = self._channel_manager.channel_configs
         
@@ -944,15 +889,26 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.set_trigger_channels([])
 
+        controller = self._controller
+        if controller is not None:
+            try:
+                if ids:
+                    controller.set_active_channels(ids)
+                else:
+                    controller.clear_active_channels()
+            except Exception as exc:
+                self._logger.warning("Failed to update active channels: %s", exc)
         if ids:
-            self.configure_acquisition(channels=ids)
-            # Ensure acquisition is started if we have active channels and a device
             if self._device_connected:
-                self.start_acquisition()
+                try:
+                    self.runtime.start_acquisition()
+                except Exception as exc:
+                    self._logger.warning("Failed to start acquisition: %s", exc)
         else:
-            self.configure_acquisition(channels=[])
-            # Stop acquisition if no channels are active
-            self.stop_acquisition()
+            try:
+                self.runtime.stop_acquisition()
+            except Exception as exc:
+                self._logger.warning("Failed to stop acquisition: %s", exc)
         self._update_sample_rate_enabled()
         dock = self._analysis_dock
         if dock is not None:
@@ -1394,9 +1350,7 @@ class MainWindow(QtWidgets.QMainWindow):
         _run_shutdown_step("shutdown runtime", self.runtime.shutdown)
 
         # 5. Device manager
-        dm = self.runtime.device_manager
-        if dm is not None:
-            _run_shutdown_step("cleanup device manager", dm.cleanup)
+        _run_shutdown_step("cleanup device manager", self.runtime.cleanup_device_manager)
 
         if shutdown_failures:
             summary = "; ".join(f"{label}: {exc}" for label, exc in shutdown_failures)

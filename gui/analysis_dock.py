@@ -310,8 +310,8 @@ class AnalysisDock(QtWidgets.QDockWidget):
             return
         widget.setParent(self._tabs)
         self._tabs.addTab(widget, title)
-        # We don't track these in _tab_info for now unless they need active channel updates
-        # If they inherit from BaseTab they can access runtime themselves.
+        # Plugin tabs manage runtime access themselves unless they need
+        # active-channel updates from the dock.
 
     def open_settings(self, widget: QtWidgets.QWidget, title: str = "Settings & Debug") -> None:
         if widget is None:

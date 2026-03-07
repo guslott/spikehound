@@ -623,20 +623,9 @@ class SimulatedPhysiologySource(BaseDevice):
                         if insert_pos < buf_len:
                             wave_buf[insert_pos:end] += scaled[: end - insert_pos]
 
-                        # Create PSP event (will be rendered in step 3)
-                        # CRITICAL TIMING CORRECTION:
-                        # The buffer insertion adds max_delay offset, but proximal reads from wave[delay:]
-                        # This means proximal spike appears in output at: chunk_start + off
-                        # Distal reads from wave[0:], so distal spike appears at: chunk_start + off + max_delay
-                        # We need to calculate when the distal spike actually appears in the output stream
-                        # and add synaptic delay from there.
-                        #
-                        # Actual output timing:
-                        # - Proximal in output: chunk_start_sample + off (because it reads from offset position)
-                        # - Distal in output: chunk_start_sample + off + max_delay (because it reads from start)
-                        # - PSP should appear AFTER distal by synaptic delay
-                        #
-                        # Therefore: PSP_start = (chunk_start + off + max_delay) + synaptic_delay
+                        # Distal spikes appear after the extra insertion delay,
+                        # so the PSP start is computed from the distal arrival
+                        # time plus the synaptic delay.
                         psp_delay_samples = u['syn_delay_samples']
                         # Skip template[0] which is forced to 0.0 for baseline correction
                         new_psp = ActivePSP(
@@ -648,10 +637,7 @@ class SimulatedPhysiologySource(BaseDevice):
                         self._active_psps.append(new_psp)
 
 
-                # CRITICAL: Preserve the order of active_ids as provided by the UI.
-                # The dispatcher and UI expect data columns to match the user-added order,
-                # NOT sorted by channel ID. Sorting here caused data mismatches when
-                # channels were added out of order (e.g., adding ch0, ch2, ch1).
+                # Preserve the UI-selected channel order in the emitted columns.
 
                 
                 # ============================================================

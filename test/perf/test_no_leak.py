@@ -23,7 +23,29 @@ import pytest
 
 from core.runtime import SpikeHoundRuntime
 from daq.simulated_source import SimulatedPhysiologySource
+from shared.models import TriggerConfig
 from shared.ring_buffer import SharedRingBuffer
+
+
+def pipeline(runtime: SpikeHoundRuntime):
+    controller = runtime.controller
+    assert controller is not None
+    return controller
+
+
+def configure_triggered_visualization(runtime: SpikeHoundRuntime, channels: list[int]) -> None:
+    controller = pipeline(runtime)
+    controller.set_active_channels(channels)
+    controller.update_trigger_config(
+        TriggerConfig(
+            channel_index=channels[0],
+            threshold=0.0,
+            hysteresis=0.0,
+            pretrigger_frac=0.0,
+            window_sec=1.0,
+            mode="repeated",
+        )
+    )
 
 
 @pytest.mark.slow
@@ -72,9 +94,7 @@ class TestMemoryStability:
             devices = SimulatedPhysiologySource.list_available_devices()
             runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
-            runtime.configure_acquisition(
-                channels=[0],
-            )
+            configure_triggered_visualization(runtime, [0])
 
             # Start and run for initial period
             runtime.start_acquisition()
@@ -119,9 +139,7 @@ class TestThreadStability:
             devices = SimulatedPhysiologySource.list_available_devices()
             runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
-            runtime.configure_acquisition(
-                channels=[0],
-            )
+            configure_triggered_visualization(runtime, [0])
 
             # Multiple start/stop cycles
             for cycle in range(10):
@@ -156,9 +174,7 @@ class TestQueueStability:
             devices = SimulatedPhysiologySource.list_available_devices()
             runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
-            runtime.configure_acquisition(
-                channels=[0],
-            )
+            configure_triggered_visualization(runtime, [0])
 
             runtime.start_acquisition()
 
@@ -194,9 +210,7 @@ class TestTimingStability:
             runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": sample_rate, "chunk_size": chunk_size})
             runtime.select_device(devices[0].id)
 
-            runtime.configure_acquisition(
-                channels=[0],
-            )
+            configure_triggered_visualization(runtime, [0])
 
             runtime.start_acquisition()
             time.sleep(0.5)  # Let it stabilize
@@ -240,9 +254,7 @@ class TestLongRunStability:
             devices = SimulatedPhysiologySource.list_available_devices()
             runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
-            runtime.configure_acquisition(
-                channels=[0, 1],  # Multiple channels
-            )
+            configure_triggered_visualization(runtime, [0, 1])  # Multiple channels
 
             runtime.start_acquisition()
 

@@ -61,8 +61,11 @@ from core.runtime import SpikeHoundRuntime
 
 runtime = SpikeHoundRuntime()
 
-# Attach device and start
-runtime.attach_source(driver, sample_rate=20000, channels=channels)
+# Configure the pipeline and start
+controller = runtime.controller
+assert controller is not None
+controller.attach_source(driver, sample_rate=20000, channels=channels)
+controller.set_active_channels([ch.id for ch in channels])
 runtime.start_acquisition()
 
 # Get health metrics
@@ -75,8 +78,6 @@ runtime.stop_acquisition()
 **Public API:**
 | Method | Purpose |
 |--------|---------|
-| `attach_source(driver, sample_rate, channels)` | Attach DAQ driver |
-| `configure_acquisition(...)` | Update filters, triggers, channels |
 | `start_acquisition()` / `stop_acquisition()` | Control streaming |
 | `health_snapshot()` | Get dispatcher stats, queue depths |
 | `open_analysis_stream(channel, sr)` | Start analysis worker |

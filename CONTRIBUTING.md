@@ -155,7 +155,9 @@ class MyExperimentTab(BaseTab):
             window_sec=1.0,
             mode="repeated",       # "stream", "single", "repeated"
         )
-        self.runtime.configure_acquisition(trigger_cfg=trigger_cfg)
+        controller = self.runtime.controller
+        if controller is not None:
+            controller.update_trigger_config(trigger_cfg)
 
     def closeEvent(self, event):
         if self._dispatcher_unsubscribe is not None:

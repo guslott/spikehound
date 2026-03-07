@@ -91,14 +91,14 @@ class AnalysisTab(QtWidgets.QWidget):
         self._t0_event: Optional[float] = None
         self._metric_events: deque[dict[str, float | int]] = deque(maxlen=100_000)
         self._metrics_dirty: bool = False
-        # Performance optimization: track state to skip unnecessary updates
+        # Track visible-state deltas so metric updates can avoid full recounts.
         self._last_scatter_count: int = 0
-        self._cluster_membership_dirty: bool = True  # Recompute classification on ROI change only
-        # [H2] Maintained cluster counts for visible events — avoids Counter() scan each frame
-        self._cluster_counts: dict[int, int] = {}   # cluster_id → count of visible classified events
-        # [H5] Maintained unclassified count for visible events — avoids O(n) sum each frame
+        self._cluster_membership_dirty: bool = True
+        # Visible classified-event counts by cluster ID.
+        self._cluster_counts: dict[int, int] = {}
+        # Visible event count with no cluster assignment.
         self._unclassified_count: int = 0
-        # [H2] Number of event_ids from the previous _update_metric_points() call
+        # Visible event count from the previous metric update.
         self._last_visible_len: int = 0
         self._brush_cache: dict[int, object] = {}  # cluster_id -> cached brush object
         # Scatter plot coordinate caching to avoid rebuilding on every update
@@ -536,11 +536,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self.threshold2_line.sigPositionChanged.connect(lambda _: self._update_spin_from_line(self.threshold2_line, self.threshold2_spin))
         self.event_window_combo.currentIndexChanged.connect(self._on_event_window_changed)
 
-        # [H4] Consolidated update timer: single timer reduces scheduling overhead
-        # and prevents clustered work bursts from multiple independent timers
-        # firing in rapid succession.  Runs at 50ms (~20Hz) — lowered from 30ms
-        # (~33Hz) to reduce GUI-thread load on low-end student laptops while
-        # remaining visually smooth for scatter plots and overlays.
+        # One timer coordinates the plot/metric/STA update cadence.
         self._update_timer = QtCore.QTimer(self)
         self._update_timer.setInterval(50)
         self._update_timer.timeout.connect(self._on_unified_timer)
@@ -1330,12 +1326,12 @@ class AnalysisTab(QtWidgets.QWidget):
                     self._last_event_id = max(ev.id for ev in all_buf)
             except Exception:
                 pass
-        # Reset optimization tracking
+        # Reset cached visible-event accounting.
         self._last_scatter_count = 0
         self._cluster_membership_dirty = True
-        self._cluster_counts = {}          # [H2] reset visible cluster counts
-        self._unclassified_count = 0      # [H5] reset unclassified counter
-        self._last_visible_len = 0        # [H2] reset visible-set cursor
+        self._cluster_counts = {}
+        self._unclassified_count = 0
+        self._last_visible_len = 0
         self._invalidate_scatter_cache()
         # Note: overlay colors are set at creation time, not refreshed
         self._t0_event = None
@@ -2122,9 +2118,9 @@ class AnalysisTab(QtWidgets.QWidget):
         self._t0_event = None
         self._last_scatter_count = 0
         self._cluster_membership_dirty = True
-        self._cluster_counts = {}          # [H2]
-        self._unclassified_count = 0      # [H5]
-        self._last_visible_len = 0        # [H2]
+        self._cluster_counts = {}
+        self._unclassified_count = 0
+        self._last_visible_len = 0
         self._update_metric_points()
 
     def _update_metric_points(self) -> None:
@@ -2247,13 +2243,11 @@ class AnalysisTab(QtWidgets.QWidget):
                     min_y, max_y = max_y, min_y
                 cluster_bounds.append((cluster.id, min_x, max_x, min_y, max_y))
 
-            if cluster_bounds:
-                if self._cluster_membership_dirty:
-                    # [H2] Dirty path: _recompute_cluster_membership() already ran and
-                    # populated _event_cluster_labels for all metric events.  Just recount
-                    # among the VISIBLE set — no per-cluster bounds loop needed for
-                    # events that already have labels.
-                    new_counts: dict[int, int] = {c.id: 0 for c in self._clusters}
+                if cluster_bounds:
+                    if self._cluster_membership_dirty:
+                        # Membership labels are already current; only
+                        # visible-count accounting needs to be rebuilt.
+                        new_counts: dict[int, int] = {c.id: 0 for c in self._clusters}
                     new_unclassified = 0
                     for idx, event_id in enumerate(event_ids):
                         if event_id is None:
@@ -2267,8 +2261,8 @@ class AnalysisTab(QtWidgets.QWidget):
                     self._unclassified_count = new_unclassified
 
                 elif current_visible_len > self._last_visible_len:
-                    # [H2] Pure-growth case: the visible set only grew at the tail.
-                    # Classify only the new tail events; existing counts stay valid.
+                    # If the visible set only grew at the tail, classify just
+                    # the new tail events and keep existing counts.
                     tail_start = self._last_visible_len
                     for idx in range(tail_start, current_visible_len):
                         event_id = event_ids[idx]
@@ -2295,9 +2289,8 @@ class AnalysisTab(QtWidgets.QWidget):
                             self._cluster_counts[cid] = self._cluster_counts.get(cid, 0) + 1
 
                 else:
-                    # [H2] Shrinkage or same-length time-window slide: recount from
-                    # the visible set.  Existing labels are still valid; only classify
-                    # any newly appearing events that have never been seen before.
+                    # On shrinkage or a same-length window slide, rebuild the
+                    # visible counts and classify any newly visible events.
                     new_counts = {c.id: 0 for c in self._clusters}
                     new_unclassified = 0
                     for idx, event_id in enumerate(event_ids):
@@ -2320,7 +2313,7 @@ class AnalysisTab(QtWidgets.QWidget):
                     self._cluster_counts = new_counts
                     self._unclassified_count = new_unclassified
 
-            # [H5] Update cluster list items using maintained visible counts
+            # Refresh cluster labels from the maintained visible counts.
             for cluster in self._clusters:
                 item = self._cluster_items.get(cluster.id)
                 if item is not None:
@@ -2330,12 +2323,11 @@ class AnalysisTab(QtWidgets.QWidget):
             self._cluster_membership_dirty = False
 
         elif not self._clusters and need_reclassify:
-            # [H5] No clusters defined: all visible events with IDs are unclassified.
-            # O(n) but no k-factor; only runs when count actually changed.
+            # Without clusters, every visible event with an ID is unclassified.
             self._unclassified_count = sum(1 for eid in event_ids if eid is not None)
             self._cluster_membership_dirty = False
 
-        # [H5] Update Unclassified count using maintained counter — O(1)
+        # Refresh the unclassified label from the maintained visible count.
         if self._unclassified_item is not None:
             self._unclassified_item.setText(f"Unclassified ({self._unclassified_count} events)")
         
@@ -2370,7 +2362,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self.energy_scatter.setData(xs, ys, brush=brushes)
         self.energy_scatter.show()
         self._last_scatter_count = current_count
-        self._last_visible_len = current_visible_len  # [H2] track visible set size
+        self._last_visible_len = current_visible_len
         plot_item = self.metrics_plot.getPlotItem()
         self._set_metrics_range(plot_item, min(xs), max(xs), min(ys), max(ys))
 
@@ -2524,8 +2516,8 @@ class AnalysisTab(QtWidgets.QWidget):
                 "event_id": payload.event_id,
             }
         )
-        # Classify the event immediately before applying color
-        # so overlay gets the correct color at creation time
+        # Classify the event before applying color so new overlays render with
+        # their cluster color immediately.
         event_id = payload.event_id
         if isinstance(event_id, int) and self._clusters:
             metrics = payload.metrics
@@ -2612,14 +2604,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._update_metric_points()
 
     def _recompute_cluster_membership(self) -> None:
-        """Recalculate which events belong to which clusters based on ROI bounds.
-
-        Always sets ``_cluster_membership_dirty`` so the subsequent
-        ``_update_metric_points()`` call knows to recount visible events
-        (required for [H2] incremental cluster counts to stay correct).
-        """
-        # [H2] Signal to _update_metric_points() that a full recount of visible
-        # events is needed — _cluster_counts will be rebuilt from scratch there.
+        """Recalculate cluster membership from the current ROI bounds."""
         self._cluster_membership_dirty = True
         if not self._clusters:
             self._event_cluster_labels.clear()

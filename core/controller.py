@@ -460,12 +460,10 @@ class PipelineController:
                     self._source.start()
                     self._start_streaming_locked() # Ensure dispatcher is also running/ready
 
-            # CRITICAL: Call set_channel_layout AFTER the source and buffer are configured
-            # This ensures the Dispatcher's channel IDs match the actual buffer shape
+            # Apply layout after the source/buffer reconfiguration so channel
+            # IDs line up with the current buffer shape.
             if self._dispatcher is not None:
-                # Build name lookup, then create names list in the SAME ORDER as _active_channel_ids
-                # This is critical - previously we iterated _channel_infos which is in device order,
-                # not the user-added order stored in _active_channel_ids
+                # Keep names/units in the same order as ``_active_channel_ids``.
                 id_to_name = {info.id: info.name for info in self._channel_infos}
                 id_to_info = {info.id: info for info in self._channel_infos}
                 active_names = [id_to_name.get(cid, f"Channel {cid}") for cid in self._active_channel_ids]

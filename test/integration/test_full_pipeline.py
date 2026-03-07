@@ -25,7 +25,7 @@ from core.runtime import SpikeHoundRuntime
 from core.conditioning import ChannelFilterSettings, FilterSettings
 from core.dispatcher import Dispatcher
 from daq.simulated_source import SimulatedPhysiologySource
-from shared.models import Chunk, ChunkPointer, EndOfStream
+from shared.models import Chunk, ChunkPointer, EndOfStream, TriggerConfig
 from shared.ring_buffer import SharedRingBuffer
 
 
@@ -44,6 +44,27 @@ def drain_queue(q: queue.Queue, timeout: float = 0.1) -> List:
     return items
 
 
+def pipeline(runtime: SpikeHoundRuntime):
+    controller = runtime.controller
+    assert controller is not None
+    return controller
+
+
+def configure_triggered_visualization(runtime: SpikeHoundRuntime, channels: list[int]) -> None:
+    controller = pipeline(runtime)
+    controller.set_active_channels(channels)
+    controller.update_trigger_config(
+        TriggerConfig(
+            channel_index=channels[0],
+            threshold=0.0,
+            hysteresis=0.0,
+            pretrigger_frac=0.0,
+            window_sec=1.0,
+            mode="repeated",
+        )
+    )
+
+
 class TestFullPipelineDataFlow:
     """Tests for complete data flow through the pipeline."""
 
@@ -56,9 +77,7 @@ class TestFullPipelineDataFlow:
             devices = SimulatedPhysiologySource.list_available_devices()
             runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
-            runtime.configure_acquisition(
-                channels=[0],
-            )
+            configure_triggered_visualization(runtime, [0])
 
             # Start acquisition
             runtime.start_acquisition()
@@ -82,9 +101,7 @@ class TestFullPipelineDataFlow:
             devices = SimulatedPhysiologySource.list_available_devices()
             runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
-            runtime.configure_acquisition(
-                channels=[0],
-            )
+            configure_triggered_visualization(runtime, [0])
 
             # Apply aggressive low-pass filter
             filter_settings = FilterSettings(
@@ -93,7 +110,7 @@ class TestFullPipelineDataFlow:
                     lowpass_order=4,
                 )
             )
-            runtime.update_filter_settings(filter_settings)
+            pipeline(runtime).update_filter_settings(filter_settings)
 
             runtime.start_acquisition()
             time.sleep(0.2)
@@ -126,9 +143,7 @@ class TestPipelineLifecycle:
             devices = SimulatedPhysiologySource.list_available_devices()
             runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
-            runtime.configure_acquisition(
-                channels=[0],
-            )
+            configure_triggered_visualization(runtime, [0])
 
             for cycle in range(3):
                 runtime.start_acquisition()
@@ -151,9 +166,7 @@ class TestPipelineLifecycle:
             devices = SimulatedPhysiologySource.list_available_devices()
             runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
-            runtime.configure_acquisition(
-                channels=[0],
-            )
+            pipeline(runtime).set_active_channels([0])
 
             # Stop without starting - should not crash
             runtime.stop_acquisition()
@@ -168,9 +181,7 @@ class TestPipelineLifecycle:
             devices = SimulatedPhysiologySource.list_available_devices()
             runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
-            runtime.configure_acquisition(
-                channels=[0],
-            )
+            pipeline(runtime).set_active_channels([0])
 
             runtime.start_acquisition()
             runtime.start_acquisition()  # Second start - should be safe
@@ -195,9 +206,7 @@ class TestPipelineResourceCleanup:
             devices = SimulatedPhysiologySource.list_available_devices()
             runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
-            runtime.configure_acquisition(
-                channels=[0],
-            )
+            pipeline(runtime).set_active_channels([0])
 
             runtime.start_acquisition()
             time.sleep(0.2)
@@ -225,9 +234,7 @@ class TestPipelineResourceCleanup:
         devices = SimulatedPhysiologySource.list_available_devices()
         runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
         runtime.select_device(devices[0].id)
-        runtime.configure_acquisition(
-            channels=[0],
-        )
+        pipeline(runtime).set_active_channels([0])
 
         runtime.start_acquisition()
         time.sleep(0.1)
@@ -249,9 +256,7 @@ class TestAnalysisQueueIntegration:
             devices = SimulatedPhysiologySource.list_available_devices()
             runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
-            runtime.configure_acquisition(
-                channels=[0],
-            )
+            pipeline(runtime).set_active_channels([0])
 
             # Open analysis stream
             analysis_queue, token = runtime.open_analysis_stream("Extracellular Proximal", 10000.0)
@@ -280,9 +285,7 @@ class TestHealthMonitoring:
             devices = SimulatedPhysiologySource.list_available_devices()
             runtime.switch_backend(SimulatedPhysiologySource, configure_kwargs={"sample_rate": 10000, "chunk_size": 256})
             runtime.select_device(devices[0].id)
-            runtime.configure_acquisition(
-                channels=[0],
-            )
+            pipeline(runtime).set_active_channels([0])
 
             runtime.start_acquisition()
             time.sleep(0.2)
@@ -317,9 +320,7 @@ class TestMultiChannelPipeline:
             n_channels = min(3, len(available))
             channels = [c.id for c in available[:n_channels]]
 
-            runtime.configure_acquisition(
-                channels=channels,
-            )
+            configure_triggered_visualization(runtime, channels)
 
             runtime.start_acquisition()
             time.sleep(0.2)

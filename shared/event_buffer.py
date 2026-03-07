@@ -14,8 +14,8 @@ class EventRingBuffer:
     Analysis workers push into the buffer, while visualization code can either
     peek at the most recent events or drain the buffer entirely.
 
-    [H1] Performance: a monotonic write counter lets consumers pull only new
-    events since their last poll without copying the full buffer or sorting.
+    A monotonic write counter lets consumers pull only new events since their
+    last poll without copying or sorting the full buffer.
     """
 
     def __init__(self, capacity: int = 1000) -> None:
@@ -57,10 +57,7 @@ class EventRingBuffer:
 
     def extend(self, events: Sequence[AnalysisEvent]) -> None:
         """
-        Convenience helper to push a batch of events.
-
-        [H8] Acquires the lock once for the entire batch instead of once per
-        event to reduce lock contention when detectors fire multiple events.
+        Convenience helper to push a batch of events under one lock hold.
         """
         with self._lock:
             for event in events:
@@ -141,10 +138,9 @@ class AnalysisEvents:
     def pull_events(self, last_event_id: Optional[int] = None) -> Tuple[List[AnalysisEvent], Optional[int]]:
         """Pull new events since *last_event_id*.
 
-        [H1] Delegates to ``EventRingBuffer.pull_since()`` which avoids the
-        full-buffer copy and O(n log n) sort that the original implementation
-        performed on every poll.  The return signature is unchanged for
-        backward compatibility.
+        Delegates to ``EventRingBuffer.pull_since()`` to avoid full-buffer
+        copies and sorting on every poll while preserving the existing return
+        signature.
         """
         events, new_id, _seq = self._buffer.pull_since(last_event_id)
         return events, new_id

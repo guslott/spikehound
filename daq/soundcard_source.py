@@ -319,10 +319,9 @@ class SoundCardSource(BaseDevice):
     def _emitter_loop(self) -> None:
         """Emitter thread: drains local buffer and calls emit_array.
 
-        CRITICAL: emit_array() must be called **outside** _buf_lock.
-        The miniaudio capture callback also acquires _buf_lock; if we hold it
-        during emit_array() (which can block on a full queue), the callback
-        stalls and causes an XRUN.
+        ``emit_array()`` must run outside ``_buf_lock``. The miniaudio capture
+        callback also takes that lock, and `emit_array()` can block on a full
+        queue.
 
         Strategy: drain all ready chunks into a local list under the lock,
         release the lock, then emit from the local list.
@@ -440,4 +439,3 @@ class SoundCardSource(BaseDevice):
 
     # ---------- Internals ------------------------------------------------------
     # No longer needed as we use index-based resolution
-

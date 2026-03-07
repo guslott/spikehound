@@ -8,10 +8,9 @@ from typing import Any, Optional, Sequence, TYPE_CHECKING, Tuple
 
 from daq.base_device import BaseDevice
 
-from .conditioning import FilterSettings, SignalConditioner
+from .conditioning import SignalConditioner
 from .device_registry import DeviceRegistry
 from shared.app_settings import AppSettings, AppSettingsStore
-from shared.models import TriggerConfig
 from shared.types import AnalysisEvent
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -127,63 +126,40 @@ class SpikeHoundRuntime:
         if self.device_manager is not None:
             self.device_manager.refresh_devices()
 
+    def disconnect_device(self) -> None:
+        """Disconnect the active device through the runtime-owned device manager."""
+        if self.device_manager is not None:
+            self.device_manager.disconnect_device()
+
+    def available_channels(self) -> list[Any]:
+        """Return channels available on the active device."""
+        if self.device_manager is None:
+            return []
+        return list(self.device_manager.get_available_channels())
+
+    def active_device_key(self) -> Optional[str]:
+        """Return the active device key managed by the runtime."""
+        if self.device_manager is None:
+            return None
+        return self.device_manager.active_key()
+
+    def cleanup_device_manager(self) -> None:
+        """Release the runtime-owned device manager listener."""
+        if self.device_manager is not None:
+            self.device_manager.cleanup()
+
     def connect_device(self, device_key: str, sample_rate: float, chunk_size: int = 1024) -> None:
         """Connect a device via the DeviceManager and wire it into the pipeline."""
-        # OPTIMIZATION: Calculate chunk size for ~20ms latency if not explicitly overridden
-        # default was 1024, which is >100ms at 10kHz.
-        # We target 20ms (0.02s) with a minimum of 32 samples for safety.
+        # Use a ~20 ms chunk when callers leave the default in place.
         if chunk_size == 1024:  # Only override if it's the default
             target_latency = 0.02  # 20ms
             chunk_size = max(32, int(sample_rate * target_latency))
-            # Align to 2/4 for cleanliness? Not strictly necessary but 128/256 are nice.
-            # actually strict 20ms is better for time alignment.
             
         driver = self.device_manager.connect_device(device_key, sample_rate, chunk_size=chunk_size)
         channels = self.device_manager.get_available_channels()
-        self.attach_source(driver, sample_rate, channels)
+        self._attach_source(driver, sample_rate, channels)
         # Emit deviceConnected AFTER dispatcher is created so GUI can bind to it
         self._device_registry.emit_device_connected(device_key)
-
-    def configure_acquisition(
-        self,
-        *,
-        channels: Optional[list[int]] = None,
-        filter_settings: Optional[FilterSettings] = None,
-        trigger_cfg: Optional[TriggerConfig] = None,
-    ) -> None:
-        """Configure the acquisition pipeline with updated settings.
-        
-        Updates filter settings, trigger configuration, and active channel list
-        on the underlying pipeline controller. All parameters are optional;
-        only provided values are applied.
-        
-        Args:
-            channels: List of channel IDs to enable. Empty list clears all channels.
-            filter_settings: Signal conditioning parameters (high-pass, low-pass, notch).
-            trigger_cfg: Trigger configuration (threshold, mode, pretrigger, window).
-        """
-        controller = self._pipeline
-        if controller is None:
-            return
-        if filter_settings is not None:
-            controller.update_filter_settings(filter_settings)
-        if trigger_cfg is not None:
-            controller.update_trigger_config(trigger_cfg)
-        if channels is not None:
-            if channels:
-                controller.set_active_channels(channels)
-            else:
-                controller.clear_active_channels()
-
-    def update_filter_settings(self, settings: FilterSettings) -> None:
-        """Update filter settings for the pipeline."""
-        if self._pipeline is not None:
-            self._pipeline.update_filter_settings(settings)
-
-    def update_trigger_config(self, config: TriggerConfig) -> None:
-        """Update trigger configuration for the pipeline."""
-        if self._pipeline is not None:
-            self._pipeline.update_trigger_config(config)
 
     def start_acquisition(self) -> None:
         """Start streaming data from the DAQ source into the pipeline.
@@ -240,15 +216,7 @@ class SpikeHoundRuntime:
             return
         self._acquisition_start_time = None  # Reset uptime
         controller.stop(join=True)
-        # FIX: Do not detach device here. MainWindow calls this when channels are empty,
-        # but we want to keep the device open so we can resume later when channels are added.
-        # try:
-        #     controller.detach_device()
-        # except Exception:
-        #     pass
-        # self.daq_source = None
-
-    def attach_source(self, driver: BaseDevice, sample_rate: float, channels) -> None:
+    def _attach_source(self, driver: BaseDevice, sample_rate: float, channels) -> None:
         """Attach a connected driver to the pipeline controller."""
         controller = self._pipeline
         if controller is None or driver is None:
@@ -370,7 +338,7 @@ class SpikeHoundRuntime:
             self.sample_rate = float(sample_rate)
 
     def set_listen_output_device(self, device_key: Optional[str]) -> None:
-        """Select audio output target for listen/mirror mode (persist only for now)."""
+        """Select audio output target for listen/mirror mode."""
         if self.app_settings_store is not None:
             try:
                 self.app_settings_store.update(listen_output_key=device_key)

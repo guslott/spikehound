@@ -267,10 +267,9 @@ class Dispatcher:
             channels = len(self._channel_ids) if self._channel_ids else len(self._channel_names)
             min_capacity = self._source_buffer.capacity if self._source_buffer is not None else 1
             self._ensure_viz_buffer_locked(channels or 1, min_capacity=min_capacity)
-            self._reset_viz_counters_locked() # Log this call?
-            
-            # CRITICAL: Reset filters if channel count changed
-            # Filters need to be re-initialized for the new channel configuration
+            self._reset_viz_counters_locked()
+
+            # Reinitialize filters when the channel count changes.
             if channel_count_changed:
                 current_settings = self._conditioner.settings
                 self._conditioner.update_settings(current_settings)
@@ -596,11 +595,8 @@ class Dispatcher:
             self._stop_event.wait(self._tick_interval)
 
     def _collect_window_payload(self) -> Optional[dict]:
-        # PERFORMANCE FIX: Minimize lock holding time to prevent blocking DAQ writes.
-        # Capture only the necessary state snapshot under the lock, then release it
-        # before doing expensive buffer reads and data copies.
-        
-        # Phase 1: Quick state snapshot under lock
+        # Capture only the state needed under the ring lock, then do buffer
+        # reads and copies after releasing it.
         with self._ring_lock:
             status = {
                 "sample_rate": float(self._sample_rate or 0.0),
@@ -703,10 +699,9 @@ class Dispatcher:
         (samples, missing_prefix, missing_suffix) where the missing values
         indicate how many samples at the start/end were unavailable.
         """
-        # PERFORMANCE FIX: Minimize lock holding time to prevent blocking DAQ writes.
-        # Capture only the necessary state snapshot under the lock, then release it
-        # before doing expensive buffer reads and data assembly.
-        
+        # Capture only the state needed under the ring lock, then assemble the
+        # window after releasing it.
+
         window_samples = int(window_samples)
         if window_samples <= 0:
             result = np.empty(0, dtype=np.float32)

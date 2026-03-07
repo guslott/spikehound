@@ -10,8 +10,7 @@
 - Track health snapshot data (dispatcher stats, queue utilization, chunk/plot rates, sample rate).
 
 ## Public API (current)
-- `attach_source(driver, sample_rate, channels)`: attach a configured DAQ driver to the pipeline.
-- `configure_acquisition(channels=None, filter_settings=None, trigger_cfg=None)`: push filter/trigger/channel updates into the pipeline.
+- `connect_device(device_key, sample_rate, chunk_size=...)`: connect via the runtime-owned device manager.
 - `start_acquisition()` / `stop_acquisition()`: start/stop streaming through the dispatcher.
 - `shutdown()`: stop everything and release resources.
 - `open_analysis_stream(channel_name, sample_rate) -> (queue, worker)`: start an `AnalysisWorker` for a channel and return its output queue.
@@ -26,11 +25,11 @@ from core import PipelineController
 
 runtime = SpikeHoundRuntime(pipeline=PipelineController())
 
-# Attach an already-open driver (from daq.registry) and configure
-driver = ...  # BaseDevice
-channels = driver.list_available_channels(driver.config.device_id)
-runtime.attach_source(driver, sample_rate=20_000, channels=channels)
-runtime.configure_acquisition(channels=[ch.id for ch in channels])
+# Configure the underlying pipeline explicitly
+controller = runtime.controller
+assert controller is not None
+controller.switch_source(...)
+controller.set_active_channels([0])
 runtime.start_acquisition()
 
 # Subscribe to analysis for a channel

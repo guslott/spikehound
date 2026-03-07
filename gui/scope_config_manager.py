@@ -264,7 +264,7 @@ class ScopeConfigManager:
 
         # Refresh channel lists with the newly connected device
         try:
-            available_channels = p.runtime.device_manager.get_available_channels()
+            available_channels = p.runtime.available_channels()
             p._on_available_channels(available_channels)
         except Exception as exc:
             self._logger.debug("Failed to refresh channels after load: %s", exc)

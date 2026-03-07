@@ -392,9 +392,7 @@ class SpectrogramTab(QtWidgets.QWidget):
     def _on_timer(self) -> None:
         """Update plots with latest data.
 
-        [H3] Skip all FFT / image work when the tab is not visible.
-        This eliminates ~20% of background GUI work for students in
-        analysis or scope mode.
+        Skip FFT and image work while the tab is hidden.
         """
         if not self.isVisible():
             return
