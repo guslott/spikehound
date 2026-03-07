@@ -131,11 +131,34 @@ class AudioManager:
 
     def set_gain(self, gain: float) -> None:
         """Set audio output gain.
-        
+
+        Also forwards the new gain to the live MonitorAudioBridge so the
+        bridge and AudioPlayer stay in sync whenever the GUI slider moves.
+
         Args:
             gain: Gain value (0.0 to 1.0)
         """
-        self._audio_gain = max(0.0, min(1.0, float(gain)))
+        gain = max(0.0, min(1.0, float(gain)))
+        self._audio_gain = gain
+        with self._audio_lock:
+            bridge = self._monitor_bridge
+        if bridge is not None:
+            bridge.set_gain(gain)
+
+    def update_filter_settings(self, settings: "FilterSettings") -> None:  # noqa: F821
+        """Forward updated filter settings to the live MonitorAudioBridge.
+
+        Called by PipelineController.update_filter_settings() whenever the GUI
+        pushes a new FilterSettings object so the bridge conditioner stays in
+        parity with the dispatcher conditioner.
+
+        Args:
+            settings: New FilterSettings to apply.
+        """
+        with self._audio_lock:
+            bridge = self._monitor_bridge
+        if bridge is not None:
+            bridge.update_filter_settings(settings)
 
     def update_active_channels(self, channel_ids: list[int]) -> None:
         """Update the list of active channels.
@@ -361,7 +384,33 @@ class AudioManager:
         if listen_id is not None:
             try:
                 from .monitor_audio_bridge import MonitorAudioBridge
-                from .conditioning import FilterSettings
+
+                controller = self.runtime.controller
+
+                # Seed the bridge with the current filter state so it is in
+                # parity with the dispatcher conditioner from the first chunk.
+                current_filter_settings = None
+                if controller is not None:
+                    try:
+                        current_filter_settings = controller.filter_settings
+                    except Exception:
+                        pass
+                if current_filter_settings is None:
+                    from .conditioning import FilterSettings
+                    current_filter_settings = FilterSettings()
+
+                # Use real channel names so that per-channel filter overrides
+                # (keyed by name) resolve correctly inside the bridge conditioner.
+                if controller is not None:
+                    try:
+                        channel_infos = controller.active_channels()
+                        id_to_name = {info.id: info.name for info in channel_infos}
+                        channel_names = [id_to_name.get(cid, str(cid)) for cid in channel_ids]
+                    except Exception:
+                        channel_names = [str(cid) for cid in channel_ids]
+                else:
+                    channel_names = [str(cid) for cid in channel_ids]
+
                 listen_idx: Optional[int] = None
                 try:
                     listen_idx = channel_ids.index(listen_id)
@@ -369,14 +418,13 @@ class AudioManager:
                     pass
                 bridge = MonitorAudioBridge(
                     player=player,
-                    filter_settings=FilterSettings(),  # Sync via update_filter_settings later
+                    filter_settings=current_filter_settings,
                     sample_rate=sample_rate,
                     n_channels=len(channel_ids),
-                    channel_names=[str(cid) for cid in channel_ids],
+                    channel_names=channel_names,
                     listen_channel_idx=listen_idx,
                     gain=gain,
                 )
-                controller = self.runtime.controller
                 if controller is not None:
                     controller.set_monitor_bridge(bridge)
                 with self._audio_lock:

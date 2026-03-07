@@ -326,6 +326,11 @@ class PipelineController:
             self._filter_settings = settings
             if self._dispatcher is not None:
                 self._dispatcher.update_filter_settings(settings)
+        # Forward to the MonitorAudioBridge (via AudioManager) so the bridge
+        # conditioner stays in parity with the dispatcher conditioner whenever
+        # the GUI pushes a new FilterSettings object.
+        if self._audio_manager is not None:
+            self._audio_manager.update_filter_settings(settings)
 
     def update_analysis_settings(self, *, event_window_ms: Optional[float] = None) -> None:
         updates: Dict[str, float] = {}
