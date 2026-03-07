@@ -165,14 +165,14 @@ class TestTriggerController:
         assert after is not None
         np.testing.assert_allclose(after, before)
 
-    def test_legacy_continuous_mode_is_canonicalized(self):
-        """Legacy mode name should map to canonical repeated mode."""
+    def test_legacy_continuous_mode_is_rejected(self):
+        """Only canonical trigger mode names should be accepted."""
         ctrl = TriggerController()
-        ctrl.configure(
-            mode="continuous",
-            threshold=0.5,
-            pre_seconds=0.01,
-            window_sec=0.2,
-            channel_id=0,
-        )
-        assert ctrl.mode == "repeated"
+        with pytest.raises(ValueError, match="mode must be one of"):
+            ctrl.configure(
+                mode="continuous",
+                threshold=0.5,
+                pre_seconds=0.01,
+                window_sec=0.2,
+                channel_id=0,
+            )

@@ -365,8 +365,8 @@ class AudioManager:
             try:
                 player_to_stop.stop()
                 player_to_stop.join(timeout=1.0)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to stop previous AudioPlayer cleanly: %s", exc)
         
         # Create new player
         queue_obj: queue.Queue = queue.Queue(maxsize=1)
@@ -418,25 +418,18 @@ class AudioManager:
 
                 # Seed the bridge with the current filter state so it is in
                 # parity with the dispatcher conditioner from the first chunk.
-                current_filter_settings = None
                 if controller is not None:
-                    try:
-                        current_filter_settings = controller.filter_settings
-                    except Exception:
-                        pass
-                if current_filter_settings is None:
+                    current_filter_settings = controller.filter_settings
+                else:
                     from .conditioning import FilterSettings
                     current_filter_settings = FilterSettings()
 
                 # Use real channel names so that per-channel filter overrides
                 # (keyed by name) resolve correctly inside the bridge conditioner.
                 if controller is not None:
-                    try:
-                        channel_infos = controller.active_channels()
-                        id_to_name = {info.id: info.name for info in channel_infos}
-                        channel_names = [id_to_name.get(cid, str(cid)) for cid in channel_ids]
-                    except Exception:
-                        channel_names = [str(cid) for cid in channel_ids]
+                    channel_infos = controller.active_channels()
+                    id_to_name = {info.id: info.name for info in channel_infos}
+                    channel_names = [id_to_name.get(cid, str(cid)) for cid in channel_ids]
                 else:
                     channel_names = [str(cid) for cid in channel_ids]
 
@@ -480,8 +473,8 @@ class AudioManager:
         if controller is not None:
             try:
                 controller.set_monitor_bridge(None)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to deregister monitor bridge: %s", exc)
         
         if player is not None:
             try:

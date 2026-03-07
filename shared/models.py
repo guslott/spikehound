@@ -240,7 +240,6 @@ class _EndOfStreamSentinel:
 EndOfStream = _EndOfStreamSentinel()
 
 
-_TRIGGER_MODE_ALIASES = {"continuous": "repeated"}
 _VALID_TRIGGER_MODES = frozenset({"repeated", "stream", "single"})
 
 
@@ -256,10 +255,6 @@ class TriggerConfig:
     mode: str
 
     def __post_init__(self) -> None:
-        canonical_mode = _TRIGGER_MODE_ALIASES.get(self.mode, self.mode)
-        if canonical_mode != self.mode:
-            object.__setattr__(self, "mode", canonical_mode)
-
         if self.mode not in _VALID_TRIGGER_MODES:
             raise ValueError(
                 f"mode must be one of {sorted(_VALID_TRIGGER_MODES)}, got {self.mode!r}"

@@ -77,9 +77,15 @@ class AppSettingsStore:
                 except (TypeError, ValueError):
                     pass
             elif f.type == bool or f.type == "bool":
-                if isinstance(val, str):
-                    kwargs[f.name] = bool(int(val))
-                else:
+                if isinstance(val, bool):
+                    kwargs[f.name] = val
+                elif isinstance(val, str):
+                    lowered = val.strip().lower()
+                    if lowered in {"true", "1"}:
+                        kwargs[f.name] = True
+                    elif lowered in {"false", "0"}:
+                        kwargs[f.name] = False
+                elif isinstance(val, (int, float)):
                     kwargs[f.name] = bool(val)
             elif f.type == Optional[str] or f.type == "Optional[str]":
                 kwargs[f.name] = str(val) if val is not None else None
@@ -123,13 +129,7 @@ class AppSettingsStore:
 
     def _persist(self, settings: AppSettings) -> None:
         """Persist settings to the configured backend."""
-        data = asdict(settings)
-        # Convert booleans to int for compatibility
-        for key, val in data.items():
-            if isinstance(val, bool):
-                data[key] = int(val)
-        self._persistence.save(data)
+        self._persistence.save(asdict(settings))
 
 
 __all__ = ["AppSettings", "AppSettingsStore", "SettingsPersistence", "InMemoryPersistence"]
-

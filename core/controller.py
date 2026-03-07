@@ -254,10 +254,7 @@ class PipelineController:
                 filter_settings=self._filter_settings,
                 poll_timeout=self._dispatcher_timeout,
             )
-            try:
-                self._dispatcher.set_source_buffer(source.get_buffer(), sample_rate=actual.sample_rate)
-            except Exception:
-                pass
+            self._dispatcher.set_source_buffer(source.get_buffer(), sample_rate=actual.sample_rate)
             self._running = False
             self._reset_output_queues()
             return actual
@@ -291,33 +288,54 @@ class PipelineController:
                 return
 
             self._push_end_of_stream()
-            self._stop_streaming_locked()
-            self._running = False
-
-            if join:
-                self._flush_queue(self._source.data_queue)
+            try:
+                self._stop_streaming_locked()
+            finally:
+                self._running = False
+                if join:
+                    self._flush_queue(self._source.data_queue)
 
     def shutdown(self) -> None:
         """Stop everything and close the active source."""
         with self._lock:
+            teardown_errors: List[tuple[str, Exception]] = []
+
             # Stop recording first
             if self._wav_logger is not None:
-                try:
-                    self._wav_logger.stop()
-                except Exception:
-                    pass
+                self._collect_teardown_error(
+                    teardown_errors,
+                    "stop WAV logger during shutdown",
+                    self._wav_logger.stop,
+                )
                 self._wav_logger = None
             
             # Stop audio manager
             if self._audio_manager is not None:
-                self._audio_manager.stop()
+                self._collect_teardown_error(
+                    teardown_errors,
+                    "stop audio manager during shutdown",
+                    self._audio_manager.stop,
+                )
             
-            self.stop(join=True)
-            self._destroy_dispatcher()
-            self._close_source()
+            self._collect_teardown_error(
+                teardown_errors,
+                "stop acquisition during shutdown",
+                lambda: self.stop(join=True),
+            )
+            self._collect_teardown_error(
+                teardown_errors,
+                "destroy dispatcher during shutdown",
+                self._destroy_dispatcher,
+            )
+            self._collect_teardown_error(
+                teardown_errors,
+                "close source during shutdown",
+                self._close_source,
+            )
             self._actual_config = None
             self._device_id = None
             self._configure_kwargs = {}
+            self._raise_teardown_errors("Pipeline shutdown", teardown_errors)
 
     def update_filter_settings(self, settings: FilterSettings) -> None:
         with self._lock:
@@ -429,20 +447,13 @@ class PipelineController:
                 if was_running:
                     self._source.stop()
                     
-                try:
-                    # STRICT: Only enable the requested channels at the source level
-                    # This ensures the source only emits data for what we want
-                    self._source.set_active_channels(self._active_channel_ids)
-                except Exception:
-                    pass
+                # STRICT: Only enable the requested channels at the source level.
+                self._source.set_active_channels(self._active_channel_ids)
                     
                 # Rewire dispatcher to the source buffer (it may have been replaced/resized)
                 if self._dispatcher is not None and hasattr(self._source, 'ring_buffer') and self._source.ring_buffer is not None:
-                    try:
-                        sr = self._actual_config.sample_rate if self._actual_config is not None else None
-                        self._dispatcher.set_source_buffer(self._source.get_buffer(), sample_rate=sr)
-                    except Exception as exc:
-                        logger.debug("Could not re-link source buffer on channel change: %s", exc)
+                    sr = self._actual_config.sample_rate if self._actual_config is not None else None
+                    self._dispatcher.set_source_buffer(self._source.get_buffer(), sample_rate=sr)
                 
                 # Restart if it was running
                 if was_running:
@@ -646,7 +657,7 @@ class PipelineController:
             try:
                 raw_queue.put_nowait(EndOfStream)
             except queue.Full:
-                pass
+                logger.warning("Failed to enqueue EndOfStream into full raw queue")
 
     def _flush_queue(self, q: "queue.Queue") -> None:
         try:
@@ -664,72 +675,107 @@ class PipelineController:
     def _destroy_dispatcher(self) -> None:
         if self._dispatcher is None:
             return
+        dispatcher = self._dispatcher
         try:
-            self._dispatcher.stop()
-            self._dispatcher.emit_empty_tick()
-        except Exception as exc:
-            logger.warning("Failed to stop dispatcher: %s", exc)
-        self._dispatcher = None
+            dispatcher.stop()
+        finally:
+            try:
+                dispatcher.emit_empty_tick()
+            finally:
+                self._dispatcher = None
 
     def _close_source(self) -> None:
         if self._source is None:
             return
+        source = self._source
+        teardown_errors: List[tuple[str, Exception]] = []
         try:
-            if self._source.running:
-                self._source.stop()
-            self._source.close()
-        except Exception as exc:
-            logger.warning("Failed to close source: %s", exc)
-        self._source = None
-        self._streaming = False
-        self._active_channel_ids = []
+            if source.running:
+                self._collect_teardown_error(teardown_errors, "stop source", source.stop)
+            self._collect_teardown_error(teardown_errors, "close source", source.close)
+        finally:
+            self._source = None
+            self._streaming = False
+            self._running = False
+            self._active_channel_ids = []
+        self._raise_teardown_errors("Source teardown", teardown_errors)
 
     def _start_streaming_locked(self) -> None:
         if self._dispatcher is None or self._source is None:
             return
-        try:
-            # Respect the currently selected active channels and their names
-            if self._active_channel_ids:
-                id_to_name = {info.id: info.name for info in self._channel_infos}
-                id_to_info = {info.id: info for info in self._channel_infos}
-                active_names = [id_to_name.get(cid, f"Channel {cid}") for cid in self._active_channel_ids]
-                active_units = [id_to_info[cid].units for cid in self._active_channel_ids if cid in id_to_info]
-                self._dispatcher.set_channel_layout(self._active_channel_ids, active_names, active_units)
-            else:
-                # Fallback to full layout if no specific channels are active
-                full_ids = [info.id for info in self._channel_infos]
-                full_names = [info.name for info in self._channel_infos]
-                full_units = [info.units for info in self._channel_infos]
-                self._dispatcher.set_channel_layout(full_ids, full_names, full_units)
+        # Respect the currently selected active channels and their names
+        if self._active_channel_ids:
+            id_to_name = {info.id: info.name for info in self._channel_infos}
+            id_to_info = {info.id: info for info in self._channel_infos}
+            active_names = [id_to_name.get(cid, f"Channel {cid}") for cid in self._active_channel_ids]
+            active_units = [id_to_info[cid].units for cid in self._active_channel_ids if cid in id_to_info]
+            self._dispatcher.set_channel_layout(self._active_channel_ids, active_names, active_units)
+        else:
+            full_ids = [info.id for info in self._channel_infos]
+            full_names = [info.name for info in self._channel_infos]
+            full_units = [info.units for info in self._channel_infos]
+            self._dispatcher.set_channel_layout(full_ids, full_names, full_units)
 
-            self._dispatcher.set_active_channels(self._active_channel_ids)
-            self._dispatcher.start()
-        except Exception as exc:
-            logger.warning("Failed to start dispatcher: %s", exc)
-        try:
-            # Only start if not already running
-            if not self._source.running:
-                self._source.start()
-        except Exception as exc:
-            logger.warning("Failed to start source: %s", exc)
+        self._dispatcher.set_active_channels(self._active_channel_ids)
+        self._dispatcher.start()
+        # Only start if not already running
+        if not self._source.running:
+            self._source.start()
         self._streaming = True
 
 
     def _stop_streaming_locked(self) -> None:
         if not self._streaming:
             return
-        if self._source is not None:
-            try:
-                if self._source.running:
-                    self._source.stop()
-            except Exception as exc:
-                logger.warning("Failed to stop source: %s", exc)
-        if self._dispatcher is not None:
-            try:
-                self._dispatcher.clear_active_channels()
-                self._dispatcher.reset_buffers()
-                self._dispatcher.emit_empty_tick()
-                self._dispatcher.stop()
-            except Exception as exc:
-                logger.warning("Failed to stop dispatcher during stream stop: %s", exc)
-        self._streaming = False
+        teardown_errors: List[tuple[str, Exception]] = []
+        try:
+            if self._source is not None and self._source.running:
+                self._collect_teardown_error(teardown_errors, "stop source", self._source.stop)
+            if self._dispatcher is not None:
+                self._collect_teardown_error(
+                    teardown_errors,
+                    "clear dispatcher active channels",
+                    self._dispatcher.clear_active_channels,
+                )
+                self._collect_teardown_error(
+                    teardown_errors,
+                    "reset dispatcher buffers",
+                    self._dispatcher.reset_buffers,
+                )
+                self._collect_teardown_error(
+                    teardown_errors,
+                    "emit dispatcher empty tick",
+                    self._dispatcher.emit_empty_tick,
+                )
+                self._collect_teardown_error(
+                    teardown_errors,
+                    "stop dispatcher",
+                    self._dispatcher.stop,
+                )
+        finally:
+            self._streaming = False
+        self._raise_teardown_errors("Streaming shutdown", teardown_errors)
+
+    def _collect_teardown_error(
+        self,
+        errors: List[tuple[str, Exception]],
+        label: str,
+        action: Any,
+    ) -> None:
+        try:
+            action()
+        except Exception as exc:
+            errors.append((label, exc))
+
+    def _raise_teardown_errors(
+        self,
+        context: str,
+        errors: List[tuple[str, Exception]],
+    ) -> None:
+        if not errors:
+            return
+        if len(errors) == 1:
+            label, exc = errors[0]
+            raise RuntimeError(f"{context} failed while trying to {label}: {exc}") from exc
+        summary = "; ".join(f"{label}: {exc}" for label, exc in errors)
+        raise RuntimeError(f"{context} failed: {summary}") from errors[0][1]

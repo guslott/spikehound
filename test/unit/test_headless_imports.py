@@ -69,6 +69,37 @@ class TestHeadlessImports:
         assert new_settings.plot_refresh_hz == 60.0
         assert store.get().plot_refresh_hz == 60.0
 
+    def test_app_settings_persists_booleans_as_booleans(self, monkeypatch):
+        """Boolean settings should round-trip without int compatibility shims."""
+        modules_to_remove = [k for k in sys.modules if 'shared.app_settings' in k]
+        for mod in modules_to_remove:
+            monkeypatch.delitem(sys.modules, mod, raising=False)
+
+        monkeypatch.setitem(sys.modules, 'PySide6', None)
+        monkeypatch.setitem(sys.modules, 'PySide6.QtCore', None)
+
+        from shared.app_settings import AppSettingsStore, InMemoryPersistence
+
+        persistence = InMemoryPersistence()
+        store = AppSettingsStore(persistence=persistence)
+        updated = store.update(
+            list_all_audio_devices=True,
+            load_config_on_launch=True,
+            recording_use_float32=True,
+            recording_auto_increment=False,
+        )
+
+        assert updated.list_all_audio_devices is True
+        assert updated.load_config_on_launch is True
+        assert updated.recording_use_float32 is True
+        assert updated.recording_auto_increment is False
+
+        raw = persistence.load()
+        assert raw["list_all_audio_devices"] is True
+        assert raw["load_config_on_launch"] is True
+        assert raw["recording_use_float32"] is True
+        assert raw["recording_auto_increment"] is False
+
     def test_controller_headless_import(self, monkeypatch):
         """PipelineController should be importable without PySide6."""
         # Remove any cached imports of core modules

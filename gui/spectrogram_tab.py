@@ -400,17 +400,14 @@ class SpectrogramTab(QtWidgets.QWidget):
             return
         mw = self._main_window
 
-        # Get samples from PlotManager
         plot_manager = getattr(mw, "_plot_manager", None)
-        if plot_manager is not None:
-            samples_dict = getattr(plot_manager, "channel_last_samples", {}) or {}
-            times = getattr(plot_manager, "last_times", None)
-        else:
-            samples_dict = getattr(mw, "_channel_last_samples", {}) or {}
-            times = getattr(mw, "_last_times", None)
+        if plot_manager is None:
+            return
+        samples_dict = plot_manager.channel_last_samples
+        times = plot_manager.last_times
 
         # Get sample rate
-        sr = float(getattr(mw, "_current_sample_rate", 0.0) or 0.0)
+        sr = float(plot_manager.sample_rate or 0.0)
         if sr <= 0 and self._sample_rate > 0:
             sr = float(self._sample_rate)
 
@@ -444,11 +441,11 @@ class SpectrogramTab(QtWidgets.QWidget):
         else:
             t_rel = None
 
-        sr = float(getattr(mw, "_current_sample_rate", 0.0) or 0.0)
+        sr = float(plot_manager.sample_rate or 0.0)
         if sr <= 0:
             sr = self._sample_rate if self._sample_rate > 0 else 10_000.0
 
-        window_sec = float(getattr(mw, "_current_window_sec", 1.0) or 1.0)
+        window_sec = float(plot_manager.window_sec or 1.0)
 
         # --- Time Domain Plot ---
         if t_rel is None:

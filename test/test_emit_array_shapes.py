@@ -1,9 +1,5 @@
 # test/test_emit_array_shapes.py
-"""Tests for BaseDevice.emit_array shape handling.
-
-Verifies that emit_array correctly handles both (frames, channels) and
-(channels, frames) data orientations.
-"""
+"""Tests for BaseDevice.emit_array shape handling."""
 from __future__ import annotations
 
 import queue
@@ -15,7 +11,7 @@ from shared.models import ChunkPointer
 
 
 class TestEmitArrayShapes:
-    """Tests for emit_array shape orientation detection."""
+    """Tests for the strict emit_array frames-by-channels contract."""
 
     @pytest.fixture
     def configured_device(self):
@@ -42,22 +38,19 @@ class TestEmitArrayShapes:
         assert isinstance(pointer, ChunkPointer)
         assert pointer.length == frames
 
-    def test_channels_frames_shape(self, configured_device):
-        """emit_array should handle (channels, frames) shape correctly."""
+    def test_channels_frames_shape_raises(self, configured_device):
+        """emit_array should reject channel-major input."""
         device = configured_device
         
         # Create data with shape (channels=2, frames=100)
         frames, channels = 100, 2
         data = np.random.randn(channels, frames).astype(np.float32)
         
-        # Should not raise - auto-detected as channel-major
-        pointer = device.emit_array(data)
-        
-        assert isinstance(pointer, ChunkPointer)
-        assert pointer.length == frames
+        with pytest.raises(ValueError, match="does not match expected"):
+            device.emit_array(data)
 
-    def test_buffer_content_consistency(self, configured_device):
-        """Both orientations should produce identical buffer content."""
+    def test_buffer_content_matches_frames_channels_input(self, configured_device):
+        """emit_array should write frames-by-channels input as channel-major data."""
         device = configured_device
         
         # Reference data in (frames, channels) format
@@ -68,20 +61,12 @@ class TestEmitArrayShapes:
             [5.0, 6.0],  # frame 2
         ], dtype=np.float32)
         
-        # Test with (frames, channels) orientation
         device._reset_counters()
         ptr1 = device.emit_array(original.copy())
         buffer1 = device.ring_buffer.read(ptr1.start_index, ptr1.length)
-        
-        # Test with (channels, frames) orientation (transposed)
-        device._reset_counters()
-        ptr2 = device.emit_array(original.T.copy())
-        buffer2 = device.ring_buffer.read(ptr2.start_index, ptr2.length)
-        
-        # Both should produce the same channel-major buffer content
-        np.testing.assert_array_almost_equal(buffer1, buffer2)
-        
-        # Verify the expected channel-major shape: (channels, frames) 
+
+        expected = original.T
+        np.testing.assert_array_almost_equal(buffer1, expected)
         assert buffer1.shape == (channels, 3)
 
     def test_mismatched_dimensions_error(self, configured_device):
@@ -94,8 +79,8 @@ class TestEmitArrayShapes:
         with pytest.raises(ValueError, match="does not match expected"):
             device.emit_array(data)
 
-    def test_square_array_assumes_frames_channels(self, configured_device):
-        """Square arrays should be treated as (frames, channels) for backward compat."""
+    def test_square_array_is_accepted_only_as_frames_channels(self, configured_device):
+        """Square arrays are accepted because they still satisfy (frames, channels)."""
         # Reconfigure with equal frames and channels
         device = configured_device
         device.stop()
@@ -111,8 +96,30 @@ class TestEmitArrayShapes:
             # Square array: 3x3
             data = np.random.randn(3, 3).astype(np.float32)
             
-            # Should treat as (frames=3, channels=3) and transpose
             pointer = device.emit_array(data)
             assert pointer.length == 3
         finally:
             device.close()
+
+    def test_failing_monitor_bridge_is_disabled(self, configured_device):
+        """A failing monitor bridge should be detached after the first error."""
+
+        class _FailingBridge:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def on_chunk(self, raw) -> None:
+                self.calls += 1
+                raise RuntimeError("bridge boom")
+
+        device = configured_device
+        bridge = _FailingBridge()
+        device.register_monitor_bridge(bridge)
+
+        data = np.random.randn(32, 2).astype(np.float32)
+        device.emit_array(data)
+        assert bridge.calls == 1
+        assert device._monitor_bridge is None
+
+        device.emit_array(data)
+        assert bridge.calls == 1

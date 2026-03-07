@@ -3,12 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import queue
-import threading
 import time
-from collections import deque
 from pathlib import Path
 
-from dataclasses import dataclass, field, replace
 from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
@@ -20,14 +17,12 @@ from core.runtime import SpikeHoundRuntime
 from shared.app_settings import AppSettings
 from core.conditioning import ChannelFilterSettings, FilterSettings
 from shared.models import ChunkPointer, EndOfStream, TriggerConfig
-from shared.ring_buffer import SharedRingBuffer
 from .analysis_dock import AnalysisDock
 from .settings_tab import SettingsTab
-from .scope_widget import ScopeWidget, ChannelConfig as ScopeChannelConfig
+from .scope_widget import ScopeWidget
 from .channel_controls_widget import ChannelControlsWidget, ChannelDetailPanel
 from .device_control_widget import DeviceControlWidget
 from .types import ChannelConfig
-from .trace_renderer import TraceRenderer
 from .trigger_controller import TriggerController
 from .plot_manager import PlotManager
 from .device_manager import DeviceManager
@@ -82,7 +77,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar()
 
         # Persistent view/model state for the plotting surface and UI panels
-        self._renderers: Dict[int, TraceRenderer] = {}
         self._channel_names: List[str] = []
         self._chunk_rate: float = 0.0
         self._device_map: Dict[str, dict] = {}
@@ -92,9 +86,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._channel_ids_current: List[int] = []
         self._channel_configs: Dict[int, ChannelConfig] = {}
         self._channel_panels: Dict[int, ChannelDetailPanel] = {}
-        self._channel_last_samples: Dict[int, np.ndarray] = {}
-        self._channel_display_buffers: Dict[int, np.ndarray] = {}
-        self._last_times: np.ndarray = np.zeros(0, dtype=np.float32)
         # Color cycle managed by ChannelManager
         self._current_sample_rate: float = 0.0
         self._analysis_sample_rate: float = 0.0
@@ -943,9 +934,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._channel_manager.ensure_active_channel_focus()
         self._active_channel_id = self._channel_manager.active_channel_id
         
-        self._channel_last_samples = {cid: self._channel_last_samples[cid] for cid in ids if cid in self._channel_last_samples}
-        self._channel_display_buffers = {cid: self._channel_display_buffers[cid] for cid in ids if cid in self._channel_display_buffers}
-        
         # Clear listen channel if no longer in active list
         self._audio_listen_manager.clear_if_channel_removed(ids)
         self._listen_channel_id = self._audio_listen_manager.listen_channel_id
@@ -994,9 +982,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _clear_channel_panels(self) -> None:
         """Delegate to ChannelManager."""
         self._channel_manager.clear_channel_panels()
-        # Clear local display buffers
-        self._channel_last_samples.clear()
-        self._channel_display_buffers.clear()
+        self._plot_manager.clear_cached_samples()
 
     def _show_channel_panel(self, channel_id: Optional[int]) -> None:
         self.channel_controls.show_panel(channel_id)
@@ -1058,15 +1044,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._channel_configs[channel_id] = config
         if display_changed:
             if not config.display_enabled:
-                renderer = self._renderers.get(channel_id)
+                renderer = self._plot_manager.renderers.get(channel_id)
                 if renderer is not None:
                     renderer.clear()
-                self._channel_last_samples.pop(channel_id, None)
-                self._channel_display_buffers.pop(channel_id, None)
+                self._plot_manager.drop_cached_channel(channel_id)
             else:
-                self._channel_last_samples.clear()
-                self._channel_display_buffers.clear()
-                self._last_times = np.zeros(0, dtype=np.float32)
+                self._plot_manager.clear_cached_samples()
         
         # If this channel is the current trigger source, update trigger visuals
         # to reflect potential changes in vertical span or offset.
@@ -1088,8 +1071,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._active_channel_id == channel_id:
             self._update_axis_label()
         self._handle_listen_change(channel_id, config.listen_enabled)
-        if display_changed and config.display_enabled and self._channel_ids_current and self._channel_names_current:
-            self._reset_scope_for_channels(self._channel_ids_current, self._channel_names_current)
+        if display_changed and config.display_enabled and self._channel_ids_current and self._channel_names:
+            self._reset_scope_for_channels(self._channel_ids_current, self._channel_names)
         # Sync Analysis tab scaling when vertical span changes
         self._sync_analysis_scales()
 
@@ -1177,12 +1160,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.runtime.update_metrics(chunk_rate=self._chunk_rate, sample_rate=self._current_sample_rate)
         except Exception as e:
             self._logger.debug("Failed to update runtime metrics: %s", e)
-
-    def _transform_to_screen(self, raw_data: np.ndarray, span_v: float, offset_pct: float) -> np.ndarray:
-        span = max(float(span_v), 1e-9)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            result = np.asarray(raw_data, dtype=np.float32) / span + float(offset_pct)
-        return np.nan_to_num(result, nan=offset_pct, posinf=offset_pct, neginf=offset_pct)
 
     def _update_plot_y_range(self) -> None:
         """Fix the normalized viewport to [0.0, 1.0]."""
@@ -1390,40 +1367,40 @@ class MainWindow(QtWidgets.QMainWindow):
           4. Shut down runtime  (stops dispatcher, source, audio manager)
           5. Clean up device manager
         """
+        shutdown_failures: List[tuple[str, Exception]] = []
+
+        def _run_shutdown_step(label: str, action: Callable[[], None]) -> None:
+            try:
+                action()
+            except Exception as exc:
+                shutdown_failures.append((label, exc))
+                self._logger.error("Shutdown step failed (%s)", label, exc_info=True)
+
         # 1. Recording
         if self._is_recording and self._controller is not None:
-            try:
+            def _stop_recording() -> None:
                 self._controller.stop_recording()
                 self._is_recording = False
-            except Exception as e:
-                self._logger.debug("Exception stopping recording on close: %s", e)
+            _run_shutdown_step("stop recording", _stop_recording)
 
         # 2. Audio listen
-        try:
-            self._clear_listen_channel()
-        except Exception as e:
-            self._logger.debug("Exception clearing listen channel on close: %s", e)
+        _run_shutdown_step("clear listen channel", self._clear_listen_channel)
 
         # 3. Analysis workers
         if self._analysis_dock is not None:
-            try:
-                self._analysis_dock.shutdown()
-            except Exception as e:
-                self._logger.debug("Exception shutting down analysis dock: %s", e)
+            _run_shutdown_step("shutdown analysis dock", self._analysis_dock.shutdown)
 
         # 4. Runtime (pipeline, dispatcher, source)
-        try:
-            self.runtime.shutdown()
-        except Exception as e:
-            self._logger.debug("Exception during runtime shutdown: %s", e)
+        _run_shutdown_step("shutdown runtime", self.runtime.shutdown)
 
         # 5. Device manager
         dm = self.runtime.device_manager
         if dm is not None:
-            try:
-                dm.cleanup()
-            except Exception as e:
-                self._logger.debug("Exception during device manager cleanup: %s", e)
+            _run_shutdown_step("cleanup device manager", dm.cleanup)
+
+        if shutdown_failures:
+            summary = "; ".join(f"{label}: {exc}" for label, exc in shutdown_failures)
+            self._logger.error("Application shutdown completed with errors: %s", summary)
 
         super().closeEvent(event)
 
@@ -1651,7 +1628,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Ensure local state tracks the new layout
         self._channel_ids_current = list(channel_ids)
-        self._channel_names_current = list(channel_names)
+        self._channel_names = list(channel_names)
         
         if self._controller is not None:
             self._controller.update_window_span(self._current_window_sec)
@@ -1659,7 +1636,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _clear_scope_display(self) -> None:
         self._plot_manager.clear_scope_display()
         self._channel_ids_current = []
-        self._channel_names_current = []
+        self._channel_names = []
         self._active_channel_id = None
         
         # Sync simple state
@@ -1686,7 +1663,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Sync state back partial
         self._channel_ids_current = list(channel_ids)
-        self._channel_names_current = list(channel_names) if channel_names else [f"Ch {i}" for i in channel_ids]
+        self._channel_names = list(channel_names) if channel_names else [f"Ch {i}" for i in channel_ids]
     
 
     def _maybe_update_analysis_sample_rate(self, sample_rate: float) -> None:
@@ -1729,28 +1706,11 @@ class MainWindow(QtWidgets.QMainWindow):
             samples = payload.get("samples")
             times = payload.get("times")
 
-        # Always drain the queue to keep it from growing.
-        queue_pointers = self._drain_visualization_queue()
-        has_samples = samples is not None and not (isinstance(samples, np.ndarray) and samples.size == 0)
-        
-        # Logic to decide source:
-        # 1. If in Trigger Mode (single/repeated), we MUST use queue_pointers (chunks) to build history correctly.
-        #    We must NEVER use the window payload (samples) because it's a snapshot, not a stream, and will cause
-        #    overlaps, duplicates, and channel count mismatches (oscillation).
-        # 2. If in Stream Mode, we prefer the payload (window) for smooth display, unless it's missing.
-        use_pointers = False
-        if self._trigger_controller.mode != "stream":
-            # STRICT: Only use pointers. If no pointers, we have no new stream data.
-            # Do NOT fall back to samples.
-            use_pointers = True
-            # CRITICAL: Discard samples to prevent fallback in the 'else' block below
+        mode = self._trigger_controller.mode or "stream"
+        if mode != "stream":
+            pointers = self._drain_visualization_queue()
             samples = None
             times = None
-        elif not has_samples and queue_pointers:
-            use_pointers = True
-            
-        if use_pointers:
-            pointers = queue_pointers
 
         viz_buffer = self._controller.viz_buffer() if self._controller else None
         sample_rate = float(status.get("sample_rate", self._current_sample_rate))
@@ -1783,8 +1743,6 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 times_arr = np.zeros(data.shape[1], dtype=np.float32)
             if not channel_ids:
-                # When using pointers, channel_ids might not be in the payload.
-                # Prioritize the cached user selection to preserve non-contiguous IDs.
                 channel_ids = self._channel_ids_current if self._channel_ids_current else list(range(data.shape[0]))
             if not channel_names:
                 channel_names = [str(cid) for cid in channel_ids]
@@ -1792,7 +1750,6 @@ class MainWindow(QtWidgets.QMainWindow):
             data = np.asarray(samples) if samples is not None else np.zeros((0, 0), dtype=np.float32)
             times_arr = np.asarray(times) if times is not None else np.zeros(0, dtype=np.float32)
 
-        self._last_times = times_arr
         now = time.perf_counter()
 
         # Register chunk with plot manager
@@ -1812,7 +1769,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._chunk_last_rate_update = time.perf_counter()
             self._update_status(viz_depth=0)
             return
-        mode = self._trigger_controller.mode or "stream"
         if mode == "stream":
             self._plot_manager.process_streaming(data, times_arr, sample_rate, window_sec, channel_ids, now)
             # Sync state back from PlotManager
@@ -1834,8 +1790,6 @@ class MainWindow(QtWidgets.QMainWindow):
             # Sync state back from PlotManager
             self._current_sample_rate = self._plot_manager.sample_rate
             self._current_window_sec = self._plot_manager.window_sec
-            self._channel_last_samples = self._plot_manager.channel_last_samples
-            self._last_times = self._plot_manager.last_times
             try:
                 self.runtime.update_metrics(sample_rate=sample_rate)
             except Exception:

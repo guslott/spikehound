@@ -7,24 +7,12 @@ channel display management, and trigger visualization.
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional
-from dataclasses import dataclass, field
+from typing import Optional
 
-import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class ChannelConfig:
-    """Configuration for a single channel's display properties."""
-    color: QtGui.QColor = field(default_factory=lambda: QtGui.QColor(0, 0, 139))
-    display_enabled: bool = True
-    vertical_span_v: float = 1.0
-    screen_offset: float = 0.5
-    channel_name: str = ""
 
 
 class VoltageAxis(pg.AxisItem):
@@ -173,4 +161,3 @@ class ScopeWidget(QtWidgets.QWidget):
         """Emit signal when user moves the threshold line."""
         value = float(self.threshold_line.value())
         self.thresholdChanged.emit(value)
-

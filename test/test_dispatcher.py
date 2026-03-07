@@ -22,7 +22,7 @@ from core import (
     FilterSettings,
     SignalConditioner,
 )
-from shared.models import ChunkPointer
+from shared.models import ChunkPointer, TriggerConfig
 from shared.ring_buffer import SharedRingBuffer
 
 
@@ -67,6 +67,10 @@ def _make_dispatcher_with_buffer(
     
     # Link the source buffer
     dispatcher.set_source_buffer(source_buffer, sample_rate=sample_rate)
+    dispatcher.set_trigger_config(
+        TriggerConfig(0, 0.0, 0.0, 0.0, 0.2, "repeated"),
+        sample_rate=sample_rate,
+    )
     
     return dispatcher, source_buffer, {
         "raw": raw_queue,
@@ -238,6 +242,10 @@ def test_dispatcher_fan_out_and_backpressure_tracking():
         filter_settings=settings,
     )
     dispatcher.set_source_buffer(source_buffer, sample_rate=fs)
+    dispatcher.set_trigger_config(
+        TriggerConfig(0, 0.0, 0.0, 0.0, 0.2, "repeated"),
+        sample_rate=fs,
+    )
     
     # Register analysis queue
     # Use maxsize=2 so we can retain at least one chunk + EndOfStream
@@ -427,6 +435,47 @@ def test_eos_delivery_with_drop_policy():
     # 2. Second item should be EndOfStream
     item2 = visualization_queue.get_nowait()
     assert item2 is EndOfStream
+
+
+def test_dispatcher_stream_mode_skips_visualization_queue():
+    settings = FilterSettings()
+    raw_queue = queue.Queue()
+    visualization_queue = queue.Queue()
+    audio_queue = queue.Queue()
+    logging_queue = queue.Queue()
+    event_queue = queue.Queue()
+
+    fs = 1_000.0
+    frames = 16
+    source_buffer = SharedRingBuffer((1, 64), dtype=np.float32)
+
+    dispatcher = Dispatcher(
+        raw_queue,
+        visualization_queue,
+        audio_queue,
+        logging_queue,
+        event_queue,
+        filter_settings=settings,
+    )
+    dispatcher.set_source_buffer(source_buffer, sample_rate=fs)
+    dispatcher.set_trigger_config(
+        TriggerConfig(None, 0.0, 0.0, 0.0, 0.2, "stream"),
+        sample_rate=fs,
+    )
+
+    samples = np.ones((1, frames), dtype=np.float32)
+    start = source_buffer.write(samples)
+    pointer = ChunkPointer(start_index=start, length=frames, render_time=0.0, seq=0, start_sample=0)
+
+    dispatcher.start()
+    raw_queue.put(pointer)
+    raw_queue.put(EndOfStream)
+    dispatcher.join(timeout=2.0)
+
+    viz_items = _drain_chunks(visualization_queue)
+    audio_items = _drain_chunks(audio_queue)
+    assert viz_items == []
+    assert len(audio_items) == 1
 
 
 def test_eos_delivery_to_events_queue_when_full():

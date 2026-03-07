@@ -345,8 +345,7 @@ class BaseDevice(ABC):
         """Helper for simple drivers to emit a 2D float32 array.
         
         Args:
-            data: np.ndarray of shape (frames, channels) or (channels, frames).
-                  Shape is auto-detected by comparing dimensions to expected channel count.
+            data: np.ndarray of shape (frames, channels).
             device_time: Optional hardware timestamp (seconds)
             mono_time: Optional host monotonic time (recommended if available)
         """
@@ -365,56 +364,27 @@ class BaseDevice(ABC):
         mono = _time.monotonic() if mono_time is None else mono_time
         
         with self._state_lock:
-            # Validate shape (and possibly adapt) within the lock to ensure synchronization 
-            # with active_channel_ids and ring_buffer updates from configure().
+            # Validate shape within the lock to ensure synchronization with
+            # active_channel_ids and ring_buffer updates from configure().
             if data.ndim != 2:
                 raise ValueError("data must be 2D array.")
             
-            dim0, dim1 = data.shape
+            frames, chans = data.shape
             expected_chans = len(self._active_channel_ids)
             
             # Guard: if no active channels, cannot emit
             if expected_chans == 0:
                 raise RuntimeError("No active channels configured; cannot emit data.")
-            
-            # Detect orientation: (frames, channels) vs (channels, frames)
-            # We use expected_chans to disambiguate when possible
-            if dim1 == expected_chans and dim0 != expected_chans:
-                # Unambiguously (frames, channels) - row-major frames
-                frames, chans = dim0, dim1
-                channel_major = np.ascontiguousarray(data.T)
-            elif dim0 == expected_chans and dim1 != expected_chans:
-                # Unambiguously (channels, frames) - already channel-major
-                chans, frames = dim0, dim1
-                channel_major = np.ascontiguousarray(data)
-            elif dim0 == expected_chans and dim1 == expected_chans:
-                # Ambiguous square case: assume (frames, channels) for backward compat
-                frames, chans = dim0, dim1
-                channel_major = np.ascontiguousarray(data.T)
-            else:
-                # Neither dimension matches expected channels
-                # Check if this is a superset we can slice from
-                with self._channel_lock:
-                    if dim1 >= expected_chans and dim1 == len(self._available_channels):
-                        # (frames, all_channels) - slice by active channel order
-                        idx = [self._index_of_channel_id(cid) for cid in self._active_channel_ids]
-                        data = data[:, idx]
-                        frames, chans = data.shape
-                        channel_major = np.ascontiguousarray(data.T)
-                    elif dim0 >= expected_chans and dim0 == len(self._available_channels):
-                        # (all_channels, frames) - slice by active channel order
-                        idx = [self._index_of_channel_id(cid) for cid in self._active_channel_ids]
-                        data = data[idx, :]
-                        chans, frames = data.shape
-                        channel_major = np.ascontiguousarray(data)
-                    else:
-                        raise ValueError(
-                            f"data shape {(dim0, dim1)} does not match expected {expected_chans} channels. "
-                            "Provide shape (frames, channels) or (channels, frames)."
-                        )
+
+            if chans != expected_chans:
+                raise ValueError(
+                    f"data shape {data.shape} does not match expected (frames, {expected_chans})"
+                )
 
             if frames == 0:
                 raise ValueError("data must contain at least one frame")
+
+            channel_major = np.ascontiguousarray(data.T)
 
             # Capture current counters BEFORE incrementing for the pointer
             seq = self._next_seq
@@ -449,8 +419,9 @@ class BaseDevice(ABC):
         if bridge is not None:
             try:
                 bridge.on_chunk(channel_major.T)
-            except Exception:
-                pass  # Never let bridge errors disrupt the data path
+            except Exception as exc:
+                self._monitor_bridge = None
+                logger.warning("Disabling monitor bridge after bridge callback failure: %s", exc)
 
         return pointer
 

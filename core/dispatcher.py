@@ -111,7 +111,15 @@ class Dispatcher:
         self._channel_units: tuple[str, ...] = tuple()
         self._channel_ids: tuple[int, ...] = tuple()
         self._channel_index_map: Dict[int, int] = {}
-        self._current_trigger: Optional[TriggerConfig] = None
+        self._current_trigger: TriggerConfig = TriggerConfig(
+            channel_index=None,
+            threshold=0.0,
+            hysteresis=0.0,
+            pretrigger_frac=0.0,
+            window_sec=self._window_sec,
+            mode="stream",
+        )
+        self._visualization_queue_enabled: bool = False
         self._active_channel_ids: list[int] = []
         self._analysis_lock = threading.Lock()
         self._analysis_queues: Dict[int, queue.Queue] = {}
@@ -318,11 +326,14 @@ class Dispatcher:
     def set_trigger_config(self, config: TriggerConfig, sample_rate: float) -> None:
         with self._ring_lock:
             self._current_trigger = config
+            self._visualization_queue_enabled = config.mode != "stream"
             if sample_rate > 0:
                 self._sample_rate = float(sample_rate)
             self._window_sec = max(config.window_sec, 1e-3)
             channels = self.viz_buffer.shape[0]
             self._ensure_viz_buffer_locked(channels, min_capacity=self.viz_buffer.capacity)
+        if not self._visualization_queue_enabled:
+            self._clear_visualization_queue()
 
     def set_window_duration(self, window_sec: float) -> None:
         if window_sec <= 0:
@@ -402,20 +413,25 @@ class Dispatcher:
             return None
 
         with self._ring_lock:
-            # Determine if we should fallback to default indices.
-            # We allow the count to match either the total registered layout (set_channel_layout)
-            # OR the active subset (set_active_channels).
             incoming_count = raw.shape[0]
             layout_count = len(self._channel_ids)
-            active_count = len(self._active_channel_ids)
-            
-            if not self._channel_ids or (incoming_count != layout_count and incoming_count != active_count):
-                # Fallback: if count is wrong, we have to reset to default indices
-                self._channel_ids = tuple(range(incoming_count))
-                self._channel_index_map = {cid: idx for idx, cid in enumerate(self._channel_ids)}
-                self._channel_names = tuple(str(idx) for idx in range(incoming_count))
-            elif not self._channel_names:
-                self._channel_names = tuple(str(idx) for idx in range(incoming_count))
+            if layout_count <= 0 or len(self._channel_names) != layout_count:
+                msg = "Dispatcher Error: Channel layout must be configured before processing chunks"
+                if self._strict_invariants:
+                    logger.critical(msg)
+                    raise RuntimeError(msg)
+                logger.warning("%s; skipping pointer", msg)
+                return None
+            if incoming_count != layout_count:
+                msg = (
+                    "Dispatcher Error: Incoming channel count "
+                    f"{incoming_count} does not match configured layout count {layout_count}"
+                )
+                if self._strict_invariants:
+                    logger.critical(msg)
+                    raise RuntimeError(msg)
+                logger.warning("%s; skipping pointer", msg)
+                return None
             channel_names: tuple[str, ...] = self._channel_names
             
             # Determine common unit
@@ -498,11 +514,24 @@ class Dispatcher:
         for name, out_queue in self._output_queues.items():
             if name == "events":
                 continue  # Handled in _process_pointer
-            if name in ("visualization", "audio"):
+            if name == "visualization":
+                if self._visualization_queue_enabled:
+                    self._enqueue_with_policy(name, out_queue, viz_pointer)
+            elif name == "audio":
                 self._enqueue_with_policy(name, out_queue, viz_pointer)
             else:
                 self._enqueue_with_policy(name, out_queue, filtered_chunk)
         self._dispatch_to_analysis(filtered_chunk)
+
+    def _clear_visualization_queue(self) -> None:
+        target_queue = self._output_queues.get("visualization")
+        if target_queue is None:
+            return
+        while True:
+            try:
+                target_queue.get_nowait()
+            except queue.Empty:
+                break
 
     def _dispatch_to_analysis(self, filtered_chunk: Chunk) -> None:
         with self._analysis_lock:

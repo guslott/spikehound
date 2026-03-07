@@ -48,6 +48,33 @@ def test_loose_invariants_logs_only():
     result = d._process_pointer(pointer)
     assert result is None
 
+
+def test_channel_layout_mismatch_skips_pointer_without_reconstructing_layout():
+    d, _ = _make_dispatcher(strict=False)
+    buf = _setup_buffer(d, n_channels=2)
+    d.set_channel_layout([7], ["ch7"], ["uV"])
+
+    buf.write(np.zeros((2, 10), dtype=np.float32))
+    pointer = ChunkPointer(start_index=0, length=10, render_time=0.0, seq=0, start_sample=0)
+
+    result = d._process_pointer(pointer)
+
+    assert result is None
+    assert d._channel_ids == (7,)
+    assert d._channel_names == ("ch7",)
+
+
+def test_strict_channel_layout_mismatch_raises():
+    d, _ = _make_dispatcher(strict=True)
+    buf = _setup_buffer(d, n_channels=2)
+    d.set_channel_layout([7], ["ch7"], ["uV"])
+
+    buf.write(np.zeros((2, 10), dtype=np.float32))
+    pointer = ChunkPointer(start_index=0, length=10, render_time=0.0, seq=0, start_sample=0)
+
+    with pytest.raises(RuntimeError, match="Incoming channel count 2 does not match configured layout count 1"):
+        d._process_pointer(pointer)
+
 def test_gap_policy_crash():
     """Test that gap_policy='crash' raises RuntimeError on sample gap."""
     d, raw_q = _make_dispatcher(gap_policy="crash")

@@ -266,7 +266,7 @@ def test_boardless_neuron_pro_exposes_two_channels_and_avoids_c_command(monkeypa
     src.close()
 
 
-def test_neuron_pro_mfi_uses_fixed_four_channel_stream(monkeypatch):
+def test_legacy_neuron_pro_mfi_is_not_enumerated(monkeypatch):
     port = _FakePort(
         device="/dev/tty.mfi",
         name="tty.mfi",
@@ -284,18 +284,13 @@ def test_neuron_pro_mfi_uses_fixed_four_channel_stream(monkeypatch):
     monkeypatch.setattr(byb, "serial", fake_serial)
     monkeypatch.setattr(byb, "hid", None)
 
+    devices = byb.BackyardBrainsSource.list_available_devices()
+
+    assert devices == []
+
     src = byb.BackyardBrainsSource()
-    src.open(port.device)
-
-    channels = src.list_available_channels(port.device)
-    assert [ch.id for ch in channels] == [0, 1, 2, 3]
-
-    cfg = src.configure(sample_rate=10000, channels=[0, 1], chunk_size=32)
-    assert cfg.sample_rate == 10000
-    assert src.stats()["stream_channels"] == 4
-    assert all(cmd not in {"?:;", "b:;", "board:;"} for handle in fake_serial.instances for cmd in handle.write_log)
-    assert not any(cmd.startswith("c:") for handle in fake_serial.instances for cmd in handle.write_log)
-    src.close()
+    with pytest.raises(RuntimeError, match="Unsupported Backyard Brains serial device"):
+        src.open(port.device)
 
 
 def test_spikershield_channel_config_uses_c_command_and_validates_rate(monkeypatch):

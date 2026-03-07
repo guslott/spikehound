@@ -166,26 +166,14 @@ class SpikeHoundRuntime:
         if controller is None:
             return
         if filter_settings is not None:
-            try:
-                controller.update_filter_settings(filter_settings)
-            except Exception as exc:
-                self.logger.warning("Failed to update filter settings: %s", exc)
+            controller.update_filter_settings(filter_settings)
         if trigger_cfg is not None:
-            try:
-                controller.update_trigger_config(trigger_cfg)
-            except Exception as exc:
-                self.logger.warning("Failed to update trigger config: %s", exc)
+            controller.update_trigger_config(trigger_cfg)
         if channels is not None:
             if channels:
-                try:
-                    controller.set_active_channels(channels)
-                except Exception as exc:
-                    self.logger.warning("Failed to set active channels: %s", exc)
+                controller.set_active_channels(channels)
             else:
-                try:
-                    controller.clear_active_channels()
-                except Exception as exc:
-                    self.logger.warning("Failed to clear active channels: %s", exc)
+                controller.clear_active_channels()
 
     def update_filter_settings(self, settings: FilterSettings) -> None:
         """Update filter settings for the pipeline."""
@@ -207,12 +195,8 @@ class SpikeHoundRuntime:
         controller = self._pipeline
         if controller is None:
             return
-        try:
-            controller.start()
-            self._acquisition_start_time = time.monotonic()  # Track uptime
-        except Exception as exc:
-            self.logger.warning("Failed to start acquisition: %s", exc)
-            return
+        controller.start()
+        self._acquisition_start_time = time.monotonic()  # Track uptime
 
 
     def shutdown(self) -> None:
@@ -255,10 +239,7 @@ class SpikeHoundRuntime:
         if controller is None:
             return
         self._acquisition_start_time = None  # Reset uptime
-        try:
-            controller.stop(join=True)
-        except Exception as exc:
-            self.logger.warning("Failed to stop acquisition: %s", exc)
+        controller.stop(join=True)
         # FIX: Do not detach device here. MainWindow calls this when channels are empty,
         # but we want to keep the device open so we can resume later when channels are added.
         # try:
@@ -272,11 +253,7 @@ class SpikeHoundRuntime:
         controller = self._pipeline
         if controller is None or driver is None:
             return
-        try:
-            controller.attach_source(driver, float(sample_rate), channels)
-        except Exception as exc:
-            self.logger.warning("Failed to attach source: %s", exc)
-            return
+        controller.attach_source(driver, float(sample_rate), channels)
         self.dispatcher = getattr(controller, "dispatcher", None)
         self.visualization_queue = getattr(controller, "visualization_queue", None)
         self.audio_queue = getattr(controller, "audio_queue", None)

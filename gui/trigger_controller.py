@@ -147,9 +147,7 @@ class TriggerController(QtCore.QObject):
             preserve_display_on_reset: If True and reset_state=True, keep the
                 currently displayed capture while resetting trigger internals.
         """
-        # Backward compatibility: accept legacy "continuous" and canonicalize.
-        canonical_mode = "repeated" if mode == "continuous" else mode
-        self._mode = canonical_mode
+        self._mode = mode
         self._channel_id = channel_id
         self._threshold = threshold
         self._pre_seconds = pre_seconds
@@ -164,7 +162,7 @@ class TriggerController(QtCore.QObject):
             hysteresis=0.0,
             pretrigger_frac=pre_seconds,
             window_sec=window_sec,
-            mode=canonical_mode,
+            mode=mode,
         )
         self.configChanged.emit(config)
 

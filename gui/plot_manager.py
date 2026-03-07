@@ -54,7 +54,6 @@ class PlotManager(QtCore.QObject):
         self._channel_names: List[str] = []
         self._channel_configs: Dict[int, ChannelConfig] = {}
         self._channel_last_samples: Dict[int, np.ndarray] = {}
-        self._channel_display_buffers: Dict[int, np.ndarray] = {}
         self._last_times: np.ndarray = np.zeros(0, dtype=np.float32)
         self._active_channel_id: Optional[int] = None
         self._last_styled_active_id: Optional[int] = None  # Track last styled channel to skip redundant updates
@@ -159,7 +158,6 @@ class PlotManager(QtCore.QObject):
             for renderer in self._renderers.values():
                 renderer.cleanup()
             self._renderers.clear()
-            self._channel_display_buffers.clear()
             self._channel_names = []
             self._channel_ids_current = []
             self._active_channel_id = None
@@ -177,8 +175,6 @@ class PlotManager(QtCore.QObject):
             if cid not in current_set:
                 self._renderers[cid].cleanup()
                 del self._renderers[cid]
-                if cid in self._channel_display_buffers:
-                    del self._channel_display_buffers[cid]
 
         # Create renderers for new channels
         for cid, name in zip(channel_ids, self._channel_names):
@@ -259,8 +255,6 @@ class PlotManager(QtCore.QObject):
         for renderer in self._renderers.values():
             renderer.cleanup()
         self._renderers.clear()
-
-        self._channel_display_buffers.clear()
         self._channel_ids_current = []
         self._channel_names = []
         self._active_channel_id = None
@@ -292,6 +286,15 @@ class PlotManager(QtCore.QObject):
                 renderer.update_data(raw, self._last_times, downsample=1)
         
         self._apply_active_channel_style()
+
+    def drop_cached_channel(self, channel_id: int) -> None:
+        """Forget cached waveform data for one channel."""
+        self._channel_last_samples.pop(channel_id, None)
+
+    def clear_cached_samples(self) -> None:
+        """Clear cached waveform/timing data."""
+        self._channel_last_samples.clear()
+        self._last_times = np.zeros(0, dtype=np.float32)
 
     # -------------------------------------------------------------------------
     # Data Processing
@@ -541,15 +544,6 @@ class PlotManager(QtCore.QObject):
             self._active_channel_id = None
         self._apply_active_channel_style()
     
-    def transform_to_screen(
-        self, raw_data: np.ndarray, span_v: float, offset_pct: float
-    ) -> np.ndarray:
-        """Transform raw voltage data to normalized screen coordinates."""
-        span = max(float(span_v), 1e-9)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            result = np.asarray(raw_data, dtype=np.float32) / span + float(offset_pct)
-        return np.nan_to_num(result, nan=offset_pct, posinf=offset_pct, neginf=offset_pct)
-
     def get_channel_at_y(self, y: float) -> Optional[int]:
         """Return the channel with screen offset closest to y, if within range."""
         candidates = []

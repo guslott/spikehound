@@ -160,20 +160,6 @@ _PROFILES: Dict[str, _BYBProfile] = {
         infer_stream_width=True,
         description="Composite CDC device with 2-4 input channels and expansion events.",
     ),
-    "neuron_pro_mfi": _BYBProfile(
-        key="neuron_pro_mfi",
-        label="Neuron SpikerBox Pro (Serial + MFi)",
-        hardware_aliases=("NRNSBPRO",),
-        transports=("serial",),
-        bits=14,
-        max_channels=4,
-        candidate_stream_channels=(4,),
-        sample_rate_map={4: 10000},
-        baud_rates=(222222, 500000),
-        requires_start=True,
-        supports_board_query=False,
-        description="Composite Neuron Pro variant that streams a fixed 4-channel 14-bit packet layout.",
-    ),
     "plant": _BYBProfile(
         key="plant",
         label="Plant SpikerBox",
@@ -312,8 +298,6 @@ def _candidate_profile_hints(meta: Mapping[str, Any]) -> list[_ProfileHint]:
         return [_ProfileHint("neuron_pro", "usb_id")]
     if (vid, pid) == (_BYB_VID, 0x0004):
         return [_ProfileHint("human_spikerbox", "usb_id")]
-    if (vid, pid) == (_BYB_VID, 0x0009):
-        return [_ProfileHint("neuron_pro_mfi", "usb_id")]
     if (vid, pid) == (_BYB_VID, 0x000D):
         return [_ProfileHint("spike_station", "usb_id")]
     if (vid, pid) == (_ARDUINO_VID, 0x8036):
@@ -637,40 +621,6 @@ class _SerialTransport(_BYBTransport):
                 self._ser = None
 
 
-class _CompatSerialTransport(_BYBTransport):
-    kind = "serial"
-
-    def __init__(self, serial_like: Any) -> None:
-        self._ser = serial_like
-
-    @property
-    def is_open(self) -> bool:
-        return self._ser is not None and getattr(self._ser, "is_open", True)
-
-    def write_command(self, cmd: str) -> None:
-        if self._ser is None:
-            raise RuntimeError("serial transport is not open")
-        payload = cmd.encode("ascii")
-        if hasattr(self._ser, "write"):
-            self._ser.write(payload)
-
-    def read(self, timeout_ms: int = 0) -> bytes:
-        if self._ser is None:
-            return b""
-        available = int(getattr(self._ser, "in_waiting", 0) or 0)
-        if available > 0:
-            return bytes(self._ser.read(min(available, _MAX_READ_SIZE)))
-        if timeout_ms > 0:
-            time.sleep(timeout_ms / 1000.0)
-            available = int(getattr(self._ser, "in_waiting", 0) or 0)
-            if available > 0:
-                return bytes(self._ser.read(min(available, _MAX_READ_SIZE)))
-        return b""
-
-    def close(self) -> None:
-        return
-
-
 class _HIDTransport(_BYBTransport):
     kind = "hid"
 
@@ -927,7 +877,6 @@ class BackyardBrainsSource(BaseDevice):
 
     def __init__(self, queue_maxsize: int = 64) -> None:
         super().__init__(queue_maxsize=queue_maxsize)
-        self._ser: Any = None  # legacy hook used by existing tests
         self._transport: Optional[_BYBTransport] = None
         self._transport_kind: str = "serial"
         self._producer_thread: Optional[threading.Thread] = None
@@ -1043,6 +992,8 @@ class BackyardBrainsSource(BaseDevice):
         pid = meta.get("pid")
         if (vid, pid) in _BOOTLOADER_PIDS:
             return False
+        if (vid, pid) == (_BYB_VID, 0x0009):
+            return False
         if vid == _BYB_VID:
             return True
         if (vid, pid) in {
@@ -1135,7 +1086,7 @@ class BackyardBrainsSource(BaseDevice):
         channels: list[ChannelInfo] = []
         for idx in range(visible_channels):
             label = f"Channel {idx + 1}"
-            if profile.key in {"muscle_pro", "neuron_pro", "human_spikerbox", "neuron_pro_mfi"} and idx >= 2:
+            if profile.key in {"muscle_pro", "neuron_pro", "human_spikerbox"} and idx >= 2:
                 label = f"Expansion {idx - 1}"
             channels.append(ChannelInfo(id=idx, name=label, units="V", range=(-5.0, 5.0)))
         return channels
@@ -1191,12 +1142,12 @@ class BackyardBrainsSource(BaseDevice):
             meta = _make_hid_meta(entry)
             transport = _HIDTransport(bytes(meta["path"]))
             transport.open()
-            self._ser = None
         else:
+            if not self._is_supported_serial_candidate(meta):
+                raise RuntimeError(f"Unsupported Backyard Brains serial device: {device_id!r}")
             if serial is None:
                 raise RuntimeError("pyserial is not installed.")
             transport = self._open_serial_transport(str(meta.get("device")), candidates)
-            self._ser = getattr(transport, "serial_handle", None)
 
         self._transport = transport
         self._transport_kind = transport.kind
@@ -1239,15 +1190,6 @@ class BackyardBrainsSource(BaseDevice):
         baud_candidates = self._preferred_baud_rates(candidate_profiles)
         if not baud_candidates:
             baud_candidates = [222222]
-
-        # Keep the legacy Serial+MFi path conservative. The older adapter opened
-        # this profile at 222222 baud without probe traffic and it worked on real
-        # hardware; use the same behavior here instead of gating the open on
-        # probe replies from commands the guide does not list for this profile.
-        if len(candidate_profiles) == 1 and candidate_profiles[0].key == "neuron_pro_mfi":
-            transport = _SerialTransport(device_id, baudrate=baud_candidates[0])
-            transport.open()
-            return transport
 
         last_exc: Optional[Exception] = None
         fallback_baud: Optional[int] = None
@@ -1292,9 +1234,6 @@ class BackyardBrainsSource(BaseDevice):
     ) -> _BYBProtocolState:
         state = _BYBProtocolState()
         if not transport.is_open:
-            return state
-
-        if len(candidate_profiles) == 1 and candidate_profiles[0].key == "neuron_pro_mfi":
             return state
 
         try:
@@ -1381,7 +1320,6 @@ class BackyardBrainsSource(BaseDevice):
                 self._transport.close()
             finally:
                 self._transport = None
-        self._ser = None
         self._profile = None
         self._profile_candidates = []
         self._profile_hint_reason = None
@@ -1534,19 +1472,11 @@ class BackyardBrainsSource(BaseDevice):
         self._transport.write_command(cmd)
 
     def _active_transport(self) -> Optional[_BYBTransport]:
-        if self._transport is not None:
-            return self._transport
-        if self._ser is not None:
-            return _CompatSerialTransport(self._ser)
-        return None
+        return self._transport
 
     def _run_loop(self) -> None:
         transport = self._active_transport()
         if transport is None or self.config is None:
-            return
-
-        if self._profile is not None and self._profile.key == "neuron_pro_mfi":
-            self._run_loop_legacy_serial_mfi(transport)
             return
 
         candidate_widths = self._decoder_candidate_widths or (self._stream_channel_count,)
@@ -1617,97 +1547,6 @@ class BackyardBrainsSource(BaseDevice):
                 )
                 self.note_xrun()
                 decoder = _BYBDecoder(bits=self._bits, candidate_widths=candidate_widths)
-                sample_idx = 0
-
-    def _run_loop_legacy_serial_mfi(self, transport: _BYBTransport) -> None:
-        if self.config is None:
-            return
-
-        stream_channels = max(1, int(self._stream_channel_count or 4))
-        bits = max(8, min(self._bits, 16))
-        center_val = float(1 << (bits - 1))
-        raw_chunk_size = self.config.chunk_size
-        sample_buffer = np.zeros((raw_chunk_size, stream_channels), dtype=np.float32)
-        sample_idx = 0
-        raw_buffer = bytearray()
-        last_emit_time = time.monotonic()
-        sync_lost = False
-        sync_lost_time = 0.0
-        frame_size = stream_channels * 2
-
-        while not self.stop_event.is_set():
-            try:
-                data = transport.read(timeout_ms=25)
-            except Exception as exc:
-                _LOGGER.error("BYB transport read error: %s", exc)
-                break
-
-            if not data:
-                time.sleep(0.001)
-            else:
-                raw_buffer.extend(data)
-
-            while True:
-                try:
-                    start_idx = raw_buffer.find(_MSG_START)
-                    if start_idx < 0:
-                        break
-                    end_idx = raw_buffer.find(_MSG_END, start_idx + len(_MSG_START))
-                    if end_idx < 0:
-                        break
-                    payload = bytes(raw_buffer[start_idx + len(_MSG_START) : end_idx])
-                    del raw_buffer[start_idx : end_idx + len(_MSG_END)]
-                    for message in _iter_complete_messages(payload.decode("ascii", errors="ignore"))[0]:
-                        _update_protocol_state(self._protocol_state, message)
-                except Exception:
-                    break
-
-            while len(raw_buffer) >= 2:
-                start_idx = next((i for i, b in enumerate(raw_buffer) if b & 0x80), -1)
-                if start_idx < 0:
-                    raw_buffer.clear()
-                    break
-                if start_idx > 0:
-                    del raw_buffer[:start_idx]
-                if len(raw_buffer) < frame_size:
-                    break
-
-                for ch_idx in range(stream_channels):
-                    hi = raw_buffer[2 * ch_idx]
-                    lo = raw_buffer[2 * ch_idx + 1]
-                    raw_val = ((hi & 0x7F) << 7) | (lo & 0x7F)
-                    sample_buffer[sample_idx, ch_idx] = (raw_val - center_val) / center_val
-
-                del raw_buffer[:frame_size]
-                sample_idx += 1
-                if sample_idx >= raw_chunk_size:
-                    self._emit_active(sample_buffer, sample_idx)
-                    sample_buffer.fill(0.0)
-                    sample_idx = 0
-                    last_emit_time = time.monotonic()
-                    if sync_lost:
-                        _LOGGER.info(
-                            "BYB frame sync recovered after %.1f s.",
-                            last_emit_time - sync_lost_time,
-                        )
-                        sync_lost = False
-
-            elapsed = time.monotonic() - last_emit_time
-            if elapsed > self._SYNC_TIMEOUT_S and not sync_lost:
-                sync_lost = True
-                sync_lost_time = time.monotonic()
-                _LOGGER.warning(
-                    "BYB frame sync lost: no valid frames for %.1f s. "
-                    "profile=%s board=%s decode_widths=%s current_width=%s. "
-                    "Resetting decoder; check device mode, USB cable, and electrode connection.",
-                    elapsed,
-                    None if self._profile is None else self._profile.key,
-                    self._protocol_state.board_type,
-                    self._decoder_candidate_widths,
-                    self._stream_channel_count,
-                )
-                self.note_xrun()
-                raw_buffer.clear()
                 sample_idx = 0
 
     def _emit_active(self, sample_buffer: np.ndarray, frames: int) -> None:

@@ -10,7 +10,7 @@ Coverage
 5. SyncWatchdogRecovery   – valid data after timeout → INFO recovery log; steady data
                              keeps xruns at zero
 
-All _run_loop tests inject a ControlledFakeSerial and run the loop in a daemon
+All _run_loop tests inject a controlled fake transport and run the loop in a daemon
 thread; the stop_event is set to terminate it.  _SYNC_TIMEOUT_S is patched to
 a small value (0.02 s) on the test instance to keep suites fast.
 """
@@ -70,8 +70,8 @@ def _make_byb_device(
 ) -> BackyardBrainsSource:
     """Create a BackyardBrainsSource pre-configured for unit tests.
 
-    Bypasses the real open/configure lifecycle — no serial hardware needed.
-    The caller must set ``dev._ser`` before invoking ``_run_loop``.
+    Bypasses the real open/configure lifecycle — no hardware needed.
+    The caller must set ``dev._transport`` before invoking ``_run_loop``.
     """
     dev = BackyardBrainsSource(queue_maxsize=queue_maxsize)
     dev._bits = bits
@@ -99,30 +99,39 @@ def _make_byb_device(
     return dev
 
 
-class ControlledFakeSerial:
-    """Thread-safe mock serial that supports byte injection at any time.
+class ControlledFakeTransport:
+    """Thread-safe BYB transport mock that supports byte injection at any time.
 
-    Mimics the two attributes that ``_run_loop`` uses::
-
-        ser.in_waiting  -> int   number of bytes waiting to be read
-        ser.read(n)     -> bytes up to n bytes from the front of the buffer
+    Mimics the subset of the transport API that ``_run_loop`` uses.
     """
+
+    kind = "serial"
 
     def __init__(self, initial_data: bytes = b""):
         self._lock = threading.Lock()
         self._buf = bytearray(initial_data)
         self.is_open = True
 
-    @property
-    def in_waiting(self) -> int:
+    def read(self, timeout_ms: int = 0) -> bytes:
         with self._lock:
-            return len(self._buf)
+            if self._buf:
+                size = min(len(self._buf), 4096)
+                chunk = bytes(self._buf[:size])
+                del self._buf[:size]
+                return chunk
+        if timeout_ms > 0:
+            time.sleep(timeout_ms / 1000.0)
+        return b""
 
-    def read(self, n: int) -> bytes:
+    def write_command(self, cmd: str) -> None:
+        return
+
+    def reset_input_buffer(self) -> None:
         with self._lock:
-            chunk = bytes(self._buf[:n])
-            del self._buf[:n]
-            return chunk
+            self._buf.clear()
+
+    def close(self) -> None:
+        self.is_open = False
 
     def feed(self, data: bytes) -> None:
         """Append bytes to the receive buffer (callable from any thread)."""
@@ -230,7 +239,7 @@ class TestBYBValidFrameDecoding:
         """200 valid 1-channel frames at chunk_size=100 should emit >= 2 chunks."""
         dev = _make_byb_device(stream_channels=1, chunk_size=100)
         data = _encode_byb_frames([512] * 200)
-        dev._ser = ControlledFakeSerial(initial_data=data)
+        dev._transport = ControlledFakeTransport(initial_data=data)
 
         t = threading.Thread(target=dev._run_loop, daemon=True)
         t.start()
@@ -246,7 +255,7 @@ class TestBYBValidFrameDecoding:
         """Center-value frames must produce near-zero float32 output."""
         dev = _make_byb_device(stream_channels=1, chunk_size=50)
         data = _encode_byb_frames([512] * 100)
-        dev._ser = ControlledFakeSerial(initial_data=data)
+        dev._transport = ControlledFakeTransport(initial_data=data)
 
         t = threading.Thread(target=dev._run_loop, daemon=True)
         t.start()
@@ -272,7 +281,7 @@ class TestBYBValidFrameDecoding:
                 raw.append(((v >> 7) & 0x7F) | 0x80)
                 raw.append(v & 0x7F)
 
-        dev._ser = ControlledFakeSerial(initial_data=bytes(raw))
+        dev._transport = ControlledFakeTransport(initial_data=bytes(raw))
 
         t = threading.Thread(target=dev._run_loop, daemon=True)
         t.start()
@@ -296,7 +305,7 @@ class TestBYBAlignment:
         garbage = bytes([0x00, 0x1F, 0x7F, 0x0A, 0x3C, 0x55, 0x01])
         frames  = _encode_byb_frames([512] * 150)
         dev = _make_byb_device(stream_channels=1, chunk_size=100)
-        dev._ser = ControlledFakeSerial(initial_data=garbage + frames)
+        dev._transport = ControlledFakeTransport(initial_data=garbage + frames)
 
         t = threading.Thread(target=dev._run_loop, daemon=True)
         t.start()
@@ -309,7 +318,7 @@ class TestBYBAlignment:
     def test_all_low_bytes_no_crash(self):
         """Buffer of only MSB=0 bytes must be cleared without an exception."""
         dev = _make_byb_device(stream_channels=1, chunk_size=100)
-        dev._ser = ControlledFakeSerial(initial_data=bytes([0x00] * 500))
+        dev._transport = ControlledFakeTransport(initial_data=bytes([0x00] * 500))
         dev._SYNC_TIMEOUT_S = 0.03  # speed up watchdog for this test
 
         # If _run_loop raises, the thread will simply die; we detect that via is_alive.
@@ -334,7 +343,7 @@ class TestSyncWatchdogTimeout:
     def test_watchdog_increments_xrun_counter(self):
         """Empty serial → _xruns must be >= 1 after the timeout elapses."""
         dev = _make_byb_device()
-        dev._ser = ControlledFakeSerial()   # empty — no data ever arrives
+        dev._transport = ControlledFakeTransport()   # empty — no data ever arrives
         dev._SYNC_TIMEOUT_S = 0.02
 
         t = threading.Thread(target=dev._run_loop, daemon=True)
@@ -350,7 +359,7 @@ class TestSyncWatchdogTimeout:
     def test_watchdog_emits_warning_log(self, caplog):
         """Sync-loss event must be logged at WARNING level."""
         dev = _make_byb_device()
-        dev._ser = ControlledFakeSerial()
+        dev._transport = ControlledFakeTransport()
         dev._SYNC_TIMEOUT_S = 0.02
 
         with caplog.at_level(logging.WARNING, logger="daq.backyard_brains"):
@@ -368,7 +377,7 @@ class TestSyncWatchdogTimeout:
     def test_watchdog_fires_only_once_per_episode(self):
         """A single continuous silent period must produce exactly 1 xrun."""
         dev = _make_byb_device()
-        dev._ser = ControlledFakeSerial()
+        dev._transport = ControlledFakeTransport()
         dev._SYNC_TIMEOUT_S = 0.02
 
         t = threading.Thread(target=dev._run_loop, daemon=True)
@@ -385,8 +394,8 @@ class TestSyncWatchdogTimeout:
     def test_watchdog_clears_buffers_so_valid_data_can_follow(self):
         """After the watchdog fires, subsequently injected valid frames must emit chunks."""
         dev = _make_byb_device(chunk_size=50)
-        fake_ser = ControlledFakeSerial()  # starts empty
-        dev._ser = fake_ser
+        fake_ser = ControlledFakeTransport()  # starts empty
+        dev._transport = fake_ser
         dev._SYNC_TIMEOUT_S = 0.02
 
         t = threading.Thread(target=dev._run_loop, daemon=True)
@@ -413,8 +422,8 @@ class TestSyncWatchdogRecovery:
     def test_recovery_logged_at_info_level(self, caplog):
         """Emitting a chunk after _sync_lost=True must produce an INFO 'recovered' log."""
         dev = _make_byb_device(chunk_size=50)
-        fake_ser = ControlledFakeSerial()
-        dev._ser = fake_ser
+        fake_ser = ControlledFakeTransport()
+        dev._transport = fake_ser
         dev._SYNC_TIMEOUT_S = 0.02
 
         with caplog.at_level(logging.INFO, logger="daq.backyard_brains"):
@@ -436,8 +445,8 @@ class TestSyncWatchdogRecovery:
     def test_second_silence_fires_watchdog_again(self):
         """Two separate silent episodes must each produce one xrun (total == 2)."""
         dev = _make_byb_device(chunk_size=50)
-        fake_ser = ControlledFakeSerial()
-        dev._ser = fake_ser
+        fake_ser = ControlledFakeTransport()
+        dev._transport = fake_ser
         dev._SYNC_TIMEOUT_S = 0.02
 
         t = threading.Thread(target=dev._run_loop, daemon=True)
@@ -468,7 +477,7 @@ class TestSyncWatchdogRecovery:
         dev = _make_byb_device(chunk_size=50, sample_rate=1000)
         # Pre-load 3 s worth of valid data at 1 kHz
         data = _encode_byb_frames([512] * 3000)
-        dev._ser = ControlledFakeSerial(initial_data=data)
+        dev._transport = ControlledFakeTransport(initial_data=data)
         # Use the real default timeout so we don't artificially inflate sensitivity
         dev._SYNC_TIMEOUT_S = 0.5
 
