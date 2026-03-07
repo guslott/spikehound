@@ -418,6 +418,98 @@ class TestSettingsUpdates:
 
 
 # ---------------------------------------------------------------------------
+# Latency statistics
+# ---------------------------------------------------------------------------
+
+class TestLatencyStats:
+    """chunk_latency_stats_ms() must report plausible measured timings."""
+
+    def test_returns_none_before_any_chunks(self) -> None:
+        """No data yet → returns None."""
+        bridge, _ = _bridge(1)
+        assert bridge.chunk_latency_stats_ms() is None
+
+    def test_returns_tuple_after_one_chunk(self) -> None:
+        """After one chunk, returns a (mean, p95) tuple of positive floats."""
+        rng = np.random.default_rng(50)
+        raw = _raw_chunk(1, N_FRAMES, rng=rng)
+        bridge, _ = _bridge(1)
+        bridge.on_chunk(raw)
+
+        stats = bridge.chunk_latency_stats_ms()
+        assert stats is not None
+        mean_ms, p95_ms = stats
+        assert mean_ms > 0.0, "Mean latency must be positive"
+        assert p95_ms >= mean_ms, "p95 must be >= mean"
+
+    def test_p95_gte_mean(self) -> None:
+        """p95 must always be >= mean over any sample size."""
+        rng = np.random.default_rng(51)
+        bridge, _ = _bridge(2, listen_channel_idx=0)
+
+        for _ in range(30):
+            bridge.on_chunk(_raw_chunk(2, N_FRAMES, rng=rng))
+
+        stats = bridge.chunk_latency_stats_ms()
+        assert stats is not None
+        mean_ms, p95_ms = stats
+        assert p95_ms >= mean_ms - 1e-9, f"p95 {p95_ms:.4f} < mean {mean_ms:.4f}"
+
+    def test_rolling_window_bounded(self) -> None:
+        """Stats must reflect only the last _LATENCY_WINDOW chunks, not all history."""
+        from core.monitor_audio_bridge import _LATENCY_WINDOW
+
+        rng = np.random.default_rng(52)
+        bridge, _ = _bridge(1)
+
+        # Process well beyond the window size
+        for _ in range(_LATENCY_WINDOW * 3):
+            bridge.on_chunk(_raw_chunk(1, N_FRAMES, rng=rng))
+
+        with bridge._latency_lock:
+            n_stored = len(bridge._latency_deque)
+
+        assert n_stored == _LATENCY_WINDOW, (
+            f"Deque should cap at {_LATENCY_WINDOW}, got {n_stored}"
+        )
+
+    def test_stats_plausible_magnitude(self) -> None:
+        """Bridge processing time for a simple notch+256-frame chunk should be
+        in the microsecond-to-low-millisecond range (< 10 ms on any reasonable
+        machine), not zero and not seconds."""
+        rng = np.random.default_rng(53)
+        settings = FilterSettings(
+            default=ChannelFilterSettings(
+                notch_enabled=True, notch_freq_hz=60.0, notch_q=30.0
+            )
+        )
+        bridge, _ = _bridge(2, filter_settings=settings, listen_channel_idx=0)
+
+        for _ in range(20):
+            bridge.on_chunk(_raw_chunk(2, N_FRAMES, rng=rng))
+
+        stats = bridge.chunk_latency_stats_ms()
+        assert stats is not None
+        mean_ms, _ = stats
+        assert 0.001 < mean_ms < 10.0, (
+            f"Bridge mean latency {mean_ms:.4f} ms is implausible "
+            "(expected 0.001–10 ms range)"
+        )
+
+    def test_none_idx_does_not_record_timing(self) -> None:
+        """When listen_idx is None the chunk is skipped; no timing is recorded."""
+        rng = np.random.default_rng(54)
+        raw = _raw_chunk(1, N_FRAMES, rng=rng)
+
+        bridge, _ = _bridge(1, listen_channel_idx=None)
+        bridge.on_chunk(raw)
+
+        assert bridge.chunk_latency_stats_ms() is None, (
+            "Skipped chunks must not contribute to latency stats"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Thread safety smoke test
 # ---------------------------------------------------------------------------
 

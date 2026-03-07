@@ -354,12 +354,14 @@ class SpikeHoundRuntime:
         if self._acquisition_start_time is not None:
             uptime = time.monotonic() - self._acquisition_start_time
 
-        # Monitor audio latency estimate
+        # Monitor audio latency — both mean and p95 from measured bridge timing.
         monitor_latency_ms: Optional[float] = None
+        monitor_latency_p95_ms: Optional[float] = None
         try:
             am = getattr(self, "_audio_manager", None)
             if am is not None:
                 monitor_latency_ms = am.monitor_latency_ms()
+                monitor_latency_p95_ms = am.monitor_latency_p95_ms()
         except Exception:
             pass
 
@@ -372,6 +374,7 @@ class SpikeHoundRuntime:
             "dispatcher": stats,
             "queues": queues,
             "monitor_latency_ms": monitor_latency_ms,
+            "monitor_latency_p95_ms": monitor_latency_p95_ms,
         }
 
     def update_metrics(

@@ -160,7 +160,7 @@ class SettingsTab(QtWidgets.QWidget):
             ("Plot refresh", "plot_refresh", "Frequency of UI plot updates. Expected: Usually stabilizes at ~30-60 Hz for smooth visualization."),
             ("Xruns", "xruns", "Hardware under-runs or over-runs reported by the driver. Expected: Should be 0. Any value > 0 indicates potential data loss or timing glitches."),
             ("Drops", "drops", "Total samples dropped by the source before reaching the dispatcher. Expected: Should be 0. Values > 0 indicate the system cannot pull data fast enough."),
-            ("Audio latency", "audio_latency", "Estimated end-to-end monitor audio latency: capture device buffer + upstream routing + software ring fill + playback device buffer. Only shown when audio monitoring is active. Lower is better; target < 40 ms for low-latency monitoring."),
+            ("Audio latency", "audio_latency", "Measured end-to-end monitor audio latency: 10 ms capture device buffer + measured bridge processing time (rolling mean over last 64 chunks) + software ring fill + 10 ms playback device buffer. p95 shows the 95th-percentile bridge time, a conservative jitter bound. Only shown when audio monitoring is active. Target: mean < 30 ms, p95 < 40 ms."),
         ]
         
         col2_labels = [
@@ -576,19 +576,25 @@ class SettingsTab(QtWidgets.QWidget):
                 headroom_label.setText("–")
                 headroom_label.setStyleSheet("")
         
-        # Audio latency
+        # Audio latency — show mean with p95 jitter in parentheses once measured.
+        # The mean uses the measured bridge time; p95 reveals worst-case jitter.
         audio_latency_label = self._metric_fields.get("audio_latency")
         if audio_latency_label is not None:
             latency_ms = snapshot.get("monitor_latency_ms")
+            p95_ms = snapshot.get("monitor_latency_p95_ms")
             if latency_ms is not None:
-                # Color-code: green < 30 ms, yellow 30–60 ms, red > 60 ms
+                # Colour-code on the mean; thresholds are mean-based targets.
                 if latency_ms < 30.0:
                     color = "green"
                 elif latency_ms < 60.0:
                     color = "orange"
                 else:
                     color = "red"
-                audio_latency_label.setText(f"{latency_ms:.1f} ms")
+                if p95_ms is not None:
+                    text = f"{latency_ms:.1f} ms (p95: {p95_ms:.1f} ms)"
+                else:
+                    text = f"{latency_ms:.1f} ms"
+                audio_latency_label.setText(text)
                 audio_latency_label.setStyleSheet(f"color: {color};")
             else:
                 audio_latency_label.setText("–")

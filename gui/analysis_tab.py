@@ -531,17 +531,19 @@ class AnalysisTab(QtWidgets.QWidget):
         self.threshold2_line.sigPositionChanged.connect(lambda _: self._update_spin_from_line(self.threshold2_line, self.threshold2_spin))
         self.event_window_combo.currentIndexChanged.connect(self._on_event_window_changed)
 
-        # Consolidated update timer: single timer reduces scheduling overhead and
-        # prevents clustered work bursts from multiple independent timers firing
-        # in rapid succession. Runs at 30ms (~33Hz) for raw trace responsiveness.
+        # [H4] Consolidated update timer: single timer reduces scheduling overhead
+        # and prevents clustered work bursts from multiple independent timers
+        # firing in rapid succession.  Runs at 50ms (~20Hz) — lowered from 30ms
+        # (~33Hz) to reduce GUI-thread load on low-end student laptops while
+        # remaining visually smooth for scatter plots and overlays.
         self._update_timer = QtCore.QTimer(self)
-        self._update_timer.setInterval(30)
+        self._update_timer.setInterval(50)
         self._update_timer.timeout.connect(self._on_unified_timer)
         self._update_timer.start()
-        # Tick counter for throttling slower updates (metrics at ~10Hz, STA at ~10Hz)
+        # Tick counter for throttling slower updates (metrics at ~7Hz, STA at ~7Hz)
         self._timer_tick_count: int = 0
-        self._METRICS_UPDATE_TICKS: int = 3  # Every 3rd tick = ~90ms (~11Hz)
-        self._STA_UPDATE_TICKS: int = 3      # Every 3rd tick = ~90ms (~11Hz)
+        self._METRICS_UPDATE_TICKS: int = 3  # Every 3rd tick = ~150ms (~7Hz)
+        self._STA_UPDATE_TICKS: int = 3      # Every 3rd tick = ~150ms (~7Hz)
         self._in_threshold_update = False
         self._on_axis_metric_changed()
         self._apply_ranges()

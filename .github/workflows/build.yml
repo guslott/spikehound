@@ -43,6 +43,12 @@ jobs:
         pip install -r requirements.txt
         pip install pyinstaller
 
+    - name: Install Linux packaging tools
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y dpkg-dev file
+
     # --- MAC SPECIFIC SETUP ---
     - name: Install Mac Tools
       if: runner.os == 'macOS'
@@ -90,6 +96,30 @@ jobs:
 
         DEB_VERSION="0.0.${GITHUB_RUN_NUMBER}"
 
+        mapfile -t ELF_FILES < <(
+          find "$PKG_ROOT/opt/spikehound" -type f -print0 \
+            | xargs -0 file \
+            | awk -F: '/ELF/{print $1}'
+        )
+
+        SHLIB_DEPS=""
+        if ((${#ELF_FILES[@]} > 0)); then
+          SHLIB_DEPS="$(
+            dpkg-shlibdeps \
+              -O \
+              -l"$PKG_ROOT/opt/spikehound" \
+              -l"$PKG_ROOT/opt/spikehound/_internal" \
+              "${ELF_FILES[@]}" \
+            | sed -n 's/^shlibs:Depends=//p'
+          )"
+        fi
+
+        if [[ -n "$SHLIB_DEPS" ]]; then
+          DEPENDS_LINE="Depends: ${SHLIB_DEPS}, libasound2"
+        else
+          DEPENDS_LINE="Depends: libasound2"
+        fi
+
         cat > "$PKG_ROOT/DEBIAN/control" << EOF
         Package: spikehound
         Version: ${DEB_VERSION}
@@ -97,7 +127,7 @@ jobs:
         Priority: optional
         Architecture: amd64
         Maintainer: SpikeHound Maintainers
-        Depends: libc6, libstdc++6, libglib2.0-0, libx11-6, libxext6, libxrender1, libxkbcommon0, libxcb1, libegl1, libgl1, libasound2
+        ${DEPENDS_LINE}
         Description: SpikeHound real-time neurophysiology app
          Real-time bioelectric data acquisition, visualization, and analysis.
         EOF

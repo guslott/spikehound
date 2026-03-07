@@ -319,23 +319,24 @@ class PlotManager(QtCore.QObject):
             self._chunk_accum_count = 0
             return
 
-        # Update renderers
-        # data is (channels, samples), times_arr is (samples,)
+        # Always cache the newest samples so downstream consumers (for example
+        # the spectrogram tab) see fresh data even when curve redraw is
+        # throttled between frames.
         active_samples: Dict[int, np.ndarray] = {}
-        ds = 1  # Downsampling handled by TraceRenderer
-            
         for i, cid in enumerate(channel_ids):
             if i >= data.shape[0]:
                 break
-            
-            channel_data = data[i]
-            active_samples[cid] = channel_data
-            
-            if cid in self._renderers:
-                self._renderers[cid].update_data(channel_data, times_arr, downsample=ds)
+            active_samples[cid] = data[i]
 
         self._channel_last_samples = active_samples
+        self._last_times = times_arr
+
         if should_redraw:
+            ds = 1  # Downsampling handled by TraceRenderer
+            for cid, channel_data in active_samples.items():
+                renderer = self._renderers.get(cid)
+                if renderer is not None:
+                    renderer.update_data(channel_data, times_arr, downsample=ds)
             self._apply_active_channel_style()
             # Only call setXRange when the window duration has actually changed;
             # calling it every frame triggers an unnecessary repaint at 60 Hz.

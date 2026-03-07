@@ -10,6 +10,7 @@ miniaudio>=1.60
 
 # Serial communication (BYB devices)
 pyserial>=3.5
+hidapi>=0.14.0.post4  # Optional: Backyard Brains HID support
 
 # Testing
 pytest>=8.0.0

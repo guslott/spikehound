@@ -63,7 +63,7 @@ SpikeHound **democratizes neurophysiology** by removing financial and technical 
 | Device | Status | Notes |
 |--------|--------|-------|
 | **Sound Card** | ✅ Supported | Any USB/built-in audio input (up to 96kHz+) |
-| **Neuron SpikerBox** | ✅ Supported | Supports Muscle/Neuron/Pro models (Backyard Brains) |
+| **Neuron SpikerBox** | ✅ Supported | BYB CDC/serial devices are supported; HID Pro variants are supported when `hidapi` is installed; unknown BYB USB IDs fall back to conservative probe mode |
 | **Simulation** | ✅ Supported | Neural simulator for testing analysis pipelines |
 | **WAV Files** | ✅ Supported | Replay recorded data for offline analysis |
 | **NI-DAQmx** | 🔄 Planned | National Instruments boards (via generic Python drivers) |
@@ -108,7 +108,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-> **Dependencies:** numpy, scipy, PySide6, pyqtgraph, miniaudio, pyserial (see `requirements.txt` for version constraints)
+> **Dependencies:** numpy, scipy, PySide6, pyqtgraph, miniaudio, pyserial, and optional `hidapi` for Backyard Brains HID devices (see `requirements.txt` for version constraints)
 
 #### Building a Standalone App
 ```bash

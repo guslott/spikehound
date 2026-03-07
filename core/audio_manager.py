@@ -180,29 +180,58 @@ class AudioManager:
         with self._audio_lock:
             return self._listen_channel_id is not None
 
-    # Fixed upstream latency contributions (ms) that precede the AudioPlayer ring.
-    # Capture device buffer (set in soundcard_source.py):    10 ms
-    # Dispatcher + audio router thread round-trip (typical): ~5 ms
-    # These are conservative estimates; Phase 2 instrumentation will replace them
-    # with measured values once the low-latency monitor bridge is in place.
-    _UPSTREAM_LATENCY_MS: float = 15.0
+    # Hardware capture-device buffer latency (ms).
+    # Set in daq/soundcard_source.py (buffersize_msec=10).  This is the only
+    # upstream contribution that cannot be measured in software because it
+    # represents the time audio spends inside the hardware before the first
+    # callback fires.  Everything downstream of the callback is now measured
+    # directly by MonitorAudioBridge.chunk_latency_stats_ms().
+    _CAPTURE_DEVICE_MS: float = 10.0
 
     def monitor_latency_ms(self) -> Optional[float]:
-        """Return the estimated total end-to-end monitor latency in milliseconds.
+        """Return the measured mean end-to-end monitor latency in milliseconds.
 
-        Combines the fixed upstream contributions (capture device buffer + routing
-        thread hops) with the live ``AudioPlayer.estimated_latency_ms()`` reading
-        (ring fill level + playback device buffer).
+        Components:
+          - Capture device hardware buffer (known constant: 10 ms).
+          - Bridge processing time: measured rolling mean from
+            ``MonitorAudioBridge.chunk_latency_stats_ms()``.  Falls back to
+            0.1 ms (typical filter + ring-write overhead) until the first
+            chunk has been processed.
+          - Player ring fill + playback device buffer: from
+            ``AudioPlayer.estimated_latency_ms()``.
 
-        Returns None when monitoring is not active or the player is not running.
+        Returns ``None`` when monitoring is not active or the player is not running.
         """
         with self._audio_lock:
             if self._listen_channel_id is None:
                 return None
             player = self._audio_player
+            bridge = self._monitor_bridge
         if player is None:
             return None
-        return self._UPSTREAM_LATENCY_MS + player.estimated_latency_ms()
+        stats = bridge.chunk_latency_stats_ms() if bridge is not None else None
+        bridge_ms = stats[0] if stats is not None else 0.1
+        return self._CAPTURE_DEVICE_MS + bridge_ms + player.estimated_latency_ms()
+
+    def monitor_latency_p95_ms(self) -> Optional[float]:
+        """Return the measured p95 end-to-end monitor latency in milliseconds.
+
+        Uses the p95 bridge processing time instead of the mean, giving a
+        conservative worst-case-ish estimate suitable for jitter analysis.
+        Returns ``None`` when monitoring is not active or no data yet.
+        """
+        with self._audio_lock:
+            if self._listen_channel_id is None:
+                return None
+            player = self._audio_player
+            bridge = self._monitor_bridge
+        if player is None:
+            return None
+        stats = bridge.chunk_latency_stats_ms() if bridge is not None else None
+        if stats is None:
+            return None
+        bridge_p95_ms = stats[1]
+        return self._CAPTURE_DEVICE_MS + bridge_p95_ms + player.estimated_latency_ms()
 
     # Internal implementation
 

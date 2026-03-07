@@ -220,6 +220,7 @@ class MainWindow(QtWidgets.QMainWindow):
         hz = max(1.0, float(hz))
         self._plot_refresh_hz = hz
         self._plot_interval = 1.0 / hz
+        self._plot_manager.set_plot_refresh_hz(hz)
         try:
             self.runtime.update_metrics(plot_refresh_hz=hz)
         except Exception as exc:
