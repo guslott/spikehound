@@ -16,6 +16,18 @@ def _encode_frames(values: list[int]) -> bytes:
     return bytes(buf)
 
 
+def _encode_frame_start_only_frames(frame_values: list[list[int]]) -> bytes:
+    buf = bytearray()
+    for frame in frame_values:
+        for idx, value in enumerate(frame):
+            high = (value >> 7) & 0x7F
+            if idx == 0:
+                high |= 0x80
+            buf.append(high)
+            buf.append(value & 0x7F)
+    return bytes(buf)
+
+
 @dataclass
 class _FakePort:
     device: str
@@ -223,7 +235,7 @@ def test_hid_probe_uses_feature_report_wrapping_and_resolves_profile(monkeypatch
     src.close()
 
 
-def test_configure_rejects_invalid_rate_channel_combo(monkeypatch):
+def test_boardless_neuron_pro_exposes_two_channels_and_avoids_c_command(monkeypatch):
     port = _FakePort(
         device="/dev/tty.neuron",
         name="tty.neuron",
@@ -235,6 +247,7 @@ def test_configure_rejects_invalid_rate_channel_combo(monkeypatch):
     script = {
         (222222, "?:;"): b"FWV:1.02;HWT:NEURONSB;HWV:2.00;",
         (222222, "b:;"): b"HWT:NSBPCDC;",
+        (222222, "board:;"): b"BRD:0;",
     }
     fake_serial = _FakeSerialModule([port], script)
     monkeypatch.setattr(byb, "serial", fake_serial)
@@ -243,13 +256,75 @@ def test_configure_rejects_invalid_rate_channel_combo(monkeypatch):
     src = byb.BackyardBrainsSource()
     src.open(port.device)
 
-    with pytest.raises(ValueError, match="10000 Hz"):
-        src.configure(sample_rate=5000, channels=[0, 1], chunk_size=32)
+    channels = src.list_available_channels(port.device)
+    assert [ch.id for ch in channels] == [0, 1]
 
-    cfg = src.configure(sample_rate=5000, channels=[0, 2], chunk_size=32)
+    cfg = src.configure(sample_rate=5000, channels=[0, 1], chunk_size=32)
+    assert cfg.sample_rate == 10000
+    assert src.stats()["stream_channels"] == 2
+    assert not any(cmd.startswith("c:") for handle in fake_serial.instances for cmd in handle.write_log)
+    src.close()
+
+
+def test_neuron_pro_mfi_uses_fixed_four_channel_stream(monkeypatch):
+    port = _FakePort(
+        device="/dev/tty.mfi",
+        name="tty.mfi",
+        vid=0x2E73,
+        pid=0x0009,
+        description="Neuron SpikerBox Pro (Serial + MFi)",
+        product="Neuron SpikerBox Pro (Serial + MFi)",
+    )
+    script = {
+        (222222, "?:;"): b"FWV:1.02;HWT:NRNSBPRO;HWV:2.00;",
+        (222222, "b:;"): b"HWT:NRNSBPRO;",
+        (222222, "board:;"): b"BRD:0;",
+    }
+    fake_serial = _FakeSerialModule([port], script)
+    monkeypatch.setattr(byb, "serial", fake_serial)
+    monkeypatch.setattr(byb, "hid", None)
+
+    src = byb.BackyardBrainsSource()
+    src.open(port.device)
+
+    channels = src.list_available_channels(port.device)
+    assert [ch.id for ch in channels] == [0, 1, 2, 3]
+
+    cfg = src.configure(sample_rate=10000, channels=[0, 1], chunk_size=32)
+    assert cfg.sample_rate == 10000
+    assert src.stats()["stream_channels"] == 4
+    assert all(cmd not in {"?:;", "b:;", "board:;"} for handle in fake_serial.instances for cmd in handle.write_log)
+    assert not any(cmd.startswith("c:") for handle in fake_serial.instances for cmd in handle.write_log)
+    src.close()
+
+
+def test_spikershield_channel_config_uses_c_command_and_validates_rate(monkeypatch):
+    port = _FakePort(
+        device="/dev/tty.shield",
+        name="tty.shield",
+        vid=0x2341,
+        pid=0x0043,
+        description="Muscle SpikerShield",
+        product="Muscle SpikerShield",
+    )
+    script = {
+        (222222, "?:;"): b"HWT:MUSCLESS;FWV:1.00;",
+        (222222, "b:;"): b"HWT:MUSCLESS;",
+    }
+    fake_serial = _FakeSerialModule([port], script)
+    monkeypatch.setattr(byb, "serial", fake_serial)
+    monkeypatch.setattr(byb, "hid", None)
+
+    src = byb.BackyardBrainsSource()
+    src.open(port.device)
+
+    with pytest.raises(ValueError, match="5000 Hz"):
+        src.configure(sample_rate=10000, channels=[0, 1], chunk_size=32)
+
+    cfg = src.configure(sample_rate=5000, channels=[0, 1], chunk_size=32)
     assert cfg.sample_rate == 5000
-    assert src.stats()["stream_channels"] == 3
-    assert any("c:3;" in handle.write_log for handle in fake_serial.instances)
+    assert src.stats()["stream_channels"] == 2
+    assert any("c:2;" in handle.write_log for handle in fake_serial.instances)
     src.close()
 
 
@@ -265,6 +340,18 @@ def test_decoder_infers_ambiguous_stream_width():
     assert decoded is not None
     assert decoder.stream_width == 4
     assert decoded.shape == (16, 4)
+
+
+def test_decoder_accepts_frame_start_only_packets():
+    decoder = byb._BYBDecoder(bits=14, candidate_widths=(4,))
+    raw = _encode_frame_start_only_frames([[8192, 8192, 8192, 8192] for _ in range(8)])
+
+    messages, decoded = decoder.feed(raw)
+
+    assert messages == []
+    assert decoded is not None
+    assert decoder.stream_width == 4
+    assert decoded.shape == (8, 4)
 
 
 def test_decoder_resyncs_after_midstream_corruption():

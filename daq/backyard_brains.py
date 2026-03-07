@@ -126,7 +126,6 @@ _PROFILES: Dict[str, _BYBProfile] = {
         sample_rate_map={2: 10000, 3: 5000, 4: 5000},
         baud_rates=(222222,),
         requires_start=True,
-        supports_channel_cfg=True,
         supports_board_query=True,
         infer_stream_width=True,
         description="Pre-2023 Pro family with expansion port and 2-4 channel modes.",
@@ -142,7 +141,6 @@ _PROFILES: Dict[str, _BYBProfile] = {
         sample_rate_map={2: 10000, 3: 5000, 4: 5000},
         baud_rates=(222222,),
         requires_start=True,
-        supports_channel_cfg=True,
         supports_board_query=True,
         infer_stream_width=True,
         description="Pre-2023 Pro family with expansion port and 2-4 channel modes.",
@@ -169,13 +167,12 @@ _PROFILES: Dict[str, _BYBProfile] = {
         transports=("serial",),
         bits=14,
         max_channels=4,
-        candidate_stream_channels=(2, 3, 4),
-        sample_rate_map={2: 10000, 3: 10000, 4: 10000},
+        candidate_stream_channels=(4,),
+        sample_rate_map={4: 10000},
         baud_rates=(222222, 500000),
         requires_start=True,
-        supports_board_query=True,
-        infer_stream_width=True,
-        description="Composite Neuron Pro variant with 14-bit samples and 222222/500000 baud.",
+        supports_board_query=False,
+        description="Composite Neuron Pro variant that streams a fixed 4-channel 14-bit packet layout.",
     ),
     "plant": _BYBProfile(
         key="plant",
@@ -757,6 +754,7 @@ class _BYBDecoder:
         self._msg_buf = bytearray()
         self._candidate_widths = tuple(sorted({int(v) for v in candidate_widths if int(v) > 0}))
         self._stream_width: Optional[int] = None
+        self._frame_mode: str = "per_sample"
 
     @property
     def stream_width(self) -> Optional[int]:
@@ -778,26 +776,29 @@ class _BYBDecoder:
         if not self._candidate_widths:
             return
 
-        best: tuple[int, int, int] | None = None  # (score_bytes, width, offset)
+        best: tuple[int, int, int, str] | None = None  # (score_bytes, width, offset, mode)
         for width in self._candidate_widths:
             frame_size = width * 2
             if len(self._raw) < frame_size * 2:
                 continue
             max_offset = min(frame_size, len(self._raw))
             for offset in range(max_offset):
-                score = self._score_alignment(width, offset)
-                if score <= 0:
-                    continue
-                if best is None or score > best[0]:
-                    best = (score, width, offset)
-                elif best is not None and score == best[0] and width > best[1]:
-                    best = (score, width, offset)
+                for mode in ("frame_start", "per_sample"):
+                    score = self._score_alignment(width, offset, mode)
+                    if score <= 0:
+                        continue
+                    if best is None or score > best[0]:
+                        best = (score, width, offset, mode)
+                    elif best is not None and score == best[0]:
+                        _, best_width, _, best_mode = best
+                        if width > best_width or (width == best_width and mode == "frame_start" and best_mode != "frame_start"):
+                            best = (score, width, offset, mode)
 
         if best is None:
             self._drop_leading_garbage()
             return
 
-        score, width, offset = best
+        score, width, offset, mode = best
         frame_size = width * 2
         if score < frame_size * 2:
             return
@@ -805,8 +806,9 @@ class _BYBDecoder:
         if offset > 0:
             del self._raw[:offset]
         self._stream_width = width
+        self._frame_mode = mode
 
-    def _score_alignment(self, width: int, offset: int) -> int:
+    def _score_alignment(self, width: int, offset: int, mode: str) -> int:
         frame_size = width * 2
         usable = len(self._raw) - offset
         usable -= usable % frame_size
@@ -816,7 +818,7 @@ class _BYBDecoder:
         chunk = memoryview(self._raw)[offset : offset + usable]
         score = 0
         for pos, byte in enumerate(chunk):
-            if pos % 2 == 0:
+            if self._byte_flag_expected(pos, frame_size, mode):
                 if byte & 0x80:
                     score += 1
                 else:
@@ -826,6 +828,12 @@ class _BYBDecoder:
                     break
                 score += 1
         return score
+
+    @staticmethod
+    def _byte_flag_expected(pos: int, frame_size: int, mode: str) -> bool:
+        if mode == "frame_start":
+            return (pos % frame_size) == 0
+        return (pos % 2) == 0
 
     def _drop_leading_garbage(self) -> None:
         idx = next((i for i, b in enumerate(self._raw) if b & 0x80), -1)
@@ -875,8 +883,9 @@ class _BYBDecoder:
         return np.asarray(decoded, dtype=np.float32)
 
     def _frame_bytes_valid(self, frame_bytes: memoryview) -> bool:
+        frame_size = len(frame_bytes)
         for pos, byte in enumerate(frame_bytes):
-            if pos % 2 == 0:
+            if self._byte_flag_expected(pos, frame_size, self._frame_mode):
                 if (byte & 0x80) == 0:
                     return False
             else:
@@ -890,12 +899,15 @@ class _BYBDecoder:
         frame_size = self._stream_width * 2
 
         for offset in range(1, min(len(self._raw), frame_size * 2 + 1)):
-            score = self._score_alignment(self._stream_width, offset)
-            if score >= frame_size * 2:
-                del self._raw[:offset]
-                return
+            for mode in (self._frame_mode, "frame_start", "per_sample"):
+                score = self._score_alignment(self._stream_width, offset, mode)
+                if score >= frame_size * 2:
+                    del self._raw[:offset]
+                    self._frame_mode = mode
+                    return
 
         self._stream_width = None
+        self._frame_mode = "per_sample"
         self._drop_leading_garbage()
 
 
@@ -1119,13 +1131,39 @@ class BackyardBrainsSource(BaseDevice):
             else:
                 profile = _PROFILES["generic_serial"]
 
+        visible_channels = self._visible_channel_count(profile)
         channels: list[ChannelInfo] = []
-        for idx in range(profile.max_channels):
+        for idx in range(visible_channels):
             label = f"Channel {idx + 1}"
             if profile.key in {"muscle_pro", "neuron_pro", "human_spikerbox", "neuron_pro_mfi"} and idx >= 2:
                 label = f"Expansion {idx - 1}"
             channels.append(ChannelInfo(id=idx, name=label, units="V", range=(-5.0, 5.0)))
         return channels
+
+    def _resolved_stream_width_candidates(
+        self,
+        profile: Optional[_BYBProfile] = None,
+    ) -> tuple[int, ...]:
+        profile = profile or self._profile
+        if profile is None:
+            return (1,)
+
+        board_type = self._protocol_state.board_type
+        if profile.key in {"muscle_pro", "neuron_pro"}:
+            if board_type in {None, 0, 4, 5}:
+                return (2,)
+            if board_type == 1:
+                return (3, 4)
+        elif profile.key == "human_spikerbox":
+            if board_type in {None, 0, 4, 5}:
+                return (2,)
+            if board_type == 1:
+                return (3, 4)
+        candidates = tuple(int(width) for width in profile.candidate_stream_channels if int(width) > 0)
+        return candidates or (profile.default_stream_channels,)
+
+    def _visible_channel_count(self, profile: _BYBProfile) -> int:
+        return max(self._resolved_stream_width_candidates(profile))
 
     def _meta_for_device(self, device_id: str) -> dict[str, Any]:
         if device_id.startswith("hid:"):
@@ -1177,9 +1215,9 @@ class BackyardBrainsSource(BaseDevice):
         self._supports_channel_cfg = profile.supports_channel_cfg
         self._baudrate = transport.baudrate
 
-        self._decoder_candidate_widths = profile.candidate_stream_channels
-        self._stream_channel_count = profile.default_stream_channels
-        self._runtime_width_inferred = profile.infer_stream_width and len(profile.candidate_stream_channels) > 1
+        self._decoder_candidate_widths = self._resolved_stream_width_candidates(profile)
+        self._stream_channel_count = self._decoder_candidate_widths[0]
+        self._runtime_width_inferred = profile.infer_stream_width and len(self._decoder_candidate_widths) > 1
 
         _LOGGER.info(
             "Opened BYB device transport=%s profile=%s fallback=%s baud=%s hw=%s fw=%s",
@@ -1201,6 +1239,15 @@ class BackyardBrainsSource(BaseDevice):
         baud_candidates = self._preferred_baud_rates(candidate_profiles)
         if not baud_candidates:
             baud_candidates = [222222]
+
+        # Keep the legacy Serial+MFi path conservative. The older adapter opened
+        # this profile at 222222 baud without probe traffic and it worked on real
+        # hardware; use the same behavior here instead of gating the open on
+        # probe replies from commands the guide does not list for this profile.
+        if len(candidate_profiles) == 1 and candidate_profiles[0].key == "neuron_pro_mfi":
+            transport = _SerialTransport(device_id, baudrate=baud_candidates[0])
+            transport.open()
+            return transport
 
         last_exc: Optional[Exception] = None
         fallback_baud: Optional[int] = None
@@ -1245,6 +1292,9 @@ class BackyardBrainsSource(BaseDevice):
     ) -> _BYBProtocolState:
         state = _BYBProtocolState()
         if not transport.is_open:
+            return state
+
+        if len(candidate_profiles) == 1 and candidate_profiles[0].key == "neuron_pro_mfi":
             return state
 
         try:
@@ -1386,47 +1436,68 @@ class BackyardBrainsSource(BaseDevice):
             self._decoder_candidate_widths = (stream_channels,)
             self._runtime_width_inferred = False
         else:
+            dynamic_width_profile = self._profile.key in {
+                "muscle_pro",
+                "neuron_pro",
+                "human_spikerbox",
+            }
             minimum_stream_width = max(1, highest_selected_id + 1)
-            candidate_widths = tuple(
-                width for width in self._profile.candidate_stream_channels if width >= minimum_stream_width
-            )
+            base_candidate_widths = self._resolved_stream_width_candidates(self._profile)
+            if dynamic_width_profile:
+                candidate_widths = base_candidate_widths
+            else:
+                candidate_widths = tuple(
+                    width for width in base_candidate_widths if width >= minimum_stream_width
+                )
             if not candidate_widths:
                 raise ValueError(
                     f"{self._profile.label} cannot expose selected channel ids {channels}"
                 )
-
-            # Human/CDC composite devices expose expansion channels only when an
-            # attached board is present. When the board query says "none" (or we
-            # have never seen a board id) and the selection only touches the base
-            # channels, lock to the documented 2-channel stream width rather than
-            # leaving the decoder with an avoidable 2-vs-4 ambiguity.
-            if (
-                self._profile.key in {"human_spikerbox", "neuron_pro_mfi"}
-                and minimum_stream_width <= 2
-                and self._protocol_state.board_type in {None, 0}
-                and 2 in candidate_widths
-            ):
-                candidate_widths = (2,)
-
-            if len(candidate_widths) == 1:
-                self._stream_channel_count = candidate_widths[0]
-                self._decoder_candidate_widths = candidate_widths
-                self._runtime_width_inferred = False
-            else:
-                self._stream_channel_count = candidate_widths[0]
-                self._decoder_candidate_widths = candidate_widths
-                self._runtime_width_inferred = True
-
-            actual_rate = self._profile.actual_rate_for_stream_channels(self._stream_channel_count)
-            requested = int(sample_rate) if sample_rate else actual_rate
-            if requested != actual_rate:
-                raise ValueError(
-                    f"{self._profile.label} exposes {actual_rate} Hz with the current stream width; "
-                    f"requested {requested} Hz"
+            rate_candidates = {
+                self._profile.actual_rate_for_stream_channels(width) for width in candidate_widths
+            }
+            requested = int(sample_rate) if sample_rate else 0
+            if requested > 0:
+                matching_widths = tuple(
+                    width
+                    for width in candidate_widths
+                    if self._profile.actual_rate_for_stream_channels(width) == requested
                 )
+                if matching_widths:
+                    candidate_widths = matching_widths
+                    actual_rate = requested
+                elif len(rate_candidates) == 1:
+                    actual_rate = next(iter(rate_candidates))
+                    _LOGGER.info(
+                        "BYB sample rate request %s Hz overridden to %s Hz for %s",
+                        requested,
+                        actual_rate,
+                        self._profile.label,
+                    )
+                else:
+                    raise ValueError(
+                        f"{self._profile.label} does not support {requested} Hz for the current hardware state"
+                    )
+            elif len(rate_candidates) == 1:
+                actual_rate = next(iter(rate_candidates))
+            else:
+                actual_rate = self._profile.actual_rate_for_stream_channels(candidate_widths[0])
+
+            self._stream_channel_count = candidate_widths[0]
+            self._decoder_candidate_widths = candidate_widths
+            self._runtime_width_inferred = len(candidate_widths) > 1
 
         if self._profile.supports_spike_station_queries:
             self._query_optional_state()
+
+        _LOGGER.info(
+            "Configured BYB profile=%s board=%s active_channels=%s decode_widths=%s actual_rate=%s",
+            self._profile.key,
+            self._protocol_state.board_type,
+            [ch.id for ch in selected_channels],
+            self._decoder_candidate_widths,
+            actual_rate,
+        )
 
         return ActualConfig(
             sample_rate=actual_rate,
@@ -1472,6 +1543,10 @@ class BackyardBrainsSource(BaseDevice):
     def _run_loop(self) -> None:
         transport = self._active_transport()
         if transport is None or self.config is None:
+            return
+
+        if self._profile is not None and self._profile.key == "neuron_pro_mfi":
+            self._run_loop_legacy_serial_mfi(transport)
             return
 
         candidate_widths = self._decoder_candidate_widths or (self._stream_channel_count,)
@@ -1532,11 +1607,107 @@ class BackyardBrainsSource(BaseDevice):
                 sync_lost_time = time.monotonic()
                 _LOGGER.warning(
                     "BYB frame sync lost: no valid frames for %.1f s. "
-                    "Resetting decoder — check USB cable and electrode connection.",
+                    "profile=%s board=%s decode_widths=%s current_width=%s. "
+                    "Resetting decoder; check device mode, USB cable, and electrode connection.",
                     elapsed,
+                    None if self._profile is None else self._profile.key,
+                    self._protocol_state.board_type,
+                    self._decoder_candidate_widths,
+                    self._stream_channel_count,
                 )
                 self.note_xrun()
                 decoder = _BYBDecoder(bits=self._bits, candidate_widths=candidate_widths)
+                sample_idx = 0
+
+    def _run_loop_legacy_serial_mfi(self, transport: _BYBTransport) -> None:
+        if self.config is None:
+            return
+
+        stream_channels = max(1, int(self._stream_channel_count or 4))
+        bits = max(8, min(self._bits, 16))
+        center_val = float(1 << (bits - 1))
+        raw_chunk_size = self.config.chunk_size
+        sample_buffer = np.zeros((raw_chunk_size, stream_channels), dtype=np.float32)
+        sample_idx = 0
+        raw_buffer = bytearray()
+        last_emit_time = time.monotonic()
+        sync_lost = False
+        sync_lost_time = 0.0
+        frame_size = stream_channels * 2
+
+        while not self.stop_event.is_set():
+            try:
+                data = transport.read(timeout_ms=25)
+            except Exception as exc:
+                _LOGGER.error("BYB transport read error: %s", exc)
+                break
+
+            if not data:
+                time.sleep(0.001)
+            else:
+                raw_buffer.extend(data)
+
+            while True:
+                try:
+                    start_idx = raw_buffer.find(_MSG_START)
+                    if start_idx < 0:
+                        break
+                    end_idx = raw_buffer.find(_MSG_END, start_idx + len(_MSG_START))
+                    if end_idx < 0:
+                        break
+                    payload = bytes(raw_buffer[start_idx + len(_MSG_START) : end_idx])
+                    del raw_buffer[start_idx : end_idx + len(_MSG_END)]
+                    for message in _iter_complete_messages(payload.decode("ascii", errors="ignore"))[0]:
+                        _update_protocol_state(self._protocol_state, message)
+                except Exception:
+                    break
+
+            while len(raw_buffer) >= 2:
+                start_idx = next((i for i, b in enumerate(raw_buffer) if b & 0x80), -1)
+                if start_idx < 0:
+                    raw_buffer.clear()
+                    break
+                if start_idx > 0:
+                    del raw_buffer[:start_idx]
+                if len(raw_buffer) < frame_size:
+                    break
+
+                for ch_idx in range(stream_channels):
+                    hi = raw_buffer[2 * ch_idx]
+                    lo = raw_buffer[2 * ch_idx + 1]
+                    raw_val = ((hi & 0x7F) << 7) | (lo & 0x7F)
+                    sample_buffer[sample_idx, ch_idx] = (raw_val - center_val) / center_val
+
+                del raw_buffer[:frame_size]
+                sample_idx += 1
+                if sample_idx >= raw_chunk_size:
+                    self._emit_active(sample_buffer, sample_idx)
+                    sample_buffer.fill(0.0)
+                    sample_idx = 0
+                    last_emit_time = time.monotonic()
+                    if sync_lost:
+                        _LOGGER.info(
+                            "BYB frame sync recovered after %.1f s.",
+                            last_emit_time - sync_lost_time,
+                        )
+                        sync_lost = False
+
+            elapsed = time.monotonic() - last_emit_time
+            if elapsed > self._SYNC_TIMEOUT_S and not sync_lost:
+                sync_lost = True
+                sync_lost_time = time.monotonic()
+                _LOGGER.warning(
+                    "BYB frame sync lost: no valid frames for %.1f s. "
+                    "profile=%s board=%s decode_widths=%s current_width=%s. "
+                    "Resetting decoder; check device mode, USB cable, and electrode connection.",
+                    elapsed,
+                    None if self._profile is None else self._profile.key,
+                    self._protocol_state.board_type,
+                    self._decoder_candidate_widths,
+                    self._stream_channel_count,
+                )
+                self.note_xrun()
+                raw_buffer.clear()
                 sample_idx = 0
 
     def _emit_active(self, sample_buffer: np.ndarray, frames: int) -> None:

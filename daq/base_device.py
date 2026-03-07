@@ -106,6 +106,11 @@ class BaseDevice(ABC):
         self.config: Optional[ActualConfig] = None
         self.ring_buffer: Optional[SharedRingBuffer] = None
 
+        # Low-latency monitor bridge — same protocol as SoundCardSource.
+        # Written once by the control thread; read on every emit_array() call.
+        # CPython reference assignment is atomic so no lock is needed here.
+        self._monitor_bridge: Optional[object] = None
+
     # ------------------------
     # Device enumeration APIs
     # ------------------------
@@ -436,7 +441,17 @@ class BaseDevice(ABC):
                 device_time=device_time,
             )
             self._safe_put(pointer)
-            
+
+        # Notify the MonitorAudioBridge AFTER releasing the state lock so that
+        # filter processing inside on_chunk() does not block DAQ writes.
+        # channel_major is (channels, frames); on_chunk() expects (frames, channels).
+        bridge = self._monitor_bridge
+        if bridge is not None:
+            try:
+                bridge.on_chunk(channel_major.T)
+            except Exception:
+                pass  # Never let bridge errors disrupt the data path
+
         return pointer
 
     def emit_chunk(self, chunk: Chunk) -> None:
@@ -470,6 +485,21 @@ class BaseDevice(ABC):
                 device_time=device_time,
             )
             self._safe_put(pointer)
+
+    def register_monitor_bridge(self, bridge: Optional[object]) -> None:
+        """Attach or detach the low-latency MonitorAudioBridge.
+
+        Default implementation stores the bridge and calls ``bridge.on_chunk()``
+        from inside :meth:`emit_array` so that every source — including simulated
+        sources — can feed the audio monitor path without extra driver-level code.
+
+        ``SoundCardSource`` overrides this with an identical API so that its
+        emitter-thread call site remains unchanged.
+
+        Args:
+            bridge: A ``MonitorAudioBridge`` instance, or ``None`` to detach.
+        """
+        self._monitor_bridge = bridge
 
     def note_xrun(self, count: int = 1) -> None:
         """Drivers can call this when the backend reports over/underruns."""

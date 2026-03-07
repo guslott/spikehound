@@ -352,16 +352,10 @@ class SoundCardSource(BaseDevice):
             if chunks_to_emit:
                 mono_now = _time.monotonic()
 
-                # Low-latency monitor bridge: feed filtered audio directly to
-                # the player ring BEFORE the dispatcher path to minimize latency.
-                bridge = self._monitor_bridge
-                if bridge is not None:
-                    for chunk in chunks_to_emit:
-                        try:
-                            bridge.on_chunk(chunk)
-                        except Exception:
-                            pass  # Never let bridge errors stall acquisition.
-
+                # Low-latency monitor bridge is called from inside emit_array()
+                # (BaseDevice) so that the same on_chunk() path works for every
+                # source including SimulatedPhysiologySource.  No explicit call
+                # needed here.
                 for chunk in chunks_to_emit:
                     self.emit_array(chunk, mono_time=mono_now)
 

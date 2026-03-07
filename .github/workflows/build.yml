@@ -11,22 +11,31 @@ jobs:
       matrix:
         include:
           - os: macos-latest
+            runner: macos-latest
             # Mac-specific variables
             upload_path: dist/SpikeHound-Mac-Installer.dmg
             asset_name: SpikeHound-Mac-Installer.dmg
             content_type: application/x-apple-diskimage
           - os: windows-latest
+            runner: windows-latest
             # Windows-specific variables
             upload_path: dist/SpikeHound-Windows-Installer.exe
             asset_name: SpikeHound-Windows-Installer.exe
             content_type: application/vnd.microsoft.portable-executable
-          - os: ubuntu-latest
-            # Linux-specific variables
+          - os: ubuntu-22.04
+            runner: ubuntu-22.04
+            deb_arch: amd64
             upload_path: dist/SpikeHound-Linux-Installer-amd64.deb
             asset_name: SpikeHound-Linux-Installer-amd64.deb
             content_type: application/vnd.debian.binary-package
+          - os: ubuntu-22.04-arm
+            runner: ubuntu-22.04-arm
+            deb_arch: arm64
+            upload_path: dist/SpikeHound-Linux-Installer-arm64.deb
+            asset_name: SpikeHound-Linux-Installer-arm64.deb
+            content_type: application/vnd.debian.binary-package
 
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
 
     steps:
     - uses: actions/checkout@v4
@@ -125,7 +134,7 @@ jobs:
         Version: ${DEB_VERSION}
         Section: science
         Priority: optional
-        Architecture: amd64
+        Architecture: ${{ matrix.deb_arch || 'all' }}
         Maintainer: SpikeHound Maintainers
         ${DEPENDS_LINE}
         Description: SpikeHound real-time neurophysiology app
@@ -133,7 +142,7 @@ jobs:
         EOF
 
         chmod 0644 "$PKG_ROOT/DEBIAN/control"
-        dpkg-deb --build "$PKG_ROOT" "dist/SpikeHound-Linux-Installer-amd64.deb"
+        dpkg-deb --build "$PKG_ROOT" "${{ matrix.upload_path }}"
 
     # --- WINDOWS PACKAGING (Inno Setup) ---
     - name: Build Windows Installer
