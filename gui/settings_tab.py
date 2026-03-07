@@ -160,6 +160,7 @@ class SettingsTab(QtWidgets.QWidget):
             ("Plot refresh", "plot_refresh", "Frequency of UI plot updates. Expected: Usually stabilizes at ~30-60 Hz for smooth visualization."),
             ("Xruns", "xruns", "Hardware under-runs or over-runs reported by the driver. Expected: Should be 0. Any value > 0 indicates potential data loss or timing glitches."),
             ("Drops", "drops", "Total samples dropped by the source before reaching the dispatcher. Expected: Should be 0. Values > 0 indicate the system cannot pull data fast enough."),
+            ("Audio latency", "audio_latency", "Estimated end-to-end monitor audio latency: capture device buffer + upstream routing + software ring fill + playback device buffer. Only shown when audio monitoring is active. Lower is better; target < 40 ms for low-latency monitoring."),
         ]
         
         col2_labels = [
@@ -575,6 +576,24 @@ class SettingsTab(QtWidgets.QWidget):
                 headroom_label.setText("–")
                 headroom_label.setStyleSheet("")
         
+        # Audio latency
+        audio_latency_label = self._metric_fields.get("audio_latency")
+        if audio_latency_label is not None:
+            latency_ms = snapshot.get("monitor_latency_ms")
+            if latency_ms is not None:
+                # Color-code: green < 30 ms, yellow 30–60 ms, red > 60 ms
+                if latency_ms < 30.0:
+                    color = "green"
+                elif latency_ms < 60.0:
+                    color = "orange"
+                else:
+                    color = "red"
+                audio_latency_label.setText(f"{latency_ms:.1f} ms")
+                audio_latency_label.setStyleSheet(f"color: {color};")
+            else:
+                audio_latency_label.setText("–")
+                audio_latency_label.setStyleSheet("")
+
         # Dispatcher stats
         dropped = stats.get("dropped", {}) if isinstance(stats, dict) else {}
         forwarded = stats.get("forwarded", {}) if isinstance(stats, dict) else {}

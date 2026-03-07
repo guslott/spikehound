@@ -156,6 +156,16 @@ class PipelineController:
         if self._audio_manager is not None:
             self._audio_manager.update_active_channels([int(cid) for cid in channel_ids])
 
+    def set_monitor_bridge(self, bridge: Optional[object]) -> None:
+        """Register or deregister a MonitorAudioBridge on the active source.
+
+        Delegates to ``source.register_monitor_bridge()``.  No-op if there is
+        no active source or the source does not support the bridge protocol.
+        """
+        source = self.source
+        if source is not None and hasattr(source, "register_monitor_bridge"):
+            source.register_monitor_bridge(bridge)
+
     def set_list_all_audio_devices(self, enabled: bool) -> None:
         self._list_all_audio_devices = bool(enabled)
 

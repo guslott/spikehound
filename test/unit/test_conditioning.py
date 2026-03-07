@@ -452,3 +452,129 @@ class TestFilterValidation:
 
         with pytest.raises(ValueError):
             settings.validate(sample_rate)
+
+
+class TestConditionerSoSPath:
+    """Tests for the SOS-based conditioner refactor (uniform vs. non-uniform paths,
+    bypass, shape/dtype, and settings reset).  These cover cases not already handled
+    by the FFT-based tests above.
+    """
+
+    SAMPLE_RATE = 44_100.0
+
+    def _rng(self) -> np.random.Generator:
+        return np.random.default_rng(42)
+
+    def _chunk(
+        self,
+        n_channels: int,
+        n_frames: int,
+        rng: np.random.Generator | None = None,
+    ) -> tuple[np.ndarray, "Chunk"]:
+        """Return (raw_float32_array, Chunk) shaped (n_channels, n_frames)."""
+        if rng is None:
+            rng = self._rng()
+        data = rng.standard_normal((n_channels, n_frames)).astype(np.float32)
+        names = tuple(f"ch{i}" for i in range(n_channels))
+        return data, make_chunk(data, self.SAMPLE_RATE, channel_names=names)
+
+    # ── T1: output shape and dtype ──────────────────────────────────────────
+
+    @pytest.mark.parametrize(
+        "n_ch,n_fr",
+        [(1, 64), (2, 128), (8, 256), (4, 512)],
+    )
+    def test_output_shape_and_dtype(self, n_ch: int, n_fr: int) -> None:
+        """process() must return float32 array shaped (n_channels, n_frames)."""
+        settings = FilterSettings(
+            default=ChannelFilterSettings(
+                notch_enabled=True, notch_freq_hz=60.0, notch_q=30.0
+            )
+        )
+        cond = SignalConditioner(settings)
+        _, chunk = self._chunk(n_ch, n_fr)
+        out = cond.process(chunk)
+        assert out.shape == (n_ch, n_fr), (
+            f"Expected shape ({n_ch}, {n_fr}), got {out.shape}"
+        )
+        assert out.dtype == np.float32, f"Expected float32, got {out.dtype}"
+
+    # ── T3: uniform path == non-uniform path ────────────────────────────────
+
+    def test_uniform_matches_nonuniform_path(self) -> None:
+        """Uniform mode (single spec for all channels) must produce the same
+        output as the non-uniform path when all per-channel overrides are
+        identical to the default spec."""
+        spec = ChannelFilterSettings(
+            notch_enabled=True,
+            notch_freq_hz=60.0,
+            notch_q=30.0,
+            lowpass_hz=300.0,
+        )
+        # Uniform: no overrides → uses vectorised multi-channel sosfilt
+        cond_uniform = SignalConditioner(FilterSettings(default=spec))
+        # Non-uniform: override ch1 with the same spec → forces per-channel path
+        cond_nonuniform = SignalConditioner(
+            FilterSettings(default=spec, overrides={"ch1": spec})
+        )
+
+        rng = self._rng()
+        n_ch, n_fr = 2, 512
+        data, chunk = self._chunk(n_ch, n_fr, rng=rng)
+
+        out_u = cond_uniform.process(chunk)
+        out_n = cond_nonuniform.process(chunk)
+
+        np.testing.assert_allclose(
+            out_u,
+            out_n,
+            atol=1e-5,
+            err_msg="Uniform and non-uniform paths diverge for identical specs",
+        )
+
+    # ── T4: bypass path ─────────────────────────────────────────────────────
+
+    def test_bypass_returns_input_unchanged(self) -> None:
+        """When no filters are enabled, process() must return input unchanged."""
+        cond = SignalConditioner(FilterSettings())
+        rng = self._rng()
+        n_ch, n_fr = 3, 128
+        data, chunk = self._chunk(n_ch, n_fr, rng=rng)
+
+        out = cond.process(chunk)
+        np.testing.assert_array_equal(
+            out,
+            data,
+            err_msg="Bypass path modified the signal",
+        )
+
+    # ── T8: update_settings resets state cleanly ────────────────────────────
+
+    def test_update_settings_resets_to_bypass(self) -> None:
+        """After update_settings(FilterSettings()), the conditioner must act
+        as a pure bypass regardless of previously accumulated filter state."""
+        settings_with_notch = FilterSettings(
+            default=ChannelFilterSettings(
+                notch_enabled=True, notch_freq_hz=60.0, notch_q=30.0
+            )
+        )
+        cond = SignalConditioner(settings_with_notch)
+        rng = self._rng()
+        n_ch, n_fr = 2, 256
+        data, chunk = self._chunk(n_ch, n_fr, rng=rng)
+
+        # Warm up filter state
+        cond.process(chunk)
+
+        # Reset to bypass
+        cond.update_settings(FilterSettings())
+
+        # Fresh data through the now-bypassed conditioner
+        data2, chunk2 = self._chunk(n_ch, n_fr, rng=rng)
+        out = cond.process(chunk2)
+
+        np.testing.assert_array_equal(
+            out,
+            data2,
+            err_msg="post-update_settings bypass modified the signal",
+        )

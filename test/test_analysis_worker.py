@@ -243,10 +243,9 @@ def test_worker_updates_auto_detector_window_on_settings_change() -> None:
     
     worker.configure_threshold(enabled=True, value=0.5, auto_detect=True)
     
-    # Initial check (default 5.0ms from settings)
+    # Initial check (default 10.0ms from settings)
     assert worker._auto_detector is not None
-    # We expect 5.0 because AnalysisSettings default is now 5.0
-    assert worker._auto_detector._window_ms == 5.0
+    assert worker._auto_detector._window_ms == 10.0
     
     # Change settings
     controller.analysis_settings_store.update(event_window_ms=20.0)

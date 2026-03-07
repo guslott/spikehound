@@ -44,6 +44,11 @@ class AudioManager:
         self._audio_current_device: Optional[object] = None
         self._audio_player_buffer: Optional[SharedRingBuffer] = None
         self._audio_gain: float = 0.7
+
+        # MonitorAudioBridge — when active, audio is written directly to the
+        # player ring from the emitter thread; the router loop drains the
+        # audio_queue but does not forward to the player.
+        self._monitor_bridge: Optional[object] = None
         
         # Thread control
         self._audio_router_thread: Optional[threading.Thread] = None
@@ -95,11 +100,20 @@ class AudioManager:
         with self._audio_lock:
             self._listen_channel_id = channel_id
             self._listen_channel_idx = None  # Will be computed on next chunk
+            bridge = self._monitor_bridge
+            channel_ids = self._channel_ids_current
 
         if channel_id is None:
             self._stop_audio_player()
             logger.debug("Audio monitoring stopped")
         else:
+            # Keep bridge channel index in sync.
+            if bridge is not None:
+                try:
+                    idx = channel_ids.index(channel_id)
+                except ValueError:
+                    idx = None
+                bridge.set_listen_channel_idx(idx)
             logger.debug(f"Audio monitoring channel {channel_id}")
 
     def set_output_device(self, device_id: Optional[object]) -> None:
@@ -136,12 +150,36 @@ class AudioManager:
 
     def is_monitoring(self) -> bool:
         """Check if currently monitoring a channel.
-        
+
         Returns:
             True if monitoring is active
         """
         with self._audio_lock:
             return self._listen_channel_id is not None
+
+    # Fixed upstream latency contributions (ms) that precede the AudioPlayer ring.
+    # Capture device buffer (set in soundcard_source.py):    10 ms
+    # Dispatcher + audio router thread round-trip (typical): ~5 ms
+    # These are conservative estimates; Phase 2 instrumentation will replace them
+    # with measured values once the low-latency monitor bridge is in place.
+    _UPSTREAM_LATENCY_MS: float = 15.0
+
+    def monitor_latency_ms(self) -> Optional[float]:
+        """Return the estimated total end-to-end monitor latency in milliseconds.
+
+        Combines the fixed upstream contributions (capture device buffer + routing
+        thread hops) with the live ``AudioPlayer.estimated_latency_ms()`` reading
+        (ring fill level + playback device buffer).
+
+        Returns None when monitoring is not active or the player is not running.
+        """
+        with self._audio_lock:
+            if self._listen_channel_id is None:
+                return None
+            player = self._audio_player
+        if player is None:
+            return None
+        return self._UPSTREAM_LATENCY_MS + player.estimated_latency_ms()
 
     # Internal implementation
 
@@ -219,11 +257,18 @@ class AudioManager:
                     player_queue = self._audio_player_queue
 
                 if player is not None and player_queue is not None:
-                    player.set_selected_channel(idx)
-                    try:
-                        player_queue.put_nowait(item)
-                    except queue.Full:
-                        pass  # Drop if queue full
+                    # When the MonitorAudioBridge is active it writes directly
+                    # to the player ring from the emitter thread, so we only
+                    # drain this queue (to prevent backpressure) without
+                    # forwarding to the player.
+                    with self._audio_lock:
+                        bridge_active = self._monitor_bridge is not None
+                    if not bridge_active:
+                        player.set_selected_channel(idx)
+                        try:
+                            player_queue.put_nowait(item)
+                        except queue.Full:
+                            pass  # Drop if queue full
             
             except Exception as exc:
                 logger.error(f"Error in audio router loop: {exc}", exc_info=True)
@@ -279,7 +324,11 @@ class AudioManager:
             device=device_id,
             gain=self._audio_gain,
             blocksize=64,
-            ring_seconds=0.03,
+            # Reduced from 30 ms → 15 ms now that the MonitorAudioBridge
+            # writes directly to this ring from the emitter thread.  The ring
+            # only needs to absorb one capture chunk + scheduler jitter between
+            # the emitter write and the playback callback read.
+            ring_seconds=0.015,
         )
         
         try:
@@ -300,10 +349,42 @@ class AudioManager:
             self._audio_player_queue = queue_obj
             self._audio_input_samplerate = float(sample_rate)
             self._audio_player_buffer = viz_buffer
-        
+            listen_id = self._listen_channel_id
+            channel_ids = self._channel_ids_current
+            gain = self._audio_gain
+
         # Start player
         player.start()
         logger.info(f"AudioPlayer started: {sample_rate}Hz -> 44.1kHz")
+
+        # Create the low-latency monitor bridge and register it with the source.
+        if listen_id is not None:
+            try:
+                from .monitor_audio_bridge import MonitorAudioBridge
+                from .conditioning import FilterSettings
+                listen_idx: Optional[int] = None
+                try:
+                    listen_idx = channel_ids.index(listen_id)
+                except ValueError:
+                    pass
+                bridge = MonitorAudioBridge(
+                    player=player,
+                    filter_settings=FilterSettings(),  # Sync via update_filter_settings later
+                    sample_rate=sample_rate,
+                    n_channels=len(channel_ids),
+                    channel_names=[str(cid) for cid in channel_ids],
+                    listen_channel_idx=listen_idx,
+                    gain=gain,
+                )
+                controller = self.runtime.controller
+                if controller is not None:
+                    controller.set_monitor_bridge(bridge)
+                with self._audio_lock:
+                    self._monitor_bridge = bridge
+                logger.info("MonitorAudioBridge registered — low-latency path active")
+            except Exception as exc:
+                logger.warning("Failed to create MonitorAudioBridge: %s", exc)
+
         return True
 
     def _stop_audio_player(self) -> None:
@@ -314,6 +395,16 @@ class AudioManager:
             self._audio_player_queue = None
             self._audio_input_samplerate = 0.0
             self._audio_player_buffer = None
+            self._monitor_bridge = None
+
+        # Deregister the bridge from the source before stopping the player so
+        # the emitter thread cannot call on_chunk() after the ring is gone.
+        controller = self.runtime.controller
+        if controller is not None:
+            try:
+                controller.set_monitor_bridge(None)
+            except Exception:
+                pass
         
         if player is not None:
             try:

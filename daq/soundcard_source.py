@@ -213,6 +213,20 @@ class SoundCardSource(BaseDevice):
         self._stop_evt = threading.Event()
         self._data_available = threading.Event()  # Signal for emitter thread
         self._emitter_thread: Optional[threading.Thread] = None
+        # Low-latency monitor bridge — written once (under GIL) by the control
+        # thread; read once per chunk by the emitter thread.  CPython reference
+        # assignment is atomic, so no lock is needed for the read side.
+        self._monitor_bridge: Optional[object] = None
+
+    def register_monitor_bridge(self, bridge: Optional[object]) -> None:
+        """Attach or detach the low-latency monitor bridge.
+
+        Called from the control/GUI thread.  The bridge's ``on_chunk()``
+        method will be invoked from the emitter thread for every captured
+        chunk, BEFORE the chunk is forwarded through the dispatcher path.
+        Pass ``None`` to detach.
+        """
+        self._monitor_bridge = bridge
 
     # ---------- Helpers ---------------------------------------------------------
 
@@ -334,9 +348,20 @@ class SoundCardSource(BaseDevice):
                 self._data_available.clear()
             # Lock released here — callback can write again immediately
 
-            # Phase 2: emit outside the lock so the callback is never blocked
+            # Phase 2: emit outside the lock so the callback is never blocked.
             if chunks_to_emit:
                 mono_now = _time.monotonic()
+
+                # Low-latency monitor bridge: feed filtered audio directly to
+                # the player ring BEFORE the dispatcher path to minimize latency.
+                bridge = self._monitor_bridge
+                if bridge is not None:
+                    for chunk in chunks_to_emit:
+                        try:
+                            bridge.on_chunk(chunk)
+                        except Exception:
+                            pass  # Never let bridge errors stall acquisition.
+
                 for chunk in chunks_to_emit:
                     self.emit_array(chunk, mono_time=mono_now)
 

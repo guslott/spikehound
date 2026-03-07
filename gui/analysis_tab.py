@@ -11,6 +11,7 @@ from typing import Optional, TYPE_CHECKING, Sequence
 import numpy as np
 
 import pyqtgraph as pg
+from pyqtgraph.exporters import ImageExporter
 from PySide6 import QtCore, QtWidgets, QtGui
 
 logger = logging.getLogger(__name__)
@@ -797,14 +798,14 @@ class AnalysisTab(QtWidgets.QWidget):
         self._apply_ranges()
 
     def _initial_event_window_ms(self) -> float:
-        """Get initial event window duration from settings or default to 5ms."""
+        """Get initial event window duration from settings or default to 10ms."""
         if self._analysis_settings is None:
-            return 5.0
+            return 10.0
         try:
             return float(self._analysis_settings.get().event_window_ms)
         except Exception as e:
             logger.debug("Failed to get event_window_ms from settings: %s", e)
-            return 5.0
+            return 10.0
 
     def _set_event_window_selection(self, value_ms: float) -> None:
         """Set the event window combo to match value_ms."""
@@ -2831,12 +2832,16 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
             return
         if not path.lower().endswith(".png"):
             path = f"{path}.png"
-        pixmap = self.grab()
-        if pixmap.isNull():
-            QtWidgets.QMessageBox.warning(self, "Save image", "Unable to capture the waveform window.")
-            return
-        if not pixmap.save(path, "PNG"):
-            QtWidgets.QMessageBox.critical(self, "Save image", "Failed to save the image.")
+        try:
+            exporter = ImageExporter(self.plot_widget.plotItem)
+            params = exporter.parameters()
+            plot_size = self.plot_widget.size()
+            if plot_size.width() > 0:
+                params["width"] = int(plot_size.width())
+            exporter.export(path)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to export waveform image")
+            QtWidgets.QMessageBox.critical(self, "Save image", f"Failed to save the image:\n{exc}")
 
     def _on_save_traces(self) -> None:
         if not self._aligned_samples or self._export_time_axis is None or self._median_waveform is None:

@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class AnalysisSettings:
-    event_window_ms: float = 5.0
+    event_window_ms: float = 10.0
 
 
 class AnalysisSettingsStore:

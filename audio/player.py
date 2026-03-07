@@ -105,6 +105,7 @@ class AudioPlayer(threading.Thread):
 
         self._stop_evt = threading.Event()
         self._device: Optional[miniaudio.PlaybackDevice] = None
+        self._playback_buf_msec: int = 20  # updated in run(); used for latency estimate
 
     # ---- Public control ------------------------------------------------------
 
@@ -116,6 +117,23 @@ class AudioPlayer(threading.Thread):
 
     def stop(self) -> None:
         self._stop_evt.set()
+
+    def estimated_latency_ms(self) -> float:
+        """Return a conservative estimate of current end-to-end monitor playback latency.
+
+        Accounts for:
+          - Samples currently sitting in the software ring waiting to be consumed
+            by the playback callback (variable, reflects real-time queue depth).
+          - The miniaudio playback device hardware buffer (fixed, set at device open).
+
+        Does NOT include upstream pipeline latency (dispatcher queue, audio router
+        thread, capture device buffer).  Those fixed contributions are tracked
+        separately via ``AudioManager.monitor_latency_ms()``.
+        """
+        with self._r_lock:
+            ring_samples = self._r_count
+        ring_ms = (ring_samples / self.in_sr) * 1000.0 if self.in_sr > 0 else 0.0
+        return ring_ms + float(self._playback_buf_msec)
 
     # ---- Ring buffer helpers -------------------------------------------------
     # All three methods must be called with _r_lock held (or from __init__).
@@ -256,8 +274,12 @@ class AudioPlayer(threading.Thread):
         # Miniaudio handles resampling, so we don't need to bloat the buffer 
         # based on input rate (which was punishing low-sr devices).
         # We ensure at least 5ms to avoid underruns on busy systems.
-        buf_msec = 20
-        
+        # Reduced from 20 ms → 10 ms: MonitorAudioBridge writes directly into
+        # this ring so the upstream queue-hop latency is gone.  10 ms keeps us
+        # safe on most systems while halving the playback device contribution.
+        buf_msec = 10
+        self._playback_buf_msec = buf_msec
+
         # Configure miniaudio device with INPUT sample rate.
         # miniaudio handles resampling to hardware rate (e.g., 44.1kHz) in C,
         # which is significantly faster and lower latency than Python.

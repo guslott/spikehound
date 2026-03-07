@@ -74,6 +74,7 @@ class SpikeHoundRuntime:
         audio_manager = AudioManager(runtime=self)
         pipeline.attach_audio_manager(audio_manager)
         audio_manager.start()  # Start audio routing thread
+        self._audio_manager: AudioManager = audio_manager
 
     def set_pipeline(self, controller: Optional["PipelineController"]) -> None:
         """Update the underlying pipeline controller used for delegation."""
@@ -353,6 +354,15 @@ class SpikeHoundRuntime:
         if self._acquisition_start_time is not None:
             uptime = time.monotonic() - self._acquisition_start_time
 
+        # Monitor audio latency estimate
+        monitor_latency_ms: Optional[float] = None
+        try:
+            am = getattr(self, "_audio_manager", None)
+            if am is not None:
+                monitor_latency_ms = am.monitor_latency_ms()
+        except Exception:
+            pass
+
         return {
             "chunk_rate": float(self.chunk_rate),
             "plot_refresh_hz": float(self.plot_refresh_hz),
@@ -361,6 +371,7 @@ class SpikeHoundRuntime:
             "source": source_stats,
             "dispatcher": stats,
             "queues": queues,
+            "monitor_latency_ms": monitor_latency_ms,
         }
 
     def update_metrics(
