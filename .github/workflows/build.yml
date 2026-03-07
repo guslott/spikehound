@@ -99,6 +99,10 @@ jobs:
         cp -R dist/SpikeHound/. "$PKG_ROOT/opt/spikehound/"
         cp media/icon.png "$PKG_ROOT/usr/share/icons/hicolor/512x512/apps/spikehound.png"
 
+        # Qt's optional WebP image plugin can be linked against an older libwebp ABI
+        # than Ubuntu 22.04 provides on arm64. SpikeHound does not rely on WebP support.
+        rm -f "$PKG_ROOT/opt/spikehound/_internal/PySide6/Qt/plugins/imageformats/libqwebp.so"
+
         cat > "$PKG_ROOT/usr/bin/spikehound" << 'EOF'
         #!/usr/bin/env bash
         exec /opt/spikehound/SpikeHound "$@"
