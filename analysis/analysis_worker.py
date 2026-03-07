@@ -167,6 +167,11 @@ class AnalysisWorker(threading.Thread):
             self._settings_unsub = self._settings_store.subscribe(self._on_settings_changed)
         self._noise_mad: float = 0.0
         self._noise_initialized: bool = False
+        # Throttle the O(n log n) np.median noise estimate to every N chunks.
+        # At 60 Hz chunks a value of 8 still updates ~7.5 times/sec — plenty
+        # for a slow-moving noise floor estimate.
+        self._noise_update_interval: int = 8
+        self._noise_update_counter: int = 0
 
     def start(self) -> None:  # type: ignore[override]
         if self._controller is None:
@@ -387,16 +392,23 @@ class AnalysisWorker(threading.Thread):
             self._last_window_end_sample = -10**12
 
     def _update_noise_level(self, chunk: Chunk) -> None:
+        # Run the O(n log n) MAD estimate only every _noise_update_interval chunks.
+        # The noise floor changes slowly; ~7–8 updates/sec is more than sufficient.
+        self._noise_update_counter += 1
+        if self._noise_update_counter < self._noise_update_interval:
+            return
+        self._noise_update_counter = 0
+
         if chunk.samples.size == 0:
             return
         sig = np.asarray(chunk.samples[0], dtype=np.float32)
         if sig.size == 0:
             return
-        
+
         # Calculate MAD for global noise estimation
         med = float(np.median(sig))
         mad = float(np.median(np.abs(sig - med)))
-        
+
         with self._state_lock:
             if not self._noise_initialized:
                 self._noise_mad = mad
@@ -598,6 +610,8 @@ class AnalysisWorker(threading.Thread):
     def _waveform_crosses_threshold(waveform: np.ndarray, threshold: float) -> bool:
         if waveform.size == 0:
             return False
+        # Waveform samples are filtered float32 from the pipeline — always finite.
+        # np.max/min are ~2× faster than np.nanmax/nanmin (no NaN scan overhead).
         if threshold >= 0:
-            return bool(np.nanmax(waveform) >= threshold)
-        return bool(np.nanmin(waveform) <= threshold)
+            return bool(np.max(waveform) >= threshold)
+        return bool(np.min(waveform) <= threshold)

@@ -152,10 +152,10 @@ class SoundCardSource(BaseDevice):
             return []
             
         out: List[DeviceInfo] = []
-        
+
         for idx, dev in enumerate(devices):
             # dev is a dict: {'name': str, 'id': cdata, 'type': enum, 'formats': list}
-            
+
             # Get max channels from formats
             max_channels = 0
             default_rate = 44100
@@ -164,15 +164,22 @@ class SoundCardSource(BaseDevice):
                 for fmt in dev['formats']:
                     max_channels = max(max_channels, fmt.get('channels', 0))
                 default_rate = dev['formats'][0].get('samplerate', 44100)
-            
+
+            # Build a stable device key from name so the ID survives
+            # across restarts even if enumeration order changes.
+            import hashlib
+            dev_name = dev.get('name', f'device_{idx}')
+            stable_key = hashlib.sha256(dev_name.encode()).hexdigest()[:12]
+
             out.append(
                 DeviceInfo(
-                    id=str(idx), # Use index as stable-ish ID for this session
-                    name=dev['name'],
+                    id=stable_key,
+                    name=dev_name,
                     details={
                         "channels": max_channels,
                         "sample_rate": default_rate,
-                        "real_id": dev['id'] # Store real ID here
+                        "real_id": dev['id'],  # Store real ID here
+                        "enum_index": idx,      # Keep original index for fallback
                     },
                 )
             )
@@ -207,51 +214,54 @@ class SoundCardSource(BaseDevice):
         self._data_available = threading.Event()  # Signal for emitter thread
         self._emitter_thread: Optional[threading.Thread] = None
 
+    # ---------- Helpers ---------------------------------------------------------
+
+    @staticmethod
+    def _resolve_device(device_id: str):
+        """Resolve a stable hash-based device_id back to a miniaudio capture dict.
+
+        Returns the capture dict, or raises ValueError.
+        """
+        import hashlib
+        captures = miniaudio.Devices().get_captures()
+        for dev in captures:
+            name = dev.get('name', '')
+            key = hashlib.sha256(name.encode()).hexdigest()[:12]
+            if key == device_id:
+                return dev
+        raise ValueError(f"No capture device matching id '{device_id}'")
+
+    @staticmethod
+    def _max_channels(dev) -> int:
+        max_in = 0
+        if 'formats' in dev:
+            for fmt in dev['formats']:
+                max_in = max(max_in, fmt.get('channels', 0))
+        return max_in
+
     # ---------- Required interface --------------------------------------------
 
     def get_capabilities(self, device_id: str) -> Capabilities:
         if miniaudio is None:
             raise RuntimeError(f"`miniaudio` unavailable: {_IMPORT_ERROR!r}")
-        
-        # Handle default device
+
         if device_id == "default":
             return Capabilities(max_channels_in=2, sample_rates=[44100, 48000, 88200, 96000], dtype=self.dtype)
-        
-        # Resolve device info
-        idx = int(device_id)
-        captures = miniaudio.Devices().get_captures()
-        if idx < 0 or idx >= len(captures):
-             raise ValueError(f"Invalid device ID: {device_id}")
-        
-        dev = captures[idx]
-        max_in = 0
-        if 'formats' in dev:
-            for fmt in dev['formats']:
-                max_in = max(max_in, fmt.get('channels', 0))
-        
-        # Miniaudio handles resampling, so we can support common rates
+
+        dev = self._resolve_device(device_id)
+        max_in = self._max_channels(dev)
         supported = [44100, 48000, 88200, 96000]
-        
         return Capabilities(max_channels_in=max_in, sample_rates=supported, dtype=self.dtype)
 
     def list_available_channels(self, device_id: str) -> List[ChannelInfo]:
         if miniaudio is None:
             raise RuntimeError(f"`miniaudio` unavailable: {_IMPORT_ERROR!r}")
-            
-        # Handle default device
+
         if device_id == "default":
             return [ChannelInfo(id=i, name=f"In {i+1}", units="V") for i in range(2)]
-            
-        idx = int(device_id)
-        captures = miniaudio.Devices().get_captures()
-        if idx < 0 or idx >= len(captures):
-             raise ValueError(f"Invalid device ID: {device_id}")
-             
-        dev = captures[idx]
-        max_in = 0
-        if 'formats' in dev:
-            for fmt in dev['formats']:
-                max_in = max(max_in, fmt.get('channels', 0))
+
+        dev = self._resolve_device(device_id)
+        max_in = self._max_channels(dev)
         return [ChannelInfo(id=i, name=f"In {i+1}", units="V") for i in range(max_in)]
 
     # ---------- Lifecycle ------------------------------------------------------
@@ -259,26 +269,16 @@ class SoundCardSource(BaseDevice):
     def _open_impl(self, device_id: str) -> None:
         if miniaudio is None:
             raise RuntimeError(f"`miniaudio` unavailable: {_IMPORT_ERROR!r}")
-            
+
         if device_id == "default":
-            self._miniaudio_device_id = None # None means default in miniaudio
-            self._n_in = 2 # Assume stereo
+            self._miniaudio_device_id = None
+            self._n_in = 2
             self._chan_names = ["In 1", "In 2"]
             return
-            
-        idx = int(device_id)
-        captures = miniaudio.Devices().get_captures()
-        if idx < 0 or idx >= len(captures):
-             raise ValueError(f"Invalid device ID: {device_id}")
-        
-        dev = captures[idx]
+
+        dev = self._resolve_device(device_id)
         self._miniaudio_device_id = dev['id']
-        
-        max_in = 0
-        if 'formats' in dev:
-            for fmt in dev['formats']:
-                max_in = max(max_in, fmt.get('channels', 0))
-        self._n_in = max_in
+        self._n_in = self._max_channels(dev)
         self._chan_names = [f"In {i+1}" for i in range(self._n_in)]
 
     def _close_impl(self) -> None:
@@ -304,32 +304,41 @@ class SoundCardSource(BaseDevice):
 
     def _emitter_loop(self) -> None:
         """Emitter thread: drains local buffer and calls emit_array.
-        
-        This decouples the miniaudio callback from queue operations to prevent
-        blocking in the audio callback path, which could cause XRUNs or glitches.
+
+        CRITICAL: emit_array() must be called **outside** _buf_lock.
+        The miniaudio capture callback also acquires _buf_lock; if we hold it
+        during emit_array() (which can block on a full queue), the callback
+        stalls and causes an XRUN.
+
+        Strategy: drain all ready chunks into a local list under the lock,
+        release the lock, then emit from the local list.
         """
         while not self._stop_evt.is_set():
             # Wait for signal that data is available
             if not self._data_available.wait(timeout=0.01):
                 continue
-            
+
+            # Phase 1: collect ready chunks under the lock (no I/O, no blocking)
+            chunks_to_emit: list[np.ndarray] = []
             with self._buf_lock:
                 if self._residual_buffer is None or self.config is None:
                     self._data_available.clear()
                     continue
-                    
-                # Drain buffer in chunks
-                while self._residual_buffer.filled >= self.config.chunk_size:
-                    data_chunk = self._residual_buffer.read(self.config.chunk_size)
-                    
-                    idxs = [c.id for c in self.get_active_channels()]
-                    if not idxs:
-                        continue
-                    data_chunk = data_chunk[:, idxs]
-                    # Emit via base to stamp counters
-                    self.emit_array(data_chunk, mono_time=_time.monotonic())
-                
+
+                idxs = [c.id for c in self.get_active_channels()]
+                if idxs:
+                    while self._residual_buffer.filled >= self.config.chunk_size:
+                        data_chunk = self._residual_buffer.read(self.config.chunk_size)
+                        chunks_to_emit.append(data_chunk[:, idxs])
+
                 self._data_available.clear()
+            # Lock released here — callback can write again immediately
+
+            # Phase 2: emit outside the lock so the callback is never blocked
+            if chunks_to_emit:
+                mono_now = _time.monotonic()
+                for chunk in chunks_to_emit:
+                    self.emit_array(chunk, mono_time=mono_now)
 
     def _start_impl(self) -> None:
         if self._device is not None:
@@ -377,7 +386,7 @@ class SoundCardSource(BaseDevice):
                 nchannels=self._n_in,
                 sample_rate=self.config.sample_rate,
                 input_format=miniaudio.SampleFormat.FLOAT32,
-                buffersize_msec=30  # Lower buffer for reduced latency and smoother data flow
+                buffersize_msec=10  # 10 ms: lowest practical latency without risking XRUNs on most systems
             )
             
             gen = capture_generator()

@@ -43,6 +43,9 @@ class TraceRenderer:
         # Intermediate buffers for min/max computation during downsampling
         self._mins_buffer: np.ndarray | None = None
         self._maxs_buffer: np.ndarray | None = None
+        # Cached row-index array for advanced indexing in _resample_peak
+        self._row_indices: np.ndarray | None = None
+        self._row_indices_n: int = 0
         
     def update_config(self, config: ChannelConfig) -> None:
         """Update visual properties based on new config."""
@@ -129,6 +132,8 @@ class TraceRenderer:
         self._downsample_t_buffer = None
         self._mins_buffer = None
         self._maxs_buffer = None
+        self._row_indices = None
+        self._row_indices_n = 0
 
     def cleanup(self) -> None:
         """Remove curve from plot."""
@@ -182,8 +187,13 @@ class TraceRenderer:
         min_indices = y_view.argmin(axis=1)
         max_indices = y_view.argmax(axis=1)
 
+        # Reuse row-index array — reallocate only when chunk count changes
+        if self._row_indices is None or self._row_indices_n != n_chunks:
+            self._row_indices = np.arange(n_chunks)
+            self._row_indices_n = n_chunks
+        row_indices = self._row_indices
+
         # Gather min/max values using advanced indexing into pre-allocated buffers
-        row_indices = np.arange(n_chunks)
         np.copyto(mins, y_view[row_indices, min_indices])
         np.copyto(maxs, y_view[row_indices, max_indices])
 

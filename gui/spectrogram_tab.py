@@ -53,11 +53,22 @@ class SpectrogramTab(QtWidgets.QWidget):
         # State
         self._sample_rate: float = 0.0
         self._cached_nyquist: float = 0.0
+        # Cached frequency axis — recomputed only when sr or fft_size changes
         self._freqs: Optional[np.ndarray] = None
+        self._freqs_cached_sr: float = 0.0
         self._time_axis: np.ndarray = np.linspace(-1.0, 0.0, self._spec_columns)
 
+        # Double-wide spectrogram buffer to avoid np.roll on every frame.
+        #
+        # Classic circular-buffer trick: keep a 2× wide array.  Write each new
+        # column at position _spec_col_idx AND at _spec_col_idx + spec_columns.
+        # Reading display = self._spec_data[:, _spec_col_idx : _spec_col_idx + spec_columns]
+        # is always contiguous (index never wraps in the double-wide space) so
+        # zero-copy views are possible and no roll is ever needed.
+        self._spec_col_idx: int = 0
+        freq_bins = self._fft_size // 2 + 1
         self._spec_data: np.ndarray = np.full(
-            (self._fft_size // 2 + 1, self._spec_columns),
+            (freq_bins, 2 * self._spec_columns),
             -120.0,
             dtype=np.float32,
         )
@@ -341,13 +352,17 @@ class SpectrogramTab(QtWidgets.QWidget):
         if new_size and new_size != self._fft_size:
             self._fft_size = new_size
             self._window = np.hanning(self._fft_size).astype(np.float32)
+            # Rebuild double-wide buffer with new freq-bin count
+            freq_bins = self._fft_size // 2 + 1
             self._spec_data = np.full(
-                (self._fft_size // 2 + 1, self._spec_columns),
+                (freq_bins, 2 * self._spec_columns),
                 -120.0,
                 dtype=np.float32,
             )
+            self._spec_col_idx = 0
             self._baseline_db = None
             self._freqs = None
+            self._freqs_cached_sr = 0.0
 
     def _on_range_changed(self, index: int) -> None:
         """Handle dynamic range change."""
@@ -447,8 +462,15 @@ class SpectrogramTab(QtWidgets.QWidget):
         mag = np.abs(spectrum)
         mag_db = 20.0 * np.log10(np.maximum(mag, 1e-12))
 
-        freqs = np.fft.rfftfreq(self._fft_size, d=1.0 / sr)
-        self._freqs = freqs
+        # Cache the frequency axis — recompute only when sr or fft_size changes
+        if (
+            self._freqs is None
+            or self._freqs.size != self._fft_size // 2 + 1
+            or abs(sr - self._freqs_cached_sr) > 0.1
+        ):
+            self._freqs = np.fft.rfftfreq(self._fft_size, d=1.0 / sr)
+            self._freqs_cached_sr = sr
+        freqs = self._freqs
         self._fft_curve.setData(freqs, mag)
 
         # Set FFT X range to match selected frequency range
@@ -478,10 +500,16 @@ class SpectrogramTab(QtWidgets.QWidget):
         else:
             disp_db = mag_db
 
-        mag_db_clipped = np.clip(disp_db, self._db_floor, self._db_ceil)
+        mag_db_clipped = np.clip(disp_db, self._db_floor, self._db_ceil).astype(
+            np.float32, copy=False
+        )
 
-        self._spec_data = np.roll(self._spec_data, -1, axis=1)
-        self._spec_data[:, -1] = mag_db_clipped.astype(np.float32, copy=False)
+        # Double-wide circular write: write the new column to both halves of
+        # the buffer so a contiguous window view is always available without roll.
+        col = self._spec_col_idx
+        self._spec_data[:, col] = mag_db_clipped
+        self._spec_data[:, col + self._spec_columns] = mag_db_clipped
+        self._spec_col_idx = (col + 1) % self._spec_columns
 
         self._time_axis = np.linspace(-window_sec, 0.0, self._spec_columns, dtype=np.float32)
 
@@ -499,14 +527,22 @@ class SpectrogramTab(QtWidgets.QWidget):
         if self._spec_data.size == 0:
             return
 
-        img = self._spec_data.astype(np.float32, copy=False)
+        # Contiguous view of the display window (oldest … newest columns).
+        # _spec_col_idx is the next-write position, so the oldest column lives
+        # at _spec_col_idx and the newest at _spec_col_idx + spec_columns - 1.
+        # Because the buffer is 2× wide, this slice never wraps — always contiguous.
+        display = self._spec_data[:, self._spec_col_idx : self._spec_col_idx + self._spec_columns]
+
+        # setImage expects (time_cols, freq_bins); np.ascontiguousarray ensures the
+        # transpose is C-contiguous so pyqtgraph/Qt don't have to copy it internally.
+        img = np.ascontiguousarray(display.T)
 
         # Fixed levels based on dynamic range selection
         low = self._db_ceil - self._spec_dynamic_range_db
         levels = (float(low), float(self._db_ceil))
 
         self.spec_view.setImage(
-            img.T,
+            img,
             autoLevels=False,
             levels=levels,
             autoRange=False,

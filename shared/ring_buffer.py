@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from threading import RLock
+from threading import Lock
 from typing import Tuple
 
 import numpy as np
@@ -24,7 +24,7 @@ class SharedRingBuffer:
         self._shape = shape
         self._capacity = shape[-1]
         self._data = np.empty(self._shape, dtype=dtype)
-        self._lock = RLock()
+        self._lock = Lock()  # Plain Lock is sufficient — this buffer is never re-entered
         self._write_pos = 0
 
     @property

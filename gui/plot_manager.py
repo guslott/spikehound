@@ -337,7 +337,9 @@ class PlotManager(QtCore.QObject):
         self._channel_last_samples = active_samples
         if should_redraw:
             self._apply_active_channel_style()
-            if window_sec > 0:
+            # Only call setXRange when the window duration has actually changed;
+            # calling it every frame triggers an unnecessary repaint at 60 Hz.
+            if window_sec > 0 and window_sec != self._current_window_sec:
                 self._plot_widget.getPlotItem().setXRange(0, window_sec, padding=0)
             self._update_plot_y_range()
             self._last_plot_refresh = now

@@ -107,62 +107,87 @@ class _BaseFilter:
 
     def prime(self, initial_values: np.ndarray) -> None:
         """Set initial conditions based on the first sample of each channel."""
-        # Default: nothing to do
-        return
+        return  # Default: nothing to do
 
 
 class _IIRFilter(_BaseFilter):
-    def __init__(self, b: np.ndarray, a: np.ndarray, n_channels: int) -> None:
-        self._b = np.asarray(b, dtype=np.float64)
-        self._a = np.asarray(a, dtype=np.float64)
-        self._n_states = max(len(self._a), len(self._b)) - 1
-        self._zi = np.zeros((n_channels, self._n_states), dtype=np.float64)
-        if self._n_states > 0:
-            try:
-                self._zi_template = signal.lfilter_zi(self._b, self._a)
-            except Exception:  # pragma: no cover - defensive
-                self._zi_template = np.zeros(self._n_states, dtype=np.float64)
-        else:  # pragma: no cover - zero-order filter, uncommon
-            self._zi_template = np.zeros(0, dtype=np.float64)
+    """SOS-based IIR filter that processes ALL channels simultaneously.
+
+    Using Second-Order Sections (SOS) rather than direct-form b/a coefficients
+    gives better numerical stability for higher-order filters.
+
+    scipy.signal.sosfilt processes the full (n_channels, n_frames) array in
+    a single C-level loop — eliminating the Python-level per-channel iteration
+    and the float32→float64→float32 cast that happened once per channel.
+
+    zi layout expected by sosfilt with axis=1:
+        (n_channels, n_sections, 2)
+    """
+
+    def __init__(self, sos: np.ndarray, n_channels: int) -> None:
+        self._sos = np.atleast_2d(np.asarray(sos, dtype=np.float64))
+        self._n_sections = self._sos.shape[0]
+        self._n_channels = n_channels
+        # scipy sosfilt with axis=1 on input (n_channels, n_frames) requires
+        # zi.shape == (n_sections, n_channels, 2)  — NOT (n_channels, n_sections, 2).
+        # The rule is: zi = (*batch_dims_of_x_excluding_axis, n_sections, 2)
+        # → batch_dim = x.shape[0] = n_channels → (n_sections, n_channels, 2).
+        self._zi = np.zeros((self._n_sections, n_channels, 2), dtype=np.float64)
+        # Template for priming: shape (n_sections, 2) — one IC per section
+        self._zi_template = signal.sosfilt_zi(self._sos)
 
     def apply(self, samples: np.ndarray) -> np.ndarray:
-        if samples.ndim != 2:
-            raise ValueError("samples must be 2D (channels, frames)")
-        if samples.shape[0] != self._zi.shape[0]:
-            raise ValueError("channel count changed without reset")
+        """Apply filter to all channels at once.
 
-        out = np.empty_like(samples, dtype=np.float32)
-        for idx in range(samples.shape[0]):
-            row = samples[idx].astype(np.float64, copy=False)
-            filtered, zf = signal.lfilter(self._b, self._a, row, zi=self._zi[idx])
-            self._zi[idx] = zf
-            out[idx] = filtered.astype(np.float32, copy=False)
-        return out
+        Args:
+            samples: float32 array of shape (n_channels, n_frames)
+        Returns:
+            Filtered float32 array of same shape.
+        """
+        if samples.ndim != 2 or samples.shape[0] != self._n_channels:
+            raise ValueError(
+                f"Expected ({self._n_channels}, n_frames), got {samples.shape}"
+            )
+        # sosfilt operates in float64 for precision; cast the whole array once
+        # rather than once per channel in a Python loop.
+        out, self._zi = signal.sosfilt(
+            self._sos,
+            samples.astype(np.float64, copy=False),
+            axis=1,
+            zi=self._zi,
+        )
+        return out.astype(np.float32, copy=False)
 
     def reset(self, n_channels: int) -> None:
-        self._zi = np.zeros((n_channels, self._n_states), dtype=np.float64)
+        self._n_channels = n_channels
+        self._zi = np.zeros((self._n_sections, n_channels, 2), dtype=np.float64)
 
     def prime(self, initial_values: np.ndarray) -> None:
-        if self._n_states == 0 or self._zi_template.size == 0:
-            return
-        if initial_values.shape[0] != self._zi.shape[0]:
-            raise ValueError("initial_values length must match channel count")
-        for idx, value in enumerate(initial_values):
-            self._zi[idx] = self._zi_template * float(value)
+        """Seed filter state so the first output matches the DC level of the signal.
+
+        Args:
+            initial_values: 1-D array of shape (n_channels,) — the first sample
+                            of each channel used to compute step-response ICs.
+        """
+        n = min(self._n_channels, len(initial_values))
+        for i in range(n):
+            # zi[:, i, :] is the section×delay slice for channel i
+            self._zi[:, i, :] = self._zi_template * float(initial_values[i])
 
 
 class _ACCouplingFilter(_IIRFilter):
     def __init__(self, sample_rate: float, cutoff_hz: float, n_channels: int) -> None:
         norm = cutoff_hz / (sample_rate / 2.0)
-        b, a = signal.butter(1, norm, btype="highpass")
-        super().__init__(b, a, n_channels)
+        sos = signal.butter(1, norm, btype="highpass", output="sos")
+        super().__init__(sos, n_channels)
 
 
 class _NotchFilter(_IIRFilter):
     def __init__(self, sample_rate: float, freq_hz: float, q: float, n_channels: int) -> None:
         norm = freq_hz / (sample_rate / 2.0)
         b, a = signal.iirnotch(norm, q)
-        super().__init__(b, a, n_channels)
+        sos = signal.tf2sos(b, a)
+        super().__init__(sos, n_channels)
 
 
 class _ButterworthFilter(_IIRFilter):
@@ -176,19 +201,35 @@ class _ButterworthFilter(_IIRFilter):
         btype: str,
     ) -> None:
         norm = cutoff_hz / (sample_rate / 2.0)
-        b, a = signal.butter(order, norm, btype=btype)
-        super().__init__(b, a, n_channels)
+        sos = signal.butter(order, norm, btype=btype, output="sos")
+        super().__init__(sos, n_channels)
 
 
 class SignalConditioner:
-    """Applies configured IIR filters while preserving per-channel state."""
+    """Applies configured IIR filters while preserving per-channel state.
+
+    Filter strategy
+    ---------------
+    *Uniform mode* (all channels share the same FilterSettings):
+        A single set of _IIRFilter objects is created with n_channels=N.
+        ``sosfilt`` processes the full (N, frames) array in one C-level call —
+        no Python loop, no per-channel cast overhead.
+
+    *Non-uniform mode* (per-channel overrides active):
+        Falls back to one n_channels=1 filter per channel.  Still uses sosfilt
+        rather than lfilter so the zi shape is consistent.
+    """
 
     def __init__(self, settings: Optional[FilterSettings] = None) -> None:
         self._settings = settings or FilterSettings()
         self._sample_rate: Optional[float] = None
         self._channel_names: Optional[Sequence[str]] = None
         self._channel_specs: Optional[Tuple[ChannelFilterSettings, ...]] = None
+        # Non-uniform path: one chain per channel
         self._channel_filters: List[List[_BaseFilter]] = []
+        # Uniform path: single chain shared by all channels
+        self._uniform_chain: List[_BaseFilter] = []
+        self._uniform_mode: bool = False
 
     @property
     def settings(self) -> FilterSettings:
@@ -199,6 +240,8 @@ class SignalConditioner:
         # Force rebuild on next chunk
         self._sample_rate = None
         self._channel_filters = []
+        self._uniform_chain = []
+        self._uniform_mode = False
         self._channel_specs = None
 
     def describe(self) -> Dict[str, str]:
@@ -210,8 +253,11 @@ class SignalConditioner:
         sample_rate = 1.0 / chunk.dt
         channel_names = chunk.channel_names
         channel_specs = tuple(self._settings.for_channel(name) for name in channel_names)
+
+        # Check if anything has changed; if not, reuse existing filter state
+        already_built = bool(self._channel_filters) or bool(self._uniform_chain)
         if (
-            self._channel_filters
+            already_built
             and self._sample_rate == sample_rate
             and self._channel_names == channel_names
             and self._channel_specs == channel_specs
@@ -223,68 +269,96 @@ class SignalConditioner:
         self._channel_names = channel_names
         self._channel_specs = channel_specs
 
-        channel_filters: List[List[_BaseFilter]] = []
-        for spec in channel_specs:
+        n_ch = len(channel_specs)
+
+        def _build_chain(spec: ChannelFilterSettings, n_channels: int) -> List[_BaseFilter]:
             chain: List[_BaseFilter] = []
             if spec.ac_couple:
-                chain.append(_ACCouplingFilter(sample_rate, spec.ac_cutoff_hz, 1))
+                chain.append(_ACCouplingFilter(sample_rate, spec.ac_cutoff_hz, n_channels))
             if spec.notch_enabled:
-                chain.append(_NotchFilter(sample_rate, spec.notch_freq_hz, spec.notch_q, 1))
+                chain.append(_NotchFilter(sample_rate, spec.notch_freq_hz, spec.notch_q, n_channels))
             if spec.highpass_hz is not None:
                 chain.append(
                     _ButterworthFilter(
-                        sample_rate,
-                        spec.highpass_hz,
-                        1,
-                        order=spec.highpass_order,
-                        btype="highpass",
+                        sample_rate, spec.highpass_hz, n_channels,
+                        order=spec.highpass_order, btype="highpass",
                     )
                 )
             if spec.lowpass_hz is not None:
                 chain.append(
                     _ButterworthFilter(
-                        sample_rate,
-                        spec.lowpass_hz,
-                        1,
-                        order=spec.lowpass_order,
-                        btype="lowpass",
+                        sample_rate, spec.lowpass_hz, n_channels,
+                        order=spec.lowpass_order, btype="lowpass",
                     )
                 )
-            channel_filters.append(chain)
+            return chain
 
-        self._channel_filters = channel_filters
+        # Uniform mode: all channels share the same spec (the overwhelmingly common case).
+        # Build ONE multi-channel filter chain so sosfilt processes all channels in one call.
+        if n_ch > 0 and len(set(channel_specs)) == 1:
+            self._uniform_chain = _build_chain(channel_specs[0], n_ch)
+            self._channel_filters = []
+            self._uniform_mode = True
+        else:
+            # Non-uniform: per-channel specs — one n_channels=1 chain per channel
+            self._channel_filters = [_build_chain(spec, 1) for spec in channel_specs]
+            self._uniform_chain = []
+            self._uniform_mode = False
+
         return True
 
     def process(self, chunk: Chunk) -> np.ndarray:
-        samples = np.array(chunk.samples, dtype=np.float32, copy=True)
+        # np.ascontiguousarray only allocates when the source is non-contiguous or
+        # the dtype differs — avoids the unconditional copy=True that existed before.
+        samples = np.ascontiguousarray(chunk.samples, dtype=np.float32)
+
         if not self._settings.any_enabled():
             return samples
 
         rebuilt = self._ensure_filters(chunk)
-        if not self._channel_filters:
+        has_filters = bool(self._uniform_chain) or bool(self._channel_filters)
+        if not has_filters:
             return samples
 
+        # Prime filter initial conditions on the first chunk after a rebuild so
+        # the filter starts at the DC level of the signal (avoids transient artifacts).
         if rebuilt and samples.size:
-            initial = samples[:, 0]
+            initial = samples[:, 0]  # (n_channels,)
+            if self._uniform_mode:
+                for filt in self._uniform_chain:
+                    filt.prime(initial)
+            else:
+                for idx, chain in enumerate(self._channel_filters):
+                    if chain and idx < len(initial):
+                        priming = initial[idx : idx + 1]
+                        for filt in chain:
+                            filt.prime(priming)
+
+        if self._uniform_mode:
+            # All channels share the same filter spec — process the full
+            # (n_channels, n_frames) array in a single sosfilt call (no Python loop).
+            row: np.ndarray = samples
+            for filt in self._uniform_chain:
+                row = filt.apply(row)
+            return row
+        else:
+            # Per-channel filters — build output without a full-array pre-copy.
+            filtered = np.empty_like(samples)
             for idx, chain in enumerate(self._channel_filters):
                 if not chain:
+                    filtered[idx] = samples[idx]
                     continue
-                priming = np.asarray([initial[idx]], dtype=np.float32)
+                row = samples[idx : idx + 1]
                 for filt in chain:
-                    filt.prime(priming)
-
-        filtered = samples.copy()
-        for idx, chain in enumerate(self._channel_filters):
-            if not chain:
-                continue
-            row = filtered[idx : idx + 1]
-            for filt in chain:
-                row = filt.apply(row)
-            filtered[idx, :] = row[0]
-        return filtered
+                    row = filt.apply(row)
+                filtered[idx] = row[0]
+            return filtered
 
     def reset(self) -> None:
-        if self._channel_filters:
+        if self._uniform_mode:
+            for filt in self._uniform_chain:
+                filt.reset(filt._n_channels)
+        else:
             for chain in self._channel_filters:
                 for filt in chain:
                     filt.reset(1)

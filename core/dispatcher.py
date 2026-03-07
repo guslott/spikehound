@@ -55,7 +55,15 @@ class DispatcherStats:
 
 
 class Dispatcher:
-    """Router thread that conditions incoming samples from ChunkPointers and fans them out to consumers."""
+    """Router thread that conditions incoming samples from ChunkPointers and fans them out to consumers.
+
+    Lock ordering (always acquire in this order to prevent deadlocks):
+        1. _ring_lock        – visualization ring buffer and bookkeeping
+        2. _stats_lock       – dispatcher statistics counters
+        3. _analysis_lock    – analysis queue registration
+        4. _detectors_lock   – event-detector list
+    Never acquire an earlier-numbered lock while holding a later one.
+    """
 
     def __init__(
         self,
@@ -68,7 +76,7 @@ class Dispatcher:
         filter_settings: Optional[FilterSettings] = None,
         poll_timeout: float = 0.05,
         strict_invariants: bool = False,
-        gap_policy: str = "crash",  # "crash", "reset", "ignore"
+        gap_policy: str = "reset",  # "reset", "crash", "ignore"
     ) -> None:
         self._raw_queue = raw_queue
         self._output_queues: Dict[str, queue.Queue] = {
@@ -119,6 +127,11 @@ class Dispatcher:
 
         # Recording state - only enqueue to logging when True
         self._recording_enabled: bool = False
+
+        # Cached times array — reused across ticks when window/rate are stable
+        self._cached_times: Optional[np.ndarray] = None
+        self._cached_times_window_samples: int = 0
+        self._cached_times_window_sec: float = 0.0
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -499,18 +512,19 @@ class Dispatcher:
         for token, queue_obj in targets:
             self._enqueue_with_policy("analysis", queue_obj, filtered_chunk)
 
+    def _stats_callback(self, q_name: QueueName, action: str) -> None:
+        """Bound stats callback — avoids creating a new closure object on every enqueue call."""
+        with self._stats_lock:
+            if action == "forwarded":
+                self._stats.forwarded[q_name] += 1
+            elif action == "dropped":
+                self._stats.dropped[q_name] += 1
+            elif action == "evicted":
+                self._stats.evicted[q_name] += 1
+
     def _enqueue_with_policy(self, queue_name: QueueName, target_queue: queue.Queue, item: object) -> None:
         """Unified enqueue method that dispatches on shared QUEUE_POLICIES."""
-        def stats_cb(q_name: QueueName, action: str) -> None:
-            with self._stats_lock:
-                if action == "forwarded":
-                    self._stats.forwarded[q_name] += 1
-                elif action == "dropped":
-                    self._stats.dropped[q_name] += 1
-                elif action == "evicted":
-                    self._stats.evicted[q_name] += 1
-
-        enqueue_with_policy(queue_name, target_queue, item, stats_callback=stats_cb)
+        enqueue_with_policy(queue_name, target_queue, item, stats_callback=self._stats_callback)
 
 
 
@@ -594,7 +608,10 @@ class Dispatcher:
         # Phase 2: Expensive operations outside the lock
         # This allows DAQ thread to write new data while GUI processes
         try:
-            data = np.array(viz_buffer.read(start, window_samples), copy=True, dtype=np.float32)
+            raw = viz_buffer.read(start, window_samples)
+            # viz_buffer is always float32; raw.copy() is faster than np.array(…, dtype=…) when
+            # types already match, and we need a writable copy to protect the ring buffer.
+            data = raw.copy()
         except Exception:
             # Buffer may have been resized/replaced - return empty
             return self._empty_payload(status)
@@ -620,8 +637,21 @@ class Dispatcher:
         channel_names = [channel_names_tuple[idx] if idx < len(channel_names_tuple) else str(channel_ids[i]) for i, idx in enumerate(safe_indices)]
         
         actual_window_sec = window_samples / sample_rate if sample_rate else 0.0
-        times = np.linspace(0.0, actual_window_sec, window_samples, endpoint=False, dtype=np.float32)
-        
+
+        # Cache the times array and reuse it when window parameters haven't changed.
+        # At 60 Hz this avoids ~60 np.linspace allocations/sec for a constant window.
+        if (
+            self._cached_times is None
+            or self._cached_times_window_samples != window_samples
+            or abs(self._cached_times_window_sec - actual_window_sec) > 1e-9
+        ):
+            self._cached_times = np.linspace(
+                0.0, actual_window_sec, window_samples, endpoint=False, dtype=np.float32
+            )
+            self._cached_times_window_samples = window_samples
+            self._cached_times_window_sec = actual_window_sec
+        times = self._cached_times
+
         return {
             "channel_ids": channel_ids,
             "channel_names": channel_names,

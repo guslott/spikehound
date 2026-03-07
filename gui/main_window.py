@@ -1380,27 +1380,50 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_channel_buttons()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[override]
-        # Stop recording first to ensure WAV file header is properly finalized
+        """Formal shutdown sequence.
+
+        Order:
+          1. Stop recording  (finalize WAV header)
+          2. Stop audio listen (release sound-card output)
+          3. Shut down analysis workers
+          4. Shut down runtime  (stops dispatcher, source, audio manager)
+          5. Clean up device manager
+        """
+        # 1. Recording
         if self._is_recording and self._controller is not None:
             try:
                 self._controller.stop_recording()
                 self._is_recording = False
             except Exception as e:
                 self._logger.debug("Exception stopping recording on close: %s", e)
-        
+
+        # 2. Audio listen
+        try:
+            self._clear_listen_channel()
+        except Exception as e:
+            self._logger.debug("Exception clearing listen channel on close: %s", e)
+
+        # 3. Analysis workers
+        if self._analysis_dock is not None:
+            try:
+                self._analysis_dock.shutdown()
+            except Exception as e:
+                self._logger.debug("Exception shutting down analysis dock: %s", e)
+
+        # 4. Runtime (pipeline, dispatcher, source)
+        try:
+            self.runtime.shutdown()
+        except Exception as e:
+            self._logger.debug("Exception during runtime shutdown: %s", e)
+
+        # 5. Device manager
         dm = self.runtime.device_manager
         if dm is not None:
-            try:
-                dm.disconnect_device()
-            except Exception as e:
-                self._logger.debug("Exception during device disconnect on close: %s", e)
             try:
                 dm.cleanup()
             except Exception as e:
                 self._logger.debug("Exception during device manager cleanup: %s", e)
-        self._clear_listen_channel()
-        if self._analysis_dock is not None:
-            self._analysis_dock.shutdown()
+
         super().closeEvent(event)
 
     def _quit_application(self) -> None:

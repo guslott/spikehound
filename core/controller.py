@@ -39,7 +39,7 @@ class PipelineController:
         *,
         filter_settings: Optional[FilterSettings] = None,
         visualization_queue_size: int = 8,
-        audio_queue_size: int = 2,
+        audio_queue_size: int = 16,  # was 2 — 16 slots gives ~260 ms headroom at 44.1 kHz / 735-sample chunks
         logging_queue_size: int = 512,
         dispatcher_poll_timeout: float = 0.05,
         app_settings_store: Optional[AppSettingsStore] = None,
@@ -490,11 +490,11 @@ class PipelineController:
                 channels=channels,
                 use_float32=use_float32,
             )
-            self._wav_logger.start()
-            
-            # Enable data flow to logging queue
+            # Arm the dispatcher first so chunks queue up immediately,
+            # then start the logger thread so nothing is dropped.
             if self._dispatcher is not None:
                 self._dispatcher.set_recording_enabled(True)
+            self._wav_logger.start()
             
             logger.info("Recording started: %s", path)
 
