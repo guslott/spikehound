@@ -60,6 +60,7 @@ jobs:
           dpkg-dev \
           file \
           libegl1 \
+          libwebp7 \
           libxcb-cursor0 \
           libxcb-icccm4 \
           libxcb-image0 \
