@@ -2243,11 +2243,11 @@ class AnalysisTab(QtWidgets.QWidget):
                     min_y, max_y = max_y, min_y
                 cluster_bounds.append((cluster.id, min_x, max_x, min_y, max_y))
 
-                if cluster_bounds:
-                    if self._cluster_membership_dirty:
-                        # Membership labels are already current; only
-                        # visible-count accounting needs to be rebuilt.
-                        new_counts: dict[int, int] = {c.id: 0 for c in self._clusters}
+            if cluster_bounds:
+                if self._cluster_membership_dirty:
+                    # Membership labels are already current; only
+                    # visible-count accounting needs to be rebuilt.
+                    new_counts: dict[int, int] = {c.id: 0 for c in self._clusters}
                     new_unclassified = 0
                     for idx, event_id in enumerate(event_ids):
                         if event_id is None:
