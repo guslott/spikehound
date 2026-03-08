@@ -577,7 +577,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Update channel display
         self._update_channel_display(channel_id)
 
-        
+        # Keep any open Analysis tabs locked to the same per-channel scope span.
+        self._sync_analysis_scales()
+
         if self._active_channel_id == channel_id:
             self._update_axis_label()
 
@@ -1059,7 +1061,8 @@ class MainWindow(QtWidgets.QMainWindow):
             sample_rate = float(self._current_sample_rate_value())
         if sample_rate <= 0:
             sample_rate = 1.0
-        dock.open_analysis(channel_name, sample_rate)
+        widget = dock.open_analysis(channel_name, sample_rate)
+        widget.update_scale(self._current_window_sec, float(config.vertical_span_v))
 
     def _open_spectrogram_for_channel(self, channel_id: int) -> None:
         """Open or focus a spectrogram tab for the specified channel."""
