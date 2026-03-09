@@ -1061,7 +1061,7 @@ class MainWindow(QtWidgets.QMainWindow):
             sample_rate = float(self._current_sample_rate_value())
         if sample_rate <= 0:
             sample_rate = 1.0
-        widget = dock.open_analysis(channel_name, sample_rate)
+        widget = dock.open_analysis(channel_name, sample_rate, channel_id=channel_id)
         widget.update_scale(self._current_window_sec, float(config.vertical_span_v))
 
     def _open_spectrogram_for_channel(self, channel_id: int) -> None:
@@ -1234,11 +1234,13 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         connected = self._device_connected
         not_recording = not self._is_recording
+        has_active_channel = self.channel_controls.active_combo.count() > 0
         # Only enable add channel if connected AND not recording AND channels available
         can_add = connected and not_recording and self.device_control.available_combo.count() > 0
         self.device_control.add_channel_btn.setEnabled(can_add)
         self.device_control.available_combo.setEnabled(connected and not_recording)
         self.trigger_control.set_enabled_for_scanning(connected)
+        self.record_group.set_recording_ready(connected and has_active_channel)
 
     # -------------------------------------------------------------------------
     # Recording signal handlers (logic delegated to RecordingControlWidget)
@@ -1275,11 +1277,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trigger_control.trigger_channel_combo.setEnabled(enabled)
         self.trigger_control.trigger_single_button.setEnabled(enabled)
         
-        for attr_name in ("device_control", "channel_controls"):
-            panel = getattr(self, attr_name, None)
-            if panel is not None:
-                panel.setEnabled(enabled)
-        
         # Recording widget handles its own enable/disable
         self.record_group.set_enabled_for_recording(enabled)
         
@@ -1290,9 +1287,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # Disable adding new channels during recording
         dc.available_combo.setEnabled(enabled and self._device_connected)
         dc.add_channel_btn.setEnabled(enabled and self._device_connected)
-        
-        # Note: active_combo intentionally NOT disabled so users can still
-        # switch channels and adjust filters/visualization during recording
+
+        # Channel tools remain available during recording; only channel-add/remove
+        # operations are blocked via the device controls above.
+        self.channel_controls.setEnabled(True)
         
         # If disabling, ensure we don't leave stale state
         if not enabled:

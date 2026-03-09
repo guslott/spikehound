@@ -58,6 +58,7 @@ class AnalysisTab(QtWidgets.QWidget):
         sample_rate: float,
         parent: Optional[QtWidgets.QWidget] = None,
         controller: Optional["PipelineController"] = None,
+        channel_id: Optional[int] = None,
     ) -> None:
         super().__init__(parent)
         self.channel_name = channel_name
@@ -79,7 +80,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._overlay_capacity: int = 64
         self._latest_sample_time: Optional[float] = None
         self._window_start_time: Optional[float] = None
-        self._channel_index: Optional[int] = None
+        self._channel_index: Optional[int] = int(channel_id) if channel_id is not None else None
         self._latest_sample_index: Optional[int] = None
         self._window_start_index: Optional[int] = None
         if controller is not None:

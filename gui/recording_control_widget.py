@@ -34,6 +34,7 @@ class RecordingControlWidget(QtWidgets.QGroupBox):
         self._recording_start_time: Optional[float] = None
         self._recording_timer: Optional[QtCore.QTimer] = None
         self._controller = None  # Will be set by parent for duration queries
+        self._recording_ready = False
         
         self._setup_ui()
     
@@ -75,6 +76,10 @@ class RecordingControlWidget(QtWidgets.QGroupBox):
         self.path_edit.setEnabled(enabled)
         self.browse_btn.setEnabled(enabled)
 
+    def set_recording_ready(self, ready: bool) -> None:
+        """Gate whether recording can start based on device/channel availability."""
+        self._recording_ready = bool(ready)
+        self._update_button_enabled()
 
     # -------------------------------------------------------------------------
     # Event handlers
@@ -90,7 +95,7 @@ class RecordingControlWidget(QtWidgets.QGroupBox):
     def _update_button_enabled(self, text: str = "") -> None:
         """Enable/disable the record button based on whether a filename is set."""
         has_path = bool(self.path_edit.text().strip())
-        self.toggle_btn.setEnabled(has_path)
+        self.toggle_btn.setEnabled(self.toggle_btn.isChecked() or (has_path and self._recording_ready))
 
     def _on_toggle(self, checked: bool) -> None:
         if checked:
