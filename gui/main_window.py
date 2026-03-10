@@ -531,10 +531,19 @@ class MainWindow(QtWidgets.QMainWindow):
         """Handle connection request from DeviceControlWidget."""
         if self._device_connected:
             return
-        
+
+        entry = self._device_map.get(device_key)
+        driver_kwargs = {}
+        if self._is_file_source_entry(device_key, entry):
+            file_path = self._browse_file_source_path()
+            if not file_path:
+                self.device_control.set_connected(False)
+                return
+            driver_kwargs["device_id_override"] = file_path
+
         # Actually connect the device using the runtime
         try:
-            self.runtime.connect_device(device_key, sample_rate=sample_rate)
+            self.runtime.connect_device(device_key, sample_rate=sample_rate, **driver_kwargs)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Device", f"Failed to connect: {exc}")
             self.device_control.set_connected(False)
@@ -643,21 +652,34 @@ class MainWindow(QtWidgets.QMainWindow):
         """Handle device combo selection change."""
         key = self.device_control.device_combo.currentData()
         entry = self._device_map.get(key) if key else None
-        
-        # Detect if this is a file source device
-        is_file_source = False
-        if entry is not None:
-            driver_name = str(entry.get("driver_name", ""))
-            device_name = str(entry.get("name", ""))
-            # Check if this is the file source device (check multiple fields)
-            if "File" in driver_name or "File" in device_name or (key and "file" in key.lower()):
-                is_file_source = True
-        
+
+        is_file_source = self._is_file_source_entry(key, entry)
+
         # Update device control widget mode
         self.device_control.set_file_source_mode(is_file_source)
         
         self._populate_sample_rate_options(entry)
         self._update_sample_rate_enabled()
+
+    def _is_file_source_entry(self, key: Optional[str], entry: Optional[dict]) -> bool:
+        """Return True when the selected entry is the virtual file-playback source."""
+        if key and "file_source" in key.lower():
+            return True
+        if entry is None:
+            return False
+        driver_name = str(entry.get("driver_name", ""))
+        device_name = str(entry.get("name", ""))
+        return "File" in driver_name or "File" in device_name
+
+    def _browse_file_source_path(self) -> Optional[str]:
+        """Prompt for a WAV file to use with the file playback source."""
+        path_str, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Open WAV File",
+            str(Path.home()),
+            "WAV Files (*.wav);;All Files (*)",
+        )
+        return path_str or None
 
 
 

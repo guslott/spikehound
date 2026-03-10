@@ -42,6 +42,13 @@ class TriggerControlWidget(QtWidgets.QWidget):
         
         self._setup_ui()
         self._connect_signals()
+
+    @staticmethod
+    def _format_window_width(value: float) -> str:
+        """Format sweep widths while preserving the 0.05s option."""
+        if value < 0.1:
+            return f"{value:.2f}"
+        return f"{value:.1f}"
         
     def _setup_ui(self) -> None:
         """Create the trigger UI layout."""
@@ -138,10 +145,10 @@ class TriggerControlWidget(QtWidgets.QWidget):
         window_box.addWidget(QtWidgets.QLabel("Window Width (s)"))
         self.window_combo = QtWidgets.QComboBox()
         self.window_combo.setMaximumWidth(110)
-        for value in (0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0):
-            self.window_combo.addItem(f"{value:.1f}", value)
+        for value in (0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0):
+            self.window_combo.addItem(self._format_window_width(value), value)
         # Default roughly 1.0s or so
-        default_index = 3 # 1.0 is index 3
+        default_index = 4 # 1.0 is index 4
         # Original logic: default_index = 1 if count > 1 else max...
         # Let's stick to a sensible default.
         self.window_combo.setCurrentIndex(default_index)

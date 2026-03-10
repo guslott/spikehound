@@ -578,7 +578,7 @@ class AnalysisTab(QtWidgets.QWidget):
         """Expand the circular buffer if needed to hold required_sec of data."""
         if self.sample_rate <= 0:
             return
-        required_sec = max(required_sec, 0.1)
+        required_sec = max(required_sec, 0.05)
         if required_sec <= self._buffer_span_sec and self._buffer.size:
             return
         self._buffer_span_sec = max(required_sec * 1.25, self._buffer_span_sec)
@@ -797,7 +797,7 @@ class AnalysisTab(QtWidgets.QWidget):
             window_sec: Time window width in seconds (from scope)
             vertical_span_v: Amplitude scale in volts (from channel config)
         """
-        self._scope_window_sec = max(0.1, float(window_sec))
+        self._scope_window_sec = max(0.05, float(window_sec))
         self._scope_vertical_span = max(0.01, float(vertical_span_v))
         self._apply_ranges()
 

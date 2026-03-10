@@ -237,12 +237,16 @@ class DeviceRegistry:
 
         descriptor_key = entry.get("descriptor_key")
         device_id = entry.get("device_id")
+        device_id_override = driver_kwargs.pop("device_id_override", None)
         if descriptor_key is None or not isinstance(descriptor_key, str):
             raise KeyError(f"Invalid descriptor for key: {device_key!r}")
 
         descriptor = self._descriptors.get(descriptor_key)
         if descriptor is None:
             raise KeyError(f"Unknown descriptor key: {descriptor_key!r}")
+
+        if device_id_override not in (None, ""):
+            device_id = str(device_id_override)
 
         if device_id is None or device_id == "":
             error_message = entry.get("error") or "No hardware devices detected for this driver."
@@ -252,17 +256,20 @@ class DeviceRegistry:
         driver = reg.create_device(descriptor_key, **driver_kwargs)
         available = descriptor.cls.list_available_devices()
         target = next((dev for dev in available if str(dev.id) == str(device_id)), None)
-        if target is None:
+        open_device_id = str(device_id)
+        if target is not None:
+            open_device_id = str(target.id)
+        elif device_id_override in (None, ""):
             raise RuntimeError(f"Selected device is no longer available: {device_id!r}")
 
-        driver.open(target.id)
-        channels = driver.list_available_channels(target.id)
+        driver.open(open_device_id)
+        channels = driver.list_available_channels(open_device_id)
 
         # Handle devices that determine sample rate after opening (e.g., FileSource)
         effective_sample_rate = sample_rate
         if effective_sample_rate <= 0:
             try:
-                caps = driver.get_capabilities(target.id)
+                caps = driver.get_capabilities(open_device_id)
                 if caps.sample_rates and len(caps.sample_rates) > 0:
                     effective_sample_rate = caps.sample_rates[0]
             except Exception as e:

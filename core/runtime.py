@@ -148,14 +148,25 @@ class SpikeHoundRuntime:
         if self.device_manager is not None:
             self.device_manager.cleanup()
 
-    def connect_device(self, device_key: str, sample_rate: float, chunk_size: int = 1024) -> None:
+    def connect_device(
+        self,
+        device_key: str,
+        sample_rate: float,
+        chunk_size: int = 1024,
+        **driver_kwargs,
+    ) -> None:
         """Connect a device via the DeviceManager and wire it into the pipeline."""
         # Use a ~20 ms chunk when callers leave the default in place.
         if chunk_size == 1024:  # Only override if it's the default
             target_latency = 0.02  # 20ms
             chunk_size = max(32, int(sample_rate * target_latency))
             
-        driver = self.device_manager.connect_device(device_key, sample_rate, chunk_size=chunk_size)
+        driver = self.device_manager.connect_device(
+            device_key,
+            sample_rate,
+            chunk_size=chunk_size,
+            **driver_kwargs,
+        )
         channels = self.device_manager.get_available_channels()
         self._attach_source(driver, sample_rate, channels)
         # Emit deviceConnected AFTER dispatcher is created so GUI can bind to it

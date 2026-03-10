@@ -348,6 +348,10 @@ class FileSource(BaseDevice):
 
             # Convert to float32 and normalize
             data = self._normalize_chunk(raw_chunk)
+            with self._channel_lock:
+                active_ids = list(self._active_channel_ids)
+            if active_ids:
+                data = data[:, active_ids]
 
             frames_read = data.shape[0]
             self._current_frame += frames_read
