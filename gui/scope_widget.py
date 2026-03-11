@@ -68,6 +68,7 @@ class ScopeWidget(QtWidgets.QWidget):
     viewDragged = QtCore.Signal(float)  # y_pos
     viewDragFinished = QtCore.Signal()
     thresholdChanged = QtCore.Signal(float)
+    popoutRequested = QtCore.Signal()
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -126,7 +127,40 @@ class ScopeWidget(QtWidgets.QWidget):
         self.pretrigger_line.setVisible(False)
         self.plot_widget.addItem(self.pretrigger_line)
 
-        layout.addWidget(self.plot_widget)
+        plot_container = QtWidgets.QWidget(self)
+        plot_grid = QtWidgets.QGridLayout(plot_container)
+        plot_grid.setContentsMargins(0, 0, 0, 0)
+        plot_grid.setSpacing(0)
+        plot_grid.addWidget(self.plot_widget, 0, 0)
+
+        overlay = QtWidgets.QWidget(plot_container)
+        overlay_layout = QtWidgets.QHBoxLayout(overlay)
+        overlay_layout.setContentsMargins(8, 0, 0, 8)
+        overlay_layout.setSpacing(0)
+        self.popout_button = QtWidgets.QPushButton("", overlay)
+        self.popout_button.setObjectName("scopePopoutButton")
+        self.popout_button.setFixedSize(18, 18)
+        self.popout_button.setCursor(QtCore.Qt.PointingHandCursor)
+        self.popout_button.setToolTip("Open the active scope trace in a separate waveform window.")
+        self.popout_button.setStyleSheet(
+            "#scopePopoutButton {"
+            "background-color: rgb(128, 0, 32);"
+            "border: 1px solid rgb(84, 0, 21);"
+            "border-radius: 2px;"
+            "}"
+            "#scopePopoutButton:hover {"
+            "background-color: rgb(150, 20, 52);"
+            "}"
+            "#scopePopoutButton:pressed {"
+            "background-color: rgb(102, 0, 26);"
+            "}"
+        )
+        self.popout_button.clicked.connect(self.popoutRequested.emit)
+        overlay_layout.addWidget(self.popout_button, 0, QtCore.Qt.AlignLeft | QtCore.Qt.AlignBottom)
+        overlay_layout.addStretch(1)
+        plot_grid.addWidget(overlay, 0, 0, QtCore.Qt.AlignLeft | QtCore.Qt.AlignBottom)
+
+        layout.addWidget(plot_container)
 
         # Connect signals
         self.threshold_line.sigPositionChanged.connect(self._on_threshold_moved)

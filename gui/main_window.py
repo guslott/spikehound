@@ -18,6 +18,7 @@ from shared.app_settings import AppSettings
 from core.conditioning import ChannelFilterSettings, FilterSettings
 from shared.models import ChunkPointer, EndOfStream, TriggerConfig
 from .analysis_dock import AnalysisDock
+from .analysis_tab import ClusterWaveformDialog
 from .settings_tab import SettingsTab
 from .scope_widget import ScopeWidget
 from .channel_controls_widget import ChannelControlsWidget, ChannelDetailPanel
@@ -113,6 +114,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._window_combo_suppress = False
         self._signal_bridge = SignalBridge(self)
         self._branding_manager: Optional[BrandingManager] = None
+        self._scope_popout_windows: list[QtWidgets.QDialog] = []
 
         # Config manager for save/load operations
         self._config_manager = ScopeConfigManager(self)
@@ -246,6 +248,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scope.viewDragged.connect(self._on_scope_dragged)
         self.scope.viewDragFinished.connect(self._on_scope_drag_finished)
         self.scope.thresholdChanged.connect(self._on_scope_threshold_changed)
+        self.scope.popoutRequested.connect(self._on_scope_popout_requested)
 
         self._status_labels = {}
 
@@ -1437,6 +1440,56 @@ class MainWindow(QtWidgets.QMainWindow):
             self.trigger_control.threshold_spin.blockSignals(True)
             self.trigger_control.threshold_spin.setValue(value)
             self.trigger_control.threshold_spin.blockSignals(False)
+
+    def _scope_popout_channel_id(self) -> Optional[int]:
+        """Choose the best channel to export from the scope view."""
+        if self._active_channel_id in self._channel_ids_current:
+            return self._active_channel_id
+        if self._trigger_controller.channel_id in self._channel_ids_current:
+            return self._trigger_controller.channel_id
+        if self._channel_ids_current:
+            return self._channel_ids_current[0]
+        return None
+
+    def _on_scope_popout_requested(self) -> None:
+        """Open the active scope trace in a separate waveform window."""
+        channel_id = self._scope_popout_channel_id()
+        if channel_id is None:
+            QtWidgets.QMessageBox.information(self, "Scope trace", "No active scope trace is available.")
+            return
+        samples = self._plot_manager.channel_last_samples.get(channel_id)
+        times = self._plot_manager.last_times
+        if samples is None or times.size == 0 or samples.size == 0:
+            QtWidgets.QMessageBox.information(self, "Scope trace", "No scope data is available to pop out yet.")
+            return
+        length = int(min(samples.size, times.size))
+        if length <= 0:
+            QtWidgets.QMessageBox.information(self, "Scope trace", "No scope data is available to pop out yet.")
+            return
+        config = self._channel_configs.get(channel_id)
+        channel_name = f"Channel {channel_id}"
+        color = None
+        if config is not None:
+            channel_name = config.channel_name or channel_name
+            color = QtGui.QColor(config.color)
+        dialog = ClusterWaveformDialog(
+            self,
+            f"Scope {channel_name}",
+            [(np.array(times[:length], copy=True), np.array(samples[:length], copy=True))],
+            color=color,
+        )
+        dialog.setModal(False)
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+        dialog.destroyed.connect(lambda *_args, window=dialog: self._drop_scope_popout_window(window))
+        self._scope_popout_windows.append(dialog)
+        dialog.resize(900, 500)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _drop_scope_popout_window(self, window: QtWidgets.QDialog) -> None:
+        """Forget a scope pop-out window after it closes."""
+        self._scope_popout_windows = [item for item in self._scope_popout_windows if item is not window]
 
     # ScopeWidget signal handlers
     # ScopeWidget signal handlers
