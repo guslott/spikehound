@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
+import numpy as np
 
 import daq.backyard_brains as byb
 
@@ -144,6 +145,15 @@ class _FakeHIDModule:
         return self.handle
 
 
+def test_protocol_state_parses_combined_max_rate_and_channel_count():
+    state = byb._BYBProtocolState()
+
+    byb._update_protocol_state(state, "MSF:20000MNC:4;")
+
+    assert state.reported_sample_rate == 20000
+    assert state.reported_channel_count == 4
+
+
 def test_serial_probe_resolves_profile_and_truthful_capabilities(monkeypatch):
     port = _FakePort(
         device="/dev/tty.neuron",
@@ -266,7 +276,7 @@ def test_boardless_neuron_pro_exposes_two_channels_and_avoids_c_command(monkeypa
     src.close()
 
 
-def test_legacy_neuron_pro_mfi_is_not_enumerated(monkeypatch):
+def test_neuron_pro_mfi_is_enumerated_and_uses_descriptor_profile(monkeypatch):
     port = _FakePort(
         device="/dev/tty.mfi",
         name="tty.mfi",
@@ -285,12 +295,164 @@ def test_legacy_neuron_pro_mfi_is_not_enumerated(monkeypatch):
     monkeypatch.setattr(byb, "hid", None)
 
     devices = byb.BackyardBrainsSource.list_available_devices()
-
-    assert devices == []
+    assert len(devices) == 1
+    assert devices[0].details["pid"] == 0x0009
+    assert devices[0].details["profile_hint"] == "Neuron SpikerBox Pro"
 
     src = byb.BackyardBrainsSource()
-    with pytest.raises(RuntimeError, match="Unsupported Backyard Brains serial device"):
-        src.open(port.device)
+    src.open(port.device)
+
+    assert src._profile is not None
+    assert src._profile.key == "neuron_pro_mfi"
+
+    caps = src.get_capabilities(port.device)
+    assert caps.max_channels_in == 2
+    assert caps.sample_rates == [10000]
+    src.close()
+
+
+def test_neuron_pro_mfi_pins_decoder_width_to_selected_channels(monkeypatch):
+    port = _FakePort(
+        device="/dev/tty.mfi",
+        name="tty.mfi",
+        vid=0x2E73,
+        pid=0x0009,
+        description="Neuron SpikerBox Pro (Serial + MFi)",
+        product="Neuron SpikerBox Pro (Serial + MFi)",
+    )
+    script = {
+        (222222, "?:;"): b"FWV:1.02;HWT:NRNSBPRO;HWV:2.00;",
+        (222222, "b:;"): b"HWT:NRNSBPRO;",
+    }
+    fake_serial = _FakeSerialModule([port], script)
+    monkeypatch.setattr(byb, "serial", fake_serial)
+    monkeypatch.setattr(byb, "hid", None)
+
+    src = byb.BackyardBrainsSource()
+    src.open(port.device)
+
+    cfg = src.configure(sample_rate=10000, channels=[0, 1], chunk_size=32)
+
+    assert cfg.sample_rate == 10000
+    assert src.stats()["stream_channels"] == 2
+    assert src._decoder_candidate_widths == (2,)
+    src.close()
+
+
+def test_neuron_pro_mfi_board_zero_exposes_two_channels(monkeypatch):
+    port = _FakePort(
+        device="/dev/tty.mfi",
+        name="tty.mfi",
+        vid=0x2E73,
+        pid=0x0009,
+        description="Neuron SpikerBox Pro (Serial + MFi)",
+        product="Neuron SpikerBox Pro (Serial + MFi)",
+    )
+    script = {
+        (222222, "?:;"): b"FWV:1.02;HWT:NRNSBPRO;HWV:2.00;",
+        (222222, "b:;"): b"HWT:NRNSBPRO;",
+        (222222, "board:;"): b"BRD:0;",
+    }
+    fake_serial = _FakeSerialModule([port], script)
+    monkeypatch.setattr(byb, "serial", fake_serial)
+    monkeypatch.setattr(byb, "hid", None)
+
+    src = byb.BackyardBrainsSource()
+    src.open(port.device)
+
+    channels = src.list_available_channels(port.device)
+
+    assert src.stats()["board_type"] == 0
+    assert [ch.id for ch in channels] == [0, 1]
+    src.close()
+
+
+def test_neuron_pro_mfi_prefers_reported_max_rate_and_channel_count(monkeypatch):
+    port = _FakePort(
+        device="/dev/tty.mfi",
+        name="tty.mfi",
+        vid=0x2E73,
+        pid=0x0009,
+        description="Neuron SpikerBox Pro (Serial + MFi)",
+        product="Neuron SpikerBox Pro (Serial + MFi)",
+    )
+    script = {
+        (222222, "?:;"): b"FWV:1.02;HWT:NRNSBPRO;HWV:2.00;",
+        (222222, "b:;"): b"HWT:NRNSBPRO;",
+        (222222, "max:;"): b"MSF:20000MNC:2;",
+        (222222, "board:;"): b"BRD:0;",
+    }
+    fake_serial = _FakeSerialModule([port], script)
+    monkeypatch.setattr(byb, "serial", fake_serial)
+    monkeypatch.setattr(byb, "hid", None)
+
+    src = byb.BackyardBrainsSource()
+    src.open(port.device)
+
+    caps = src.get_capabilities(port.device)
+    cfg = src.configure(sample_rate=10000, channels=[0, 1], chunk_size=32)
+
+    assert caps.max_channels_in == 2
+    assert caps.sample_rates == [10000, 20000]
+    assert cfg.sample_rate == 20000
+    assert src._decoder_candidate_widths == (2,)
+    assert src.stats()["reported_sample_rate"] == 20000
+    assert src.stats()["reported_channel_count"] == 2
+    src.close()
+
+
+def test_neuron_pro_mfi_exposes_reported_four_channel_stream(monkeypatch):
+    port = _FakePort(
+        device="/dev/tty.mfi",
+        name="tty.mfi",
+        vid=0x2E73,
+        pid=0x0009,
+        description="Neuron SpikerBox Pro (Serial + MFi)",
+        product="Neuron SpikerBox Pro (Serial + MFi)",
+    )
+    script = {
+        (222222, "?:;"): b"FWV:1.02;HWT:NRNSBPRO;HWV:2.00;",
+        (222222, "b:;"): b"HWT:NRNSBPRO;",
+        (222222, "max:;"): b"MSF:20000MNC:4;",
+        (222222, "board:;"): b"BRD:1;",
+    }
+    fake_serial = _FakeSerialModule([port], script)
+    monkeypatch.setattr(byb, "serial", fake_serial)
+    monkeypatch.setattr(byb, "hid", None)
+
+    src = byb.BackyardBrainsSource()
+    src.open(port.device)
+
+    channels = src.list_available_channels(port.device)
+    cfg = src.configure(sample_rate=20000, channels=[0, 1, 2, 3], chunk_size=32)
+
+    assert [ch.id for ch in channels] == [0, 1, 2, 3]
+    assert cfg.sample_rate == 20000
+    assert src._decoder_candidate_widths == (4,)
+    assert src.stats()["reported_channel_count"] == 4
+    src.close()
+
+
+def test_emit_active_holds_locks_through_emit(monkeypatch):
+    src = byb.BackyardBrainsSource()
+    src._available_channels = [
+        byb.ChannelInfo(id=0, name="Channel 1", units="V"),
+        byb.ChannelInfo(id=1, name="Channel 2", units="V"),
+    ]
+    src._active_channel_ids = [0]
+
+    observed: dict[str, object] = {}
+
+    def _capture_emit(data, *, mono_time=None, device_time=None):
+        observed["shape"] = data.shape
+        observed["state_locked"] = src._state_lock._is_owned()
+
+    monkeypatch.setattr(src, "emit_array", _capture_emit)
+
+    src._emit_active(np.ones((32, 2), dtype=np.float32), 32)
+
+    assert observed["shape"] == (32, 1)
+    assert observed["state_locked"] is True
 
 
 def test_spikershield_channel_config_uses_c_command_and_validates_rate(monkeypatch):

@@ -61,6 +61,7 @@ class _BYBProfile:
     requires_start: bool = False
     supports_channel_cfg: bool = False
     supports_board_query: bool = False
+    supports_max_query: bool = False
     supports_human_controls: bool = False
     supports_spike_station_queries: bool = False
     infer_stream_width: bool = False
@@ -98,6 +99,8 @@ class _BYBProtocolState:
     hardware_version: Optional[str] = None
     firmware_version: Optional[str] = None
     board_type: Optional[int] = None
+    reported_sample_rate: Optional[int] = None
+    reported_channel_count: Optional[int] = None
     last_event: Optional[int] = None
     joy_state: Optional[int] = None
     p300_enabled: Optional[bool] = None
@@ -127,6 +130,7 @@ _PROFILES: Dict[str, _BYBProfile] = {
         baud_rates=(222222,),
         requires_start=True,
         supports_board_query=True,
+        supports_max_query=True,
         infer_stream_width=True,
         description="Pre-2023 Pro family with expansion port and 2-4 channel modes.",
     ),
@@ -142,8 +146,24 @@ _PROFILES: Dict[str, _BYBProfile] = {
         baud_rates=(222222,),
         requires_start=True,
         supports_board_query=True,
+        supports_max_query=True,
         infer_stream_width=True,
         description="Pre-2023 Pro family with expansion port and 2-4 channel modes.",
+    ),
+    "neuron_pro_mfi": _BYBProfile(
+        key="neuron_pro_mfi",
+        label="Neuron SpikerBox Pro",
+        hardware_aliases=("NRNSBPRO",),
+        transports=("serial",),
+        bits=14,
+        max_channels=3,
+        candidate_stream_channels=(2, 3),
+        sample_rate_map={2: 10000, 3: 10000},
+        baud_rates=(222222, 500000),
+        requires_start=True,
+        supports_board_query=True,
+        supports_max_query=True,
+        description="Composite CDC/iOS model with 14-bit samples and 2-3 channel modes.",
     ),
     "human_spikerbox": _BYBProfile(
         key="human_spikerbox",
@@ -156,6 +176,7 @@ _PROFILES: Dict[str, _BYBProfile] = {
         sample_rate_map={2: 5000, 3: 5000, 4: 5000},
         baud_rates=(222222, 500000),
         supports_board_query=True,
+        supports_max_query=True,
         supports_human_controls=True,
         infer_stream_width=True,
         description="Composite CDC device with 2-4 input channels and expansion events.",
@@ -296,6 +317,8 @@ def _candidate_profile_hints(meta: Mapping[str, Any]) -> list[_ProfileHint]:
         return [_ProfileHint("muscle_pro", "usb_id")]
     if (vid, pid) == (_BYB_VID, 0x0007):
         return [_ProfileHint("neuron_pro", "usb_id")]
+    if (vid, pid) == (_BYB_VID, 0x0009):
+        return [_ProfileHint("neuron_pro_mfi", "usb_id")]
     if (vid, pid) == (_BYB_VID, 0x0004):
         return [_ProfileHint("human_spikerbox", "usb_id")]
     if (vid, pid) == (_BYB_VID, 0x000D):
@@ -431,6 +454,14 @@ def _parse_gamepad_state(value: str) -> Optional[int]:
     return (high_nibble << 4) | low_nibble
 
 
+def _parse_positive_int(value: str) -> Optional[int]:
+    try:
+        parsed = int(value.strip())
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
 def _update_protocol_state(state: _BYBProtocolState, message: str) -> None:
     token = message.strip()
     if not token.endswith(";"):
@@ -438,6 +469,16 @@ def _update_protocol_state(state: _BYBProtocolState, message: str) -> None:
     state.note_message(token)
 
     body = token[:-1]
+    combined_match = re.fullmatch(r"MSF:(\d+)MNC:(\d+)", body)
+    if combined_match is not None:
+        sample_rate = _parse_positive_int(combined_match.group(1))
+        channel_count = _parse_positive_int(combined_match.group(2))
+        if sample_rate is not None:
+            state.reported_sample_rate = sample_rate
+        if channel_count is not None:
+            state.reported_channel_count = channel_count
+        return
+
     key, _, raw_value = body.partition(":")
     key = key.strip()
     value = raw_value.strip()
@@ -457,6 +498,16 @@ def _update_protocol_state(state: _BYBProtocolState, message: str) -> None:
             state.board_type = int(value)
         except ValueError:
             pass
+        return
+    if key == "MSF":
+        sample_rate = _parse_positive_int(value)
+        if sample_rate is not None:
+            state.reported_sample_rate = sample_rate
+        return
+    if key == "MNC":
+        channel_count = _parse_positive_int(value)
+        if channel_count is not None:
+            state.reported_channel_count = channel_count
         return
     if key == "EVNT":
         try:
@@ -992,8 +1043,6 @@ class BackyardBrainsSource(BaseDevice):
         pid = meta.get("pid")
         if (vid, pid) in _BOOTLOADER_PIDS:
             return False
-        if (vid, pid) == (_BYB_VID, 0x0009):
-            return False
         if vid == _BYB_VID:
             return True
         if (vid, pid) in {
@@ -1046,8 +1095,14 @@ class BackyardBrainsSource(BaseDevice):
     def get_capabilities(self, device_id: str) -> Capabilities:
         if self._profile is not None:
             profile = self._profile
-            max_channels = profile.max_channels
-            sample_rates = profile.sample_rates
+            reported_channels = self._reported_stream_width()
+            reported_rate = self._reported_sample_rate()
+            max_channels = reported_channels or self._visible_channel_count(profile)
+            sample_rates = (
+                sorted({int(rate) for rate in [*profile.sample_rates, reported_rate] if rate is not None})
+                if reported_rate is not None
+                else profile.sample_rates
+            )
             notes = (
                 f"{profile.label}. "
                 f"Transport={self._transport_kind}. "
@@ -1091,6 +1146,18 @@ class BackyardBrainsSource(BaseDevice):
             channels.append(ChannelInfo(id=idx, name=label, units="V", range=(-5.0, 5.0)))
         return channels
 
+    def _reported_stream_width(self) -> Optional[int]:
+        reported = self._protocol_state.reported_channel_count
+        if reported is None or int(reported) <= 0:
+            return None
+        return int(reported)
+
+    def _reported_sample_rate(self) -> Optional[int]:
+        reported = self._protocol_state.reported_sample_rate
+        if reported is None or int(reported) <= 0:
+            return None
+        return int(reported)
+
     def _resolved_stream_width_candidates(
         self,
         profile: Optional[_BYBProfile] = None,
@@ -1098,6 +1165,10 @@ class BackyardBrainsSource(BaseDevice):
         profile = profile or self._profile
         if profile is None:
             return (1,)
+
+        reported_width = self._reported_stream_width()
+        if reported_width is not None:
+            return (reported_width,)
 
         board_type = self._protocol_state.board_type
         if profile.key in {"muscle_pro", "neuron_pro"}:
@@ -1110,6 +1181,11 @@ class BackyardBrainsSource(BaseDevice):
                 return (2,)
             if board_type == 1:
                 return (3, 4)
+        elif profile.key == "neuron_pro_mfi":
+            if board_type in {None, 0, 4, 5}:
+                return (2,)
+            if board_type == 1:
+                return (3,)
         candidates = tuple(int(width) for width in profile.candidate_stream_channels if int(width) > 0)
         return candidates or (profile.default_stream_channels,)
 
@@ -1181,6 +1257,9 @@ class BackyardBrainsSource(BaseDevice):
         )
 
         self._query_optional_state()
+        self._decoder_candidate_widths = self._resolved_stream_width_candidates(profile)
+        self._stream_channel_count = self._decoder_candidate_widths[0]
+        self._runtime_width_inferred = profile.infer_stream_width and len(self._decoder_candidate_widths) > 1
 
     def _open_serial_transport(
         self,
@@ -1283,6 +1362,8 @@ class BackyardBrainsSource(BaseDevice):
             return
 
         extra_commands: list[str] = []
+        if self._profile.supports_max_query:
+            extra_commands.append("max:;")
         if self._profile.supports_board_query:
             extra_commands.append("board:;")
         if self._profile.supports_human_controls:
@@ -1377,6 +1458,7 @@ class BackyardBrainsSource(BaseDevice):
             dynamic_width_profile = self._profile.key in {
                 "muscle_pro",
                 "neuron_pro",
+                "neuron_pro_mfi",
                 "human_spikerbox",
             }
             minimum_stream_width = max(1, highest_selected_id + 1)
@@ -1391,35 +1473,49 @@ class BackyardBrainsSource(BaseDevice):
                 raise ValueError(
                     f"{self._profile.label} cannot expose selected channel ids {channels}"
                 )
-            rate_candidates = {
-                self._profile.actual_rate_for_stream_channels(width) for width in candidate_widths
-            }
             requested = int(sample_rate) if sample_rate else 0
-            if requested > 0:
-                matching_widths = tuple(
-                    width
-                    for width in candidate_widths
-                    if self._profile.actual_rate_for_stream_channels(width) == requested
-                )
-                if matching_widths:
-                    candidate_widths = matching_widths
-                    actual_rate = requested
-                elif len(rate_candidates) == 1:
-                    actual_rate = next(iter(rate_candidates))
+            reported_rate = self._reported_sample_rate()
+            if reported_rate is not None:
+                actual_rate = reported_rate
+                if requested > 0 and requested != actual_rate:
                     _LOGGER.info(
-                        "BYB sample rate request %s Hz overridden to %s Hz for %s",
+                        "BYB sample rate request %s Hz overridden to protocol-reported %s Hz for %s",
                         requested,
                         actual_rate,
                         self._profile.label,
                     )
-                else:
-                    raise ValueError(
-                        f"{self._profile.label} does not support {requested} Hz for the current hardware state"
-                    )
-            elif len(rate_candidates) == 1:
-                actual_rate = next(iter(rate_candidates))
             else:
-                actual_rate = self._profile.actual_rate_for_stream_channels(candidate_widths[0])
+                rate_candidates = {
+                    self._profile.actual_rate_for_stream_channels(width) for width in candidate_widths
+                }
+                if requested > 0:
+                    matching_widths = tuple(
+                        width
+                        for width in candidate_widths
+                        if self._profile.actual_rate_for_stream_channels(width) == requested
+                    )
+                    if matching_widths:
+                        candidate_widths = matching_widths
+                        actual_rate = requested
+                    elif len(rate_candidates) == 1:
+                        actual_rate = next(iter(rate_candidates))
+                        _LOGGER.info(
+                            "BYB sample rate request %s Hz overridden to %s Hz for %s",
+                            requested,
+                            actual_rate,
+                            self._profile.label,
+                        )
+                    else:
+                        raise ValueError(
+                            f"{self._profile.label} does not support {requested} Hz for the current hardware state"
+                        )
+                elif len(rate_candidates) == 1:
+                    actual_rate = next(iter(rate_candidates))
+                else:
+                    actual_rate = self._profile.actual_rate_for_stream_channels(candidate_widths[0])
+
+            if not self._profile.infer_stream_width and candidate_widths:
+                candidate_widths = (candidate_widths[0],)
 
             self._stream_channel_count = candidate_widths[0]
             self._decoder_candidate_widths = candidate_widths
@@ -1550,21 +1646,22 @@ class BackyardBrainsSource(BaseDevice):
                 sample_idx = 0
 
     def _emit_active(self, sample_buffer: np.ndarray, frames: int) -> None:
-        with self._channel_lock:
-            active_ids = list(self._active_channel_ids)
-            avail_map = {ch.id: idx for idx, ch in enumerate(self._available_channels)}
+        with self._state_lock:
+            with self._channel_lock:
+                active_ids = list(self._active_channel_ids)
+                avail_map = {ch.id: idx for idx, ch in enumerate(self._available_channels)}
 
-        if not active_ids or frames <= 0:
-            return
+            if not active_ids or frames <= 0:
+                return
 
-        out = np.zeros((frames, len(active_ids)), dtype=np.float32)
-        for out_idx, channel_id in enumerate(active_ids):
-            src_idx = avail_map.get(channel_id)
-            if src_idx is None or src_idx >= sample_buffer.shape[1]:
-                continue
-            out[:, out_idx] = sample_buffer[:frames, src_idx]
+            out = np.zeros((frames, len(active_ids)), dtype=np.float32)
+            for out_idx, channel_id in enumerate(active_ids):
+                src_idx = avail_map.get(channel_id)
+                if src_idx is None or src_idx >= sample_buffer.shape[1]:
+                    continue
+                out[:, out_idx] = sample_buffer[:frames, src_idx]
 
-        self.emit_array(out, mono_time=time.monotonic())
+            self.emit_array(out, mono_time=time.monotonic())
 
     def stats(self) -> dict[str, Any]:
         stats = super().stats()
@@ -1581,6 +1678,8 @@ class BackyardBrainsSource(BaseDevice):
                 "hardware_version": self._protocol_state.hardware_version,
                 "firmware_version": self._protocol_state.firmware_version,
                 "board_type": self._protocol_state.board_type,
+                "reported_sample_rate": self._protocol_state.reported_sample_rate,
+                "reported_channel_count": self._protocol_state.reported_channel_count,
                 "last_event": self._protocol_state.last_event,
                 "joy_state": self._protocol_state.joy_state,
             }
