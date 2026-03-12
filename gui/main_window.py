@@ -1287,21 +1287,9 @@ class MainWindow(QtWidgets.QMainWindow):
         """Enable or disable UI panels when recording starts/stops.
         
         Disables channel add/remove controls during recording to prevent
-        ring buffer dimension mismatches. Active channel selection and
-        cosmetic controls (window width, etc.) remain enabled.
+        ring buffer dimension mismatches. Trigger controls remain fully
+        interactive while recording because they do not reconfigure the stream.
         """
-        # Trigger control: disable data-affecting controls, keep cosmetic ones
-        # Trigger control: disable data-affecting controls, keep cosmetic ones
-        tc = self.trigger_control
-        # Window combo is purely cosmetic - keep it enabled
-        tc.window_combo.setEnabled(True)  # Always enabled
-        # Trigger mode affects which data is captured - disable during recording
-        tc.trigger_mode_single.setEnabled(enabled)
-        tc.trigger_mode_repeated.setEnabled(enabled)
-        self.trigger_control.threshold_spin.setEnabled(enabled)
-        self.trigger_control.trigger_channel_combo.setEnabled(enabled)
-        self.trigger_control.trigger_single_button.setEnabled(enabled)
-        
         # Recording widget handles its own enable/disable
         self.record_group.set_enabled_for_recording(enabled)
         
@@ -1441,48 +1429,52 @@ class MainWindow(QtWidgets.QMainWindow):
             self.trigger_control.threshold_spin.setValue(value)
             self.trigger_control.threshold_spin.blockSignals(False)
 
-    def _scope_popout_channel_id(self) -> Optional[int]:
-        """Choose the best channel to export from the scope view."""
-        if self._active_channel_id in self._channel_ids_current:
-            return self._active_channel_id
-        if self._trigger_controller.channel_id in self._channel_ids_current:
-            return self._trigger_controller.channel_id
-        if self._channel_ids_current:
-            return self._channel_ids_current[0]
-        return None
-
     def _on_scope_popout_requested(self) -> None:
-        """Open the active scope trace in a separate waveform window."""
-        channel_id = self._scope_popout_channel_id()
-        if channel_id is None:
-            QtWidgets.QMessageBox.information(self, "Scope trace", "No active scope trace is available.")
-            return
-        samples = self._plot_manager.channel_last_samples.get(channel_id)
         times = self._plot_manager.last_times
-        if samples is None or times.size == 0 or samples.size == 0:
+        if times.size == 0:
             QtWidgets.QMessageBox.information(self, "Scope trace", "No scope data is available to pop out yet.")
             return
-        length = int(min(samples.size, times.size))
-        if length <= 0:
-            QtWidgets.QMessageBox.information(self, "Scope trace", "No scope data is available to pop out yet.")
+        waveforms: list[tuple[np.ndarray, np.ndarray, QtGui.QColor]] = []
+        visible_count = 0
+        for channel_id in self._channel_ids_current:
+            config = self._channel_configs.get(channel_id)
+            if config is None or not config.display_enabled:
+                continue
+            samples = self._plot_manager.channel_last_samples.get(channel_id)
+            if samples is None or samples.size == 0:
+                continue
+            length = int(min(samples.size, times.size))
+            if length <= 0:
+                continue
+            span = max(float(config.vertical_span_v), 1e-6)
+            offset = float(config.screen_offset)
+            normalized = (np.asarray(samples[:length], dtype=np.float32) / (2.0 * span)) + offset
+            waveforms.append(
+                (
+                    np.array(times[:length], copy=True),
+                    np.array(normalized, copy=True),
+                    QtGui.QColor(config.color),
+                )
+            )
+            visible_count += 1
+        if not waveforms:
+            QtWidgets.QMessageBox.information(self, "Scope trace", "No visible scope traces are available to pop out yet.")
             return
-        config = self._channel_configs.get(channel_id)
-        channel_name = f"Channel {channel_id}"
-        color = None
-        if config is not None:
-            channel_name = config.channel_name or channel_name
-            color = QtGui.QColor(config.color)
         dialog = ClusterWaveformDialog(
             self,
-            f"Scope {channel_name}",
-            [(np.array(times[:length], copy=True), np.array(samples[:length], copy=True))],
-            color=color,
+            "Scope traces",
+            waveforms,
+            show_median=False,
+            background_color=QtGui.QColor("white"),
+            y_label="Scope position",
+            y_units="",
         )
         dialog.setModal(False)
         dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
         dialog.destroyed.connect(lambda *_args, window=dialog: self._drop_scope_popout_window(window))
         self._scope_popout_windows.append(dialog)
         dialog.resize(900, 500)
+        dialog.setWindowTitle(f"Scope traces ({visible_count} channel{'s' if visible_count != 1 else ''})")
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()

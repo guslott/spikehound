@@ -2685,18 +2685,28 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
         self,
         parent: Optional[QtWidgets.QWidget],
         class_name: str,
-        waveforms: Sequence[tuple[np.ndarray, np.ndarray]],
+        waveforms: Sequence[tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, QtGui.QColor | None]],
         color: Optional[QtGui.QColor] = None,
         median_waveform: Optional[np.ndarray] = None,
+        *,
+        show_median: bool = True,
+        background_color: QtGui.QColor | str | None = None,
+        y_label: str = "Amplitude",
+        y_units: str = "V",
     ) -> None:
         super().__init__(parent)
         self._class_name = class_name
         self._cluster_color = color
         self._waveforms = self._sanitize_waveforms(waveforms)
         self._aligned_samples: list[np.ndarray] = []
+        self._aligned_colors: list[QtGui.QColor | None] = []
         self._plot_time_axis: np.ndarray | None = None
         self._export_time_axis: np.ndarray | None = None
         self._median_waveform: np.ndarray | None = median_waveform
+        self._show_median = bool(show_median)
+        self._background_color = background_color or QtGui.QColor("white")
+        self._y_label = y_label
+        self._y_units = y_units
         self._measure_mode: str = "none"  # none | point | line
         self._measure_points: list[dict[str, object]] = []
         self._dragging_point_idx: int | None = None
@@ -2711,46 +2721,59 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
         self._plot_waveforms()
         self._update_title()
 
-    def _sanitize_waveforms(self, waveforms: Sequence[tuple[np.ndarray, np.ndarray]]) -> list[tuple[np.ndarray, np.ndarray]]:
-        sanitized: list[tuple[np.ndarray, np.ndarray]] = []
-        for times, samples in waveforms:
+    def _sanitize_waveforms(
+        self,
+        waveforms: Sequence[tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, QtGui.QColor | None]],
+    ) -> list[tuple[np.ndarray, np.ndarray, QtGui.QColor | None]]:
+        sanitized: list[tuple[np.ndarray, np.ndarray, QtGui.QColor | None]] = []
+        for waveform in waveforms:
+            if len(waveform) == 3:
+                times, samples, color = waveform
+            else:
+                times, samples = waveform
+                color = None
             t_arr = np.asarray(times, dtype=np.float64)
             s_arr = np.asarray(samples, dtype=np.float32)
             length = int(min(t_arr.size, s_arr.size))
             if length <= 0:
                 continue
             t_trim = t_arr[:length]
-            sanitized.append((t_trim, s_arr[:length]))
+            qcolor = QtGui.QColor(color) if color is not None else None
+            sanitized.append((t_trim, s_arr[:length], qcolor))
         return sanitized
 
     def _prepare_waveform_data(self) -> None:
         if not self._waveforms:
             return
         lengths: list[int] = []
-        for times, samples in self._waveforms:
+        for times, samples, _color in self._waveforms:
             lengths.append(int(min(times.size, samples.size)))
         if not lengths:
             return
         length_counts = Counter(lengths)
         target_len = max(length_counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
-        aligned: list[tuple[np.ndarray, np.ndarray]] = []
-        for times, samples in self._waveforms:
+        aligned: list[tuple[np.ndarray, np.ndarray, QtGui.QColor | None]] = []
+        for times, samples, color in self._waveforms:
             if times.size < target_len or samples.size < target_len or target_len <= 0:
                 continue
             t_copy = np.array(times[:target_len], dtype=np.float64, copy=True)
             s_copy = np.array(samples[:target_len], dtype=np.float32, copy=True)
-            aligned.append((t_copy, s_copy))
+            aligned.append((t_copy, s_copy, color))
         if not aligned:
             return
         self._plot_time_axis = aligned[0][0]
-        self._aligned_samples = [samples for _, samples in aligned]
+        self._aligned_samples = [samples for _, samples, _color in aligned]
+        self._aligned_colors = [color for _, _, color in aligned]
         
         if self._median_waveform is not None and self._plot_time_axis is not None:
              # Already calculated passed in or calculated
              if self._export_time_axis is None:
                  self._export_time_axis = self._build_export_time_axis(self._plot_time_axis)
              return
-            
+        if not self._show_median:
+            self._median_waveform = None
+            self._export_time_axis = self._build_export_time_axis(self._plot_time_axis)
+            return
         stack = np.stack(self._aligned_samples, axis=0)
         self._median_waveform = np.median(stack, axis=0)
         self._export_time_axis = self._build_export_time_axis(self._plot_time_axis)
@@ -2776,7 +2799,7 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
 
     def _build_ui(self) -> None:
         palette = self.palette()
-        palette.setColor(self.backgroundRole(), QtGui.QColor("white"))
+        palette.setColor(self.backgroundRole(), QtGui.QColor(self._background_color))
         self.setPalette(palette)
         self.setAutoFillBackground(True)
 
@@ -2818,9 +2841,9 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
         measure_menu.addAction(clear_measure_action)
 
         self.plot_widget = pg.PlotWidget(enableMenu=False)
-        self.plot_widget.setBackground("w")
+        self.plot_widget.setBackground(self._background_color)
         self.plot_widget.setLabel("bottom", "Time (s)")
-        self.plot_widget.setLabel("left", "Amplitude (V)")
+        self.plot_widget.setLabel("left", self._y_label, units=self._y_units)
         plot_item = self.plot_widget.getPlotItem()
         plot_item.showGrid(x=True, y=True, alpha=0.35)
         vb = plot_item.getViewBox()
@@ -2842,33 +2865,25 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
         if not self._aligned_samples or self._plot_time_axis is None:
             return
         line_color = QtGui.QColor(STA_TRACE_PEN.color())
-        
-        # Use a single plot item with connect='finite' to draw all lines at once
-        # This is massively faster for thousands of lines
-        
-        # Prepare concatenated data with NaN separators
         t_vals = self._plot_time_axis
         n_waveforms = len(self._aligned_samples)
-        
-        # Fast construction using numpy:
-        if n_waveforms > 0:
-            samples_mat = np.stack(self._aligned_samples) # (N, L)
-            # Create NaN column
+        multi_color = any(color is not None for color in self._aligned_colors)
+
+        if n_waveforms > 0 and not multi_color:
+            samples_mat = np.stack(self._aligned_samples)
             nan_col = np.full((n_waveforms, 1), np.nan, dtype=np.float32)
-            # Concatenate (N, L+1) then flatten
             samples_param = np.hstack([samples_mat, nan_col]).flatten()
-            
-            # Prepare time axis repeated
             t_mat = np.tile(t_vals, (n_waveforms, 1))
             nan_col_t = np.full((n_waveforms, 1), np.nan, dtype=np.float64)
             t_param = np.hstack([t_mat, nan_col_t]).flatten()
-            
-            # Plot single item
             line_pen = pg.mkPen(line_color, width=1)
-            # Use 'finite' to break lines at NaNs
             self.plot_widget.plot(t_param, samples_param, pen=line_pen, connect="finite", clear=False)
-            
-        if self._median_waveform is not None:
+        elif n_waveforms > 0:
+            for samples, color in zip(self._aligned_samples, self._aligned_colors):
+                pen_color = QtGui.QColor(color) if color is not None else line_color
+                self.plot_widget.plot(t_vals, samples, pen=pg.mkPen(pen_color, width=1.5), clear=False)
+
+        if self._show_median and self._median_waveform is not None:
             median_pen = pg.mkPen(WAVEFORM_MEDIAN_COLOR, width=3)
             self.plot_widget.plot(self._plot_time_axis, self._median_waveform, pen=median_pen)
         self.plot_widget.setAntialiasing(False)
@@ -2900,7 +2915,7 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.critical(self, "Save image", f"Failed to save the image:\n{exc}")
 
     def _on_save_traces(self) -> None:
-        if not self._aligned_samples or self._export_time_axis is None or self._median_waveform is None:
+        if not self._aligned_samples or self._export_time_axis is None:
             QtWidgets.QMessageBox.information(self, "Save traces", "No waveform data available to export.")
             return
         suggested = f"{self._safe_base_name()}_waveforms.csv"
@@ -2913,7 +2928,8 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
             with open(path, "w", newline="") as fp:
                 writer = csv.writer(fp)
                 writer.writerow(self._export_time_axis)
-                writer.writerow(self._median_waveform)
+                if self._show_median and self._median_waveform is not None:
+                    writer.writerow(self._median_waveform)
                 for samples in self._aligned_samples:
                     writer.writerow(samples)
         except Exception as exc:  # noqa: BLE001
