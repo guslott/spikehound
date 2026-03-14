@@ -43,6 +43,7 @@ class AnalysisDock(QtWidgets.QDockWidget):
         self._controller = controller
         self._last_sample_rate: float = 0.0
         self._settings_widget: Optional[QtWidgets.QWidget] = None
+        self._aux_widgets: Dict[str, QtWidgets.QWidget] = {}
         self._active_channels: list["ChannelInfo"] = []
         self._spectrogram_tabs: Dict[int, SpectrogramTab] = {}  # channel_id -> tab
 
@@ -262,6 +263,9 @@ class AnalysisDock(QtWidgets.QDockWidget):
             # Settings is now permanent; just switch to it
             self._tabs.setCurrentIndex(index)
             return
+        if widget in self._aux_widgets.values():
+            self._tabs.setCurrentIndex(index)
+            return
 
         self._tabs.removeTab(index)
         info = self._tab_info.pop(widget, None)
@@ -318,6 +322,32 @@ class AnalysisDock(QtWidgets.QDockWidget):
         self._tabs.addTab(widget, title)
         # Plugin tabs manage runtime access themselves unless they need
         # active-channel updates from the dock.
+
+    def set_aux_widget(self, key: str, widget: QtWidgets.QWidget, title: str, *, insert_index: int = 2) -> None:
+        """Add or update a permanent auxiliary tab."""
+        current = self._aux_widgets.get(key)
+        if current is widget:
+            idx = self._tabs.indexOf(widget)
+            if idx >= 0:
+                self._tabs.setTabText(idx, title)
+                self._tabs.tabBar().setTabButton(idx, QtWidgets.QTabBar.RightSide, None)
+            return
+        if current is not None:
+            self.remove_aux_widget(key)
+        widget.setParent(self._tabs)
+        insert_at = min(max(insert_index, 0), self._tabs.count())
+        self._tabs.insertTab(insert_at, widget, title)
+        self._tabs.tabBar().setTabButton(insert_at, QtWidgets.QTabBar.RightSide, None)
+        self._aux_widgets[key] = widget
+
+    def remove_aux_widget(self, key: str) -> None:
+        widget = self._aux_widgets.pop(key, None)
+        if widget is None:
+            return
+        idx = self._tabs.indexOf(widget)
+        if idx >= 0:
+            self._tabs.removeTab(idx)
+        widget.setParent(None)
 
     def open_settings(self, widget: QtWidgets.QWidget, title: str = "Settings & Debug") -> None:
         if widget is None:

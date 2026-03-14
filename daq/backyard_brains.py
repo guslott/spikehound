@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import re
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import numpy as np
@@ -45,6 +47,8 @@ _SYNC_TIMEOUT_S_DEFAULT = 0.5
 _MAX_READ_SIZE = 4096
 _HID_PACKET_SIZE = 64
 _HID_PAYLOAD_SIZE = 62
+_CAPTURE_MAX_STREAM_BYTES = 8 * 1024 * 1024
+_CAPTURE_ROOT = Path(__file__).resolve().parent.parent / "logs" / "byb_capture"
 
 
 @dataclass(frozen=True)
@@ -158,7 +162,7 @@ _PROFILES: Dict[str, _BYBProfile] = {
         bits=14,
         max_channels=3,
         candidate_stream_channels=(2, 3),
-        sample_rate_map={2: 10000, 3: 10000},
+        sample_rate_map={2: 20000, 3: 20000},
         baud_rates=(222222, 500000),
         requires_start=True,
         supports_board_query=True,
@@ -427,6 +431,16 @@ def _iter_complete_messages(text_buffer: str) -> tuple[list[str], str]:
     return messages, remainder[-512:]
 
 
+_TEXT_PROTOCOL_MESSAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9?]{0,15}:[ -~]{0,96};$")
+
+
+def _looks_like_text_protocol_message(message: str) -> bool:
+    token = message.strip()
+    if not token.endswith(";"):
+        return False
+    return _TEXT_PROTOCOL_MESSAGE_RE.fullmatch(token) is not None
+
+
 def _parse_bool_scalar(value: str) -> Optional[bool]:
     value = value.strip()
     if value == "0":
@@ -596,6 +610,120 @@ class _BYBTransport:
         return None
 
 
+class _BYBCaptureSession:
+    def __init__(
+        self,
+        *,
+        meta: Mapping[str, Any],
+        base_dir: Optional[Path] = None,
+        max_stream_bytes: int = _CAPTURE_MAX_STREAM_BYTES,
+    ) -> None:
+        root = Path(base_dir) if base_dir is not None else _CAPTURE_ROOT
+        safe_device = re.sub(r"[^A-Za-z0-9._-]+", "_", str(meta.get("device") or "unknown"))[:48]
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        self.path = root / f"{stamp}-{safe_device}"
+        self.path.mkdir(parents=True, exist_ok=True)
+        self._events_fp = self.path.joinpath("events.jsonl").open("w", encoding="utf-8")
+        self._stream_fp = self.path.joinpath("stream.bin").open("wb")
+        self._max_stream_bytes = int(max_stream_bytes)
+        self._stored_stream_bytes = 0
+        self._dropped_stream_bytes = 0
+        self._write_event("session_start", meta=dict(meta))
+
+    @staticmethod
+    def _ascii_preview(data: bytes, limit: int = 32) -> str:
+        preview = data[:limit]
+        return "".join(chr(byte) if 32 <= byte < 127 else "." for byte in preview)
+
+    def _write_event(self, event: str, **payload: Any) -> None:
+        record = {"ts": time.time(), "event": event, **payload}
+        self._events_fp.write(json.dumps(record, sort_keys=True, default=self._json_default) + "\n")
+        self._events_fp.flush()
+
+    @staticmethod
+    def _json_default(value: Any) -> Any:
+        if isinstance(value, bytes):
+            return {"hex": value.hex()}
+        return str(value)
+
+    def note(self, event: str, **payload: Any) -> None:
+        self._write_event(event, **payload)
+
+    def record_write(self, command: str) -> None:
+        self._write_event("write_command", command=command)
+
+    def record_read(self, data: bytes, *, timeout_ms: int = 0) -> None:
+        if not data:
+            return
+        offset = self._stored_stream_bytes
+        stored = 0
+        if self._stored_stream_bytes < self._max_stream_bytes:
+            stored = min(len(data), self._max_stream_bytes - self._stored_stream_bytes)
+            if stored > 0:
+                self._stream_fp.write(data[:stored])
+                self._stream_fp.flush()
+                self._stored_stream_bytes += stored
+        dropped = len(data) - stored
+        if dropped > 0:
+            self._dropped_stream_bytes += dropped
+        self._write_event(
+            "read_chunk",
+            timeout_ms=int(timeout_ms),
+            size=len(data),
+            stored=stored,
+            dropped=dropped,
+            offset=offset,
+            hex_preview=data[:16].hex(),
+            ascii_preview=self._ascii_preview(data),
+        )
+
+    def record_message(self, source: str, message: str) -> None:
+        self._write_event("protocol_message", source=source, message=message)
+
+    def close(self) -> None:
+        self._write_event(
+            "session_end",
+            stored_stream_bytes=self._stored_stream_bytes,
+            dropped_stream_bytes=self._dropped_stream_bytes,
+        )
+        self._events_fp.close()
+        self._stream_fp.close()
+
+
+class _LoggingTransport(_BYBTransport):
+    def __init__(self, inner: _BYBTransport, capture: _BYBCaptureSession) -> None:
+        self._inner = inner
+        self._capture = capture
+
+    @property
+    def kind(self) -> str:
+        return self._inner.kind
+
+    def reset_input_buffer(self) -> None:
+        return self._inner.reset_input_buffer()
+
+    def write_command(self, cmd: str) -> None:
+        self._capture.record_write(cmd)
+        self._inner.write_command(cmd)
+
+    def read(self, timeout_ms: int = 0) -> bytes:
+        data = self._inner.read(timeout_ms=timeout_ms)
+        if data:
+            self._capture.record_read(data, timeout_ms=timeout_ms)
+        return data
+
+    def close(self) -> None:
+        self._inner.close()
+
+    @property
+    def is_open(self) -> bool:
+        return self._inner.is_open
+
+    @property
+    def baudrate(self) -> Optional[int]:
+        return self._inner.baudrate
+
+
 class _SerialTransport(_BYBTransport):
     kind = "serial"
 
@@ -761,6 +889,10 @@ class _BYBDecoder:
     def stream_width(self) -> Optional[int]:
         return self._stream_width
 
+    @property
+    def frame_mode(self) -> str:
+        return self._frame_mode
+
     def feed(self, data: bytes) -> tuple[list[str], Optional[np.ndarray]]:
         if data:
             self._raw.extend(data)
@@ -921,10 +1053,15 @@ class BackyardBrainsSource(BaseDevice):
     """
 
     _SYNC_TIMEOUT_S: float = _SYNC_TIMEOUT_S_DEFAULT
+    _capture_logging_enabled: bool = False
 
     @classmethod
     def device_class_name(cls) -> str:
         return "Backyard Brains"
+
+    @classmethod
+    def set_capture_logging_enabled(cls, enabled: bool) -> None:
+        cls._capture_logging_enabled = bool(enabled)
 
     def __init__(self, queue_maxsize: int = 64) -> None:
         super().__init__(queue_maxsize=queue_maxsize)
@@ -945,6 +1082,12 @@ class BackyardBrainsSource(BaseDevice):
         self._protocol_state = _BYBProtocolState()
         self._max_channels = 1
         self._runtime_width_inferred = False
+        self._capture_session: Optional[_BYBCaptureSession] = None
+        self._read_bytes_total = 0
+        self._read_started_at: Optional[float] = None
+        self._configured_read_bytes = 0
+        self._configured_started_at: Optional[float] = None
+        self._decoder_frame_mode: Optional[str] = None
 
     @classmethod
     def list_available_devices(cls) -> List[DeviceInfo]:
@@ -1225,6 +1368,15 @@ class BackyardBrainsSource(BaseDevice):
                 raise RuntimeError("pyserial is not installed.")
             transport = self._open_serial_transport(str(meta.get("device")), candidates)
 
+        if self._capture_logging_enabled:
+            capture_meta = dict(meta)
+            capture_meta["selected_device_id"] = device_id
+            capture_meta["transport_kind"] = transport.kind
+            self._capture_session = _BYBCaptureSession(meta=capture_meta)
+            transport = _LoggingTransport(transport, self._capture_session)
+        else:
+            self._capture_session = None
+
         self._transport = transport
         self._transport_kind = transport.kind
         self._resolved_meta = dict(meta)
@@ -1255,6 +1407,14 @@ class BackyardBrainsSource(BaseDevice):
             self._protocol_state.hardware_type,
             self._protocol_state.firmware_version,
         )
+        if self._capture_session is not None:
+            self._capture_session.note(
+                "profile_resolved",
+                profile=profile.key,
+                baudrate=self._baudrate,
+                hardware_type=self._protocol_state.hardware_type,
+                firmware_version=self._protocol_state.firmware_version,
+            )
 
         self._query_optional_state()
         self._decoder_candidate_widths = self._resolved_stream_width_candidates(profile)
@@ -1346,11 +1506,17 @@ class BackyardBrainsSource(BaseDevice):
                 wrapped_buffer.extend(chunk)
                 for message in _extract_wrapped_message_payloads(wrapped_buffer):
                     _update_protocol_state(state, message)
+                    if self._capture_session is not None:
+                        self._capture_session.record_message("probe_wrapped", message)
 
                 text_buffer += chunk.decode("ascii", errors="ignore")
                 messages, text_buffer = _iter_complete_messages(text_buffer)
                 for message in messages:
+                    if not _looks_like_text_protocol_message(message):
+                        continue
                     _update_protocol_state(state, message)
+                    if self._capture_session is not None:
+                        self._capture_session.record_message("probe_text", message)
 
                 if state.hardware_type and (state.firmware_version or command == "b:;"):
                     break
@@ -1390,10 +1556,16 @@ class BackyardBrainsSource(BaseDevice):
                 wrapped_buffer.extend(chunk)
                 for message in _extract_wrapped_message_payloads(wrapped_buffer):
                     _update_protocol_state(self._protocol_state, message)
+                    if self._capture_session is not None:
+                        self._capture_session.record_message("optional_wrapped", message)
                 text_buffer += chunk.decode("ascii", errors="ignore")
                 messages, text_buffer = _iter_complete_messages(text_buffer)
                 for message in messages:
+                    if not _looks_like_text_protocol_message(message):
+                        continue
                     _update_protocol_state(self._protocol_state, message)
+                    if self._capture_session is not None:
+                        self._capture_session.record_message("optional_text", message)
 
     def _close_impl(self) -> None:
         if self._transport is not None:
@@ -1411,6 +1583,16 @@ class BackyardBrainsSource(BaseDevice):
         self._stream_channel_count = 1
         self._decoder_candidate_widths = (1,)
         self._runtime_width_inferred = False
+        self._read_bytes_total = 0
+        self._read_started_at = None
+        self._configured_read_bytes = 0
+        self._configured_started_at = None
+        self._decoder_frame_mode = None
+        if self._capture_session is not None:
+            try:
+                self._capture_session.close()
+            finally:
+                self._capture_session = None
 
     def _configure_impl(
         self,
@@ -1532,6 +1714,16 @@ class BackyardBrainsSource(BaseDevice):
             self._decoder_candidate_widths,
             actual_rate,
         )
+        if self._capture_session is not None:
+            self._capture_session.note(
+                "configured",
+                profile=self._profile.key,
+                active_channels=[ch.id for ch in selected_channels],
+                decode_widths=list(self._decoder_candidate_widths),
+                actual_rate=actual_rate,
+            )
+        self._configured_read_bytes = self._read_bytes_total
+        self._configured_started_at = time.monotonic()
 
         return ActualConfig(
             sample_rate=actual_rate,
@@ -1593,14 +1785,29 @@ class BackyardBrainsSource(BaseDevice):
 
             if not data:
                 time.sleep(0.001)
+            else:
+                if self._read_started_at is None:
+                    self._read_started_at = time.monotonic()
+                self._read_bytes_total += len(data)
             messages, decoded = decoder.feed(data)
 
             for message in messages:
                 _update_protocol_state(self._protocol_state, message)
+                if self._capture_session is not None:
+                    self._capture_session.record_message("stream_wrapped", message)
 
             if decoder.stream_width is not None and decoder.stream_width != self._stream_channel_count:
                 self._stream_channel_count = decoder.stream_width
                 self._runtime_width_inferred = False
+                self._decoder_frame_mode = decoder.frame_mode
+                if self._capture_session is not None:
+                    self._capture_session.note(
+                        "decoder_width_locked",
+                        stream_width=self._stream_channel_count,
+                        frame_mode=self._decoder_frame_mode,
+                    )
+            elif decoder.stream_width is not None and self._decoder_frame_mode != decoder.frame_mode:
+                self._decoder_frame_mode = decoder.frame_mode
 
             if decoded is not None and decoded.size:
                 if decoded.shape[1] > sample_buffer.shape[1]:
@@ -1642,6 +1849,14 @@ class BackyardBrainsSource(BaseDevice):
                     self._stream_channel_count,
                 )
                 self.note_xrun()
+                if self._capture_session is not None:
+                    self._capture_session.note(
+                        "frame_sync_lost",
+                        elapsed=elapsed,
+                        decode_widths=list(self._decoder_candidate_widths),
+                        current_width=self._stream_channel_count,
+                        board_type=self._protocol_state.board_type,
+                    )
                 decoder = _BYBDecoder(bits=self._bits, candidate_widths=candidate_widths)
                 sample_idx = 0
 
@@ -1665,6 +1880,16 @@ class BackyardBrainsSource(BaseDevice):
 
     def stats(self) -> dict[str, Any]:
         stats = super().stats()
+        measured_byte_rate = None
+        measured_frame_rate = None
+        now = time.monotonic()
+        if self._configured_started_at is not None:
+            elapsed = max(now - self._configured_started_at, 1e-9)
+            bytes_since_config = max(self._read_bytes_total - self._configured_read_bytes, 0)
+            measured_byte_rate = bytes_since_config / elapsed
+            frame_width = self._stream_channel_count if self._stream_channel_count > 0 else 0
+            if frame_width > 0:
+                measured_frame_rate = measured_byte_rate / (frame_width * 2)
         stats.update(
             {
                 "transport": self._transport_kind,
@@ -1680,6 +1905,11 @@ class BackyardBrainsSource(BaseDevice):
                 "board_type": self._protocol_state.board_type,
                 "reported_sample_rate": self._protocol_state.reported_sample_rate,
                 "reported_channel_count": self._protocol_state.reported_channel_count,
+                "last_messages": list(self._protocol_state.last_messages),
+                "decoder_frame_mode": self._decoder_frame_mode,
+                "measured_byte_rate": measured_byte_rate,
+                "measured_frame_rate": measured_frame_rate,
+                "capture_path": None if self._capture_session is None else str(self._capture_session.path),
                 "last_event": self._protocol_state.last_event,
                 "joy_state": self._protocol_state.joy_state,
             }

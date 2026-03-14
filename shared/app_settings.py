@@ -18,6 +18,7 @@ class AppSettings:
     launch_config_path: Optional[str] = None
     recording_use_float32: bool = False
     recording_auto_increment: bool = True
+    byb_debug_logging_enabled: bool = False
 
 
 @runtime_checkable

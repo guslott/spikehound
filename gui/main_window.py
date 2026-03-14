@@ -14,12 +14,14 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from core import PipelineController
 from core.runtime import SpikeHoundRuntime
+from daq.backyard_brains import BackyardBrainsSource
 from shared.app_settings import AppSettings
 from core.conditioning import ChannelFilterSettings, FilterSettings
 from shared.models import ChunkPointer, EndOfStream, TriggerConfig
 from .analysis_dock import AnalysisDock
 from .analysis_tab import ClusterWaveformDialog
 from .settings_tab import SettingsTab
+from .byb_debug_tab import BYBDebugTab
 from .scope_widget import ScopeWidget
 from .channel_controls_widget import ChannelControlsWidget, ChannelDetailPanel
 from .device_control_widget import DeviceControlWidget
@@ -149,6 +151,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _init_ui(self) -> None:
         """Initialize the main window UI components and layout."""
         self._settings_tab: Optional[SettingsTab] = None
+        self._byb_debug_tab: Optional[BYBDebugTab] = None
         
         # Apply global application theme and styling
         ThemeManager.apply_theme(self)
@@ -177,6 +180,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Create and add permanent Settings tab
         self._settings_tab = SettingsTab(self.runtime, self)
         self._analysis_dock.set_settings_widget(self._settings_tab, "Settings")
+        self._byb_debug_tab = BYBDebugTab(self.runtime, self)
         
         self.addDockWidget(QtCore.Qt.TopDockWidgetArea, self._analysis_dock)
         self._analysis_dock.select_scope()
@@ -704,13 +708,46 @@ class MainWindow(QtWidgets.QMainWindow):
             target_rate = self._current_sample_rate_value()
 
         self.device_control.sample_rate_combo.clear()
-        rates = []
+        rates: list[float] = []
+        caps = None
         if entry is not None:
             caps = entry.get("capabilities")
+            entry_key = entry.get("key")
+            device_id = entry.get("device_id")
+            if (
+                self._device_connected
+                and entry_key is not None
+                and self.runtime.active_device_key() == entry_key
+                and device_id is not None
+                and not self._is_file_source_entry(str(entry_key), entry)
+            ):
+                driver = self.runtime.daq_source
+                if driver is not None:
+                    try:
+                        caps = driver.get_capabilities(str(device_id))
+                        entry["capabilities"] = caps
+                    except Exception as exc:
+                        self._logger.debug(
+                            "Failed to refresh live capabilities for %s: %s",
+                            entry_key,
+                            exc,
+                        )
             if isinstance(caps, dict):
-                rates = caps.get("sample_rates") or []
+                rates = list(caps.get("sample_rates") or [])
             elif caps is not None:
-                rates = getattr(caps, "sample_rates", []) or []
+                rates = list(getattr(caps, "sample_rates", []) or [])
+
+        normalized_rates: list[float] = []
+        for rate in rates:
+            try:
+                numeric = float(rate)
+            except Exception:
+                continue
+            if numeric > 0:
+                normalized_rates.append(numeric)
+        if target_rate > 0:
+            normalized_rates.append(float(target_rate))
+        rates = sorted({rate for rate in normalized_rates if rate > 0})
         
         for rate in rates:
             self.device_control.sample_rate_combo.addItem(f"{int(rate):,}", float(rate))
@@ -771,6 +808,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._bind_dispatcher_signals()
         self._bind_app_settings_store()
         self._update_channel_buttons()
+        self._populate_sample_rate_options(self._device_map.get(key))
+        self._update_byb_debug_tab()
         
         # Sync UI with actual negotiated sample rate
         # Prefer driver config (immediate) over runtime metric (delayed)
@@ -837,6 +876,24 @@ class MainWindow(QtWidgets.QMainWindow):
         # Re-apply file source mode based on current device selection
         # This ensures the button says "Browse..." instead of "Click to Connect"
         self._on_device_selected()
+        self._update_byb_debug_tab()
+
+    def _update_byb_debug_tab(self) -> None:
+        if not self._device_connected or self._byb_debug_tab is None:
+            self._analysis_dock.remove_aux_widget("byb_debug")
+            return
+        driver = self.runtime.daq_source
+        profile = None
+        if driver is not None:
+            try:
+                profile = driver.stats().get("profile")
+            except Exception as exc:
+                self._logger.debug("Failed to inspect BYB profile: %s", exc)
+        if profile and self._byb_debug_tab is not None:
+            self._analysis_dock.set_aux_widget("byb_debug", self._byb_debug_tab, "BYB Debug", insert_index=2)
+            self._byb_debug_tab.refresh()
+        else:
+            self._analysis_dock.remove_aux_widget("byb_debug")
 
 
     def _on_scan_hardware(self) -> None:
@@ -1852,6 +1909,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._controller.set_list_all_audio_devices(settings.list_all_audio_devices)
                 except Exception:
                     pass
+            try:
+                BackyardBrainsSource.set_capture_logging_enabled(settings.byb_debug_logging_enabled)
+            except Exception:
+                pass
         self._app_settings_unsub = store.subscribe(_apply)
 
     def _apply_listen_output_preference(self, key: Optional[str]) -> None:

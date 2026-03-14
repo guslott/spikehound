@@ -188,6 +188,33 @@ def test_serial_probe_resolves_profile_and_truthful_capabilities(monkeypatch):
     src.close()
 
 
+def test_capture_logging_is_disabled_by_default(monkeypatch):
+    port = _FakePort(
+        device="/dev/tty.neuron",
+        name="tty.neuron",
+        vid=0x2E73,
+        pid=0x0009,
+        description="Neuron SpikerBox",
+        product="Neuron SpikerBox",
+    )
+    script = {
+        (222222, "?:;"): b"FWV:1.00;HWT:NRNSBPRO;HWV:3.10;",
+        (222222, "b:;"): b"HWT:NRNSBPRO;",
+        (222222, "board:;"): b"BRD:0;",
+    }
+    fake_serial = _FakeSerialModule([port], script)
+    monkeypatch.setattr(byb, "serial", fake_serial)
+    monkeypatch.setattr(byb, "hid", None)
+    monkeypatch.setattr(byb.BackyardBrainsSource, "_capture_logging_enabled", False)
+
+    src = byb.BackyardBrainsSource()
+    src.open(port.device)
+
+    assert src._capture_session is None
+    assert src.stats()["capture_path"] is None
+    src.close()
+
+
 def test_shared_ftdi_id_is_disambiguated_by_probe_and_baud(monkeypatch):
     port = _FakePort(
         device="/dev/tty.ftdi",
@@ -307,7 +334,7 @@ def test_neuron_pro_mfi_is_enumerated_and_uses_descriptor_profile(monkeypatch):
 
     caps = src.get_capabilities(port.device)
     assert caps.max_channels_in == 2
-    assert caps.sample_rates == [10000]
+    assert caps.sample_rates == [20000]
     src.close()
 
 
@@ -331,9 +358,9 @@ def test_neuron_pro_mfi_pins_decoder_width_to_selected_channels(monkeypatch):
     src = byb.BackyardBrainsSource()
     src.open(port.device)
 
-    cfg = src.configure(sample_rate=10000, channels=[0, 1], chunk_size=32)
+    cfg = src.configure(sample_rate=20000, channels=[0, 1], chunk_size=32)
 
-    assert cfg.sample_rate == 10000
+    assert cfg.sample_rate == 20000
     assert src.stats()["stream_channels"] == 2
     assert src._decoder_candidate_widths == (2,)
     src.close()
@@ -367,6 +394,33 @@ def test_neuron_pro_mfi_board_zero_exposes_two_channels(monkeypatch):
     src.close()
 
 
+def test_neuron_pro_mfi_accepts_20khz_without_reported_max(monkeypatch):
+    port = _FakePort(
+        device="/dev/tty.mfi",
+        name="tty.mfi",
+        vid=0x2E73,
+        pid=0x0009,
+        description="Neuron SpikerBox Pro (Serial + MFi)",
+        product="Neuron SpikerBox Pro (Serial + MFi)",
+    )
+    script = {
+        (222222, "?:;"): b"FWV:1.02;HWT:NRNSBPRO;HWV:2.00;",
+        (222222, "b:;"): b"HWT:NRNSBPRO;",
+    }
+    fake_serial = _FakeSerialModule([port], script)
+    monkeypatch.setattr(byb, "serial", fake_serial)
+    monkeypatch.setattr(byb, "hid", None)
+
+    src = byb.BackyardBrainsSource()
+    src.open(port.device)
+
+    cfg = src.configure(sample_rate=20000, channels=[0, 1], chunk_size=32)
+
+    assert cfg.sample_rate == 20000
+    assert src._decoder_candidate_widths == (2,)
+    src.close()
+
+
 def test_neuron_pro_mfi_prefers_reported_max_rate_and_channel_count(monkeypatch):
     port = _FakePort(
         device="/dev/tty.mfi",
@@ -390,10 +444,10 @@ def test_neuron_pro_mfi_prefers_reported_max_rate_and_channel_count(monkeypatch)
     src.open(port.device)
 
     caps = src.get_capabilities(port.device)
-    cfg = src.configure(sample_rate=10000, channels=[0, 1], chunk_size=32)
+    cfg = src.configure(sample_rate=20000, channels=[0, 1], chunk_size=32)
 
     assert caps.max_channels_in == 2
-    assert caps.sample_rates == [10000, 20000]
+    assert caps.sample_rates == [20000]
     assert cfg.sample_rate == 20000
     assert src._decoder_candidate_widths == (2,)
     assert src.stats()["reported_sample_rate"] == 20000

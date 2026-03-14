@@ -102,6 +102,13 @@ class SettingsTab(QtWidgets.QWidget):
         rec_row.addStretch()
         form.addRow("Recording Defaults:", rec_row)
 
+        self.byb_debug_logging_check = QtWidgets.QCheckBox("Log BYB serial for debugging")
+        self.byb_debug_logging_check.setToolTip(
+            "Capture raw Backyard Brains serial traffic and parsed protocol events to logs/byb_capture for debugging."
+        )
+        self.byb_debug_logging_check.stateChanged.connect(self._on_byb_debug_logging_toggled)
+        form.addRow("Backyard Brains:", self.byb_debug_logging_check)
+
         # Audio output device selection
         audio_row = QtWidgets.QHBoxLayout()
         self.listen_combo = QtWidgets.QComboBox()
@@ -305,6 +312,10 @@ class SettingsTab(QtWidgets.QWidget):
         self.rec_autoinc_check.setChecked(bool(settings.recording_auto_increment))
         self.rec_autoinc_check.blockSignals(False)
 
+        self.byb_debug_logging_check.blockSignals(True)
+        self.byb_debug_logging_check.setChecked(bool(settings.byb_debug_logging_enabled))
+        self.byb_debug_logging_check.blockSignals(False)
+
     def _update_launch_checkbox_label(self) -> None:
         """Update the launch config checkbox label to show path if set."""
         if self._launch_config_path:
@@ -377,6 +388,9 @@ class SettingsTab(QtWidgets.QWidget):
 
     def _on_rec_autoinc_toggled(self, state: int) -> None:
         self._update_settings(recording_auto_increment=bool(state))
+
+    def _on_byb_debug_logging_toggled(self, state: int) -> None:
+        self._update_settings(byb_debug_logging_enabled=bool(state))
 
     def _on_sim_units_changed(self, index: int) -> None:
         """Called when the simulated source unit count combo changes."""
