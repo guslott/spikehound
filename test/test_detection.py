@@ -131,6 +131,22 @@ def test_amp_threshold_detector_bidirectional():
     assert found_pos
     assert found_neg
 
+def test_amp_threshold_detector_plateau_emits_single_event():
+    fs = 1000.0
+    dt = 1.0 / fs
+    signal = np.random.normal(0, 0.01, size=300).astype(np.float32)
+    signal[100:150] += 1.0
+
+    detector = AmpThresholdDetector()
+    detector.configure(factor=5.0, sign=1, window_ms=10.0, refractory_ms=1.0)
+    detector.reset(fs, 1)
+
+    chunk = _make_chunk(signal.reshape(1, -1), start_time=0.0, dt=dt, seq=0)
+    events = detector.process_chunk(chunk)
+
+    assert len(events) == 1
+    assert abs(events[0].t - 0.100) < dt / 2
+
 def test_dispatcher_integration_with_detection():
     raw_queue = queue.Queue()
     viz_queue = queue.Queue()

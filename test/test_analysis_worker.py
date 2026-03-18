@@ -4,21 +4,25 @@ import pytest
 from analysis.analysis_worker import AnalysisWorker
 from analysis.metrics import peak_frequency_sinc as _peak_frequency_sinc
 from analysis.settings import AnalysisSettingsStore
-from shared.models import Chunk
+from shared.models import ChannelInfo, Chunk
 from shared.event_buffer import AnalysisEvents, EventRingBuffer
 from shared.types import AnalysisEvent
 
 
 class _DummyController:
-    def __init__(self, *, capacity: int = 8) -> None:
+    def __init__(self, *, capacity: int = 8, active_channels: list[ChannelInfo] | None = None) -> None:
         self.event_buffer = EventRingBuffer(capacity=capacity)
         self.analysis_settings_store = AnalysisSettingsStore()
+        self._active_channels = list(active_channels or [])
 
     def register_analysis_queue(self, _queue):
         return 1
 
     def unregister_analysis_queue(self, _token):
         return None
+
+    def active_channels(self):
+        return list(self._active_channels)
 
 
 def _stub_event(event_id: int) -> AnalysisEvent:
@@ -182,6 +186,242 @@ def test_worker_tracks_interval_since_last_event() -> None:
     assert second_event.properties.get("interval_sec") == pytest.approx(expected_interval, rel=1e-6)
 
 
+def test_analysis_events_pull_since_handles_multiple_workers(monkeypatch) -> None:
+    monkeypatch.setattr(AnalysisWorker, "_global_event_id", 0)
+
+    controller = _DummyController()
+    bus = AnalysisEvents(controller.event_buffer)
+    worker_a = AnalysisWorker(controller, "ch0", sample_rate=20_000)
+    worker_b = AnalysisWorker(controller, "ch1", sample_rate=20_000)
+    worker_a._channel_index = 0
+    worker_b._channel_index = 0
+    worker_a.configure_threshold(True, 0.25)
+    worker_b.configure_threshold(True, 0.25)
+
+    sr = 20_000
+    dt = 1.0 / sr
+
+    first = np.zeros((1, 400), dtype=np.float32)
+    first[0, 200] = 0.5
+    worker_a._detect_events(
+        Chunk(
+            samples=first,
+            start_time=0.0,
+            dt=dt,
+            seq=0,
+            channel_names=("ch0",),
+            units="V",
+            meta={"start_sample": 0},
+        )
+    )
+    events, last_id = bus.pull_events()
+    assert [ev.id for ev in events] == [1]
+    assert last_id == 1
+
+    second = np.zeros((1, 400), dtype=np.float32)
+    second[0, 220] = 0.6
+    worker_b._detect_events(
+        Chunk(
+            samples=second,
+            start_time=0.1,
+            dt=dt,
+            seq=1,
+            channel_names=("ch1",),
+            units="V",
+            meta={"start_sample": 400},
+        )
+    )
+    events, last_id = bus.pull_events(last_id)
+    assert [ev.id for ev in events] == [2]
+    assert last_id == 2
+
+
+def test_worker_manual_detection_uses_actual_channel_id() -> None:
+    controller = _DummyController(
+        active_channels=[
+            ChannelInfo(id=3, name="ch0", units="V"),
+            ChannelInfo(id=11, name="ch11", units="V"),
+        ]
+    )
+    worker = AnalysisWorker(controller, "ch11", sample_rate=20_000)
+    worker.configure_threshold(True, 0.25)
+
+    sr = 20_000
+    dt = 1.0 / sr
+    data = np.zeros((2, 400), dtype=np.float32)
+    data[1, 200] = 0.8
+    chunk = Chunk(
+        samples=data,
+        start_time=0.0,
+        dt=dt,
+        seq=0,
+        channel_names=("ch0", "ch11"),
+        units="V",
+        meta={"start_sample": 0},
+    )
+
+    worker._forward_chunk(chunk)
+    events = controller.event_buffer.drain()
+    assert len(events) == 1
+    assert events[0].channelId == 11
+
+
+def test_worker_auto_detection_uses_actual_channel_id() -> None:
+    controller = _DummyController(
+        active_channels=[
+            ChannelInfo(id=3, name="ch0", units="V"),
+            ChannelInfo(id=11, name="ch11", units="V"),
+        ]
+    )
+    worker = AnalysisWorker(controller, "ch11", sample_rate=20_000)
+    worker.configure_threshold(enabled=True, value=0.5, auto_detect=True)
+
+    sr = 20_000
+    dt = 1.0 / sr
+    data = np.zeros((2, 500), dtype=np.float32)
+    data[1, 250] = -10.0
+    chunk = Chunk(
+        samples=data,
+        start_time=0.0,
+        dt=dt,
+        seq=0,
+        channel_names=("ch0", "ch11"),
+        units="V",
+        meta={"start_sample": 0},
+    )
+
+    worker._forward_chunk(chunk)
+    events = controller.event_buffer.drain()
+    assert len(events) == 1
+    assert events[0].channelId == 11
+
+
+def test_worker_auto_detection_preserves_threshold_polarity() -> None:
+    controller = _DummyController()
+    worker = AnalysisWorker(controller, "ch0", sample_rate=20_000)
+    worker._channel_index = 0
+    worker.configure_threshold(enabled=True, value=0.5, auto_detect=True)
+
+    sr = 20_000
+    dt = 1.0 / sr
+    data = np.zeros((1, 600), dtype=np.float32)
+    data[0, 150] = -10.0
+    data[0, 350] = 10.0
+    chunk = Chunk(
+        samples=data,
+        start_time=0.0,
+        dt=dt,
+        seq=0,
+        channel_names=("ch0",),
+        units="V",
+        meta={"start_sample": 0},
+    )
+
+    worker._detect_events(chunk)
+    events = controller.event_buffer.drain()
+
+    assert len(events) == 2
+    by_index = {event.crossingIndex: event for event in events}
+    assert by_index[150].thresholdValue < 0.0
+    assert by_index[350].thresholdValue > 0.0
+
+
+def test_worker_allows_second_event_after_previous_window_end() -> None:
+    controller = _DummyController()
+    worker = AnalysisWorker(controller, "ch0", sample_rate=20_000)
+    worker._channel_index = 0
+    worker.configure_threshold(True, 0.25)
+    with worker._state_lock:
+        worker._event_window_ms = 10.0
+
+    sr = 20_000
+    dt = 1.0 / sr
+    data = np.zeros((1, 600), dtype=np.float32)
+    data[0, 200] = 0.5
+    data[0, 350] = 0.55
+    chunk = Chunk(
+        samples=data,
+        start_time=0.0,
+        dt=dt,
+        seq=0,
+        channel_names=("ch0",),
+        units="V",
+        meta={"start_sample": 0},
+    )
+
+    worker._detect_events(chunk)
+    events = controller.event_buffer.drain()
+    assert [ev.crossingIndex for ev in events] == [200, 350]
+
+
+def test_worker_manual_plateau_emits_single_event() -> None:
+    controller = _DummyController()
+    worker = AnalysisWorker(controller, "ch0", sample_rate=1_000)
+    worker._channel_index = 0
+    worker.configure_threshold(True, 0.5)
+    with worker._state_lock:
+        worker._event_window_ms = 10.0
+
+    data = np.zeros((1, 300), dtype=np.float32)
+    data[0, 100:150] = 1.0
+    chunk = Chunk(
+        samples=data,
+        start_time=0.0,
+        dt=0.001,
+        seq=0,
+        channel_names=("ch0",),
+        units="V",
+        meta={"start_sample": 0},
+    )
+
+    worker._detect_events(chunk)
+    events = controller.event_buffer.drain()
+
+    assert len(events) == 1
+    assert events[0].crossingIndex == 100
+
+
+def test_worker_manual_plateau_across_chunks_does_not_duplicate() -> None:
+    controller = _DummyController()
+    worker = AnalysisWorker(controller, "ch0", sample_rate=1_000)
+    worker._channel_index = 0
+    worker.configure_threshold(True, 0.5)
+    with worker._state_lock:
+        worker._event_window_ms = 10.0
+
+    first = np.zeros((1, 120), dtype=np.float32)
+    first[0, 95:] = 1.0
+    second = np.zeros((1, 120), dtype=np.float32)
+    second[0, :25] = 1.0
+
+    worker._detect_events(
+        Chunk(
+            samples=first,
+            start_time=0.0,
+            dt=0.001,
+            seq=0,
+            channel_names=("ch0",),
+            units="V",
+            meta={"start_sample": 0},
+        )
+    )
+    worker._detect_events(
+        Chunk(
+            samples=second,
+            start_time=0.120,
+            dt=0.001,
+            seq=1,
+            channel_names=("ch0",),
+            units="V",
+            meta={"start_sample": 120},
+        )
+    )
+    events = controller.event_buffer.drain()
+
+    assert len(events) == 1
+    assert events[0].crossingIndex == 95
+
+
 def test_peak_frequency_sinc_detects_clean_tone() -> None:
     sr = 20_000
     duration = 0.01
@@ -253,3 +493,22 @@ def test_worker_updates_auto_detector_window_on_settings_change() -> None:
     # Verify update propagated
     assert worker._event_window_ms == 20.0
     assert worker._auto_detector._window_ms == 20.0
+
+
+def test_worker_update_sample_rate_resets_auto_detector_state() -> None:
+    controller = _DummyController()
+    worker = AnalysisWorker(controller, "ch0", sample_rate=20_000)
+    worker.configure_threshold(enabled=True, value=0.5, auto_detect=True)
+
+    assert worker._auto_detector is not None
+    worker._last_crossing_time_sec = 1.23
+    worker._last_window_end_sample = 456
+    worker._auto_detector._residue = np.ones((1, 4), dtype=np.float32)
+
+    worker.update_sample_rate(10_000.0)
+
+    assert worker.sample_rate == pytest.approx(10_000.0)
+    assert worker._auto_detector._sample_rate == pytest.approx(10_000.0)
+    assert worker._auto_detector._residue is None
+    assert worker._last_crossing_time_sec is None
+    assert worker._last_window_end_sample == -10**12

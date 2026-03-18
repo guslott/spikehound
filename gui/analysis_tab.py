@@ -17,7 +17,7 @@ from PySide6 import QtCore, QtWidgets, QtGui
 logger = logging.getLogger(__name__)
 
 
-from analysis.models import AnalysisBatch
+from analysis.batch import AnalysisBatch
 from shared.models import Chunk, EndOfStream
 from shared.event_buffer import AnalysisEvents
 from shared.types import AnalysisEvent
@@ -1793,10 +1793,14 @@ class AnalysisTab(QtWidgets.QWidget):
         pre_n = max(1, int(0.2 * window.size))
         baseline = float(np.median(window[:pre_n]))
         normalized = window.astype(np.float32, copy=False) - baseline
-        # Align all traces so the trigger sample crosses zero
-        center_idx = normalized.size // 2
-        if 0 <= center_idx < normalized.size:
-            normalized = normalized - float(normalized[center_idx])
+        # Align all traces so the actual trigger-crossing sample crosses zero.
+        sr = float(getattr(event, "sampleRateHz", 0.0) or 0.0)
+        crossing_offset = normalized.size // 2
+        if sr > 0:
+            crossing_offset = int(round(float(getattr(event, "preMs", 0.0)) * sr / 1000.0))
+        if normalized.size:
+            crossing_offset = int(np.clip(crossing_offset, 0, normalized.size - 1))
+            normalized = normalized - float(normalized[crossing_offset])
         self._sta_windows.append(normalized)
         self._sta_dirty = True
         return "added"

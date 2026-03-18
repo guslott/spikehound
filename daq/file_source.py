@@ -357,7 +357,7 @@ class FileSource(BaseDevice):
             self._current_frame += frames_read
             
             # Emit through base class
-            self.emit_array(data, mono_time=time.monotonic())
+            self.emit_array(data)
             
             # Pace to real-time
             next_deadline += chunk_duration

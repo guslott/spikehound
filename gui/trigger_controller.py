@@ -152,9 +152,12 @@ class TriggerController(QtCore.QObject):
         self._threshold = threshold
         self._pre_seconds = pre_seconds
         self._window_sec = window_sec
-        
+
+        sample_rate = self._last_sample_rate
         if reset_state:
             self.reset_state(clear_display=not preserve_display_on_reset)
+        if sample_rate > 0:
+            self.update_sample_rate(sample_rate)
         
         config = TriggerConfig(
             channel_index=channel_id,
@@ -198,7 +201,6 @@ class TriggerController(QtCore.QObject):
         self._history_length = 0
         self._history_total = 0
         self._max_chunk = 0
-        self._last_sample_rate = 0.0
         self._prev_value = 0.0
         self._capture_start_abs = None
         self._capture_end_abs = None
@@ -236,19 +238,30 @@ class TriggerController(QtCore.QObject):
         """
         if chunk_samples.size == 0:
             return
-            
-        # Recalculate timing if sample rate changed
-        if sample_rate != self._last_sample_rate:
+
+        sample_rate_changed = abs(sample_rate - self._last_sample_rate) > 1e-6
+        desired_pre_samples = max(int(self._pre_seconds * sample_rate), 0)
+        desired_window_samples = max(int(self._window_sec * sample_rate), 1)
+        timing_changed = (
+            desired_pre_samples != self._pre_samples
+            or desired_window_samples != self._window_samples
+        )
+
+        # Refresh timing whenever the configured pretrigger/window changes, not
+        # only when the device sample rate changes.
+        if sample_rate_changed or timing_changed:
             self._last_sample_rate = sample_rate
-            self._pre_samples = max(int(self._pre_seconds * sample_rate), 0)
-            self._window_samples = max(int(window_sec * sample_rate), 1)
-            
-            # Clear history on sample rate change
-            self._history.clear()
-            self._history_length = 0
-            self._history_total = 0
-            self._max_chunk = 0
-        
+            self._pre_samples = desired_pre_samples
+            self._window_samples = desired_window_samples
+
+            if sample_rate_changed:
+                # History stored at the previous sample cadence is not
+                # compatible with the new rate.
+                self._history.clear()
+                self._history_length = 0
+                self._history_total = 0
+                self._max_chunk = 0
+
         self._history.append(chunk_samples)
         self._history_length += chunk_samples.shape[0]
         self._history_total += chunk_samples.shape[0]

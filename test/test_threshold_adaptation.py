@@ -9,7 +9,7 @@ was permanently set 10× too high for the rest of the session.
 
 The fix: replace the one-shot ``if _noise_levels is None`` guard with an
 Exponential Weighted Moving Average (EWMA) update on every chunk.  The time
-constant (alpha=0.1) matches RealTimeAnalyzer._maybe_update_auto_thresholds().
+constant (alpha=0.1) matches the production detector adaptation rate.
 
 These tests verify:
 

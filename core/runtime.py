@@ -167,8 +167,20 @@ class SpikeHoundRuntime:
             chunk_size=chunk_size,
             **driver_kwargs,
         )
-        channels = self.device_manager.get_available_channels()
-        self._attach_source(driver, sample_rate, channels)
+        driver_config = getattr(driver, "config", None)
+        effective_sample_rate = float(sample_rate)
+        if driver_config is not None:
+            try:
+                configured_rate = float(getattr(driver_config, "sample_rate", 0.0))
+            except (TypeError, ValueError):
+                configured_rate = 0.0
+            if configured_rate > 0:
+                effective_sample_rate = configured_rate
+
+        channels = list(getattr(driver_config, "channels", []) or [])
+        if not channels:
+            channels = self.device_manager.get_available_channels()
+        self._attach_source(driver, effective_sample_rate, channels)
         # Emit deviceConnected AFTER dispatcher is created so GUI can bind to it
         self._device_registry.emit_device_connected(device_key)
 
@@ -227,6 +239,7 @@ class SpikeHoundRuntime:
             return
         self._acquisition_start_time = None  # Reset uptime
         controller.stop(join=True)
+
     def _attach_source(self, driver: BaseDevice, sample_rate: float, channels) -> None:
         """Attach a connected driver to the pipeline controller."""
         controller = self._pipeline
@@ -237,6 +250,9 @@ class SpikeHoundRuntime:
         self.visualization_queue = getattr(controller, "visualization_queue", None)
         self.audio_queue = getattr(controller, "audio_queue", None)
         self.logging_queue = getattr(controller, "logging_queue", None)
+        sample_rate_value = getattr(controller, "sample_rate", None)
+        if sample_rate_value is not None:
+            self.sample_rate = float(sample_rate_value)
 
     def health_snapshot(self) -> dict[str, object]:
         """Return current queue depths, rates, source stats, and dispatcher health."""

@@ -392,7 +392,6 @@ class PlotManager(QtCore.QObject):
             
         tc = self._trigger_controller
         if sample_rate > 0 and abs(sample_rate - tc.sample_rate) > 1e-6:
-            tc._window_sec = window_sec
             tc.update_sample_rate(sample_rate)
 
         chunk_samples = data.T  # shape (samples, channels)

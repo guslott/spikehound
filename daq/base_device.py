@@ -96,6 +96,7 @@ class BaseDevice(ABC):
         # Run-level counters (reset at each start)
         self._next_seq: int = 0
         self._next_start_sample: int = 0
+        self._run_start_mono: Optional[float] = None
 
         # Diagnostics
         self._xruns: int = 0
@@ -162,6 +163,7 @@ class BaseDevice(ABC):
             self._active_channel_ids = []
             self.config = None
             self.ring_buffer = None
+            self._run_start_mono = None
             self._state = "closed"
             self._xruns = 0
             self._drops = 0
@@ -347,7 +349,9 @@ class BaseDevice(ABC):
         Args:
             data: np.ndarray of shape (frames, channels).
             device_time: Optional hardware timestamp (seconds)
-            mono_time: Optional host monotonic time (recommended if available)
+            mono_time: Optional host monotonic time for the FIRST sample in
+                this chunk. If omitted, the timestamp is derived from the run
+                origin plus ``start_sample / sample_rate``.
         """
         if self.config is None:
             raise RuntimeError("emit_array() called before configure().")
@@ -360,9 +364,6 @@ class BaseDevice(ABC):
             # Conservative: convert but avoid copy if possible
             data = np.asarray(data, dtype=desired_dtype)
 
-        # Stamp times/counters
-        mono = _time.monotonic() if mono_time is None else mono_time
-        
         with self._state_lock:
             # Validate shape within the lock to ensure synchronization with
             # active_channel_ids and ring_buffer updates from configure().
@@ -391,6 +392,14 @@ class BaseDevice(ABC):
             start_sample = self._next_start_sample
             self._next_start_sample += frames
             self._next_seq += 1
+            if mono_time is None:
+                sample_rate = float(self.config.sample_rate)
+                if self._run_start_mono is not None and sample_rate > 0:
+                    mono = self._run_start_mono + (start_sample / sample_rate)
+                else:
+                    mono = _time.monotonic()
+            else:
+                mono = mono_time
 
             # Write channel-major data into the ring buffer
             rb = self.ring_buffer
@@ -523,6 +532,7 @@ class BaseDevice(ABC):
         with self._state_lock:
             self._next_seq = 0
             self._next_start_sample = 0
+            self._run_start_mono = _time.monotonic()
             self._xruns = 0
             self._drops = 0
             try:

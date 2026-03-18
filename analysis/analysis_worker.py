@@ -14,7 +14,7 @@ from shared.models import Chunk, DetectionEvent, EndOfStream
 from shared.event_buffer import EventRingBuffer
 from shared.types import AnalysisEvent
 
-from .models import AnalysisBatch
+from .batch import AnalysisBatch
 from .settings import AnalysisSettings, AnalysisSettingsStore
 from .metrics import envelope, peak_frequency_sinc, event_width, min_to_max_width
 from core.detection import AmpThresholdDetector, DETECTOR_REGISTRY
@@ -93,12 +93,19 @@ def detection_to_analysis_event(
         pre_samples = wf.size // 2
     else:
         pre_samples = int(pre_samples)
+
+    event_channel_id = de.chan
+    if chunk.meta:
+        try:
+            event_channel_id = int(chunk.meta.get("source_channel_id", de.chan))
+        except (TypeError, ValueError):
+            event_channel_id = de.chan
     
     first_time_sec = de.t - (pre_samples * dt)
     
     event = AnalysisEvent(
         id=event_id,
-        channelId=de.chan,
+        channelId=event_channel_id,
         thresholdValue=de.params.get("threshold", 0.0),
         crossingIndex=abs_idx,
         crossingTimeSec=de.t,
@@ -128,13 +135,17 @@ def detection_to_analysis_event(
         props["min_to_max_width_ms"] = min_to_max_width(wf, sr)
     
     # Calculate event end sample
-    event_end = abs_idx + wf.size
+    event_start = max(abs_idx - pre_samples, 0)
+    event_end = event_start + wf.size
     
     return event, event_end, crossing_time
 
 
 class AnalysisWorker(threading.Thread):
     """Background worker that receives filtered chunks and forwards them to an output queue."""
+
+    _event_id_lock = threading.Lock()
+    _global_event_id = 0
 
     def __init__(self, controller, channel_name: str, sample_rate: float, *, queue_size: int = 512) -> None:
         super().__init__(name=f"AnalysisWorker-{channel_name}", daemon=True)
@@ -159,7 +170,7 @@ class AnalysisWorker(threading.Thread):
         self._secondary_threshold_value = 0.0
         self._last_window_end_sample = -10**12
         self._last_crossing_time_sec: Optional[float] = None
-        self._event_id = 0
+        self._manual_prev_sample: Optional[float] = None
         self._channel_id: Optional[int] = None
         self._auto_detect_enabled = False
         self._auto_detector: Optional[AmpThresholdDetector] = None
@@ -205,8 +216,13 @@ class AnalysisWorker(threading.Thread):
         except (IndexError, TypeError):
             source_name = self.channel_name
         self._ensure_channel_id(source_name)
+        try:
+            source_channel_id = int(self._channel_id) if self._channel_id is not None else int(idx)
+        except (TypeError, ValueError):
+            source_channel_id = int(idx)
         channel_names = (source_name,)
         meta = dict(chunk.meta or {})
+        meta["source_channel_id"] = source_channel_id
         meta.setdefault("source_channel_index", idx)
         meta.setdefault("source_channel_name", source_name)
         start_sample = meta.get("start_sample")
@@ -299,18 +315,20 @@ class AnalysisWorker(threading.Thread):
             self._event_buffer.push(event)
 
     def _ensure_channel_id(self, channel_name: str) -> None:
-        if self._channel_id is not None or self._controller is None:
+        if self._controller is None:
             return
         try:
             infos = self._controller.active_channels()
         except Exception as e:
             logger.debug("Failed to get active channels: %s", e)
             return
+        resolved_channel_id = None
         for info in infos or []:
             name = getattr(info, "name", None)
             if name == channel_name:
-                self._channel_id = getattr(info, "id", None)
+                resolved_channel_id = getattr(info, "id", None)
                 break
+        self._channel_id = resolved_channel_id
 
     def _collect_waveform_samples(self, start_index: int, count: int) -> np.ndarray:
         if self._controller is None or self._channel_id is None or count <= 0 or start_index < 0:
@@ -366,6 +384,9 @@ class AnalysisWorker(threading.Thread):
             self._secondary_threshold_enabled = secondary_flag
             self._secondary_threshold_value = secondary_numeric
             self._auto_detect_enabled = bool(auto_detect)
+            # Threshold reconfiguration invalidates the chunk-boundary state
+            # used by manual crossing detection.
+            self._manual_prev_sample = None
             if self._auto_detect_enabled and self._auto_detector is None:
                 # Use registry to instantiate detector
                 det_cls = DETECTOR_REGISTRY["amp_threshold"]
@@ -385,11 +406,17 @@ class AnalysisWorker(threading.Thread):
         sample_rate = float(sample_rate)
         if sample_rate <= 0:
             return
+        detector: Optional[AmpThresholdDetector] = None
         with self._state_lock:
             if abs(sample_rate - self.sample_rate) < 1e-3:
                 return
             self.sample_rate = sample_rate
             self._last_window_end_sample = -10**12
+            self._last_crossing_time_sec = None
+            self._manual_prev_sample = None
+            detector = self._auto_detector
+        if detector is not None:
+            detector.reset(sample_rate, 1)
 
     def _update_noise_level(self, chunk: Chunk) -> None:
         # Run the O(n log n) MAD estimate only every _noise_update_interval chunks.
@@ -422,8 +449,9 @@ class AnalysisWorker(threading.Thread):
     # ------------------------------------------------------------------
 
     def _next_event_id(self) -> int:
-        self._event_id += 1
-        return self._event_id
+        with self._event_id_lock:
+            type(self)._global_event_id += 1
+            return type(self)._global_event_id
 
     def _detect_events(self, chunk: Chunk) -> list[AnalysisEvent]:
         self._update_noise_level(chunk)
@@ -436,6 +464,7 @@ class AnalysisWorker(threading.Thread):
             secondary_value = float(self._secondary_threshold_value)
             last_window_end = self._last_window_end_sample
             last_crossing_time = self._last_crossing_time_sec
+            manual_prev_sample = self._manual_prev_sample
             auto_detect = self._auto_detect_enabled
             detector = self._auto_detector
         
@@ -500,15 +529,14 @@ class AnalysisWorker(threading.Thread):
         pre_samples = window_samples // 3
         post_samples = window_samples - pre_samples
 
-        if threshold_value > 0:
-            idxs = np.flatnonzero(sig >= threshold_value)
-        else:
-            idxs = np.flatnonzero(sig <= threshold_value)
+        idxs = self._manual_crossing_indices(sig, threshold_value, manual_prev_sample)
+        with self._state_lock:
+            self._manual_prev_sample = float(sig[-1])
         if idxs.size == 0:
             return []
 
         start_sample = -1
-        channel_id = self._channel_index
+        channel_id = self._channel_id
         meta = chunk.meta
         if meta is not None and hasattr(meta, "get"):
             try:
@@ -517,9 +545,16 @@ class AnalysisWorker(threading.Thread):
                 start_sample = -1
             if channel_id is None:
                 try:
+                    channel_id = int(meta.get("source_channel_id"))
+                except (TypeError, ValueError):
+                    channel_id = None
+            if channel_id is None:
+                try:
                     channel_id = int(meta.get("source_channel_index"))
                 except (TypeError, ValueError):
                     channel_id = None
+        if channel_id is None:
+            channel_id = self._channel_index
 
         use_secondary = threshold_enabled and secondary_enabled
 
@@ -615,3 +650,25 @@ class AnalysisWorker(threading.Thread):
         if threshold >= 0:
             return bool(np.max(waveform) >= threshold)
         return bool(np.min(waveform) <= threshold)
+
+    @staticmethod
+    def _manual_crossing_indices(
+        signal: np.ndarray,
+        threshold: float,
+        prev_sample: float | None,
+    ) -> np.ndarray:
+        if signal.size == 0:
+            return np.empty(0, dtype=np.int64)
+
+        if threshold >= 0:
+            tail = np.flatnonzero((signal[:-1] < threshold) & (signal[1:] >= threshold)) + 1
+            first_crosses = signal[0] >= threshold if prev_sample is None else (prev_sample < threshold and signal[0] >= threshold)
+        else:
+            tail = np.flatnonzero((signal[:-1] > threshold) & (signal[1:] <= threshold)) + 1
+            first_crosses = signal[0] <= threshold if prev_sample is None else (prev_sample > threshold and signal[0] <= threshold)
+
+        if not first_crosses:
+            return tail.astype(np.int64, copy=False)
+        if tail.size == 0:
+            return np.array([0], dtype=np.int64)
+        return np.concatenate((np.array([0], dtype=np.int64), tail.astype(np.int64, copy=False)))

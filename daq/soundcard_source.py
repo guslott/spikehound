@@ -349,14 +349,12 @@ class SoundCardSource(BaseDevice):
 
             # Phase 2: emit outside the lock so the callback is never blocked.
             if chunks_to_emit:
-                mono_now = _time.monotonic()
-
                 # Low-latency monitor bridge is called from inside emit_array()
                 # (BaseDevice) so that the same on_chunk() path works for every
                 # source including SimulatedPhysiologySource.  No explicit call
                 # needed here.
                 for chunk in chunks_to_emit:
-                    self.emit_array(chunk, mono_time=mono_now)
+                    self.emit_array(chunk)
 
     def _start_impl(self) -> None:
         if self._device is not None:

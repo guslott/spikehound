@@ -65,11 +65,11 @@ analysis_queue (filtered Chunk objects)
 ┌─────────────────────────────────────┐
 │         Analysis Layer              │
 │                                     │
-│  RealTimeAnalyzer                   │
-│  (optional, standalone detector)    │
-│                                     │
 │  AnalysisWorker                     │
-│  (per-channel, GUI-triggered)       │
+│  (supported per-channel worker)     │
+│         ↓                           │
+│  AmpThresholdDetector               │
+│  (manual / auto thresholding)       │
 │         ↓                           │
 │  Event detection + metrics          │
 │         ↓                           │
@@ -81,9 +81,9 @@ analysis_queue (filtered Chunk objects)
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
-| `RealTimeAnalyzer` | `realtime_analyzer.py` | Standalone threshold detector, auto-threshold |
-| `AnalysisWorker` | `analysis_worker.py` | Per-channel analysis worker for GUI |
-| `ThresholdConfig` | `models.py` | Detection parameters |
+| `AnalysisWorker` | `analysis_worker.py` | Supported per-channel analysis worker for GUI |
+| `AmpThresholdDetector` | `../core/detection/threshold.py` | Supported threshold detector used by `AnalysisWorker` |
+| `AnalysisBatch` | `batch.py` | Worker-to-GUI payload carrying a chunk and its detected events |
 | `AnalysisSettings` | `settings.py` | Thread-safe settings with observers |
 | `metrics.py` | `metrics.py` | Centralized metric functions |
 
@@ -91,19 +91,15 @@ analysis_queue (filtered Chunk objects)
 
 ## Data Types
 
-### ThresholdConfig (analysis/models.py)
+### AnalysisBatch (analysis/batch.py)
 
-Detection parameters for threshold crossing:
+Worker output passed to the GUI:
 
 ```python
-@dataclass
-class ThresholdConfig:
-    per_channel_thresholds: Optional[np.ndarray] = None  # If None, auto-detect
-    polarity: str = "neg"           # "neg", "pos", or "both"
-    auto_k_sigma: float = 4.5       # k * sigma when auto-thresholding
-    refractory_s: float = 0.003     # Suppress detections within this window
-    window_pre_s: float = 0.002     # Samples before crossing to capture
-    window_post_s: float = 0.004    # Samples after crossing to capture
+@dataclass(frozen=True)
+class AnalysisBatch:
+    chunk: Chunk
+    events: Sequence[AnalysisEvent]
 ```
 
 ### AnalysisEvent (shared/types.py)
@@ -135,7 +131,7 @@ Runtime-configurable parameters:
 ```python
 @dataclass(frozen=True)
 class AnalysisSettings:
-    event_window_ms: float = 5.0  # Default event window width
+    event_window_ms: float = 10.0  # Default event window width
 ```
 
 ---
@@ -256,7 +252,7 @@ def detect_threshold_crossings(
 ### Auto-Thresholding (MAD-based)
 
 ```python
-def compute_auto_threshold(samples: np.ndarray, k_sigma: float = 4.5) -> float:
+def compute_auto_threshold(samples: np.ndarray, k_sigma: float = 5.0) -> float:
     """Compute threshold from noise estimate using Median Absolute Deviation.
     
     MAD is robust to outliers (spikes) unlike standard deviation.
@@ -274,58 +270,6 @@ def compute_auto_threshold(samples: np.ndarray, k_sigma: float = 4.5) -> float:
     sigma = 1.4826 * mad
     return k_sigma * sigma
 ```
-
----
-
-## RealTimeAnalyzer Usage
-
-For standalone analysis without GUI:
-
-```python
-from analysis.realtime_analyzer import RealTimeAnalyzer
-from analysis.models import ThresholdConfig
-import queue
-
-# Create queues
-analysis_queue = queue.Queue()
-event_queue = queue.Queue()
-logging_queue = queue.Queue()
-
-# Configure
-config = ThresholdConfig(
-    polarity="neg",
-    auto_k_sigma=4.5,
-    refractory_s=0.003,
-    window_pre_s=0.002,
-    window_post_s=0.004,
-)
-
-# Create analyzer
-analyzer = RealTimeAnalyzer(
-    analysis_queue=analysis_queue,
-    event_queue=event_queue,
-    logging_queue=logging_queue,
-    sample_rate=10000.0,
-    n_channels=1,
-    config=config,
-)
-
-# Start
-analyzer.start()
-
-# Feed chunks (from dispatcher or manually)
-analysis_queue.put(chunk)
-
-# Collect events
-while not event_queue.empty():
-    event = event_queue.get_nowait()
-    print(f"Event at {event.crossingTimeSec:.3f}s")
-
-# Stop
-analyzer.stop()
-```
-
----
 
 ## AnalysisSettingsStore Pattern
 
@@ -359,12 +303,11 @@ unsubscribe()
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `analysis_worker.py` | 601 | Per-channel analysis worker for GUI integration |
-| `realtime_analyzer.py` | 270 | Standalone threshold detector |
+| `analysis_worker.py` | 674 | Per-channel analysis worker for GUI integration |
+| `batch.py` | 18 | Worker-to-GUI batch payload |
 | `metrics.py` | 168 | Centralized metric functions |
 | `settings.py` | 63 | Thread-safe settings store |
-| `models.py` | 34 | ThresholdConfig, AnalysisBatch dataclasses |
-| `__init__.py` | 5 | Package exports |
+| `__init__.py` | 4 | Package exports |
 
 ---
 
@@ -394,9 +337,9 @@ unsubscribe()
 
 ## FAQ
 
-**Q: What's the difference between RealTimeAnalyzer and AnalysisWorker?**
+**Q: What is the supported event-detection path?**
 
-`RealTimeAnalyzer` is a standalone detector that can run independently. `AnalysisWorker` is tightly integrated with the GUI and `PipelineController`, receiving registered analysis queues and publishing events for display.
+The supported path is `AnalysisWorker` with `AmpThresholdDetector`, wired through the GUI and `PipelineController`.
 
 **Q: How do I add a new detection algorithm?**
 
@@ -408,4 +351,4 @@ Pure functions are easier to test, don't require state management, and can be co
 
 **Q: How do I tune auto-threshold sensitivity?**
 
-Adjust `auto_k_sigma` in `ThresholdConfig`. Higher values = less sensitive (fewer false positives, may miss small spikes). Typical range: 3.0 (sensitive) to 6.0 (conservative).
+In the supported path, tune the detector factor configured through `AnalysisWorker.configure_threshold()`; the canonical default is `5.0` sigma.

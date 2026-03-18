@@ -2,10 +2,12 @@ import queue
 import time
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from core import FilterSettings, PipelineController
 from daq.simulated_source import SimulatedPhysiologySource
 from shared.models import TriggerConfig
+from shared.types import AnalysisEvent
 
 
 def _drain(queue_obj):
@@ -187,3 +189,74 @@ def test_shutdown_aggregates_teardown_failures_and_clears_state():
     assert controller._device_id is None
     assert controller._configure_kwargs == {}
     assert controller.running is False
+
+
+def test_collect_trigger_window_preserves_detected_geometry() -> None:
+    controller = PipelineController(filter_settings=FilterSettings())
+    calls: list[tuple[int, int, int, bool]] = []
+
+    class _WindowDispatcher:
+        def collect_window(self, start_index, window_samples, channel_id, *, return_info=False):
+            calls.append((int(start_index), int(window_samples), int(channel_id), bool(return_info)))
+            data = np.arange(window_samples, dtype=np.float32)
+            if return_info:
+                return data, 0, 0
+            return data
+
+    controller._dispatcher = _WindowDispatcher()
+    event = AnalysisEvent(
+        id=1,
+        channelId=0,
+        thresholdValue=0.5,
+        crossingIndex=500,
+        crossingTimeSec=0.5,
+        firstSampleTimeSec=0.497,
+        sampleRateHz=1_000.0,
+        windowMs=10.0,
+        preMs=3.0,
+        postMs=7.0,
+        samples=np.zeros(10, dtype=np.float32),
+    )
+
+    data, miss_pre, miss_post = controller.collect_trigger_window(
+        event,
+        target_channel_id=7,
+        window_ms=50.0,
+    )
+
+    assert calls == [(497, 10, 7, True)]
+    assert data.shape == (10,)
+    assert miss_pre == 0
+    assert miss_post == 0
+
+
+def test_collect_trigger_window_does_not_force_odd_length() -> None:
+    controller = PipelineController(filter_settings=FilterSettings())
+    calls: list[tuple[int, int, int, bool]] = []
+
+    class _WindowDispatcher:
+        def collect_window(self, start_index, window_samples, channel_id, *, return_info=False):
+            calls.append((int(start_index), int(window_samples), int(channel_id), bool(return_info)))
+            data = np.zeros(window_samples, dtype=np.float32)
+            if return_info:
+                return data, 0, 0
+            return data
+
+    controller._dispatcher = _WindowDispatcher()
+    event = AnalysisEvent(
+        id=2,
+        channelId=0,
+        thresholdValue=0.5,
+        crossingIndex=10_000,
+        crossingTimeSec=0.5,
+        firstSampleTimeSec=0.4967,
+        sampleRateHz=20_000.0,
+        windowMs=10.0,
+        preMs=3.35,
+        postMs=6.65,
+        samples=np.zeros(200, dtype=np.float32),
+    )
+
+    controller.collect_trigger_window(event, target_channel_id=3, window_ms=10.0)
+
+    assert calls == [(9933, 200, 3, True)]

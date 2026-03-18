@@ -69,6 +69,21 @@ class TestEmitArrayShapes:
         np.testing.assert_array_almost_equal(buffer1, expected)
         assert buffer1.shape == (channels, 3)
 
+    def test_implicit_render_time_tracks_first_sample_origin(self, configured_device):
+        """emit_array should derive chunk time from run origin and start_sample."""
+        device = configured_device
+        frames, channels = 8, 2
+        data = np.ones((frames, channels), dtype=np.float32)
+        device._reset_counters()
+        device._run_start_mono = 10.0
+
+        pointer_a = device.emit_array(data)
+        pointer_b = device.emit_array(data)
+
+        dt = frames / device.config.sample_rate
+        assert pointer_a.render_time == pytest.approx(10.0)
+        assert pointer_b.render_time == pytest.approx(10.0 + dt)
+
     def test_mismatched_dimensions_error(self, configured_device):
         """emit_array should raise on completely mismatched dimensions."""
         device = configured_device

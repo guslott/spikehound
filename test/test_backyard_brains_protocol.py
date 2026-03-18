@@ -500,6 +500,7 @@ def test_emit_active_holds_locks_through_emit(monkeypatch):
     def _capture_emit(data, *, mono_time=None, device_time=None):
         observed["shape"] = data.shape
         observed["state_locked"] = src._state_lock._is_owned()
+        observed["mono_time"] = mono_time
 
     monkeypatch.setattr(src, "emit_array", _capture_emit)
 
@@ -507,6 +508,7 @@ def test_emit_active_holds_locks_through_emit(monkeypatch):
 
     assert observed["shape"] == (32, 1)
     assert observed["state_locked"] is True
+    assert observed["mono_time"] is None
 
 
 def test_spikershield_channel_config_uses_c_command_and_validates_rate(monkeypatch):

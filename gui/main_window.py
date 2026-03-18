@@ -434,7 +434,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._controller.update_trigger_config(config)
             except Exception as exc:
                 self._logger.warning("Failed to update trigger config: %s", exc)
-        
+
+        if self._trigger_controller.sample_rate > 0:
+            self._update_trigger_sample_parameters(self._trigger_controller.sample_rate)
+
         self._update_trigger_visuals(config)
 
     def _on_scope_threshold_changed(self, value: float) -> None:
@@ -745,7 +748,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             if numeric > 0:
                 normalized_rates.append(numeric)
-        if target_rate > 0:
+
+        preserve_target = target_rate > 0 and self._device_connected
+        if target_rate > 0 and not preserve_target:
+            preserve_target = not normalized_rates or any(
+                abs(rate - float(target_rate)) < 1e-9 for rate in normalized_rates
+            )
+
+        if preserve_target:
             normalized_rates.append(float(target_rate))
         rates = sorted({rate for rate in normalized_rates if rate > 0})
         
@@ -1469,7 +1479,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_window_changed(self) -> None:
         value = float(self.trigger_control.window_combo.currentData() or 0.0)
         if self._window_combo_suppress:
-            self._apply_window_value(value)
             return
         self._window_combo_user_set = True
         self._apply_window_value(value)
@@ -1818,7 +1827,6 @@ class MainWindow(QtWidgets.QMainWindow):
             data = blocks[0] if len(blocks) == 1 else np.concatenate(blocks, axis=1)
             if sample_rate > 0:
                 times_arr = np.arange(data.shape[1], dtype=np.float32) / float(sample_rate)
-                window_sec = max(window_sec, float(data.shape[1]) / float(sample_rate))
             else:
                 times_arr = np.zeros(data.shape[1], dtype=np.float32)
             if not channel_ids:

@@ -754,7 +754,7 @@ class SimulatedPhysiologySource(BaseDevice):
                 
                 # Emit the chunk
                 try:
-                    self.emit_array(data_chunk, mono_time=time.monotonic())
+                    self.emit_array(data_chunk)
                 except RuntimeError as exc:
                     msg = str(exc)
                     if "No active channels configured" in msg:

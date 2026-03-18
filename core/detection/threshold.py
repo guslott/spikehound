@@ -13,7 +13,7 @@ class AmpThresholdDetector:
     display_name = "Amplitude Threshold (Auto)"
 
     # Per-chunk weight for the noise EWMA.  alpha=0.1 gives a ~10-chunk time
-    # constant, matching RealTimeAnalyzer._maybe_update_auto_thresholds().
+    # constant for the running noise estimate used by the canonical detector.
     # At a typical 100 ms/chunk delivery rate that is ~1 s of adaptation,
     # which is fast enough to recover from an electrode-insertion transient
     # yet slow enough not to be thrown by a single large spike.
@@ -171,15 +171,13 @@ class AmpThresholdDetector:
         for ch in range(self._n_channels):
             ch_data = full_samples[ch]
             thresh = thresholds[ch]
-            
-            if self._sign == 0:
-                candidates = np.where(np.abs(ch_data) > thresh)[0]
-            elif self._sign < 0:
-                candidates = np.where(ch_data < -thresh)[0]
-            else:
-                candidates = np.where(ch_data > thresh)[0]
+            candidates = self._crossing_indices(
+                ch_data,
+                float(thresh),
+                allow_first_cross=residue_len == 0,
+            )
                 
-            if len(candidates) == 0:
+            if candidates.size == 0:
                 continue
                 
             last_t = self._last_event_time[ch]
@@ -203,20 +201,23 @@ class AmpThresholdDetector:
                     continue
                 
                 # Refine peak
-                # Search in a small window around the crossing
+                # Narrow spikes benefit from peak refinement. Broad plateaus do not:
+                # once the signal stays above threshold for a long run, using a
+                # "best" sample inside the run makes the event time wander with
+                # noise. For those broad runs, keep the threshold-crossing index.
                 search_width = 20
-                s_start = idx
-                s_end = min(full_samples.shape[1], idx + search_width)
-                segment = ch_data[s_start:s_end]
-                
-                if self._sign == 0:
-                    peak_offset = np.argmax(np.abs(segment))
-                elif self._sign < 0:
-                    peak_offset = np.argmin(segment)
-                else:
-                    peak_offset = np.argmax(segment)
-                
-                real_idx = idx + peak_offset
+                run_end = self._suprathreshold_run_end(ch_data, int(idx), float(thresh))
+                run_len = max(run_end - int(idx), 1)
+                real_idx = int(idx)
+                if run_len <= search_width:
+                    segment = ch_data[int(idx):run_end]
+                    if self._sign == 0:
+                        peak_offset = int(np.argmax(np.abs(segment)))
+                    elif self._sign < 0:
+                        peak_offset = int(np.argmin(segment))
+                    else:
+                        peak_offset = int(np.argmax(segment))
+                    real_idx = int(idx) + peak_offset
                 
                 # Re-check bounds for refined peak
                 if real_idx < pre_samples or real_idx >= full_samples.shape[1] - post_samples:
@@ -232,6 +233,8 @@ class AmpThresholdDetector:
                 w_start = real_idx - pre_samples
                 w_end = real_idx + post_samples
                 waveform = ch_data[w_start:w_end]
+                crossing_value = float(ch_data[real_idx]) if 0 <= real_idx < ch_data.shape[0] else 0.0
+                threshold_value = -float(thresh) if crossing_value < 0.0 else float(thresh)
 
                 # Create event
                 event = DetectionEvent(
@@ -239,7 +242,7 @@ class AmpThresholdDetector:
                     chan=ch,
                     window=waveform,
                     properties={"amplitude": float(waveform[pre_samples] if pre_samples < len(waveform) else 0)},
-                    params={"threshold": float(thresh), "pre_samples": int(pre_samples)}
+                    params={"threshold": threshold_value, "pre_samples": int(pre_samples)}
                 )
                 events.append(event)
                 self._last_event_time[ch] = real_t
@@ -260,3 +263,44 @@ class AmpThresholdDetector:
     def finalize(self) -> Iterable[DetectionEvent]:
         return []
 
+    def _crossing_indices(
+        self,
+        signal: np.ndarray,
+        thresh: float,
+        *,
+        allow_first_cross: bool,
+    ) -> np.ndarray:
+        if signal.size == 0:
+            return np.empty(0, dtype=np.int64)
+
+        if self._sign == 0:
+            magnitude = np.abs(signal)
+            tail = np.flatnonzero((magnitude[:-1] < thresh) & (magnitude[1:] >= thresh)) + 1
+            first_crosses = allow_first_cross and magnitude[0] >= thresh
+        elif self._sign < 0:
+            level = -thresh
+            tail = np.flatnonzero((signal[:-1] > level) & (signal[1:] <= level)) + 1
+            first_crosses = allow_first_cross and signal[0] <= level
+        else:
+            tail = np.flatnonzero((signal[:-1] < thresh) & (signal[1:] >= thresh)) + 1
+            first_crosses = allow_first_cross and signal[0] >= thresh
+
+        if not first_crosses:
+            return tail.astype(np.int64, copy=False)
+        if tail.size == 0:
+            return np.array([0], dtype=np.int64)
+        return np.concatenate((np.array([0], dtype=np.int64), tail.astype(np.int64, copy=False)))
+
+    def _suprathreshold_run_end(self, signal: np.ndarray, start_idx: int, thresh: float) -> int:
+        end = max(int(start_idx), 0)
+        n = signal.shape[0]
+        while end < n and self._is_suprathreshold(signal[end], thresh):
+            end += 1
+        return end
+
+    def _is_suprathreshold(self, sample: float, thresh: float) -> bool:
+        if self._sign == 0:
+            return bool(abs(float(sample)) >= thresh)
+        if self._sign < 0:
+            return bool(float(sample) <= -thresh)
+        return bool(float(sample) >= thresh)

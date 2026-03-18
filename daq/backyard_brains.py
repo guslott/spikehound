@@ -1876,7 +1876,7 @@ class BackyardBrainsSource(BaseDevice):
                     continue
                 out[:, out_idx] = sample_buffer[:frames, src_idx]
 
-            self.emit_array(out, mono_time=time.monotonic())
+            self.emit_array(out)
 
     def stats(self) -> dict[str, Any]:
         stats = super().stats()

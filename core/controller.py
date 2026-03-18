@@ -383,9 +383,11 @@ class PipelineController:
 
             self._source = driver
             self._actual_config = getattr(driver, "config", None)
+            configured_channels = list(getattr(self._actual_config, "channels", []) or [])
+            channel_layout = configured_channels if configured_channels else list(channels)
             self._device_id = None
             self._configure_kwargs = {}
-            self._channel_infos = list(channels)
+            self._channel_infos = list(channel_layout)
             self._active_channel_ids = []
             self._streaming = False
 
@@ -398,7 +400,14 @@ class PipelineController:
                 filter_settings=self._filter_settings,
                 poll_timeout=self._dispatcher_timeout,
             )
-            effective_sr = float(sample_rate) if sample_rate is not None else 0.0
+            effective_sr = 0.0
+            if self._actual_config is not None:
+                try:
+                    effective_sr = float(getattr(self._actual_config, "sample_rate", 0.0))
+                except (TypeError, ValueError):
+                    effective_sr = 0.0
+            if effective_sr <= 0:
+                effective_sr = float(sample_rate) if sample_rate is not None else 0.0
             if effective_sr <= 0:
                 try:
                     cfg = getattr(driver, "config", None)
@@ -410,7 +419,7 @@ class PipelineController:
                 raise ValueError("Sample rate must be positive to attach source")
             if getattr(driver, "ring_buffer", None) is None:
                 try:
-                    channel_ids_cfg = [info.id for info in channels] if channels else None
+                    channel_ids_cfg = [info.id for info in channel_layout] if channel_layout else None
                     driver.configure(sample_rate=int(round(effective_sr)), channels=channel_ids_cfg)
                 except Exception as exc:
                     logger.error("Failed to configure driver before wiring dispatcher: %s", exc)
@@ -421,9 +430,9 @@ class PipelineController:
             except Exception as exc:
                 logger.error("Failed to link source buffer: %s", exc)
                 raise
-            channel_ids = [info.id for info in channels]
-            channel_names = [info.name for info in channels]
-            channel_units = [info.units for info in channels]
+            channel_ids = [info.id for info in channel_layout]
+            channel_names = [info.name for info in channel_layout]
+            channel_units = [info.units for info in channel_layout]
             self._dispatcher.set_channel_layout(channel_ids, channel_names, channel_units)
             self._dispatcher.set_window_duration(self._window_sec)
             self._dispatcher.clear_active_channels()
@@ -594,7 +603,13 @@ class PipelineController:
         target_channel_id: int,
         window_ms: float,
     ) -> tuple[np.ndarray, int, int]:
-        """Return samples centered on an event plus missing-prefix/suffix counts."""
+        """Return samples aligned to the original detected event window.
+
+        The preferred behavior is to preserve the exact first-sample offset and
+        sample count used when the event was detected. ``window_ms`` is kept for
+        API compatibility and is used only as a fallback when the event does not
+        carry enough geometry information.
+        """
         dispatcher = self._dispatcher
         if dispatcher is None:
             return np.empty(0, dtype=np.float32), 0, 0
@@ -607,14 +622,19 @@ class PipelineController:
             channel_id = int(target_channel_id)
         except (TypeError, ValueError):
             return np.empty(0, dtype=np.float32), 0, 0
-        window_samples = max(1, int(round(window_ms * sr / 1000.0)))
-        if window_samples % 2 == 0:
-            window_samples += 1
-        center_index = int(getattr(event, "crossingIndex", -1))
-        if center_index < 0:
+
+        samples = np.asarray(getattr(event, "samples", np.empty(0, dtype=np.float32)), dtype=np.float32)
+        window_samples = int(samples.size)
+        if window_samples <= 0:
+            window_samples = max(1, int(round(window_ms * sr / 1000.0)))
+
+        crossing_index = int(getattr(event, "crossingIndex", -1))
+        if crossing_index < 0:
             return np.empty(0, dtype=np.float32), 0, window_samples
-        half = window_samples // 2
-        start_index = max(0, center_index - half)
+
+        pre_samples = int(round(float(getattr(event, "preMs", 0.0)) * sr / 1000.0))
+        pre_samples = int(np.clip(pre_samples, 0, max(window_samples - 1, 0)))
+        start_index = max(0, crossing_index - pre_samples)
         data, missing_prefix, missing_suffix = dispatcher.collect_window(
             start_index,
             window_samples,

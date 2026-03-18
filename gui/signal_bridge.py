@@ -32,8 +32,8 @@ class SignalBridge:
         mw.record_group.recordingStarted.connect(mw._on_recording_started)
         mw.record_group.recordingStopped.connect(mw._on_recording_stopped)
 
-        # Trigger Widget
-        mw._trigger_controller.configChanged.connect(mw._on_trigger_config_changed)
+        # Trigger timing controls
+        mw.trigger_control.window_combo.currentIndexChanged.connect(mw._on_window_changed)
         
         # Channel Manager
         mw._channel_manager.channelConfigChanged.connect(mw._on_channel_manager_config_changed)
