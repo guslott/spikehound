@@ -550,6 +550,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.device_control.set_connected(False)
                 return
             driver_kwargs["device_id_override"] = file_path
+            sample_rate = 0.0
 
         # Actually connect the device using the runtime
         try:
@@ -696,6 +697,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _populate_sample_rate_options(self, entry: Optional[dict]) -> None:
         """Populate sample rate dropdown from device capabilities."""
         self.device_control.sample_rate_combo.blockSignals(True)
+        entry_key = entry.get("key") if entry is not None else None
+        is_file_source = self._is_file_source_entry(str(entry_key), entry) if entry_key is not None else self._is_file_source_entry(None, entry)
         
         # Determine the target sample rate to restore
         target_rate = 0.0
@@ -710,12 +713,15 @@ class MainWindow(QtWidgets.QMainWindow):
             # Otherwise, try to preserve the current UI selection
             target_rate = self._current_sample_rate_value()
 
+        if is_file_source and not self._device_connected:
+            # File playback should not inherit a stale UI rate before a WAV is chosen.
+            target_rate = 0.0
+
         self.device_control.sample_rate_combo.clear()
         rates: list[float] = []
         caps = None
         if entry is not None:
             caps = entry.get("capabilities")
-            entry_key = entry.get("key")
             device_id = entry.get("device_id")
             if (
                 self._device_connected

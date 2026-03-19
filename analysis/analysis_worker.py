@@ -11,7 +11,6 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 from shared.models import Chunk, DetectionEvent, EndOfStream
-from shared.event_buffer import EventRingBuffer
 from shared.types import AnalysisEvent
 
 from .batch import AnalysisBatch
@@ -157,7 +156,6 @@ class AnalysisWorker(threading.Thread):
         self._stop_evt = threading.Event()
         self._registration_token: Optional[object] = None
         self._channel_index: Optional[int] = None
-        self._event_buffer: Optional[EventRingBuffer] = getattr(controller, "event_buffer", None)
         self._settings_store: Optional[AnalysisSettingsStore] = getattr(controller, "analysis_settings_store", None)
         self._settings_unsub: Optional[Callable[[], None]] = None
         self._next_start_sample: int = 0
@@ -248,23 +246,7 @@ class AnalysisWorker(threading.Thread):
             logger.debug("Failed to create routed chunk: %s", e)
             return
         events = self._detect_events(routed_chunk)
-        events_tuple = tuple(events)
-        if events_tuple:
-            meta_with_events = dict(routed_chunk.meta or {})
-            meta_with_events["analysis_events"] = events_tuple
-            try:
-                routed_chunk = Chunk(
-                    samples=routed_chunk.samples,
-                    start_time=routed_chunk.start_time,
-                    dt=routed_chunk.dt,
-                    seq=routed_chunk.seq,
-                    channel_names=routed_chunk.channel_names,
-                    units=routed_chunk.units,
-                    meta=meta_with_events,
-                )
-            except Exception as e:
-                logger.debug("Failed to add events meta to chunk: %s", e)
-        batch = AnalysisBatch(chunk=routed_chunk, events=events_tuple)
+        batch = AnalysisBatch(chunk=routed_chunk, events=tuple(events))
         try:
             self.output_queue.put_nowait(batch)
         except queue.Full:
@@ -309,10 +291,6 @@ class AnalysisWorker(threading.Thread):
         if self._settings_unsub:
             self._settings_unsub()
             self._settings_unsub = None
-
-    def publish_event(self, event: AnalysisEvent) -> None:
-        if self._event_buffer is not None:
-            self._event_buffer.push(event)
 
     def _ensure_channel_id(self, channel_name: str) -> None:
         if self._controller is None:
@@ -501,7 +479,6 @@ class AnalysisWorker(threading.Thread):
             # Return collected events
             collected: list[AnalysisEvent] = []
             for event, new_last_end, crossing_time in events:
-                self.publish_event(event)
                 with self._state_lock:
                     if new_last_end > self._last_window_end_sample:
                         self._last_window_end_sample = new_last_end
@@ -633,7 +610,6 @@ class AnalysisWorker(threading.Thread):
 
         collected: list[AnalysisEvent] = []
         for event, new_last_end, crossing_time in events:
-            self.publish_event(event)
             with self._state_lock:
                 if new_last_end > self._last_window_end_sample:
                     self._last_window_end_sample = new_last_end

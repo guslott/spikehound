@@ -159,7 +159,7 @@ The codebase includes extensive documentation specifically designed for AI:
 |----------|----------|---------|
 | DAQ Driver Guide | `daq/daq_readme.md` | Adding hardware support |
 | GUI Widget Guide | `gui/gui_readme.md` | Adding UI components |
-| Analysis Guide | `analysis/analysis_readme.md` | Adding metrics/detection |
+| Analysis Guide | `analysis/analysis_readme.md` | Adding metrics, detectors, and class-aware analysis UI on the unified batch pipeline |
 | Dispatcher Guide | `doc/dispatcher_readme.md` | Understanding data flow |
 
 ### Example: Adding a New Metric
@@ -169,10 +169,11 @@ The codebase includes extensive documentation specifically designed for AI:
 
 **What happens:**
 1. AI reads `analysis/analysis_readme.md`
-2. AI adds a function to `analysis/metrics.py`
-3. AI integrates it into the analysis worker
-4. AI optionally adds display to the GUI
-5. You test with real or simulated data
+2. AI adds a pure function to `analysis/metrics.py`
+3. AI wires it through `detection_to_analysis_event()` in `analysis/analysis_worker.py`
+4. AI exposes it in `gui/analysis_tab.py` only if it needs scatter/UI/export/class support
+5. AI adds focused tests in `test/test_analysis_worker.py` and `test/test_analysis_tab_event_pipeline.py`
+6. You test with real or simulated data
 
 ---
 

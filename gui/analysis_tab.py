@@ -17,9 +17,11 @@ from PySide6 import QtCore, QtWidgets, QtGui
 logger = logging.getLogger(__name__)
 
 
+METRIC_HISTORY_CAPACITY = 100_000
+
+
 from analysis.batch import AnalysisBatch
 from shared.models import Chunk, EndOfStream
-from shared.event_buffer import AnalysisEvents
 from shared.types import AnalysisEvent
 
 
@@ -46,11 +48,12 @@ if TYPE_CHECKING:
     from analysis.analysis_worker import AnalysisWorker
     from analysis.settings import AnalysisSettingsStore
     from core.controller import PipelineController
-    from shared.event_buffer import EventRingBuffer
     from daq.base_device import ChannelInfo
 
 class AnalysisTab(QtWidgets.QWidget):
     """Simple analysis view with a top-half plot for a single channel."""
+
+    _analysis_update_ready_signal = QtCore.Signal(object, float, float, object)
 
     def __init__(
         self,
@@ -69,8 +72,6 @@ class AnalysisTab(QtWidgets.QWidget):
         self._init_buffer()
         self._controller = controller
         self._analysis_settings: Optional["AnalysisSettingsStore"] = None
-        self._event_buffer: Optional["EventRingBuffer"] = None
-        self._analysis_events: Optional[AnalysisEvents] = None
         self._analysis_executor: ThreadPoolExecutor | None = ThreadPoolExecutor(max_workers=1)
         self._analysis_futures: set[Future] = set()
         self._worker: Optional["AnalysisWorker"] = None
@@ -85,12 +86,9 @@ class AnalysisTab(QtWidgets.QWidget):
         self._window_start_index: Optional[int] = None
         if controller is not None:
             self._analysis_settings = controller.analysis_settings_store
-            self._event_buffer = controller.event_buffer
-            if self._event_buffer is not None:
-                self._analysis_events = AnalysisEvents(self._event_buffer)
         self._event_window_ms = self._initial_event_window_ms()
         self._t0_event: Optional[float] = None
-        self._metric_events: deque[dict[str, float | int]] = deque(maxlen=100_000)
+        self._metric_events: deque[dict[str, float | int]] = deque(maxlen=METRIC_HISTORY_CAPACITY)
         self._metrics_dirty: bool = False
         # Track visible-state deltas so metric updates can avoid full recounts.
         self._last_scatter_count: int = 0
@@ -99,17 +97,15 @@ class AnalysisTab(QtWidgets.QWidget):
         self._cluster_counts: dict[int, int] = {}
         # Visible event count with no cluster assignment.
         self._unclassified_count: int = 0
-        # Visible event count from the previous metric update.
-        self._last_visible_len: int = 0
         self._brush_cache: dict[int, object] = {}  # cluster_id -> cached brush object
         # Scatter plot coordinate caching to avoid rebuilding on every update
         self._cached_scatter_xs: list[float] | None = None
         self._cached_scatter_ys: list[float] | None = None
         self._cached_scatter_event_ids: list[int | None] | None = None
+        self._cached_visible_metric_records: list[dict[str, float | int]] | None = None
         self._cached_scatter_visible_count: int = 0
         self._cached_scatter_y_key: str | None = None
         self._cached_scatter_x_key: str | None = None
-        self._last_event_id: Optional[int] = None
         self._viz_paused = False
         self._cached_raw_times: Optional[np.ndarray] = None
         self._cached_raw_samples: Optional[np.ndarray] = None
@@ -118,7 +114,6 @@ class AnalysisTab(QtWidgets.QWidget):
         # Scope-linked scale values (updated from MainWindow)
         self._scope_window_sec: float = 1.0
         self._scope_vertical_span: float = 1.0
-        self._next_event_id: int = 0
         self._event_details: dict[int, dict[str, object]] = {}
         self._event_cluster_labels: dict[int, int] = {}
         self._clusters: list[MetricCluster] = []
@@ -547,6 +542,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._METRICS_UPDATE_TICKS: int = 3  # Every 3rd tick = ~150ms (~7Hz)
         self._STA_UPDATE_TICKS: int = 3      # Every 3rd tick = ~150ms (~7Hz)
         self._in_threshold_update = False
+        self._analysis_update_ready_signal.connect(self._on_analysis_update_ready)
         self._on_axis_metric_changed()
         self._apply_ranges()
         self._update_cluster_button_states()
@@ -667,18 +663,6 @@ class AnalysisTab(QtWidgets.QWidget):
         """Update the list of available STA signal channels."""
         self._refresh_sta_channel_options(channels)
 
-    def peek_all_events(self) -> list[AnalysisEvent]:
-        """Return all events in the buffer without removing them."""
-        if self._event_buffer is None:
-            return []
-        return self._event_buffer.peek_all()
-
-    def drain_events(self) -> list[AnalysisEvent]:
-        """Remove and return all events from the buffer."""
-        if self._event_buffer is None:
-            return []
-        return self._event_buffer.drain()
-
     def _toggle_threshold(self, line: pg.InfiniteLine, spin: QtWidgets.QDoubleSpinBox, checked: bool) -> None:
         """Show/hide a threshold line and sync it with the spinbox value."""
         line.setVisible(checked)
@@ -748,25 +732,10 @@ class AnalysisTab(QtWidgets.QWidget):
                 break
             if item is EndOfStream:
                 continue
-            if isinstance(item, AnalysisBatch):
-                batch = item
-            elif isinstance(item, Chunk):
-                meta = item.meta
-                events_from_meta = ()
-                if meta is not None:
-                    events_from_meta = tuple(meta.get("analysis_events") or ())
-                batch = AnalysisBatch(chunk=item, events=events_from_meta)
-            else:
+            if not isinstance(item, AnalysisBatch):
                 continue
-            self._render_batch(batch)
+            self._render_batch(item)
             processed += 1
-        if self._analysis_events is not None:
-            new_events, new_last_id = self._analysis_events.pull_events(self._last_event_id)
-            if new_events:
-                window_start = self._last_window_start
-                width = self._last_window_width or self._scope_window_sec
-                self._handle_batch_events(new_events, window_start, width, self._window_start_index)
-                self._last_event_id = new_last_id
 
     def _apply_ranges(self) -> None:
         """Apply scope-linked settings to the plot axes."""
@@ -982,12 +951,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._last_window_start = float(window_start)
         self._last_window_width = float(width_in_use)
 
-        events = batch.events or ()
-        if not events:
-            meta = getattr(batch.chunk, "meta", None)
-            if meta is not None and hasattr(meta, "get"):
-                events = tuple(meta.get("analysis_events") or ())
-        self._handle_batch_events(events, window_start, width_in_use, self._window_start_index)
+        self._handle_batch_events(batch.events or (), window_start, width_in_use, self._window_start_index)
 
     def _on_pause_viz_toggled(self, checked: bool) -> None:
         """Handle visualization pause checkbox toggle.
@@ -1115,7 +1079,15 @@ class AnalysisTab(QtWidgets.QWidget):
                     logger.debug("Failed to get pen width fallback: %s", e)
                     width = 2.0
         item.setPen(pg.mkPen(color, width=width))
-    # Note: _refresh_overlay_colors was removed - overlay colors are set once at creation
+
+    def _refresh_overlay_colors(self) -> None:
+        """Repaint all active overlay curves to match current class membership."""
+        for overlay in self._event_overlays:
+            self._apply_overlay_color(overlay)
+        if not self._viz_paused:
+            return
+        self._clear_pause_snapshot()
+        self._capture_pause_snapshot()
 
     def _handle_batch_events(
         self,
@@ -1182,10 +1154,10 @@ class AnalysisTab(QtWidgets.QWidget):
         self._analysis_futures.add(future)
 
         def _on_done(fut: Future, params=(window_start, width, window_start_idx)) -> None:
-            QtCore.QTimer.singleShot(
-                0,
-                lambda: self._on_analysis_update_ready(fut, *params),
-            )
+            try:
+                self._analysis_update_ready_signal.emit(fut, params[0], params[1], params[2])
+            except RuntimeError:
+                logger.debug("Analysis tab destroyed before async update could be delivered")
 
         future.add_done_callback(_on_done)
 
@@ -1208,17 +1180,13 @@ class AnalysisTab(QtWidgets.QWidget):
     def _build_analysis_update(self, events: tuple[AnalysisEvent, ...]) -> AnalysisUpdate:
         """Build overlay payloads and STA task for a batch of events."""
         overlays: list[OverlayPayload] = []
-        last_event_id: int | None = None
         for event in events:
             payload = self._build_overlay_payload(event)
             if payload is None:
                 continue
             overlays.append(payload)
-            event_id = payload.event_id
-            if isinstance(event_id, int):
-                last_event_id = event_id if last_event_id is None else max(last_event_id, event_id)
         sta_task = self._build_sta_task(events)
-        return AnalysisUpdate(overlays=overlays, sta_task=sta_task, last_event_id=last_event_id)
+        return AnalysisUpdate(overlays=overlays, sta_task=sta_task)
 
     def _apply_analysis_update(
         self,
@@ -1249,12 +1217,6 @@ class AnalysisTab(QtWidgets.QWidget):
             self._sta_dirty = True
         elif update.sta_task is not None:
             self._sta_handle_task(update.sta_task)
-        if isinstance(update.last_event_id, int):
-            self._last_event_id = (
-                update.last_event_id
-                if self._last_event_id is None
-                else max(self._last_event_id, update.last_event_id)
-            )
         if not self._viz_paused and payloads:
             self._refresh_overlay_positions(window_start, width, window_start_idx)
 
@@ -1274,7 +1236,6 @@ class AnalysisTab(QtWidgets.QWidget):
             if not self._apply_overlay_view(overlay, window_start, width, window_start_idx):
                 self._release_overlay_item(item)
                 continue
-            # Note: overlay color is set once at creation time, not refreshed per-frame
             kept.append(overlay)
         self._event_overlays = kept
 
@@ -1308,6 +1269,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._cached_scatter_xs = None
         self._cached_scatter_ys = None
         self._cached_scatter_event_ids = None
+        self._cached_visible_metric_records = None
         self._cached_scatter_visible_count = 0
         self._cached_scatter_y_key = None
         self._cached_scatter_x_key = None
@@ -1317,29 +1279,14 @@ class AnalysisTab(QtWidgets.QWidget):
         self._metric_events.clear()
         self._event_details.clear()
         self._event_cluster_labels.clear()
-        # Advance _last_event_id past all events currently in the ring buffer
-        # so that stale events (from a previous window configuration) are not
-        # re-delivered on the next pull_events() call.
-        if self._analysis_events is not None:
-            try:
-                all_buf = self._analysis_events._buffer.peek_all()
-                if all_buf:
-                    self._last_event_id = max(ev.id for ev in all_buf)
-            except Exception:
-                pass
-        # Reset cached visible-event accounting.
         self._last_scatter_count = 0
         self._cluster_membership_dirty = True
         self._cluster_counts = {}
         self._unclassified_count = 0
-        self._last_visible_len = 0
         self._invalidate_scatter_cache()
-        # Note: overlay colors are set at creation time, not refreshed
         self._t0_event = None
         for cluster in self._clusters:
-            item = self._cluster_items.get(cluster.id)
-            if item is not None:
-                item.setText(f"{cluster.name} (0 events)")
+            self._set_cluster_item_count(cluster, 0)
         self.energy_scatter.clear()
         self.energy_scatter.hide()
         self.metrics_plot.getPlotItem().enableAutoRange(y=True)
@@ -1455,6 +1402,97 @@ class AnalysisTab(QtWidgets.QWidget):
             return "min"
         return "envelope"
 
+    @staticmethod
+    def _metric_short_label(metric_key: str) -> str:
+        labels = {
+            "time": "Time",
+            "envelope": "Envelope",
+            "max": "Max",
+            "min": "Min",
+            "freq": "Freq",
+            "interval": "Interval",
+            "width": "Width",
+            "min_to_max_width": "Min->Max Width",
+        }
+        return labels.get(metric_key, metric_key)
+
+    def _cluster_axes_label(self, cluster: MetricCluster) -> str:
+        return (
+            f"{self._metric_short_label(cluster.x_metric)} vs "
+            f"{self._metric_short_label(cluster.y_metric)}"
+        )
+
+    def _cluster_item_text(self, cluster: MetricCluster, count: int) -> str:
+        return f"{cluster.name} [{self._cluster_axes_label(cluster)}] ({count} events)"
+
+    def _set_cluster_item_count(self, cluster: MetricCluster, count: int) -> None:
+        item = self._cluster_items.get(cluster.id)
+        if item is None:
+            return
+        item.setText(self._cluster_item_text(cluster, count))
+        item.setToolTip(f"Defined on {self._cluster_axes_label(cluster)}")
+
+    def _cluster_uses_selected_axes(self, cluster: MetricCluster) -> bool:
+        return (
+            cluster.x_metric == self._selected_x_metric()
+            and cluster.y_metric == self._selected_y_metric()
+        )
+
+    @staticmethod
+    def _cluster_bounds(
+        cluster: MetricCluster,
+    ) -> tuple[float, float, float, float] | None:
+        roi = cluster.roi
+        if roi is None:
+            return None
+        rect = roi.parentBounds()
+        if rect is None:
+            return None
+        min_x = float(rect.left())
+        max_x = float(rect.right())
+        if max_x < min_x:
+            min_x, max_x = max_x, min_x
+        min_y = float(rect.top())
+        max_y = float(rect.bottom())
+        if max_y < min_y:
+            min_y, max_y = max_y, min_y
+        return min_x, max_x, min_y, max_y
+
+    def _cluster_specs(
+        self,
+    ) -> list[tuple[int, str, str, float, float, float, float]]:
+        specs: list[tuple[int, str, str, float, float, float, float]] = []
+        for cluster in self._clusters:
+            bounds = self._cluster_bounds(cluster)
+            if bounds is None:
+                continue
+            min_x, max_x, min_y, max_y = bounds
+            specs.append(
+                (cluster.id, cluster.x_metric, cluster.y_metric, min_x, max_x, min_y, max_y)
+            )
+        return specs
+
+    @staticmethod
+    def _classify_metric_mapping(
+        metrics: dict[str, float | int] | dict[str, float],
+        cluster_specs: Sequence[tuple[int, str, str, float, float, float, float]],
+    ) -> int | None:
+        for cluster_id, x_key, y_key, min_x, max_x, min_y, max_y in cluster_specs:
+            x_val = metrics.get(x_key)
+            y_val = metrics.get(y_key)
+            if x_val is None or y_val is None:
+                continue
+            try:
+                x_num = float(x_val)
+                y_num = float(y_val)
+            except (TypeError, ValueError):
+                continue
+            if not (np.isfinite(x_num) and np.isfinite(y_num)):
+                continue
+            if min_x <= x_num <= max_x and min_y <= y_num <= max_y:
+                return cluster_id
+        return None
+
     def _on_axis_metric_changed(self) -> None:
         """Handle axis metric combo changes and update plot labels."""
         metric = self._selected_y_metric()
@@ -1499,6 +1537,7 @@ class AnalysisTab(QtWidgets.QWidget):
         # Invalidate cache when axis selection changes
         self._invalidate_scatter_cache()
         self._recompute_cluster_membership()
+        self._update_cluster_visuals()
         self._update_metric_points()
 
     def _on_class_selection_changed(
@@ -1524,7 +1563,7 @@ class AnalysisTab(QtWidgets.QWidget):
             roi = cluster.roi
             if roi is None:
                 continue
-            roi.setVisible(True)
+            roi.setVisible(self._cluster_uses_selected_axes(cluster))
             width = base_width * 3.0 if cluster.id == selected_id else base_width
             roi.setPen(pg.mkPen(cluster.color, width=width))
 
@@ -1941,15 +1980,22 @@ class AnalysisTab(QtWidgets.QWidget):
         self._cluster_id_counter += 1
         color = CLUSTER_COLORS[cluster_id % len(CLUSTER_COLORS)]
         cluster_name = f"Class {cluster_id + 1}"
-        cluster = MetricCluster(id=cluster_id, name=cluster_name, color=color)
+        cluster = MetricCluster(
+            id=cluster_id,
+            name=cluster_name,
+            color=color,
+            x_metric=self._selected_x_metric(),
+            y_metric=self._selected_y_metric(),
+        )
         roi = ClusterRectROI((x0, y0), (default_width, default_height), pen=pg.mkPen(color, width=1.5))
         roi.setZValue(50)
         cluster.roi = roi
         roi.sigRegionChanged.connect(lambda _: self._on_cluster_roi_changed())
         self.metrics_plot.addItem(roi)
         self._clusters.append(cluster)
-        item = QtWidgets.QListWidgetItem(f"{cluster.name} (0 events)")
+        item = QtWidgets.QListWidgetItem(self._cluster_item_text(cluster, 0))
         item.setData(QtCore.Qt.UserRole, cluster_id)
+        item.setToolTip(f"Defined on {self._cluster_axes_label(cluster)}")
         self.class_list.addItem(item)
         self.class_list.setCurrentItem(item)
         self._cluster_items[cluster_id] = item
@@ -2119,13 +2165,12 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def _release_metrics(self) -> None:
         """Clear all metric event records."""
-        self._metric_events = deque(maxlen=100_000)
+        self._metric_events = deque(maxlen=METRIC_HISTORY_CAPACITY)
         self._t0_event = None
         self._last_scatter_count = 0
         self._cluster_membership_dirty = True
         self._cluster_counts = {}
         self._unclassified_count = 0
-        self._last_visible_len = 0
         self._update_metric_points()
 
     def _update_metric_points(self) -> None:
@@ -2163,6 +2208,7 @@ class AnalysisTab(QtWidgets.QWidget):
             xs = self._cached_scatter_xs
             ys = self._cached_scatter_ys
             event_ids = self._cached_scatter_event_ids
+            visible_records = self._cached_visible_metric_records or []
         else:
             # Rebuild coordinates - cache is invalid
             # Determine visible events based on time window or max count
@@ -2198,6 +2244,7 @@ class AnalysisTab(QtWidgets.QWidget):
             xs = []
             ys = []
             event_ids = []
+            visible_records = []
             for event in visible_events:
                 x_val = event.get(x_key)
                 y_val = event.get(y_key)
@@ -2209,11 +2256,13 @@ class AnalysisTab(QtWidgets.QWidget):
                 ys.append(float(y_val))
                 event_id = event.get("event_id")
                 event_ids.append(event_id if isinstance(event_id, int) else None)
+                visible_records.append(event)
 
             # Update cache
             self._cached_scatter_xs = xs
             self._cached_scatter_ys = ys
             self._cached_scatter_event_ids = event_ids
+            self._cached_visible_metric_records = visible_records
             self._cached_scatter_visible_count = current_count
             self._cached_scatter_y_key = y_key
             self._cached_scatter_x_key = x_key
@@ -2227,110 +2276,40 @@ class AnalysisTab(QtWidgets.QWidget):
         
         # Only recompute cluster membership if dirty OR if we have new events
         need_reclassify = self._cluster_membership_dirty or (current_count != self._last_scatter_count)
-        current_visible_len = len(event_ids)
 
         if self._clusters and need_reclassify:
-            cluster_bounds: list[tuple[int, float, float, float, float]] = []
-            for cluster in self._clusters:
-                roi = cluster.roi
-                if roi is None:
+            cluster_specs = self._cluster_specs()
+            new_counts: dict[int, int] = {c.id: 0 for c in self._clusters}
+            new_unclassified = 0
+            for record, event_id in zip(visible_records, event_ids):
+                if event_id is None:
                     continue
-                rect = roi.parentBounds()
-                if rect is None:
-                    continue
-                min_x = float(rect.left())
-                max_x = float(rect.right())
-                if max_x < min_x:
-                    min_x, max_x = max_x, min_x
-                min_y = float(rect.top())
-                max_y = float(rect.bottom())
-                if max_y < min_y:
-                    min_y, max_y = max_y, min_y
-                cluster_bounds.append((cluster.id, min_x, max_x, min_y, max_y))
-
-            if cluster_bounds:
-                if self._cluster_membership_dirty:
-                    # Membership labels are already current; only
-                    # visible-count accounting needs to be rebuilt.
-                    new_counts: dict[int, int] = {c.id: 0 for c in self._clusters}
-                    new_unclassified = 0
-                    for idx, event_id in enumerate(event_ids):
-                        if event_id is None:
-                            continue
-                        cid = self._event_cluster_labels.get(event_id)
-                        if cid is not None:
-                            new_counts[cid] = new_counts.get(cid, 0) + 1
-                        else:
-                            new_unclassified += 1
-                    self._cluster_counts = new_counts
-                    self._unclassified_count = new_unclassified
-
-                elif current_visible_len > self._last_visible_len:
-                    # If the visible set only grew at the tail, classify just
-                    # the new tail events and keep existing counts.
-                    tail_start = self._last_visible_len
-                    for idx in range(tail_start, current_visible_len):
-                        event_id = event_ids[idx]
-                        if event_id is None:
-                            self._unclassified_count += 1
-                            continue
-                        if event_id not in self._event_cluster_labels:
-                            x_val = xs[idx]
-                            y_val = ys[idx]
-                            for cluster_id, min_x, max_x, min_y, max_y in cluster_bounds:
-                                if min_x <= x_val <= max_x and min_y <= y_val <= max_y:
-                                    self._event_cluster_labels[event_id] = cluster_id
-                                    self._cluster_counts[cluster_id] = (
-                                        self._cluster_counts.get(cluster_id, 0) + 1
-                                    )
-                                    break
-                            else:
-                                self._unclassified_count += 1
-                        else:
-                            # Already classified (e.g. labelled by a recent
-                            # _recompute_cluster_membership() but not yet counted
-                            # in the visible-only _cluster_counts).
-                            cid = self._event_cluster_labels[event_id]
-                            self._cluster_counts[cid] = self._cluster_counts.get(cid, 0) + 1
-
+                cid = self._event_cluster_labels.get(event_id)
+                if cid is None:
+                    cid = self._classify_metric_mapping(record, cluster_specs)
+                    if cid is None:
+                        self._event_cluster_labels.pop(event_id, None)
+                    else:
+                        self._event_cluster_labels[event_id] = cid
+                if cid is None:
+                    new_unclassified += 1
                 else:
-                    # On shrinkage or a same-length window slide, rebuild the
-                    # visible counts and classify any newly visible events.
-                    new_counts = {c.id: 0 for c in self._clusters}
-                    new_unclassified = 0
-                    for idx, event_id in enumerate(event_ids):
-                        if event_id is None:
-                            continue
-                        cid = self._event_cluster_labels.get(event_id)
-                        if cid is not None:
-                            new_counts[cid] = new_counts.get(cid, 0) + 1
-                        else:
-                            # Possibly a new event that appeared via window slide
-                            x_val = xs[idx]
-                            y_val = ys[idx]
-                            for cluster_id, min_x, max_x, min_y, max_y in cluster_bounds:
-                                if min_x <= x_val <= max_x and min_y <= y_val <= max_y:
-                                    self._event_cluster_labels[event_id] = cluster_id
-                                    new_counts[cluster_id] = new_counts.get(cluster_id, 0) + 1
-                                    break
-                            else:
-                                new_unclassified += 1
-                    self._cluster_counts = new_counts
-                    self._unclassified_count = new_unclassified
+                    new_counts[cid] = new_counts.get(cid, 0) + 1
+            self._cluster_counts = new_counts
+            self._unclassified_count = new_unclassified
 
             # Refresh cluster labels from the maintained visible counts.
             for cluster in self._clusters:
-                item = self._cluster_items.get(cluster.id)
-                if item is not None:
-                    item.setText(f"{cluster.name} ({self._cluster_counts.get(cluster.id, 0)} events)")
-
-            # Note: overlay colors are set at creation time, not refreshed here
+                self._set_cluster_item_count(cluster, self._cluster_counts.get(cluster.id, 0))
             self._cluster_membership_dirty = False
 
         elif not self._clusters and need_reclassify:
             # Without clusters, every visible event with an ID is unclassified.
             self._unclassified_count = sum(1 for eid in event_ids if eid is not None)
             self._cluster_membership_dirty = False
+
+        if need_reclassify:
+            self._refresh_overlay_colors()
 
         # Refresh the unclassified label from the maintained visible count.
         if self._unclassified_item is not None:
@@ -2367,7 +2346,6 @@ class AnalysisTab(QtWidgets.QWidget):
         self.energy_scatter.setData(xs, ys, brush=brushes)
         self.energy_scatter.show()
         self._last_scatter_count = current_count
-        self._last_visible_len = current_visible_len
         plot_item = self.metrics_plot.getPlotItem()
         self._set_metrics_range(plot_item, min(xs), max(xs), min(ys), max(ys))
 
@@ -2399,10 +2377,25 @@ class AnalysisTab(QtWidgets.QWidget):
             record["event_id"] = event_id
         if not has_metric:
             return
+        evicted_event_id: int | None = None
+        if len(self._metric_events) == self._metric_events.maxlen:
+            oldest = self._metric_events[0]
+            oldest_event_id = oldest.get("event_id")
+            if isinstance(oldest_event_id, int):
+                evicted_event_id = oldest_event_id
         self._metric_events.append(record)
-        # deque with maxlen handles overflow automatically - O(1) instead of O(n)
-        # Note: We don't clean up _event_cluster_labels here anymore; it's done lazily
-        # in _update_metric_points when events are no longer visible.
+        if isinstance(event_id, int):
+            details_entry: dict[str, object] = {
+                "metric_time": float(metric_time),
+                "times": np.asarray(overlay.get("times"), dtype=np.float64).copy(),
+                "samples": np.asarray(overlay.get("samples"), dtype=np.float32).copy(),
+                "metrics": dict(metrics),
+            }
+            self._event_details[event_id] = details_entry
+        if evicted_event_id is not None and evicted_event_id != event_id:
+            self._event_details.pop(evicted_event_id, None)
+            self._event_cluster_labels.pop(evicted_event_id, None)
+            self._sta_pending_events.pop(evicted_event_id, None)
 
     def _build_overlay_payload(self, event: AnalysisEvent) -> Optional[OverlayPayload]:
         """Build overlay data from a detected event for visualization."""
@@ -2468,15 +2461,8 @@ class AnalysisTab(QtWidgets.QWidget):
             metric_values["interval"] = float(interval_val)
         if metric_values:
             metrics = metric_values
-        raw_event_id = event.id
-        if isinstance(raw_event_id, int):
-            event_id = raw_event_id
-        else:
-            event_id = self._next_event_id
-            self._next_event_id += 1
-
         return OverlayPayload(
-            event_id=event_id,
+            event_id=int(event.id),
             times=times,
             samples=samples,
             last_time=last_time,
@@ -2527,43 +2513,12 @@ class AnalysisTab(QtWidgets.QWidget):
         if isinstance(event_id, int) and self._clusters:
             metrics = payload.metrics
             if isinstance(metrics, dict):
-                x_key = self._selected_x_metric()
-                y_key = self._selected_y_metric()
-                x_val = metrics.get(x_key)
-                y_val = metrics.get(y_key)
-                if x_val is not None and y_val is not None:
-                    try:
-                        x_num = float(x_val)
-                        y_num = float(y_val)
-                        for cluster in self._clusters:
-                            roi = cluster.roi
-                            if roi is None:
-                                continue
-                            rect = roi.parentBounds()
-                            if rect is None:
-                                continue
-                            min_x = float(rect.left())
-                            max_x = float(rect.right())
-                            if max_x < min_x:
-                                min_x, max_x = max_x, min_x
-                            min_y = float(rect.top())
-                            max_y = float(rect.bottom())
-                            if max_y < min_y:
-                                min_y, max_y = max_y, min_y
-                            if min_x <= x_num <= max_x and min_y <= y_num <= max_y:
-                                self._event_cluster_labels[event_id] = cluster.id
-                                break
-                    except (TypeError, ValueError):
-                        pass
+                cluster_id = self._classify_metric_mapping(metrics, self._cluster_specs())
+                if cluster_id is None:
+                    self._event_cluster_labels.pop(event_id, None)
+                else:
+                    self._event_cluster_labels[event_id] = cluster_id
         self._apply_overlay_color(overlay_data)
-        details_entry: dict[str, object] = {
-            "metric_time": float(payload.metric_time),
-            "times": payload.times,
-            "samples": payload.samples,
-            "metrics": dict(payload.metrics) if isinstance(payload.metrics, dict) else {},
-        }
-        if isinstance(payload.event_id, int):
-            self._event_details[payload.event_id] = details_entry
         return overlay_data
 
     def _apply_overlay_view(
@@ -2613,60 +2568,27 @@ class AnalysisTab(QtWidgets.QWidget):
         self._cluster_membership_dirty = True
         if not self._clusters:
             self._event_cluster_labels.clear()
-            # Note: overlay colors are set at creation time, not refreshed here
+            self._refresh_overlay_colors()
             return
-        x_key = self._selected_x_metric()
-        y_key = self._selected_y_metric()
-        cluster_bounds: list[tuple[int, float, float, float, float]] = []
-        for cluster in self._clusters:
-            roi = cluster.roi
-            if roi is None:
-                continue
-            rect = roi.parentBounds()
-            if rect is None:
-                continue
-            min_x = float(rect.left())
-            max_x = float(rect.right())
-            if max_x < min_x:
-                min_x, max_x = max_x, min_x
-            min_y = float(rect.top())
-            max_y = float(rect.bottom())
-            if max_y < min_y:
-                min_y, max_y = max_y, min_y
-            cluster_bounds.append((cluster.id, min_x, max_x, min_y, max_y))
+        cluster_specs = self._cluster_specs()
         # When paused, don't clear labels - preserve them so visible overlays keep colors
         if not self._viz_paused:
             self._event_cluster_labels.clear()
-        if not cluster_bounds:
-            # Note: overlay colors are set at creation time, not refreshed here
+        if not cluster_specs:
+            self._refresh_overlay_colors()
             return
         counts: dict[int, int] = {cluster.id: 0 for cluster in self._clusters}
         for record in self._metric_events:
             event_id = record.get("event_id")
             if not isinstance(event_id, int):
                 continue
-            x_val = record.get(x_key)
-            y_val = record.get(y_key)
-            if x_val is None or y_val is None:
+            cluster_id = self._classify_metric_mapping(record, cluster_specs)
+            if cluster_id is None:
                 continue
-            try:
-                x_num = float(x_val)
-                y_num = float(y_val)
-            except (TypeError, ValueError):
-                continue
-            if not (np.isfinite(x_num) and np.isfinite(y_num)):
-                continue
-            for cluster_id, min_x, max_x, min_y, max_y in cluster_bounds:
-                if min_x <= x_num <= max_x and min_y <= y_num <= max_y:
-                    self._event_cluster_labels[event_id] = cluster_id
-                    counts[cluster_id] = counts.get(cluster_id, 0) + 1
-                    break
+            self._event_cluster_labels[event_id] = cluster_id
+            counts[cluster_id] = counts.get(cluster_id, 0) + 1
         for cluster in self._clusters:
-            item = self._cluster_items.get(cluster.id)
-            if item is None:
-                continue
-            count = counts.get(cluster.id, 0)
-            item.setText(f"{cluster.name} ({count} events)")
+            self._set_cluster_item_count(cluster, counts.get(cluster.id, 0))
         
         # Update Unclassified count
         # Count events with valid event_id that are not in any cluster
@@ -2680,8 +2602,7 @@ class AnalysisTab(QtWidgets.QWidget):
         
         if self._unclassified_item is not None:
             self._unclassified_item.setText(f"Unclassified ({max(0, unclassified_count)} events)")
-        
-        # Note: overlay colors are set at creation time, not refreshed here
+        self._refresh_overlay_colors()
 
 
 class ClusterWaveformDialog(QtWidgets.QDialog):

@@ -198,6 +198,8 @@ class MetricCluster:
     id: int
     name: str
     color: QtGui.QColor
+    x_metric: str
+    y_metric: str
     roi: pg.RectROI | None = None
 
 
@@ -236,4 +238,3 @@ class AnalysisUpdate:
     overlays: list[OverlayPayload]
     sta_windows: list[np.ndarray] | None = None
     sta_task: StaTask | None = None
-    last_event_id: int | None = None

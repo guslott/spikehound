@@ -9,7 +9,7 @@ from shared.types import AnalysisEvent
 
 @dataclass(frozen=True)
 class AnalysisBatch:
-    """A routed chunk plus the analysis events detected within it."""
+    """Sole worker-to-analysis-UI payload: one routed chunk plus its events."""
 
     chunk: Chunk
     events: Sequence[AnalysisEvent]

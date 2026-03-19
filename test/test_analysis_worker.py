@@ -1,17 +1,15 @@
 import numpy as np
 import pytest
 
+from analysis import AnalysisBatch
 from analysis.analysis_worker import AnalysisWorker
 from analysis.metrics import peak_frequency_sinc as _peak_frequency_sinc
 from analysis.settings import AnalysisSettingsStore
 from shared.models import ChannelInfo, Chunk
-from shared.event_buffer import AnalysisEvents, EventRingBuffer
-from shared.types import AnalysisEvent
 
 
 class _DummyController:
-    def __init__(self, *, capacity: int = 8, active_channels: list[ChannelInfo] | None = None) -> None:
-        self.event_buffer = EventRingBuffer(capacity=capacity)
+    def __init__(self, *, active_channels: list[ChannelInfo] | None = None) -> None:
         self.analysis_settings_store = AnalysisSettingsStore()
         self._active_channels = list(active_channels or [])
 
@@ -25,34 +23,39 @@ class _DummyController:
         return list(self._active_channels)
 
 
-def _stub_event(event_id: int) -> AnalysisEvent:
-    return AnalysisEvent(
-        id=event_id,
-        channelId=0,
-        thresholdValue=0.5,
-        crossingIndex=event_id,
-        crossingTimeSec=float(event_id),
-        firstSampleTimeSec=float(event_id) - 0.005,
-        sampleRateHz=1000.0,
-        windowMs=10.0,
-        preMs=5.0,
-        postMs=5.0,
-        samples=np.zeros(1, dtype=np.float32),
+def _next_batch(worker: AnalysisWorker) -> AnalysisBatch:
+    batch = worker.output_queue.get_nowait()
+    assert isinstance(batch, AnalysisBatch)
+    return batch
+
+
+def test_worker_emits_analysis_batch_without_legacy_event_meta() -> None:
+    controller = _DummyController()
+    worker = AnalysisWorker(controller, "ch0", sample_rate=20_000)
+    worker._channel_index = 0
+    worker.configure_threshold(True, 0.25)
+
+    sr = 20_000
+    dt = 1.0 / sr
+    crossing_idx = 200
+    data = np.zeros((1, 400), dtype=np.float32)
+    data[0, crossing_idx] = 1.0
+    chunk = Chunk(
+        samples=data,
+        start_time=0.0,
+        dt=dt,
+        seq=0,
+        channel_names=("ch0",),
+        units="V",
+        meta={"start_sample": 0},
     )
 
+    worker._forward_chunk(chunk)
+    batch = _next_batch(worker)
 
-def test_event_ring_buffer_drops_oldest() -> None:
-    buf = EventRingBuffer(capacity=2)
-    buf.push(_stub_event(1))
-    buf.push(_stub_event(2))
-    buf.push(_stub_event(3))
-    ids = [ev.id for ev in buf.peek_all()]
-    assert ids == [2, 3], "oldest entry should be evicted once capacity is exceeded"
-
-    buf.push(_stub_event(4))
-    ids = [ev.id for ev in buf.drain()]
-    assert ids == [3, 4]
-    assert buf.drain() == []
+    assert len(batch.events) == 1
+    assert batch.events[0].crossingIndex == crossing_idx
+    assert "analysis_events" not in (batch.chunk.meta or {})
 
 
 def test_worker_window_copy_and_timing() -> None:
@@ -78,8 +81,7 @@ def test_worker_window_copy_and_timing() -> None:
         meta={"start_sample": 0},
     )
 
-    worker._detect_events(chunk)
-    events = controller.event_buffer.drain()
+    events = worker._detect_events(chunk)
     assert len(events) == 1
     ev = events[0]
 
@@ -88,10 +90,10 @@ def test_worker_window_copy_and_timing() -> None:
 
     pre_samples = int(round((ev.crossingTimeSec - ev.firstSampleTimeSec) * sr))
     post_samples = ev.samples.size - pre_samples
-    
+
     expected_pre = window_samples // 3
     expected_post = window_samples - expected_pre
-    
+
     assert pre_samples == expected_pre
     assert post_samples == expected_post
 
@@ -109,8 +111,8 @@ def test_worker_rejects_event_crossing_secondary_threshold() -> None:
     dt = 1.0 / sr
     data = np.zeros((1, 400), dtype=np.float32)
     crossing_idx = 200
-    data[0, crossing_idx] = 0.3  # crosses primary threshold
-    data[0, crossing_idx + 10] = 0.6  # exceeds secondary threshold inside the window
+    data[0, crossing_idx] = 0.3
+    data[0, crossing_idx + 10] = 0.6
     chunk = Chunk(
         samples=data,
         start_time=0.0,
@@ -121,8 +123,8 @@ def test_worker_rejects_event_crossing_secondary_threshold() -> None:
         meta={"start_sample": 0},
     )
 
-    worker._detect_events(chunk)
-    assert controller.event_buffer.drain() == []
+    events = worker._detect_events(chunk)
+    assert events == []
 
 
 def test_worker_accepts_event_when_secondary_not_crossed() -> None:
@@ -135,8 +137,8 @@ def test_worker_accepts_event_when_secondary_not_crossed() -> None:
     dt = 1.0 / sr
     data = np.zeros((1, 400), dtype=np.float32)
     crossing_idx = 200
-    data[0, crossing_idx] = 0.4  # crosses primary threshold
-    data[0, crossing_idx + 10] = 0.45  # stays below secondary threshold
+    data[0, crossing_idx] = 0.4
+    data[0, crossing_idx + 10] = 0.45
     chunk = Chunk(
         samples=data,
         start_time=0.0,
@@ -147,8 +149,7 @@ def test_worker_accepts_event_when_secondary_not_crossed() -> None:
         meta={"start_sample": 0},
     )
 
-    worker._detect_events(chunk)
-    events = controller.event_buffer.drain()
+    events = worker._detect_events(chunk)
     assert len(events) == 1
     assert events[0].crossingIndex == crossing_idx
 
@@ -176,8 +177,7 @@ def test_worker_tracks_interval_since_last_event() -> None:
         meta={"start_sample": 0},
     )
 
-    worker._detect_events(chunk)
-    events = controller.event_buffer.drain()
+    events = worker._detect_events(chunk)
     assert len(events) == 2
     first_event, second_event = events
     assert np.isnan(first_event.intervalSinceLastSec)
@@ -186,11 +186,10 @@ def test_worker_tracks_interval_since_last_event() -> None:
     assert second_event.properties.get("interval_sec") == pytest.approx(expected_interval, rel=1e-6)
 
 
-def test_analysis_events_pull_since_handles_multiple_workers(monkeypatch) -> None:
+def test_event_ids_remain_monotonic_across_workers(monkeypatch) -> None:
     monkeypatch.setattr(AnalysisWorker, "_global_event_id", 0)
 
     controller = _DummyController()
-    bus = AnalysisEvents(controller.event_buffer)
     worker_a = AnalysisWorker(controller, "ch0", sample_rate=20_000)
     worker_b = AnalysisWorker(controller, "ch1", sample_rate=20_000)
     worker_a._channel_index = 0
@@ -203,7 +202,7 @@ def test_analysis_events_pull_since_handles_multiple_workers(monkeypatch) -> Non
 
     first = np.zeros((1, 400), dtype=np.float32)
     first[0, 200] = 0.5
-    worker_a._detect_events(
+    events_a = worker_a._detect_events(
         Chunk(
             samples=first,
             start_time=0.0,
@@ -214,13 +213,11 @@ def test_analysis_events_pull_since_handles_multiple_workers(monkeypatch) -> Non
             meta={"start_sample": 0},
         )
     )
-    events, last_id = bus.pull_events()
-    assert [ev.id for ev in events] == [1]
-    assert last_id == 1
+    assert [event.id for event in events_a] == [1]
 
     second = np.zeros((1, 400), dtype=np.float32)
     second[0, 220] = 0.6
-    worker_b._detect_events(
+    events_b = worker_b._detect_events(
         Chunk(
             samples=second,
             start_time=0.1,
@@ -231,9 +228,7 @@ def test_analysis_events_pull_since_handles_multiple_workers(monkeypatch) -> Non
             meta={"start_sample": 400},
         )
     )
-    events, last_id = bus.pull_events(last_id)
-    assert [ev.id for ev in events] == [2]
-    assert last_id == 2
+    assert [event.id for event in events_b] == [2]
 
 
 def test_worker_manual_detection_uses_actual_channel_id() -> None:
@@ -261,9 +256,9 @@ def test_worker_manual_detection_uses_actual_channel_id() -> None:
     )
 
     worker._forward_chunk(chunk)
-    events = controller.event_buffer.drain()
-    assert len(events) == 1
-    assert events[0].channelId == 11
+    batch = _next_batch(worker)
+    assert len(batch.events) == 1
+    assert batch.events[0].channelId == 11
 
 
 def test_worker_auto_detection_uses_actual_channel_id() -> None:
@@ -291,9 +286,9 @@ def test_worker_auto_detection_uses_actual_channel_id() -> None:
     )
 
     worker._forward_chunk(chunk)
-    events = controller.event_buffer.drain()
-    assert len(events) == 1
-    assert events[0].channelId == 11
+    batch = _next_batch(worker)
+    assert len(batch.events) == 1
+    assert batch.events[0].channelId == 11
 
 
 def test_worker_auto_detection_preserves_threshold_polarity() -> None:
@@ -317,8 +312,7 @@ def test_worker_auto_detection_preserves_threshold_polarity() -> None:
         meta={"start_sample": 0},
     )
 
-    worker._detect_events(chunk)
-    events = controller.event_buffer.drain()
+    events = worker._detect_events(chunk)
 
     assert len(events) == 2
     by_index = {event.crossingIndex: event for event in events}
@@ -349,9 +343,8 @@ def test_worker_allows_second_event_after_previous_window_end() -> None:
         meta={"start_sample": 0},
     )
 
-    worker._detect_events(chunk)
-    events = controller.event_buffer.drain()
-    assert [ev.crossingIndex for ev in events] == [200, 350]
+    events = worker._detect_events(chunk)
+    assert [event.crossingIndex for event in events] == [200, 350]
 
 
 def test_worker_manual_plateau_emits_single_event() -> None:
@@ -374,8 +367,7 @@ def test_worker_manual_plateau_emits_single_event() -> None:
         meta={"start_sample": 0},
     )
 
-    worker._detect_events(chunk)
-    events = controller.event_buffer.drain()
+    events = worker._detect_events(chunk)
 
     assert len(events) == 1
     assert events[0].crossingIndex == 100
@@ -405,7 +397,7 @@ def test_worker_manual_plateau_across_chunks_does_not_duplicate() -> None:
             meta={"start_sample": 0},
         )
     )
-    worker._detect_events(
+    events = worker._detect_events(
         Chunk(
             samples=second,
             start_time=0.120,
@@ -416,10 +408,8 @@ def test_worker_manual_plateau_across_chunks_does_not_duplicate() -> None:
             meta={"start_sample": 120},
         )
     )
-    events = controller.event_buffer.drain()
 
-    assert len(events) == 1
-    assert events[0].crossingIndex == 95
+    assert events == []
 
 
 def test_peak_frequency_sinc_detects_clean_tone() -> None:
@@ -438,8 +428,8 @@ def test_peak_frequency_sinc_ignores_dc_and_slope() -> None:
     freq = 180.0
     t = np.arange(int(sr * duration)) / sr
     wave = 0.4 * np.sin(2 * np.pi * freq * t)
-    wave += 0.3  # DC offset
-    wave += 0.05 * (t - t.mean())  # linear drift
+    wave += 0.3
+    wave += 0.05 * (t - t.mean())
     center = len(wave) // 2
     assert _peak_frequency_sinc(wave, sr, center_index=center) == pytest.approx(freq, rel=0.08)
 
@@ -448,7 +438,7 @@ def test_peak_frequency_sinc_focuses_on_localized_event() -> None:
     sr = 20_000
     samples = int(sr * 0.02)
     wave = np.zeros(samples, dtype=np.float64)
-    burst_len = int(sr * 0.010) # Increased to 10ms for reliable detection of 220Hz
+    burst_len = int(sr * 0.010)
     start = samples // 2 - burst_len // 2
     t = np.arange(burst_len) / sr
     freq = 220.0
@@ -457,40 +447,18 @@ def test_peak_frequency_sinc_focuses_on_localized_event() -> None:
     center = start + burst_len // 2
     assert _peak_frequency_sinc(wave, sr, center_index=center) == pytest.approx(freq, rel=0.1)
 
-def test_analysis_events_pull_since() -> None:
-    buf = EventRingBuffer(capacity=2)
-    bus = AnalysisEvents(buf)
-    buf.push(_stub_event(1))
-    events, last_id = bus.pull_events()
-    assert [ev.id for ev in events] == [1]
-    assert last_id == 1
-
-    buf.push(_stub_event(2))
-    buf.push(_stub_event(3))  # evict id 1
-    events, last_id = bus.pull_events(last_id)
-    assert [ev.id for ev in events] == [2, 3]
-    assert last_id == 3
-
-    events, last_id = bus.pull_events(last_id)
-    assert events == []
-
 
 def test_worker_updates_auto_detector_window_on_settings_change() -> None:
     controller = _DummyController()
     worker = AnalysisWorker(controller, "ch0", sample_rate=20_000)
-    # Ensure worker subscribes to settings
-    # AnalysisWorker subscribes in __init__ if controller has store
-    
+
     worker.configure_threshold(enabled=True, value=0.5, auto_detect=True)
-    
-    # Initial check (default 10.0ms from settings)
+
     assert worker._auto_detector is not None
     assert worker._auto_detector._window_ms == 10.0
-    
-    # Change settings
+
     controller.analysis_settings_store.update(event_window_ms=20.0)
-    
-    # Verify update propagated
+
     assert worker._event_window_ms == 20.0
     assert worker._auto_detector._window_ms == 20.0
 

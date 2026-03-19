@@ -1,16 +1,67 @@
 # Analysis Module
 
-Real-time spike detection and event analysis for neural signals. Processes streaming data from the DAQ pipeline, detects threshold crossings, and computes event metrics.
+Real-time event analysis for filtered DAQ data. The supported path is intentionally single-track:
 
-* Simple threshold detection with auto-thresholding
-* Refractory period enforcement
-* Waveform capture around detection points
-* Centralized metric computation (envelope, frequency, amplitude)
-* Thread-safe settings with observer pattern
+`Dispatcher -> AnalysisWorker -> AnalysisBatch -> AnalysisTab`
 
-> This README covers analysis patterns for adding new detection algorithms and metrics.
+This guide is the source of truth for adding analysis features. If a change does not fit this pipeline, it is probably reintroducing a legacy pattern.
 
----
+## Supported Pipeline
+
+### Data Flow
+
+```text
+DAQ Source
+    ↓
+SharedRingBuffer (raw samples)
+    ↓
+Dispatcher (filtering + per-channel fan-out)
+    ↓
+registered analysis queue (filtered Chunk objects)
+    ↓
+AnalysisWorker
+    ↓
+detection_to_analysis_event()
+    ↓
+AnalysisBatch(chunk, events)
+    ↓
+AnalysisTab
+    ↓
+metric records / bounded event details / scatter plot / user classes / export / STA
+```
+
+### Contract Rules
+
+- `AnalysisWorker.output_queue` emits `AnalysisBatch` objects only.
+- `AnalysisBatch` is the sole worker-to-UI payload for analysis tabs.
+- `detection_to_analysis_event()` is the canonical conversion point from `DetectionEvent` to `AnalysisEvent`.
+- `AnalysisTab` owns the bounded UI-side state derived from those events: overlays, scatter metrics, class labels, waveform detail cache, exports, and STA inputs.
+- Do not add a second event-delivery bus, hidden chunk metadata fallback, or tab-side polling path.
+
+## Where To Change Code
+
+### Add a waveform-derived metric
+
+1. Add a pure function to [metrics.py](/Users/guslott/Code/SpikeHound2/spikehound/analysis/metrics.py).
+2. Compute it in [analysis_worker.py](/Users/guslott/Code/SpikeHound2/spikehound/analysis/analysis_worker.py) inside `detection_to_analysis_event()`.
+3. Store it on `event.properties`.
+4. If it should appear in the UI, wire it into [analysis_tab.py](/Users/guslott/Code/SpikeHound2/spikehound/gui/analysis_tab.py) selectors, labels, export, or class logic.
+
+### Add or change a detector
+
+1. Implement or extend a detector in `core/detection`.
+2. Register it in `DETECTOR_REGISTRY`.
+3. Configure it from `AnalysisWorker.configure_threshold()`.
+4. Keep `detection_to_analysis_event()` as the only `AnalysisEvent` creation path.
+
+### Add a new analysis-tab feature
+
+Build it from existing `AnalysisTab` state instead of creating a parallel cache:
+
+- `_metric_events` for bounded scatter/history records
+- `_event_details` for bounded waveform/detail retention
+- `_event_cluster_labels` for current class membership
+- `_clusters` for user-defined ROIs bound to metric axes
 
 ## Quick Start
 
@@ -19,81 +70,39 @@ Real-time spike detection and event analysis for neural signals. Processes strea
 ```python
 # In analysis/metrics.py
 
-def my_metric(samples: np.ndarray, sr: float) -> float:
-    """Compute my custom metric.
-    
-    Args:
-        samples: 1D array of waveform samples around event
-        sr: Sample rate in Hz
-        
-    Returns:
-        Computed metric value
-    """
-    if samples.size == 0 or sr <= 0:
+def spike_asymmetry(samples: np.ndarray, sr: float) -> float:
+    if samples.size < 2 or sr <= 0:
         return 0.0
-    # Your computation here
-    return float(result)
+    peak = float(np.max(samples))
+    trough = float(np.min(samples))
+    denom = abs(peak) + abs(trough)
+    if denom <= 1e-12:
+        return 0.0
+    return float((peak + trough) / denom)
 ```
-
-### Using a metric in the analysis worker
 
 ```python
-# In analysis/analysis_worker.py, within _detect_events():
+# In analysis/analysis_worker.py inside detection_to_analysis_event()
 
-from .metrics import my_metric
+from .metrics import spike_asymmetry
 
-# After extracting waveform:
-my_value = my_metric(waveform_samples, sample_rate)
-event.properties["my_metric"] = my_value
+props["spike_asymmetry"] = spike_asymmetry(wf, sr)
 ```
 
----
+### Surfacing a metric in the analysis tab
 
-## Architecture
+Common touch points in [analysis_tab.py](/Users/guslott/Code/SpikeHound2/spikehound/gui/analysis_tab.py):
 
-### Data Flow
+- metric selector labels for scatter axes
+- metric extraction when building point records
+- export columns
+- details panel text
 
-```
-DAQ Source
-    ↓
-SharedRingBuffer (raw samples)
-    ↓
-Dispatcher (filtering)
-    ↓
-analysis_queue (filtered Chunk objects)
-    ↓
-┌─────────────────────────────────────┐
-│         Analysis Layer              │
-│                                     │
-│  AnalysisWorker                     │
-│  (supported per-channel worker)     │
-│         ↓                           │
-│  AmpThresholdDetector               │
-│  (manual / auto thresholding)       │
-│         ↓                           │
-│  Event detection + metrics          │
-│         ↓                           │
-│  event_queue → GUI (AnalysisTab)    │
-└─────────────────────────────────────┘
-```
+If the metric affects class membership or export behavior, update the relevant `AnalysisTab` helpers instead of creating a side channel.
 
-### Key Components
+## Core Types
 
-| Component | File | Responsibility |
-|-----------|------|----------------|
-| `AnalysisWorker` | `analysis_worker.py` | Supported per-channel analysis worker for GUI |
-| `AmpThresholdDetector` | `../core/detection/threshold.py` | Supported threshold detector used by `AnalysisWorker` |
-| `AnalysisBatch` | `batch.py` | Worker-to-GUI payload carrying a chunk and its detected events |
-| `AnalysisSettings` | `settings.py` | Thread-safe settings with observers |
-| `metrics.py` | `metrics.py` | Centralized metric functions |
-
----
-
-## Data Types
-
-### AnalysisBatch (analysis/batch.py)
-
-Worker output passed to the GUI:
+### AnalysisBatch
 
 ```python
 @dataclass(frozen=True)
@@ -102,253 +111,82 @@ class AnalysisBatch:
     events: Sequence[AnalysisEvent]
 ```
 
-### AnalysisEvent (shared/types.py)
-
-Detailed event for GUI display (analysis layer):
+### AnalysisEvent
 
 ```python
 @dataclass(frozen=True)
 class AnalysisEvent:
-    id: int                       # Unique event ID
-    channelId: int                # Source channel
-    thresholdValue: float         # Threshold that was crossed
-    crossingIndex: int            # Absolute sample index
-    crossingTimeSec: float        # Timestamp of crossing
-    firstSampleTimeSec: float     # Timestamp of window start
-    sampleRateHz: float           # For time conversions
-    windowMs: float               # Total window duration
-    preMs: float                  # Pre-crossing portion
-    postMs: float                 # Post-crossing portion
-    samples: np.ndarray           # Waveform around crossing
-    properties: Dict[str, float]  # Computed metrics
-    intervalSinceLastSec: float   # Time since previous event
+    id: int
+    channelId: int
+    thresholdValue: float
+    crossingIndex: int
+    crossingTimeSec: float
+    firstSampleTimeSec: float
+    sampleRateHz: float
+    windowMs: float
+    preMs: float
+    postMs: float
+    samples: np.ndarray
+    properties: Dict[str, float]
+    intervalSinceLastSec: float
 ```
 
-### AnalysisSettings (analysis/settings.py)
+## Files That Matter
 
-Runtime-configurable parameters:
+| File | Responsibility |
+|------|----------------|
+| [analysis_worker.py](/Users/guslott/Code/SpikeHound2/spikehound/analysis/analysis_worker.py) | Per-channel event detection and `AnalysisBatch` emission |
+| [batch.py](/Users/guslott/Code/SpikeHound2/spikehound/analysis/batch.py) | Worker-to-UI payload contract |
+| [metrics.py](/Users/guslott/Code/SpikeHound2/spikehound/analysis/metrics.py) | Pure metric functions |
+| [analysis_tab.py](/Users/guslott/Code/SpikeHound2/spikehound/gui/analysis_tab.py) | Bounded UI state, scatter plot, classes, overlays, export, STA |
+| [test_analysis_worker.py](/Users/guslott/Code/SpikeHound2/spikehound/test/test_analysis_worker.py) | Worker contract and waveform/metric correctness |
+| [test_analysis_tab_event_pipeline.py](/Users/guslott/Code/SpikeHound2/spikehound/test/test_analysis_tab_event_pipeline.py) | End-to-end tab behavior from batch ingestion to classes/export/STA |
 
-```python
-@dataclass(frozen=True)
-class AnalysisSettings:
-    event_window_ms: float = 10.0  # Default event window width
+## Agent Workflow
+
+When an agent adds an analysis feature, use this order:
+
+1. Decide whether the feature is waveform-derived, detector-derived, or UI-derived.
+2. Put waveform math in [metrics.py](/Users/guslott/Code/SpikeHound2/spikehound/analysis/metrics.py) as a pure function.
+3. Wire event-level properties in `detection_to_analysis_event()` so every downstream consumer sees the same value.
+4. Extend [analysis_tab.py](/Users/guslott/Code/SpikeHound2/spikehound/gui/analysis_tab.py) only for presentation, classification, export, or STA behavior.
+5. Add worker coverage in [test_analysis_worker.py](/Users/guslott/Code/SpikeHound2/spikehound/test/test_analysis_worker.py).
+6. Add tab/pipeline coverage in [test_analysis_tab_event_pipeline.py](/Users/guslott/Code/SpikeHound2/spikehound/test/test_analysis_tab_event_pipeline.py) if the change affects scatter points, classes, overlays, export, or STA.
+7. Run the focused headless suite:
+
+```bash
+QT_QPA_PLATFORM=offscreen pytest -q test/test_analysis_worker.py test/test_analysis_tab_event_pipeline.py
 ```
 
----
+## Checklists
 
-## Metric Functions
+### New Metric
 
-All metrics are **pure functions** in `analysis/metrics.py`:
+- [ ] Pure function added to `metrics.py`
+- [ ] Metric attached in `detection_to_analysis_event()`
+- [ ] UI wiring added only where needed
+- [ ] Export/class/STA behavior updated if applicable
+- [ ] Worker tests added
+- [ ] Tab pipeline tests added if user-visible
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `baseline` | `(samples, pre_samples) → float` | Median baseline from pre-event samples |
-| `envelope` | `(samples) → float` | Signal envelope (max - min) |
-| `min_max` | `(samples) → (max, min)` | Peak amplitude extraction |
-| `peak_frequency_sinc` | `(samples, sr, min_hz, center_index) → float` | FFT + sinc interpolation frequency |
-| `autocorr_frequency` | `(segment, sr, min_hz, max_hz) → float` | Autocorrelation frequency fallback |
+### New Detector
 
-### Adding a New Metric
-
-1. **Create the function in `metrics.py`**:
-
-```python
-def spike_width(samples: np.ndarray, sr: float, threshold_frac: float = 0.5) -> float:
-    """Compute spike width at half-maximum.
-    
-    Args:
-        samples: 1D waveform array
-        sr: Sample rate in Hz
-        threshold_frac: Fraction of peak for width measurement
-        
-    Returns:
-        Width in milliseconds
-    """
-    if samples.size < 3 or sr <= 0:
-        return 0.0
-    
-    peak_idx = int(np.argmax(np.abs(samples)))
-    peak_val = np.abs(samples[peak_idx])
-    threshold = peak_val * threshold_frac
-    
-    # Find crossings
-    above = np.abs(samples) >= threshold
-    # ... (compute width)
-    
-    return float(width_samples / sr * 1000.0)  # Convert to ms
-```
-
-2. **Add to `__all__` export** (if module has one):
-
-```python
-__all__ = ["baseline", "envelope", "min_max", "peak_frequency_sinc", "spike_width"]
-```
-
-3. **Use in AnalysisWorker._detect_events()**:
-
-```python
-from .metrics import spike_width
-
-# In event detection loop:
-width = spike_width(waveform, sample_rate)
-properties["spike_width_ms"] = width
-```
-
-4. **Display in AnalysisTab** (if desired):
-
-```python
-# In gui/analysis_tab.py, add to metrics display
-self.width_label.setText(f"Width: {event.properties.get('spike_width_ms', 0):.2f} ms")
-```
-
----
-
-## Detection Patterns
-
-### Threshold Detection (Basic)
-
-```python
-def detect_threshold_crossings(
-    samples: np.ndarray,
-    threshold: float,
-    polarity: str = "neg",
-    refractory_samples: int = 30,
-) -> list[int]:
-    """Detect threshold crossings with refractory enforcement.
-    
-    Args:
-        samples: 1D signal array
-        threshold: Detection threshold (absolute value for neg/pos)
-        polarity: "neg" (below), "pos" (above), or "both"
-        refractory_samples: Minimum samples between detections
-        
-    Returns:
-        List of crossing indices
-    """
-    crossings = []
-    last_crossing = -refractory_samples
-    
-    for i in range(1, len(samples)):
-        # Check refractory
-        if i - last_crossing < refractory_samples:
-            continue
-            
-        # Check crossing based on polarity
-        if polarity == "neg":
-            crossed = samples[i-1] > -threshold and samples[i] <= -threshold
-        elif polarity == "pos":
-            crossed = samples[i-1] < threshold and samples[i] >= threshold
-        else:  # both
-            crossed = (abs(samples[i-1]) < threshold and 
-                      abs(samples[i]) >= threshold)
-        
-        if crossed:
-            crossings.append(i)
-            last_crossing = i
-    
-    return crossings
-```
-
-### Auto-Thresholding (MAD-based)
-
-```python
-def compute_auto_threshold(samples: np.ndarray, k_sigma: float = 5.0) -> float:
-    """Compute threshold from noise estimate using Median Absolute Deviation.
-    
-    MAD is robust to outliers (spikes) unlike standard deviation.
-    sigma ≈ 1.4826 * MAD for Gaussian noise.
-    
-    Args:
-        samples: 1D signal array (should be longer than typical spike)
-        k_sigma: Multiplier for noise estimate
-        
-    Returns:
-        Absolute threshold value
-    """
-    median = np.median(samples)
-    mad = np.median(np.abs(samples - median))
-    sigma = 1.4826 * mad
-    return k_sigma * sigma
-```
-
-## AnalysisSettingsStore Pattern
-
-Thread-safe settings with observer notifications:
-
-```python
-from analysis.settings import AnalysisSettings, AnalysisSettingsStore
-
-# Create store
-store = AnalysisSettingsStore()
-
-# Subscribe to changes
-def on_settings_changed(settings: AnalysisSettings):
-    print(f"Window changed to {settings.event_window_ms} ms")
-
-unsubscribe = store.subscribe(on_settings_changed, replay=True)
-
-# Update settings (notifies all subscribers)
-store.update(event_window_ms=10.0)
-
-# Get current settings
-current = store.get()
-
-# Unsubscribe when done
-unsubscribe()
-```
-
----
-
-## File Reference
-
-| File | Lines | Purpose |
-|------|-------|---------|
-| `analysis_worker.py` | 674 | Per-channel analysis worker for GUI integration |
-| `batch.py` | 18 | Worker-to-GUI batch payload |
-| `metrics.py` | 168 | Centralized metric functions |
-| `settings.py` | 63 | Thread-safe settings store |
-| `__init__.py` | 4 | Package exports |
-
----
-
-## Checklist for New Detection Algorithm
-
-- [ ] Create detector class or function
-- [ ] Handle edge cases (empty arrays, invalid sample rate)
-- [ ] Enforce refractory period between detections
-- [ ] Create AnalysisEvent objects with proper timing metadata
-- [ ] Compute and attach relevant metrics to `event.properties`
-- [ ] Add tests with synthetic signals
-- [ ] Document expected input/output formats
-
----
-
-## Checklist for New Metric
-
-- [ ] Create pure function in `metrics.py`
-- [ ] Accept `samples: np.ndarray` and `sr: float` at minimum
-- [ ] Handle edge cases (empty array, zero sample rate)
-- [ ] Return `float` (use 0.0 for invalid inputs)
-- [ ] Add to event's `properties` dict in `_detect_events()`
-- [ ] Display in GUI if user-facing
-- [ ] Add unit test with known input/output
-
----
+- [ ] Detector added under `core/detection`
+- [ ] Registered in `DETECTOR_REGISTRY`
+- [ ] Configurable through `AnalysisWorker`
+- [ ] Still creates `AnalysisEvent` objects only through `detection_to_analysis_event()`
+- [ ] Threshold/manual/auto edge cases covered by tests
 
 ## FAQ
 
-**Q: What is the supported event-detection path?**
+**Q: Where should a new event property be computed?**
 
-The supported path is `AnalysisWorker` with `AmpThresholdDetector`, wired through the GUI and `PipelineController`.
+If it comes from the waveform and should be shared by scatter/classes/export/STA, compute it in `detection_to_analysis_event()`.
 
-**Q: How do I add a new detection algorithm?**
+**Q: Should I store extra events in chunk metadata or a side queue?**
 
-Create a new detector class following `AmpThresholdDetector` (in `core/detection.py`), register it in `DETECTOR_REGISTRY`, and configure it via `AnalysisWorker.configure_threshold()`.
+No. Use `AnalysisBatch.events`. That is the supported contract.
 
-**Q: Why are metrics pure functions?**
+**Q: Where should class-aware behavior live?**
 
-Pure functions are easier to test, don't require state management, and can be composed or called from multiple locations (worker, GUI, tests) without side effects.
-
-**Q: How do I tune auto-threshold sensitivity?**
-
-In the supported path, tune the detector factor configured through `AnalysisWorker.configure_threshold()`; the canonical default is `5.0` sigma.
+In `AnalysisTab`, using `_event_cluster_labels` and the bounded event-detail/metric state already maintained there.

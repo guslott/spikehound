@@ -157,18 +157,6 @@ buffer.write(samples)  # Write from producer
 data = buffer.read(start, length)  # Read from consumers
 ```
 
-### EventRingBuffer (`event_buffer.py`)
-
-Thread-safe event storage with ID-based retrieval:
-
-```python
-from shared.event_buffer import EventRingBuffer
-
-buffer = EventRingBuffer(capacity=1000)
-buffer.push(event)
-events = buffer.pull_since(last_id)
-```
-
 ### AppSettingsStore (`app_settings.py`)
 
 Persistent application settings with observer pattern:
@@ -190,7 +178,6 @@ settings = store.get()
 | `models.py` | ~400 | Core dataclasses, queue policies, enqueue helpers |
 | `types.py` | 88 | AnalysisEvent type |
 | `ring_buffer.py` | 100 | SharedRingBuffer |
-| `event_buffer.py` | 84 | EventRingBuffer |
 | `app_settings.py` | 140 | AppSettingsStore |
 
 ---

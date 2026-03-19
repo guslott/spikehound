@@ -18,7 +18,6 @@ from shared.models import Chunk, EndOfStream, TriggerConfig
 from shared.ring_buffer import SharedRingBuffer
 from analysis.settings import AnalysisSettingsStore
 from shared.app_settings import AppSettings, AppSettingsStore
-from shared.event_buffer import AnalysisEvents, EventRingBuffer
 from shared.types import AnalysisEvent
 
 
@@ -51,8 +50,6 @@ class PipelineController:
         self.event_queue: "queue.Queue" = queue.Queue(maxsize=1024)
         self._analysis_settings = AnalysisSettingsStore()
         self._app_settings_store = app_settings_store if app_settings_store is not None else AppSettingsStore()
-        self._event_buffer = EventRingBuffer(capacity=1000)
-        self._analysis_events = AnalysisEvents(self._event_buffer)
 
         self._dispatcher_timeout = dispatcher_poll_timeout
         self._dispatcher: Optional[Dispatcher] = None
@@ -97,14 +94,6 @@ class PipelineController:
     @property
     def analysis_settings_store(self) -> AnalysisSettingsStore:
         return self._analysis_settings
-
-    @property
-    def event_buffer(self) -> EventRingBuffer:
-        return self._event_buffer
-
-    @property
-    def analysis_events(self) -> AnalysisEvents:
-        return self._analysis_events
 
     @property
     def app_settings_store(self) -> AppSettingsStore:
@@ -358,9 +347,6 @@ class PipelineController:
             return
         with self._lock:
             self._analysis_settings.update(**updates)
-
-    def pull_analysis_events(self, last_event_id: Optional[int] = None):
-        return self._analysis_events.pull_events(last_event_id)
 
     # Trigger configuration ---------------------------------------------
 
@@ -688,7 +674,6 @@ class PipelineController:
         """Clear downstream queues so the next start() begins fresh."""
         for q in (self.visualization_queue, self.audio_queue, self.logging_queue, self.event_queue):
             self._flush_queue(q)
-        self._event_buffer.clear()
 
     def _destroy_dispatcher(self) -> None:
         if self._dispatcher is None:

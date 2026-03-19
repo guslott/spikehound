@@ -13,7 +13,7 @@
 - `connect_device(device_key, sample_rate, chunk_size=...)`: connect via the runtime-owned device manager.
 - `start_acquisition()` / `stop_acquisition()`: start/stop streaming through the dispatcher.
 - `shutdown()`: stop everything and release resources.
-- `open_analysis_stream(channel_name, sample_rate) -> (queue, worker)`: start an `AnalysisWorker` for a channel and return its output queue.
+- `open_analysis_stream(channel_name, sample_rate) -> (queue, worker)`: start an `AnalysisWorker` for a channel and return its `AnalysisBatch` output queue.
 - `set_listen_output_device(device_key)`: persist the audio output preference.
 - `health_snapshot()`: return dispatcher stats, queue depths, and current rates.
 - `update_metrics(chunk_rate=None, plot_refresh_hz=None, sample_rate=None)`: let UI push live rate info for health snapshots.

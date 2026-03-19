@@ -14,7 +14,6 @@ class _FakePipeline:
         self.audio_queue = queue.Queue()
         self.logging_queue = queue.Queue()
         self.analysis_settings_store = None
-        self.event_buffer = None
         self.attached: tuple[object, float, list[ChannelInfo]] | None = None
         self.sample_rate: float | None = None
 

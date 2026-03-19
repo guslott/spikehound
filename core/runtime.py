@@ -17,7 +17,6 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .controller import PipelineController
     from analysis.analysis_worker import AnalysisWorker
     from analysis.settings import AnalysisSettingsStore
-    from shared.event_buffer import EventRingBuffer
 
 
 class SpikeHoundRuntime:
@@ -107,14 +106,6 @@ class SpikeHoundRuntime:
         if self._pipeline is not None:
             return self._pipeline.analysis_settings_store
         return None
-
-    @property
-    def event_buffer(self) -> Optional["EventRingBuffer"]:
-        """Get the event buffer from the pipeline."""
-        if self._pipeline is not None:
-            return self._pipeline.event_buffer
-        return None
-
 
     def update_analysis_settings(self, **kwargs) -> None:
         """Delegate analysis-settings updates to the PipelineController."""
