@@ -7,7 +7,6 @@ data processing, and dispatcher integration.
 from __future__ import annotations
 
 import logging
-import queue
 import time
 from typing import Dict, List, Optional, Sequence
 
@@ -45,7 +44,11 @@ class PlotManager(QtCore.QObject):
         super().__init__(parent)
         self._plot_widget = plot_widget
         self._trigger_controller = trigger_controller
-        
+        # Tracks the last held trigger capture / window so _render_trigger_display
+        # can skip redundant re-renders of a static capture (finding 7.3).
+        self._last_trigger_display: Optional[np.ndarray] = None
+        self._last_trigger_window: Optional[float] = None
+
         # Renderer management
         self._renderers: Dict[int, TraceRenderer] = {}
         
@@ -135,10 +138,6 @@ class PlotManager(QtCore.QObject):
         self._active_channel_id = channel_id
         self._apply_active_channel_style()
     
-    def update_channel_configs(self, configs: Dict[int, ChannelConfig]) -> None:
-        """Update the channel configurations reference."""
-        self._channel_configs = configs
-
     # -------------------------------------------------------------------------
     # Renderer Management
     # -------------------------------------------------------------------------
@@ -244,13 +243,14 @@ class PlotManager(QtCore.QObject):
         self._chunk_last_rate_update = time.perf_counter()
     
     def clear_scope_display(self) -> None:
-        """Clear all channels and reset the scope to initial state."""
-        plot_item = self._plot_widget.getPlotItem()
-        try:
-            plot_item.clear()
-        except Exception as e:
-            logger.debug("Failed to clear plot item: %s", e)
-        
+        """Clear all channels and reset the scope to initial state.
+
+        Removes only the per-channel curves (each renderer removes its own
+        curve in cleanup()). Deliberately does NOT call ``plot_item.clear()``:
+        that would also remove the persistent threshold/pretrigger overlay
+        lines, which are owned by ScopeWidget and must survive disconnect and
+        hardware rescans.
+        """
         # Clear renderers
         for renderer in self._renderers.values():
             renderer.cleanup()
@@ -341,6 +341,10 @@ class PlotManager(QtCore.QObject):
                 if renderer is not None:
                     renderer.update_data(channel_data, times_arr, downsample=ds)
             self._apply_active_channel_style()
+            # Streaming has overwritten the renderers, so the held-capture cache
+            # is stale: force the next _render_trigger_display to redraw even if
+            # it shows the same captured array (finding 7.3 guard).
+            self._last_trigger_display = None
             # Only call setXRange when the window duration has actually changed;
             # calling it every frame triggers an unnecessary repaint at 60 Hz.
             if window_sec > 0 and window_sec != self._current_window_sec:
@@ -455,6 +459,14 @@ class PlotManager(QtCore.QObject):
             return
         window = max(window_sec, 1e-6)
         data = tc.display_data
+        # Skip re-rendering an unchanged held capture (finding 7.3): between
+        # triggers the captured waveform is static, so re-running setXRange and
+        # the per-channel float32 copies every ~60 Hz frame is wasted work.
+        # Re-render only when the captured data object or the window changed.
+        if data is self._last_trigger_display and window_sec == self._last_trigger_window:
+            return
+        self._last_trigger_display = data
+        self._last_trigger_window = window_sec
         n = data.shape[0]
         sr = tc.sample_rate if tc.sample_rate > 0 else self._current_sample_rate
         if sr <= 0 and window > 0 and n > 0:
@@ -542,21 +554,3 @@ class PlotManager(QtCore.QObject):
         else:
             self._active_channel_id = None
         self._apply_active_channel_style()
-    
-    def get_channel_at_y(self, y: float) -> Optional[int]:
-        """Return the channel with screen offset closest to y, if within range."""
-        candidates = []
-        for cid, config in self._channel_configs.items():
-            dist = abs(float(y) - config.screen_offset)
-            candidates.append((dist, cid))
-        
-        if not candidates:
-            return None
-            
-        candidates.sort(key=lambda x: x[0])
-        dist, cid = candidates[0]
-        
-        # 5% tolerance
-        if dist > 0.05:
-            return None
-        return cid

@@ -491,3 +491,37 @@ class TestSyncWatchdogRecovery:
         assert dev._xruns == 0, (
             f"Expected 0 xruns with steady valid data; got {dev._xruns}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Group N — Teardown safety (finding 6.3)
+# ---------------------------------------------------------------------------
+
+class TestTransportTeardownRace:
+    """_run_loop must stop reading once the transport is detached, so a stalled
+    teardown can't call read() on a closed/freed handle (finding 6.3)."""
+
+    def test_loop_stops_reading_after_transport_detached(self):
+        dev = _make_byb_device(bits=10, stream_channels=1, chunk_size=50)
+        read_calls: List[int] = []
+
+        class _DetachOnReadTransport(ControlledFakeTransport):
+            def read(self, timeout_ms: int = 0) -> bytes:
+                read_calls.append(1)
+                # Simulate close() detaching the transport concurrently.
+                with dev._transport_lock:
+                    dev._transport = None
+                if timeout_ms > 0:
+                    time.sleep(timeout_ms / 1000.0)
+                return b""
+
+        dev._transport = _DetachOnReadTransport()
+
+        t = threading.Thread(target=dev._run_loop, daemon=True)
+        t.start()
+        t.join(timeout=2.0)
+
+        # The loop re-fetches _transport each iteration; after the detach it sees
+        # None and exits instead of reading the detached handle again.
+        assert not t.is_alive(), "loop should exit after the transport is detached"
+        assert len(read_calls) == 1, f"loop read the detached transport again: {len(read_calls)} reads"

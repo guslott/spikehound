@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtWidgets
 
 from .trigger_controller import TriggerController
 
@@ -65,9 +65,7 @@ class TriggerControlWidget(QtWidgets.QWidget):
 
         row = 0
         
-        # Channel Selection
-        # Note: Channel list population needs to be handled externally or via signals
-        # because this widget doesn't know about available channels yet.
+        # Channel Selection (populated externally via update_channels()).
         trigger_layout.addWidget(QtWidgets.QLabel("Channel"), row, 0)
         self.trigger_channel_combo = QtWidgets.QComboBox()
         self.trigger_channel_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
@@ -82,10 +80,8 @@ class TriggerControlWidget(QtWidgets.QWidget):
         
         self.trigger_mode_stream = QtWidgets.QRadioButton("No Trigger (Stream)")
         self.trigger_mode_single = QtWidgets.QRadioButton("Single")
-        # Start disabled until we have a valid channel? Original code had them enabled/disabled logic.
-        # But wait, original code initialized them as disabled?
-        # "self.trigger_mode_single.setEnabled(False)" in original.
-        self.trigger_mode_single.setEnabled(False) 
+        # Disabled until a valid trigger channel exists (see _set_trigger_modes_enabled).
+        self.trigger_mode_single.setEnabled(False)
         
         self.trigger_mode_repeated = QtWidgets.QRadioButton("Repeated Trigger")
         self.trigger_mode_repeated.setEnabled(False)
@@ -147,10 +143,7 @@ class TriggerControlWidget(QtWidgets.QWidget):
         self.window_combo.setMaximumWidth(110)
         for value in (0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0):
             self.window_combo.addItem(self._format_window_width(value), value)
-        # Default roughly 1.0s or so
-        default_index = 4 # 1.0 is index 4
-        # Original logic: default_index = 1 if count > 1 else max...
-        # Let's stick to a sensible default.
+        default_index = 4  # 1.0 s
         self.window_combo.setCurrentIndex(default_index)
         window_box.addWidget(self.window_combo)
         trigger_layout.addLayout(window_box, row, 0, 1, 2)
@@ -196,7 +189,17 @@ class TriggerControlWidget(QtWidgets.QWidget):
         # Channel
         chan_data = self.trigger_channel_combo.currentData()
         channel_id = int(chan_data) if chan_data is not None else None
-        
+
+        # A triggered mode requires a valid channel; TriggerConfig rejects
+        # channel_index=None for single/repeated and would raise mid-signal,
+        # silently aborting the visual update. Fall back to stream instead.
+        if mode in ("single", "repeated") and channel_id is None:
+            mode = "stream"
+            self.trigger_mode_stream.blockSignals(True)
+            self.trigger_mode_stream.setChecked(True)
+            self.trigger_mode_stream.blockSignals(False)
+            self.trigger_single_button.setEnabled(False)
+
         # Threshold
         threshold = self.threshold_spin.value()
         
@@ -265,15 +268,3 @@ class TriggerControlWidget(QtWidgets.QWidget):
             self.trigger_mode_stream.setChecked(True)
             self.trigger_single_button.setEnabled(False)
             # config change will happen via update_channels -> _on_config_changed
-
-    def select_channel_by_index(self, index: int) -> None:
-        """Programmatic selection for default behavior."""
-        if index < 0 or index >= self.trigger_channel_combo.count():
-            return
-        self.trigger_channel_combo.setCurrentIndex(index)
-    
-    def set_window_value(self, value: float) -> None:
-        """Select nearest window value."""
-        idx = self.window_combo.findData(value)
-        if idx >= 0:
-            self.window_combo.setCurrentIndex(idx)

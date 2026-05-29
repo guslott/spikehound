@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import queue
 import time
@@ -30,7 +29,7 @@ from .trigger_controller import TriggerController
 from .plot_manager import PlotManager
 from .device_manager import DeviceManager
 from .recording_control_widget import RecordingControlWidget
-from .scope_config_manager import ScopeConfigManager, ScopeConfigProvider
+from .scope_config_manager import ScopeConfigManager
 from .trigger_control_widget import TriggerControlWidget
 from .channel_manager import ChannelManager
 from .audio_listen_manager import AudioListenManager
@@ -39,6 +38,11 @@ from .branding_manager import BrandingManager
 from .tab_plugin_manager import TabPluginManager
 from .signal_bridge import SignalBridge
 from .dispatcher_adapter import DispatcherSignals, connect_dispatcher_signals
+
+
+# Minimum interval between (potentially lock-taking) status-string refreshes.
+# The dispatcher ticks at ~60 Hz; the status readout only needs a few Hz (7.3).
+_STATUS_UPDATE_INTERVAL = 0.25  # seconds (~4 Hz)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -95,7 +99,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_window_sec: float = 1.0
         self._dispatcher_signals: Optional[DispatcherSignals] = None
         self._dispatcher_unsubscribe: Optional[Callable[[], None]] = None
-        self._drag_channel_id: Optional[int] = None
         self._active_channel_id: Optional[int] = None
         # Track which channel is being monitored (for UI state only, AudioManager handles actual routing)
         self._listen_channel_id: Optional[int] = None
@@ -248,13 +251,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         
         # Connect ScopeWidget signals
-        self.scope.viewClicked.connect(self._on_scope_clicked)
-        self.scope.viewDragged.connect(self._on_scope_dragged)
-        self.scope.viewDragFinished.connect(self._on_scope_drag_finished)
         self.scope.thresholdChanged.connect(self._on_scope_threshold_changed)
         self.scope.popoutRequested.connect(self._on_scope_popout_requested)
 
         self._status_labels = {}
+        self._last_status_update = 0.0  # throttle timestamp for _update_status (7.3)
 
         # Upper-right: stacked control boxes (Recording, Trigger, Channel Options).
         side_panel = QtWidgets.QWidget()
@@ -461,6 +462,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_trigger_visuals(self, config: TriggerConfig, update_line: bool = True) -> None:
         """Update trigger visual elements on the scope."""
+        # The threshold/pretrigger lines are persistent overlay chrome; ensure
+        # they are attached to the plot before we try to show them.
+        self.scope.ensure_overlay_items()
         mode = config.mode
         channel_valid = config.channel_index != -1
         
@@ -483,15 +487,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.scope.set_threshold(normalized_value, visible=True)
         else:
             self.scope.set_threshold(visible=True)
-        
-        # Style threshold line
-        pen = pg.mkPen((0, 0, 0), width=5)
-        self.scope.threshold_line.setPen(pen)
-        try:
-            self.scope.threshold_line.setZValue(100)
-        except AttributeError:
-            pass
-        
+
         # Pretrigger line
         pre_value = float(config.pretrigger_frac)
         if pre_value > 0.0:
@@ -1021,10 +1017,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.runtime.update_audio_active_channels(ids)
 
 
-    def _ensure_channel_config(self, channel_id: int, channel_name: str) -> ChannelConfig:
-        """Delegate to ChannelManager."""
-        return self._channel_manager.ensure_channel_config(channel_id, channel_name)
-
     def _sync_channel_panels(self, channel_ids: Sequence[int], channel_names: Sequence[str]) -> None:
         """Delegate to ChannelManager."""
         self._channel_manager.sync_channel_panels(
@@ -1039,54 +1031,6 @@ class MainWindow(QtWidgets.QMainWindow):
         """Delegate to ChannelManager."""
         self._channel_manager.clear_channel_panels()
         self._plot_manager.clear_cached_samples()
-
-    def _show_channel_panel(self, channel_id: Optional[int]) -> None:
-        self.channel_controls.show_panel(channel_id)
-
-    def _select_active_channel_by_id(self, channel_id: int) -> None:
-        """Delegate to ChannelManager."""
-        self._channel_manager.select_active_channel_by_id(channel_id)
-        self._active_channel_id = self._channel_manager.active_channel_id
-
-    def _nearest_channel_at_y(self, y: float) -> Optional[int]:
-        """Delegate to ChannelManager."""
-        return self._channel_manager.get_nearest_channel_at_y(y)
-
-    def _on_plot_channel_clicked(self, y: float, button: QtCore.Qt.MouseButton) -> None:
-        if button != QtCore.Qt.MouseButton.LeftButton:
-            return
-        cid = self._nearest_channel_at_y(y)
-        if cid is None:
-            self._drag_channel_id = None
-            return
-        self._drag_channel_id = cid
-        self._select_active_channel_by_id(cid)
-        self._set_active_channel_focus(cid)
-        self._show_channel_panel(cid)
-        self._set_active_channel_focus(cid)
-
-    def _on_plot_channel_dragged(self, y: float) -> None:
-        if self._drag_channel_id is None:
-            return
-        config = self._channel_configs.get(self._drag_channel_id)
-        if config is None:
-            return
-        y_clamped = max(0.0, min(1.0, float(y)))
-        # Snap to center if within 5% of mid
-        if abs(y_clamped - 0.5) <= 0.05:
-            y_clamped = 0.5
-        if abs(config.screen_offset - y_clamped) < 1e-6:
-            return
-        config.screen_offset = y_clamped
-        panel = self._channel_panels.get(self._drag_channel_id)
-        if panel is not None:
-            panel.set_config(config)
-        self._update_channel_display(self._drag_channel_id)
-        self._update_plot_y_range()
-        self._update_axis_label()
-
-    def _on_plot_drag_finished(self) -> None:
-        self._drag_channel_id = None
 
     def _on_channel_config_changed(self, channel_id: int, config: ChannelConfig) -> None:
         existing = self._channel_configs.get(channel_id)
@@ -1489,18 +1433,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._window_combo_user_set = True
         self._apply_window_value(value)
 
-    def _on_threshold_line_changed(self) -> None:
-        y_norm = float(self.scope.threshold_line.value())
-        cfg = self._channel_configs.get(self._trigger_controller.channel_id) or self._channel_configs.get(self._active_channel_id)
-        span = cfg.vertical_span_v if cfg is not None else 1.0
-        offset = cfg.screen_offset if cfg is not None else 0.0
-        # Reverse transform: must match trace_renderer.py: voltage = (y_norm - offset) * (2 * span)
-        value = (y_norm - offset) * (2.0 * span)
-        if abs(self.trigger_control.threshold_spin.value() - value) > 1e-6:
-            self.trigger_control.threshold_spin.blockSignals(True)
-            self.trigger_control.threshold_spin.setValue(value)
-            self.trigger_control.threshold_spin.blockSignals(False)
-
     def _on_scope_popout_requested(self) -> None:
         times = self._plot_manager.last_times
         if times.size == 0:
@@ -1555,72 +1487,29 @@ class MainWindow(QtWidgets.QMainWindow):
         """Forget a scope pop-out window after it closes."""
         self._scope_popout_windows = [item for item in self._scope_popout_windows if item is not window]
 
-    # ScopeWidget signal handlers
-    # ScopeWidget signal handlers
-    def _on_scope_clicked(self, y: float, button: QtCore.Qt.MouseButton) -> None:
-        """Handle click on scope view."""
-        if button != QtCore.Qt.MouseButton.LeftButton:
-            return
-        
-        cid = self._plot_manager.get_channel_at_y(y)
-        if cid is not None:
-            self._select_active_channel_by_id(cid)
-            self._on_scope_dragged(y) # Start drag implicitly
-
-    def _on_scope_dragged(self, y: float) -> None:
-        """Handle dragging logic (update active channel offset)."""
-        if self._active_channel_id is None:
-            return
-            
-        # We assume active channel is the one being dragged if drag started
-        cid = self._active_channel_id
-        if cid not in self._channel_configs:
-            return
-            
-        config = self._channel_configs[cid]
-        
-        y_clamped = max(0.0, min(1.0, float(y)))
-        # Snap to center if within 5% of mid
-        if abs(y_clamped - 0.5) <= 0.05:
-            y_clamped = 0.5
-            
-        if abs(config.screen_offset - y_clamped) < 1e-6:
-            return
-            
-        config.screen_offset = y_clamped
-        # Update PlotManager config
-        self._plot_manager.update_channel_configs(self._channel_configs)
-        self._plot_manager.update_channel_display(cid)
-        
-        # Update Channel Detail Panel
-        panel = self._channel_panels.get(cid)
-        if panel is not None:
-             panel.set_config(config)
-
-        # Triggers
-        if self._trigger_controller.channel_id is not None and cid == self._trigger_controller.channel_id:
-            # Create TriggerConfig for visual update
-            config_update = TriggerConfig(
-                channel_index=cid,
-                threshold=self._trigger_controller.threshold,
-                hysteresis=0.0,
-                pretrigger_frac=self._trigger_controller.pre_seconds,
-                window_sec=self._trigger_controller.window_sec,
-                mode=self._trigger_controller.mode,
-            )
-            self._update_trigger_visuals(config_update)
-
-    def _on_scope_drag_finished(self) -> None:
-        """Handle end of channel drag operation."""
-        # No specific action needed
-        pass
-
     def _reset_trigger_state(self) -> None:
         """Reset trigger state and hide visual indicators."""
         self._trigger_controller.reset_state()
         self.scope.pretrigger_line.setVisible(False)
 
     def _update_status(self, viz_depth: int) -> None:
+        # Cheap, always-on side effect: clear a stale chunk-rate readout.
+        now = time.perf_counter()
+        if self._chunk_accum_count == 0 and (now - self._chunk_last_rate_update) > (self._chunk_rate_window * 2.0):
+            self._chunk_rate = 0.0
+            self._chunk_mean_samples = 0.0
+
+        # The per-queue status strings below take core locks (dispatcher_stats /
+        # queue_depths) and build strings, but are only consumed once status
+        # labels are wired up. Skip that work entirely when there is no display
+        # target, and otherwise throttle to a few Hz rather than running it on
+        # every ~60 Hz dispatcher tick (finding 7.3).
+        if not self._status_labels:
+            return
+        if (now - self._last_status_update) < _STATUS_UPDATE_INTERVAL:
+            return
+        self._last_status_update = now
+
         controller = self._controller
         if controller is None:
             stats = {}
@@ -1633,12 +1522,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         drops = stats.get("dropped", {}) if isinstance(stats, dict) else {}
         evicted = stats.get("evicted", {}) if isinstance(stats, dict) else {}
-
-        # Clear stale chunk rate
-        now = time.perf_counter()
-        if self._chunk_accum_count == 0 and (now - self._chunk_last_rate_update) > (self._chunk_rate_window * 2.0):
-            self._chunk_rate = 0.0
-            self._chunk_mean_samples = 0.0
 
         if sr > 0 and self._chunk_mean_samples > 0:
             avg_ms = (self._chunk_mean_samples / sr) * 1_000.0
@@ -1665,26 +1548,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def health_snapshot(self) -> dict:
         return self.runtime.health_snapshot()
-
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-
-    def populate_devices(self, devices: Sequence[str]) -> None:
-        """Populate the device panel once selection widgets exist."""
-        _ = devices
-
-    def set_active_channels(self, channels: Sequence[str]) -> None:
-        """Display the channels currently routed to the plot."""
-        names = [ch.name if hasattr(ch, "name") else str(ch) for ch in channels]
-        self._ensure_renderers_for_ids(self._channel_ids_current, names)
-        
-        # Trigger widget handles its own channel logic
-        # Must pass list of (name, id) tuples
-        # We assume self._channel_ids_current aligns with channels/names
-        # If lengths mismatch, zip will truncate safe-ly
-        trigger_channels = list(zip(names, self._channel_ids_current))
-        self.trigger_control.update_channels(trigger_channels)
 
     def set_trigger_channels(self, channels: Sequence[object], *, current: Optional[int] = None) -> None:
         """Update trigger channel choices presented to the user."""
@@ -1743,22 +1606,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chunk_rate = 0.0
         self._chunk_mean_samples = 0.0
         self._update_status(viz_depth=0)
-
-    def _ensure_renderers_for_ids(self, channel_ids: Sequence[int], channel_names: Sequence[str]) -> None:
-        """Synchronize the TraceRenderers with the current active channel list."""
-        # Ensure configs exist for all channels before delegating
-        for cid, name in zip(channel_ids, channel_names):
-            self._ensure_channel_config(cid, name)
-        
-        # Delegate to PlotManager
-        self._plot_manager.ensure_renderers_for_ids(
-            channel_ids, channel_names, self._channel_configs
-        )
-        
-        # Sync state back partial
-        self._channel_ids_current = list(channel_ids)
-        self._channel_names = list(channel_names) if channel_names else [f"Ch {i}" for i in channel_ids]
-    
 
     def _maybe_update_analysis_sample_rate(self, sample_rate: float) -> None:
         """Update analysis dock with sample rate changes."""

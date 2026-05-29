@@ -38,17 +38,16 @@ class VoltageAxis(pg.AxisItem):
 
 
 class ChannelViewBox(pg.ViewBox):
-    """Custom ViewBox to expose click & drag events for channel selection."""
+    """ViewBox that stays inert to mouse input.
 
-    channelClicked = QtCore.Signal(float, QtCore.Qt.MouseButton)
-    channelDragged = QtCore.Signal(float)
-    channelDragFinished = QtCore.Signal()
+    The scope is read-only for pan/zoom; the only interactive element is the
+    draggable threshold line, which consumes its own mouse events at the scene
+    level before they reach the view box.
+    """
 
     def __init__(self, *args, **kwargs) -> None:
         kwargs.setdefault("enableMenu", False)
         super().__init__(*args, **kwargs)
-        self._dragging = False
-        self._drag_button: Optional[QtCore.Qt.MouseButton] = None
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         event.ignore()
@@ -63,10 +62,6 @@ class ChannelViewBox(pg.ViewBox):
 class ScopeWidget(QtWidgets.QWidget):
     """Multi-channel oscilloscope visualization widget."""
 
-    # Updated Signals
-    viewClicked = QtCore.Signal(float, QtCore.Qt.MouseButton)  # y_pos, button
-    viewDragged = QtCore.Signal(float)  # y_pos
-    viewDragFinished = QtCore.Signal()
     thresholdChanged = QtCore.Signal(float)
     popoutRequested = QtCore.Signal()
 
@@ -106,10 +101,11 @@ class ScopeWidget(QtWidgets.QWidget):
         plot_item.showGrid(x=True, y=True, alpha=0.4)
         plot_item.vb.setBorder(pg.mkPen((0, 0, 139)))
 
-        # Add threshold and pretrigger lines
+        # Add threshold and pretrigger lines. The threshold line is black and
+        # draggable; its style is fixed here (no per-frame restyling).
         self.threshold_line = pg.InfiniteLine(
             angle=0,
-            pen=pg.mkPen((178, 34, 34), width=5),
+            pen=pg.mkPen((0, 0, 0), width=5),
             movable=True
         )
         self.threshold_line.setVisible(False)
@@ -164,9 +160,6 @@ class ScopeWidget(QtWidgets.QWidget):
 
         # Connect signals
         self.threshold_line.sigPositionChanged.connect(self._on_threshold_moved)
-        self._view_box.channelClicked.connect(self.viewClicked)
-        self._view_box.channelDragged.connect(self.viewDragged)
-        self._view_box.channelDragFinished.connect(self.viewDragFinished)
 
     def set_threshold(self, value: Optional[float] = None, visible: bool = True) -> None:
         """Set threshold line position and visibility."""
@@ -178,18 +171,18 @@ class ScopeWidget(QtWidgets.QWidget):
         """Set pretrigger line position and visibility."""
         self.pretrigger_line.setValue(time_sec)
         self.pretrigger_line.setVisible(visible)
-    
-    def set_left_axis(self, span: float, offset: float, label: str, units: str = "V", color: Optional[QtGui.QColor] = None) -> None:
-        """Update the left axis label and scaling."""
-        self._left_axis.set_scaling(span, offset)
-        pen = pg.mkPen((0, 0, 139), width=1)
-        if color:
-             pen = pg.mkPen(color, width=2)
-             
-        axis = self.plot_widget.getPlotItem().getAxis("left")
-        axis.setPen(pen)
-        axis.setTextPen(pen)
-        axis.setLabel(text=label, units=units)
+
+    def ensure_overlay_items(self) -> None:
+        """Re-attach the threshold/pretrigger overlay lines if absent.
+
+        These lines are persistent chrome owned by the scope, but a plot reset
+        elsewhere could detach them. Re-adding an already-present item is a
+        no-op, so this is safe to call defensively before showing the lines.
+        """
+        plot_item = self.plot_widget.getPlotItem()
+        for line in (self.threshold_line, self.pretrigger_line):
+            if line not in plot_item.items:
+                self.plot_widget.addItem(line)
 
     def _on_threshold_moved(self) -> None:
         """Emit signal when user moves the threshold line."""

@@ -9,8 +9,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Deque, List, Optional
 
 import numpy as np
 from PySide6 import QtCore
@@ -109,11 +108,6 @@ class TriggerController(QtCore.QObject):
         return self._display
     
     @property
-    def display_times(self) -> Optional[np.ndarray]:
-        """Time axis for display_data, or None."""
-        return self._display_times
-    
-    @property
     def display_pre_samples(self) -> int:
         """Number of pretrigger samples in current display."""
         return self._display_pre_samples
@@ -173,10 +167,6 @@ class TriggerController(QtCore.QObject):
         """Arm single-shot trigger mode."""
         self.clear_display()
         self._single_armed = True
-
-    def disarm_single(self) -> None:
-        """Disarm single-shot trigger."""
-        self._single_armed = False
 
     def update_sample_rate(self, sample_rate: float) -> None:
         """Update sample rate and recalculate sample counts."""
@@ -493,24 +483,3 @@ class TriggerController(QtCore.QObject):
 
         self.captureReady.emit()
         return True
-
-    def get_display_times(self, window_sec: float) -> np.ndarray:
-        """
-        Generate time axis for current display data.
-        
-        Args:
-            window_sec: Display window in seconds
-            
-        Returns:
-            Time array aligned with display data
-        """
-        if self._display is None:
-            return np.zeros(0, dtype=np.float32)
-            
-        n = self._display.shape[0]
-        sr = self._last_sample_rate if self._last_sample_rate > 0 else 10000.0
-        pre = self._display_pre_samples
-        
-        # Time axis: sample index 'pre' should correspond exactly to t=0.0
-        # Use arange to correctly compute: time[i] = (i - pre) / sr
-        return (np.arange(n, dtype=np.float32) - pre) / sr

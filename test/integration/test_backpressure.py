@@ -22,12 +22,15 @@ import queue
 import time
 from typing import List, Optional
 
+import threading
+
 import numpy as np
 import pytest
 
+import shared.models as shared_models
 from core.dispatcher import Dispatcher, QUEUE_POLICIES
 from core.conditioning import FilterSettings
-from shared.models import Chunk, ChunkPointer, EndOfStream, TriggerConfig
+from shared.models import Chunk, ChunkPointer, EndOfStream, TriggerConfig, enqueue_with_policy
 from shared.ring_buffer import SharedRingBuffer
 
 
@@ -463,3 +466,90 @@ class TestMultipleAnalysisQueues:
 
         # After unregister, should receive 0 new chunks
         assert post_count == 0, f"Unregistered queue received {post_count} chunks"
+
+
+class TestLosslessStallContract:
+    """Finding 4.4: a sustained lossless-queue stall (e.g. a slow disk during
+    recording) must degrade to counted, logged drops — never raise into the
+    acquisition (DAQ producer) or dispatcher thread.
+    """
+
+    def test_lossless_put_drops_without_raising_on_stall(self, monkeypatch):
+        """The lossless put returns normally (no RuntimeError) on a sustained
+        stall, in both the plain and cancel-event variants, and reports a drop.
+        """
+        monkeypatch.setattr(shared_models, "_LOSSLESS_TIMEOUT_SEC", 0.1)
+        monkeypatch.setattr(shared_models, "_LOSSLESS_POLL_SEC", 0.02)
+
+        full_q: "queue.Queue" = queue.Queue(maxsize=1)
+        full_q.put("occupied")  # saturate so every put stalls
+        actions: list[tuple[str, str]] = []
+
+        def cb(name: str, action: str) -> None:
+            actions.append((name, action))
+
+        # Plain path (dispatcher 'logging'/WAV writer): must NOT raise.
+        enqueue_with_policy("logging", full_q, "x", stats_callback=cb)
+        assert ("logging", "dropped") in actions
+        assert full_q.qsize() == 1, "stalled item must be dropped, not enqueued"
+
+        # Cancel-event path (DAQ producer) under a non-stop stall: also drops.
+        actions.clear()
+        not_stopping = threading.Event()  # cleared -> a real stall, not a stop
+        enqueue_with_policy("daq", full_q, "y", stats_callback=cb, cancel_event=not_stopping)
+        assert ("daq", "dropped") in actions
+        assert full_q.qsize() == 1
+
+    def test_recording_under_throttled_consumer_keeps_fanning_out(self, monkeypatch):
+        """With a throttled (never-drained) logging/WAV consumer, the dispatcher
+        must keep running and keep fanning out to other consumers. Previously the
+        logging put raised mid-_fan_out, aborting the rest of the fan-out (so
+        analysis lost the stalled chunks); now it drops gracefully.
+        """
+        monkeypatch.setattr(shared_models, "_LOSSLESS_TIMEOUT_SEC", 0.1)
+        monkeypatch.setattr(shared_models, "_LOSSLESS_POLL_SEC", 0.02)
+
+        dispatcher, source_buffer, queues = make_test_dispatcher(
+            viz_queue_size=10,
+            logging_queue_size=1,  # tiny + never drained -> stalls after 1 chunk
+        )
+        analysis_q: "queue.Queue" = queue.Queue(maxsize=100)
+        dispatcher.register_analysis_queue(analysis_q)
+        dispatcher.set_recording_enabled(True)
+
+        n_chunks = 5
+        chunk_size = 256
+        sample_rate = 10000.0
+        dispatcher.start()
+        for seq in range(n_chunks):
+            samples = np.ones((1, chunk_size), dtype=np.float32) * seq
+            start_idx = source_buffer.write(samples)
+            queues["raw"].put(
+                ChunkPointer(
+                    start_index=start_idx,
+                    length=chunk_size,
+                    render_time=seq * chunk_size / sample_rate,
+                    seq=seq,
+                    start_sample=seq * chunk_size,
+                )
+            )
+        queues["raw"].put(EndOfStream)
+        dispatcher.join(timeout=10.0)
+
+        received = []
+        while True:
+            try:
+                item = analysis_q.get_nowait()
+            except queue.Empty:
+                break
+            if item is not EndOfStream:
+                received.append(item)
+
+        stats = dispatcher.snapshot()
+        # Fan-out to analysis continued for every chunk despite the logging stall.
+        assert len(received) == n_chunks, (
+            f"analysis lost chunks when logging stalled: got {len(received)}/{n_chunks}"
+        )
+        assert stats["processed"] == n_chunks
+        # The stall was recorded as graceful drops, not a crash.
+        assert stats.get("dropped", {}).get("logging", 0) >= 1

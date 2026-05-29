@@ -504,3 +504,48 @@ class TestAnalysisIntegration:
         
         worker.stop()
         controller.shutdown()
+
+
+class TestHeadlessDeviceConnection:
+    """Finding 3.2 #3: connect_device must work without a Qt device_manager."""
+
+    def test_connect_device_headless_via_registry(self):
+        """A runtime with no device_manager connects through the DeviceRegistry
+        instead of raising AttributeError on self.device_manager.
+        """
+        controller = PipelineController(
+            filter_settings=FilterSettings(),
+            visualization_queue_size=32,
+            logging_queue_size=32,
+            dispatcher_poll_timeout=0.01,
+        )
+        runtime = SpikeHoundRuntime(pipeline=controller)
+        assert runtime.device_manager is None, "this test exercises the headless path"
+
+        try:
+            # Populate the registry headlessly, then locate the simulated source.
+            runtime.scan_devices()
+            sim_key = next(
+                entry["key"]
+                for entry in runtime._device_registry.get_device_list()
+                if "simulated" in str(entry.get("module", "")).lower()
+            )
+
+            # Previously raised AttributeError (device_manager is None).
+            runtime.connect_device(sim_key, sample_rate=20000, chunk_size=128)
+
+            # The source is wired into the pipeline and the headless device API works.
+            assert controller.dispatcher is not None, "source should be attached"
+            assert runtime.active_device_key() == sim_key
+            assert len(runtime.available_channels()) >= 1
+
+            # End-to-end: acquisition actually runs headlessly.
+            runtime.start_acquisition()
+            dispatcher = controller.dispatcher
+            assert _wait_until(
+                lambda: dispatcher.snapshot().get("processed", 0) > 0
+            ), "headless acquisition should process chunks"
+            controller.stop()
+        finally:
+            runtime.disconnect_device()
+            controller.shutdown()

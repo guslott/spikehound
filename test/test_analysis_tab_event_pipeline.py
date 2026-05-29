@@ -152,6 +152,60 @@ def test_analysis_tab_processes_queue_events_once_and_delivers_async_results() -
         _app().processEvents()
 
 
+class _FakeWorker:
+    """Minimal stand-in so _notify_threshold_change reaches its body."""
+
+    def __init__(self) -> None:
+        self.configure_calls = 0
+
+    def configure_threshold(self, *args, **kwargs) -> None:
+        self.configure_calls += 1
+
+    def update_sample_rate(self, sample_rate: float) -> None:
+        del sample_rate
+
+
+def test_threshold_value_nudge_preserves_history_but_mode_change_clears() -> None:
+    """Finding 7.2: nudging a threshold VALUE (spinbox tick / line drag) must
+    reconfigure detection going forward WITHOUT wiping accumulated events,
+    clusters, or STA; only a detection-MODE change (or window-width / new
+    worker) clears history.
+    """
+    controller = _DummyController()
+    widget = _make_tab(controller)
+    try:
+        worker = _FakeWorker()
+        widget.set_worker(worker)  # fresh worker -> clears (nothing accumulated yet)
+
+        # Accumulate one event into the metric history.
+        q: "queue.Queue[AnalysisBatch]" = queue.Queue()
+        widget.set_analysis_queue(q)
+        q.put(AnalysisBatch(chunk=_make_chunk(), events=(_make_event(1),)))
+        widget._last_window_start = 0.0
+        widget._last_window_width = 1.0
+        widget._window_start_index = 0
+        widget._process_analysis_queue()
+        assert _wait_for(lambda: len(widget._metric_events) == 1 and not widget._analysis_futures)
+        assert sorted(widget._event_details) == [1]
+
+        # 1) A threshold VALUE nudge must NOT wipe history, but MUST reconfigure.
+        configured_before = worker.configure_calls
+        widget.threshold1_spin.setValue(0.25)  # fires valueChanged -> _notify_threshold_change()
+        _app().processEvents()
+        assert worker.configure_calls > configured_before, "value nudge should reconfigure the worker"
+        assert len(widget._metric_events) == 1, "value nudge must NOT clear accumulated events (7.2)"
+        assert sorted(widget._event_details) == [1], "value nudge must NOT clear event details (7.2)"
+
+        # 2) A detection-MODE change (enabling auto-detect) SHOULD clear history.
+        widget.auto_detect_check.setChecked(True)
+        _app().processEvents()
+        assert len(widget._metric_events) == 0, "mode change should clear accumulated events"
+        assert len(widget._event_details) == 0, "mode change should clear event details"
+    finally:
+        widget.close()
+        _app().processEvents()
+
+
 def test_analysis_tab_requires_analysis_queue_for_live_event_processing() -> None:
     controller = _DummyController()
     widget = _make_tab(controller)
@@ -401,6 +455,35 @@ def test_event_details_retention_matches_metric_history_cap() -> None:
         assert 41 not in widget._event_cluster_labels
         assert 41 not in widget._sta_records
         assert 41 not in widget._sta_pending_events
+    finally:
+        widget.close()
+        _app().processEvents()
+
+
+def test_event_details_bounded_independently_of_metric_history(monkeypatch) -> None:
+    """Finding 7.4: the heavy _event_details waveform store is capped on its own
+    small budget, independent of the (much larger, cheap) metric history."""
+    monkeypatch.setattr(analysis_tab_module, "EVENT_DETAIL_CAPACITY", 3)
+    controller = _DummyController()
+    widget = _make_tab(controller)
+    try:
+        if widget._analysis_executor is not None:
+            widget._analysis_executor.shutdown(wait=True)
+            widget._analysis_executor = None
+
+        # Large metric history so it is NOT the binding constraint.
+        widget._metric_events = deque(maxlen=1000)
+
+        for eid in range(1, 11):  # 10 events, detail cap 3
+            widget._apply_analysis_update(
+                widget._build_analysis_update((_make_event(eid),)), 0.0, 1.0, 0
+            )
+
+        # Waveform store bounded to the small cap, keeping the most recent.
+        assert len(widget._event_details) == 3
+        assert sorted(widget._event_details) == [8, 9, 10]
+        # The cheap metric history is unaffected by the waveform cap.
+        assert len(widget._metric_events) == 10
     finally:
         widget.close()
         _app().processEvents()

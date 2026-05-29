@@ -18,6 +18,15 @@ logger = logging.getLogger(__name__)
 
 METRIC_HISTORY_CAPACITY = 100_000
 
+# `_event_details` holds the heavy per-event waveform snapshot (float32 samples +
+# float64 time axis), unlike the cheap scalar `_metric_events` history. Cap it on
+# its OWN, much smaller budget so a long session can't accumulate hundreds of MB
+# of waveforms (finding 7.4). This is decoupled from METRIC_HISTORY_CAPACITY: the
+# scatter keeps a long scalar history while retrievable waveforms stay bounded to
+# the most-recent N (comfortably above the ~3000-event visible window). At a
+# typical ~200-sample window that is ~10-15 MB; the scatter is unaffected.
+EVENT_DETAIL_CAPACITY = 5_000
+
 
 from analysis.batch import AnalysisBatch
 from shared.models import Chunk, EndOfStream
@@ -110,6 +119,10 @@ class AnalysisTab(QtWidgets.QWidget):
         self._cached_scatter_y_key: str | None = None
         self._cached_scatter_x_key: str | None = None
         self._viz_paused = False
+        # Last view ranges applied in _render_batch; used to skip redundant
+        # setXRange/setYRange calls (finding 7.3).
+        self._last_batch_xrange: float | None = None
+        self._last_batch_yrange: float | None = None
         self._cached_raw_times: Optional[np.ndarray] = None
         self._cached_raw_samples: Optional[np.ndarray] = None
         self._last_window_start: float = 0.0
@@ -665,7 +678,8 @@ class AnalysisTab(QtWidgets.QWidget):
                 self._worker.update_sample_rate(self.sample_rate)
             except AttributeError:
                 pass
-        self._notify_threshold_change()
+        # Binding a new worker is a fresh start — clearing stale history is safe.
+        self._notify_threshold_change(clear_history=True)
 
     def set_sta_channels(self, channels: Sequence["ChannelInfo"]) -> None:
         """Update the active correlation channels."""
@@ -828,7 +842,9 @@ class AnalysisTab(QtWidgets.QWidget):
                 except queue.Empty:
                     break
         self._clear_event_overlays()
-        self._notify_threshold_change()
+        # Event-window WIDTH changed → fixed-width STA/cluster history is now
+        # inconsistent, so clear it.
+        self._notify_threshold_change(clear_history=True)
 
     def _on_threshold1_toggled(self, checked: bool) -> None:
         """Handle threshold 1 checkbox toggle, update dependent controls."""
@@ -843,12 +859,14 @@ class AnalysisTab(QtWidgets.QWidget):
         if not checked:
             self.threshold2_check.setChecked(False)
         self._update_advanced_sections_visibility()
-        self._notify_threshold_change()
+        # Detection MODE toggled (manual threshold on/off) — clear history.
+        self._notify_threshold_change(clear_history=True)
 
     def _on_threshold2_toggled(self, checked: bool) -> None:
         """Handle threshold 2 checkbox toggle."""
         self.threshold2_spin.setEnabled(checked)
-        self._notify_threshold_change()
+        # Secondary-threshold detection criterion toggled — clear history.
+        self._notify_threshold_change(clear_history=True)
 
     def _on_auto_detect_toggled(self, checked: bool) -> None:
         """Handle auto-detect checkbox toggle."""
@@ -857,7 +875,8 @@ class AnalysisTab(QtWidgets.QWidget):
             self.threshold1_check.setChecked(False)
             self.threshold2_check.setChecked(False)
         self._update_advanced_sections_visibility()
-        self._notify_threshold_change()
+        # Detection MODE toggled (auto-detect on/off) — clear history.
+        self._notify_threshold_change(clear_history=True)
 
     def _update_advanced_sections_visibility(self) -> None:
         """Show/hide metrics and correlation sections based on threshold state."""
@@ -867,11 +886,25 @@ class AnalysisTab(QtWidgets.QWidget):
         self._separator2.setVisible(threshold_active)
         self._sta_container.setVisible(threshold_active)
 
-    def _notify_threshold_change(self) -> None:
-        """Push current threshold settings to the analysis worker."""
+    def _notify_threshold_change(self, *, clear_history: bool = False) -> None:
+        """Push current threshold settings to the analysis worker.
+
+        Args:
+            clear_history: When True, also wipe accumulated metrics/clusters/STA
+                via _clear_metrics(). This must only be done when the change
+                actually invalidates accumulated history — i.e. a detection-MODE
+                change (auto-detect / threshold enable toggles), an event-window
+                *width* change (which breaks fixed-width STA/cluster math), or
+                binding a new worker. A mere threshold *value* nudge (spinbox
+                tick or threshold-line drag) reconfigures detection going forward
+                but does NOT invalidate already-collected events, so it must
+                leave history intact — otherwise tuning a live recording throws
+                away every accumulated event and class assignment (finding 7.2).
+        """
         if self._worker is None:
             return
-        self._clear_metrics()
+        if clear_history:
+            self._clear_metrics()
         enabled = self.threshold1_check.isChecked()
         value = float(self.threshold1_spin.value())
         secondary_enabled = enabled and self.threshold2_check.isChecked()
@@ -947,9 +980,16 @@ class AnalysisTab(QtWidgets.QWidget):
             self.event_curve.clear()
 
         plot_item = self.plot_widget.getPlotItem()
-        plot_item.setXRange(0.0, width, padding=0.0)
         height = self._scope_vertical_span
-        plot_item.setYRange(-height, height, padding=0.0)
+        # Only set the view ranges when they actually change; calling
+        # setXRange/setYRange on every batch (up to ~100/cycle) forces redundant
+        # repaints (finding 7.3).
+        if width != self._last_batch_xrange:
+            plot_item.setXRange(0.0, width, padding=0.0)
+            self._last_batch_xrange = width
+        if height != self._last_batch_yrange:
+            plot_item.setYRange(-height, height, padding=0.0)
+            self._last_batch_yrange = height
 
         if self._window_start_time is not None:
             window_start = float(self._window_start_time)
@@ -2285,7 +2325,12 @@ class AnalysisTab(QtWidgets.QWidget):
         roi = ClusterRectROI((x0, y0), (default_width, default_height), pen=pg.mkPen(color, width=1.5))
         roi.setZValue(50)
         cluster.roi = roi
-        roi.sigRegionChanged.connect(lambda _: self._on_cluster_roi_changed())
+        # Debounce: recompute membership only when the drag finishes, not on
+        # every intermediate sigRegionChanged (which fires continuously during a
+        # drag and runs an O(history) recompute per mouse-move) — finding 7.3.
+        # The ROI rectangle still tracks the cursor live; only the (expensive)
+        # point reclassification waits for release.
+        roi.sigRegionChangeFinished.connect(lambda _: self._on_cluster_roi_changed())
         self.metrics_plot.addItem(roi)
         self._clusters.append(cluster)
         item = QtWidgets.QListWidgetItem(self._cluster_item_text(cluster, 0))
@@ -2690,11 +2735,25 @@ class AnalysisTab(QtWidgets.QWidget):
         if isinstance(event_id, int):
             details_entry: dict[str, object] = {
                 "metric_time": float(metric_time),
-                "times": np.asarray(overlay.get("times"), dtype=np.float64).copy(),
+                # `times` is a freshly built per-event axis (np.arange in
+                # _build_overlay_payload), already owned — no extra copy needed.
+                # `samples` may alias the event's window (a view into a reused
+                # chunk buffer), so it MUST be copied to own the snapshot.
+                "times": np.asarray(overlay.get("times"), dtype=np.float64),
                 "samples": np.asarray(overlay.get("samples"), dtype=np.float32).copy(),
                 "metrics": dict(metrics),
             }
             self._event_details[event_id] = details_entry
+            # Independently bound the waveform store (finding 7.4): evict the
+            # oldest details beyond EVENT_DETAIL_CAPACITY (dict preserves
+            # insertion order, so the first key is the oldest). The cheap metric
+            # history keeps its own, larger cap.
+            while len(self._event_details) > EVENT_DETAIL_CAPACITY:
+                old_id = next(iter(self._event_details))
+                self._event_details.pop(old_id, None)
+                self._event_cluster_labels.pop(old_id, None)
+                self._sta_records.pop(old_id, None)
+                self._sta_pending_events.pop(old_id, None)
         if evicted_event_id is not None and evicted_event_id != event_id:
             self._event_details.pop(evicted_event_id, None)
             self._event_cluster_labels.pop(evicted_event_id, None)

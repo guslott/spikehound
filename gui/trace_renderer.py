@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import numpy as np
 import pyqtgraph as pg
-from PySide6 import QtGui
 
 from .types import ChannelConfig
 
@@ -24,11 +23,10 @@ class TraceRenderer:
         self._config = config
         # Use width=2 for balance of visibility and performance (thick pens are slower)
         self._curve = pg.PlotCurveItem(pen=pg.mkPen(config.color, width=2))
-        self._manual_downsampling = False
         try:
             self._curve.setDownsampling(ds=True, auto=True, method="peak")
         except AttributeError:
-            self._manual_downsampling = True
+            pass
         self._plot_item.addItem(self._curve)
 
         # State
@@ -52,9 +50,8 @@ class TraceRenderer:
         self._config = config
         self._curve.setPen(pg.mkPen(config.color, width=2))
         self._curve.setVisible(config.display_enabled)
-        # Re-render with new offset/scale if we have data
-        if self._last_samples.size > 0:
-            self._update_curve_data()
+        # Offset/scale changes are re-applied on the next update_data() call,
+        # which arrives within one frame at the live refresh rate.
 
     def update_data(self, samples: np.ndarray, times: np.ndarray, downsample: int = 1) -> None:
         """
@@ -98,18 +95,6 @@ class TraceRenderer:
         # skipFiniteCheck=True: avoid scanning 100k+ points for NaN/Inf
         # connect='all': skip connection analysis, we know data is contiguous
         self._curve.setData(display_x, final_y, skipFiniteCheck=True, connect='all')
-        
-    def _update_curve_data(self) -> None:
-        """Re-apply scaling/offset to the last known data."""
-        # We don't have 'times' stored, so we can't fully re-render if we don't store times.
-        # However, update_data is called frequently. 
-        # If we need to support config changes without new data, we should store times too.
-        # For now, let's assume update_data will be called soon enough, 
-        # or we just clear if we don't have times.
-        # Actually, let's just wait for the next update_data call for simplicity 
-        # unless we want to cache times. 
-        # Given the high refresh rate, waiting is usually fine.
-        pass
 
     def set_active(self, active: bool) -> None:
         """Update visual style for active/inactive state."""

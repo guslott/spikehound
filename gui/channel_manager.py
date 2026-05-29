@@ -259,16 +259,7 @@ class ChannelManager(QtCore.QObject):
             return
         self._active_channel_id = channel_id
         self.activeChannelChanged.emit(channel_id)
-    
-    def select_active_channel_by_id(self, channel_id: int) -> None:
-        """Select a channel by ID in the active combo."""
-        for i in range(self._channel_controls.active_combo.count()):
-            info = self._channel_controls.active_combo.itemData(i)
-            if info is not None and info.id == channel_id:
-                self._channel_controls.active_combo.setCurrentIndex(i)
-                self.set_active_channel_focus(channel_id)
-                return
-    
+
     # -------------------------------------------------------------------------
     # Channel Add/Remove
     # -------------------------------------------------------------------------
@@ -410,22 +401,6 @@ class ChannelManager(QtCore.QObject):
     # -------------------------------------------------------------------------
     # Utility Methods
     # -------------------------------------------------------------------------
-    
-    def get_nearest_channel_at_y(self, y: float) -> Optional[int]:
-        """Return the channel whose configured offset is closest to the given y view coordinate."""
-        if not self._channel_ids_current:
-            return None
-        best_id: Optional[int] = None
-        best_dist = float("inf")
-        for cid in self._channel_ids_current:
-            cfg = self._channel_configs.get(cid)
-            if cfg is None:
-                continue
-            dist = abs(cfg.screen_offset - y)
-            if dist < best_dist:
-                best_dist = dist
-                best_id = cid
-        return best_id
     
     def update_listen_state(self, channel_id: int, enabled: bool) -> None:
         """Update listen state for a channel, ensuring only one channel can listen at a time."""

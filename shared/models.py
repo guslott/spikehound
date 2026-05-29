@@ -357,26 +357,29 @@ def _enqueue_lossless(
     stats_callback: Optional[Callable[[str, str], None]] = None,
     cancel_event: "Optional[threading.Event]" = None,
 ) -> None:
-    """Block until space is available; fail loudly on timeout.
+    """Block until space is available, then enqueue.
+
+    Real contract (finding 4.4): this runs on acquisition-critical threads — the
+    DAQ producer (``daq`` queue) and the dispatcher (``logging`` / WAV queue) —
+    so it MUST NOT raise into them. Under a *sustained* downstream stall (e.g. a
+    slow disk mid-recording, or a wedged dispatcher) it degrades gracefully:
+    after ``_LOSSLESS_TIMEOUT_SEC`` it DROPS the item, reports it ("dropped"),
+    and logs — rather than throwing an exception that would crash or disrupt
+    acquisition. "Lossless" therefore means *lossless under normal operation,
+    degrading to counted, logged drops under sustained backpressure* — never a
+    hard crash or a silent gap.
 
     When ``cancel_event`` is provided the wait is sliced into short polls so it
-    can bail out promptly if the event is set — used by DAQ producers so that a
+    can also bail out promptly if the event is set — used by DAQ producers so a
     stalled dispatcher cannot freeze ``stop()``. A cancelled put drops the item
-    (the producer is shutting down, so the data is discarded by design) and is
-    reported as "dropped".
+    quietly (the producer is shutting down, so the data is discarded by design).
     """
     if cancel_event is None:
-        # Original behavior: one blocking put with a hard timeout.
+        # One blocking put with a hard timeout, then graceful drop.
         try:
             target_queue.put(item, block=True, timeout=_LOSSLESS_TIMEOUT_SEC)
         except queue.Full:
-            logger.critical(
-                "Queue '%s' BLOCKED for 10+ seconds - downstream too slow",
-                queue_name
-            )
-            if stats_callback:
-                stats_callback(queue_name, "dropped")
-            raise RuntimeError(f"Queue '{queue_name}' blocked - lossless constraint violated")
+            _note_lossless_drop(queue_name, stats_callback)
         else:
             if stats_callback:
                 stats_callback(queue_name, "forwarded")
@@ -386,7 +389,7 @@ def _enqueue_lossless(
     waited = 0.0
     while waited < _LOSSLESS_TIMEOUT_SEC:
         if cancel_event.is_set():
-            # Producer is stopping; drop the item rather than enqueue late.
+            # Producer is stopping; drop the item quietly (not a stall).
             if stats_callback:
                 stats_callback(queue_name, "dropped")
             return
@@ -400,13 +403,25 @@ def _enqueue_lossless(
                 stats_callback(queue_name, "forwarded")
             return
 
+    _note_lossless_drop(queue_name, stats_callback)
+
+
+def _note_lossless_drop(
+    queue_name: str,
+    stats_callback: Optional[Callable[[str, str], None]] = None,
+) -> None:
+    """Record a lossless-queue drop caused by a sustained downstream stall.
+
+    Naturally throttled to at most one per ``_LOSSLESS_TIMEOUT_SEC`` per stalled
+    queue (a drop is only reached after that long a wait). Never raises.
+    """
     logger.critical(
-        "Queue '%s' BLOCKED for 10+ seconds - downstream too slow",
-        queue_name
+        "Queue '%s' stalled for %.0fs — downstream too slow; DROPPING data to keep "
+        "acquisition alive (no crash). Check disk/consumer throughput.",
+        queue_name, _LOSSLESS_TIMEOUT_SEC,
     )
     if stats_callback:
         stats_callback(queue_name, "dropped")
-    raise RuntimeError(f"Queue '{queue_name}' blocked - lossless constraint violated")
 
 
 def _enqueue_drop_newest(

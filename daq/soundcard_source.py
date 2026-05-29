@@ -37,23 +37,41 @@ class LocalRingBuffer:
         self._data = np.zeros((capacity, channels), dtype=dtype)
         self._write_pos = 0
         self._filled = 0
+        # Overrun diagnostics (finding 6.1): when the producer outpaces the
+        # consumer, unread frames are overwritten. Track how much is lost so the
+        # device can report it via note_xrun()/stats() instead of dropping data
+        # silently (which violates the lossless contract with zero diagnostics).
+        self.overruns = 0
+        self.dropped_frames = 0
 
-    def write(self, data: np.ndarray) -> None:
+    def write(self, data: np.ndarray) -> int:
+        """Append frames; return the number of unread frames overwritten (dropped).
+
+        Returns 0 in the normal case. A non-zero return means the consumer
+        (emitter) is not keeping up and old unread audio was discarded — the
+        caller should surface this as an XRUN.
+        """
         frames = data.shape[0]
         if frames == 0:
-            return
-        
-        # Safety check for massive chunks
+            return 0
+
+        dropped = 0
+
+        # Safety check for massive chunks: a single block larger than the whole
+        # buffer. Keep only the most recent `capacity` frames — everything else
+        # (all currently-buffered unread frames plus the head of this block) is
+        # lost.
         if frames > self.capacity:
-            # Reset and take only the latest
+            dropped = self._filled + (frames - self.capacity)
             self._write_pos = 0
             self._filled = 0
             data = data[-self.capacity:]
             frames = self.capacity
+        elif self._filled + frames > self.capacity:
+            # Overrun: the circular write advances over unread frames, silently
+            # overwriting them. Count exactly how many are lost.
+            dropped = self._filled + frames - self.capacity
 
-        # Check for overflow - in this context, we just cap filled at capacity
-        # (assuming we are overwriting old unread data, which is bad but better than crashing)
-        
         idx = self._write_pos
         end = idx + frames
         if end <= self.capacity:
@@ -62,9 +80,14 @@ class LocalRingBuffer:
             split = self.capacity - idx
             self._data[idx:] = data[:split]
             self._data[:end-self.capacity] = data[split:]
-        
+
         self._write_pos = (self._write_pos + frames) % self.capacity
         self._filled = min(self.capacity, self._filled + frames)
+
+        if dropped:
+            self.overruns += 1
+            self.dropped_frames += int(dropped)
+        return int(dropped)
 
     @property
     def filled(self) -> int:
@@ -392,9 +415,24 @@ class SoundCardSource(BaseDevice):
                     data = data.reshape((frames, self._n_in))
                     
                     # Non-blocking write to local ring buffer
+                    dropped = 0
                     with self._buf_lock:
                         if self._residual_buffer is not None:
-                            self._residual_buffer.write(data)
+                            dropped = self._residual_buffer.write(data)
+
+                    # Surface input overruns instead of dropping audio silently
+                    # (finding 6.1). Account outside the buffer lock; the log is
+                    # throttled so a sustained overrun can't flood from the
+                    # callback thread.
+                    if dropped:
+                        self.note_xrun()
+                        self._drops += int(dropped)
+                        if self._xruns == 1 or self._xruns % 100 == 0:
+                            logger.warning(
+                                "SoundCard input overrun: dropped %d frames "
+                                "(xruns=%d, total dropped=%d) — emitter not keeping up",
+                                dropped, self._xruns, self._drops,
+                            )
 
                     # Signal emitter thread (non-blocking)
                     self._data_available.set()

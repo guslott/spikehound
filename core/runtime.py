@@ -111,26 +111,34 @@ class SpikeHoundRuntime:
             self._pipeline.update_analysis_settings(**kwargs)
 
     def scan_devices(self) -> None:
-        """Scan for available DAQ devices."""
+        """Scan for available DAQ devices.
+
+        Falls back to the Qt-free DeviceRegistry when running headless, so the
+        device list is populated before a headless connect_device() (3.2 #3).
+        """
         if self.device_manager is not None:
             self.device_manager.refresh_devices()
+        else:
+            self._device_registry.refresh_devices()
 
     def disconnect_device(self) -> None:
-        """Disconnect the active device through the runtime-owned device manager."""
+        """Disconnect the active device (via device manager, or registry headless)."""
         if self.device_manager is not None:
             self.device_manager.disconnect_device()
+        else:
+            self._device_registry.disconnect_device()
 
     def available_channels(self) -> list[Any]:
         """Return channels available on the active device."""
-        if self.device_manager is None:
-            return []
-        return list(self.device_manager.get_available_channels())
+        if self.device_manager is not None:
+            return list(self.device_manager.get_available_channels())
+        return list(self._device_registry.get_available_channels())
 
     def active_device_key(self) -> Optional[str]:
         """Return the active device key managed by the runtime."""
-        if self.device_manager is None:
-            return None
-        return self.device_manager.active_key()
+        if self.device_manager is not None:
+            return self.device_manager.active_key()
+        return self._device_registry.active_key()
 
     def cleanup_device_manager(self) -> None:
         """Release the runtime-owned device manager listener."""
@@ -144,18 +152,39 @@ class SpikeHoundRuntime:
         chunk_size: int = 1024,
         **driver_kwargs,
     ) -> None:
-        """Connect a device via the DeviceManager and wire it into the pipeline."""
+        """Connect a device and wire it into the pipeline.
+
+        Uses the injected Qt ``device_manager`` when present; otherwise falls
+        back to the Qt-free ``DeviceRegistry`` (which performs the same
+        create/open/configure) so the runtime can connect devices headlessly —
+        as the class docstring promises. Previously this dereferenced
+        ``self.device_manager`` unconditionally and raised ``AttributeError`` in
+        headless use (finding 3.2 #3).
+        """
         # Use a ~20 ms chunk when callers leave the default in place.
         if chunk_size == 1024:  # Only override if it's the default
             target_latency = 0.02  # 20ms
             chunk_size = max(32, int(sample_rate * target_latency))
-            
-        driver = self.device_manager.connect_device(
-            device_key,
-            sample_rate,
-            chunk_size=chunk_size,
-            **driver_kwargs,
-        )
+
+        if self.device_manager is not None:
+            driver = self.device_manager.connect_device(
+                device_key,
+                sample_rate,
+                chunk_size=chunk_size,
+                **driver_kwargs,
+            )
+            get_channels = self.device_manager.get_available_channels
+        else:
+            driver = self._device_registry.connect_device(
+                device_key,
+                sample_rate,
+                chunk_size=chunk_size,
+                **driver_kwargs,
+            )
+            # The configured driver knows its own active channels; this is the
+            # headless analogue of device_manager.get_available_channels().
+            get_channels = driver.get_active_channels
+
         driver_config = getattr(driver, "config", None)
         effective_sample_rate = float(sample_rate)
         if driver_config is not None:
@@ -168,7 +197,7 @@ class SpikeHoundRuntime:
 
         channels = list(getattr(driver_config, "channels", []) or [])
         if not channels:
-            channels = self.device_manager.get_available_channels()
+            channels = list(get_channels())
         self._attach_source(driver, effective_sample_rate, channels)
         # Emit deviceConnected AFTER dispatcher is created so GUI can bind to it
         self._device_registry.emit_device_connected(device_key)

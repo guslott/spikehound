@@ -485,11 +485,19 @@ class SpectrogramTab(QtWidgets.QWidget):
 
         needed_bins = freqs.shape[0]
         if self._spec_data.shape[0] != needed_bins:
+            # Rebuild DOUBLE-wide, matching the buffer's circular-write contract
+            # (the writes at `col + _spec_columns` below and the window read in
+            # _update_image both assume 2 * _spec_columns). A single-wide realloc
+            # here used to index out of bounds on the very next write, throwing
+            # an IndexError on the 60 Hz QTimer hot path (finding 7.1). Mirror
+            # _on_fft_size_changed: reset the write cursor and baseline too.
             self._spec_data = np.full(
-                (needed_bins, self._spec_columns),
+                (needed_bins, 2 * self._spec_columns),
                 -120.0,
                 dtype=np.float32,
             )
+            self._spec_col_idx = 0
+            self._baseline_db = None
 
         # Baseline subtraction
         if self._use_baseline_subtraction:

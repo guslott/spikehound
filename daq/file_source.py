@@ -171,6 +171,15 @@ class FileSource(BaseDevice):
 
     def _close_impl(self) -> None:
         """Close the file (release mmap handle) and reset state."""
+        # Stop the playback worker BEFORE releasing _raw_data so it can't slice a
+        # detached array/mmap (finding 6.3). stop_event was already set by
+        # stop()/close(); re-assert defensively, then re-join.
+        self._stop_event.set()
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=2.0)
+        self._worker = None
+
         # For mmap, just releasing the object is usually enough
         if self._raw_data is not None:
              # If it was a generic mmap, could confirm close?
@@ -238,9 +247,13 @@ class FileSource(BaseDevice):
 
     def _stop_impl(self) -> None:
         """Stop the playback worker thread."""
-        if self._worker is not None and self._worker.is_alive():
-            self._worker.join(timeout=2.0)
-        self._worker = None
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=2.0)
+        # Keep the reference if the join timed out so _close_impl can re-join
+        # before releasing _raw_data (finding 6.3).
+        if worker is None or not worker.is_alive():
+            self._worker = None
 
     # ---- Playback Control Interface ----
 
@@ -309,6 +322,12 @@ class FileSource(BaseDevice):
         total_frames = self._n_frames
         
         while not self.stop_event.is_set():
+            # Snapshot the data reference for this iteration. If close() detaches
+            # it (sets _raw_data = None) we exit instead of slicing None; the
+            # local also keeps the mmap alive for this iteration (finding 6.3).
+            raw_data = self._raw_data
+            if raw_data is None:
+                break
             # Check for pause and seek requests
             with self._lock:
                 paused = self._paused
@@ -339,12 +358,12 @@ class FileSource(BaseDevice):
             
             # Slice the raw data
             # Handle 1D (mono) vs 2D (stereo/multi)
-            if self._raw_data.ndim == 1:
-                raw_chunk = self._raw_data[start:end]
+            if raw_data.ndim == 1:
+                raw_chunk = raw_data[start:end]
                 # Reshape to (frames, 1)
                 raw_chunk = raw_chunk[:, np.newaxis]
             else:
-                raw_chunk = self._raw_data[start:end, :]
+                raw_chunk = raw_data[start:end, :]
 
             # Convert to float32 and normalize
             data = self._normalize_chunk(raw_chunk)

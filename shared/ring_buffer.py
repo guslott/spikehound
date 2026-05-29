@@ -72,12 +72,29 @@ class SharedRingBuffer:
             self._write_pos = (start + length) % self._capacity
             return start
 
-    def read(self, start_index: int, length: int) -> np.ndarray:
+    def read(self, start_index: int, length: int, *, copy: bool = False) -> np.ndarray:
         """
         Read `length` samples starting at `start_index`.
 
-        Returns a view when the data is contiguous; returns a copy if the range
-        wraps around the end of the buffer.
+        Lifetime contract — read this before retaining the result:
+
+        * ``copy=False`` (default, zero-copy fast path): when the requested range
+          is contiguous the returned array is a **read-only view that aliases
+          live buffer memory**. It is valid *only until the next ``write()`` that
+          reaches those samples* — after that the producer may overwrite them and
+          the consumer would observe torn data. A consumer that keeps the result
+          past the next write **must** either pass ``copy=True`` or copy it
+          immediately (e.g. ``np.ascontiguousarray`` / ``.copy()``). The
+          wrap-around case already returns a fresh copy. In both cases the array
+          is marked ``writeable=False`` so accidental in-place mutation fails
+          loudly rather than corrupting the buffer.
+        * ``copy=True``: always returns an independent, writeable copy that is
+          safe to retain indefinitely. Use this for any consumer that holds the
+          data across writes (e.g. recording, deferred analysis).
+
+        All in-tree consumers currently copy immediately, so the default is safe
+        for them; the explicit ``copy`` flag exists so future retaining
+        consumers don't silently read torn data (finding 4.3).
         """
         if length <= 0:
             raise ValueError("length must be positive")
@@ -89,7 +106,10 @@ class SharedRingBuffer:
         with self._lock:
             end = start_index + length
             if end <= self._capacity:
-                view = self._data[..., start_index:end]
+                segment = self._data[..., start_index:end]
+                if copy:
+                    return segment.copy()
+                view = segment[...]  # distinct ndarray sharing the buffer
                 view.flags.writeable = False
                 return view
 
@@ -99,6 +119,10 @@ class SharedRingBuffer:
                 (self._data[..., start_index:], self._data[..., :tail_len]),
                 axis=-1,
             )
+            # `result` is already a fresh allocation from concatenate; only lock
+            # it down when handing back the default (non-owning) contract.
+            if copy:
+                return result
             result.flags.writeable = False
             return result
 

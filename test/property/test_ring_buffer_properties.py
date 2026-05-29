@@ -89,7 +89,13 @@ class TestRingBufferPropertyBased:
         capacity: int,
         write_lengths: list[int],
     ):
-        """Production buffer matches reference implementation."""
+        """Production buffer's latest-N window matches the reference model.
+
+        Differential test (finding 9.2): the previous version read only from the
+        reference and never compared the production output, so it asserted
+        nothing about SharedRingBuffer. This now reads the same latest window
+        from both and requires them to be element-for-element equal.
+        """
         write_lengths = [w for w in write_lengths if w <= capacity]
         assume(len(write_lengths) > 0)
 
@@ -97,19 +103,30 @@ class TestRingBufferPropertyBased:
         ref_buf = ReferenceRingBuffer(capacity, n_channels=1, dtype=np.float32)
 
         counter = 0.0
+        total = 0
         for length in write_lengths:
             data = np.arange(counter, counter + length, dtype=np.float32).reshape(1, -1)
             prod_buf.write(data)
             ref_buf.write(data)
             counter += length
+            total += length
 
-        # Compare latest N samples (up to capacity)
-        compare_len = min(capacity, sum(write_lengths))
-        if compare_len > 0:
-            # Read from the start position that would be valid
-            # For simplicity, just verify that both have same data available
-            ref_data = ref_buf.read_latest(compare_len)
-            assert ref_data.shape[1] == compare_len
+        compare_len = min(capacity, total)
+        assume(compare_len > 0)
+
+        # Reference: the latest `compare_len` samples, chronological order.
+        ref_data = ref_buf.read_latest(compare_len)
+        assert ref_data.shape == (1, compare_len)
+
+        # Production: read the same window. The next-write position is
+        # total % capacity; the latest window begins compare_len before it
+        # (read() handles the wrap and returns chronological order).
+        write_pos = total % capacity
+        latest_start = (write_pos - compare_len) % capacity
+        prod_data = prod_buf.read(latest_start, compare_len)
+
+        # The differential assertion that was missing before.
+        np.testing.assert_array_equal(prod_data, ref_data)
 
     @given(
         capacity=st.integers(min_value=8, max_value=100),
@@ -254,3 +271,48 @@ class TestRingBufferEdgeCases:
                 data.flatten(),
                 err_msg=f"Data mismatch after overwrite {overwrite}"
             )
+
+
+class TestRingBufferReadContract:
+    """Finding 4.3: explicit read() view-lifetime / copy contract."""
+
+    def test_copy_true_survives_overwrite_contiguous(self):
+        """read(copy=True) returns an independent array safe to retain across a
+        write that overwrites the source region."""
+        buf = SharedRingBuffer((1, 8), dtype=np.float32)
+        buf.write(np.arange(8, dtype=np.float32).reshape(1, -1))
+        snapshot = buf.read(0, 8, copy=True)
+        assert snapshot.flags.writeable, "copy=True must return a writeable, owning array"
+
+        buf.write(np.full((1, 8), 99.0, dtype=np.float32))  # overwrite everything
+        np.testing.assert_array_equal(
+            snapshot, np.arange(8, dtype=np.float32).reshape(1, -1)
+        )
+
+    def test_copy_true_survives_overwrite_wrapped(self):
+        """The copy contract also holds on the wrap-around path."""
+        buf = SharedRingBuffer((1, 8), dtype=np.float32)
+        buf.write(np.arange(8, dtype=np.float32).reshape(1, -1))          # write_pos -> 0
+        buf.write(np.arange(100, 104, dtype=np.float32).reshape(1, -1))   # write_pos -> 4
+        snap = buf.read(4, 8, copy=True)  # wraps: [4,5,6,7,100,101,102,103]
+        assert snap.flags.writeable
+        expected = np.array([[4, 5, 6, 7, 100, 101, 102, 103]], dtype=np.float32)
+        np.testing.assert_array_equal(snap, expected)
+
+        buf.write(np.full((1, 8), -1.0, dtype=np.float32))
+        np.testing.assert_array_equal(snap, expected, err_msg="retained copy was mutated")
+
+    def test_default_result_is_read_only(self):
+        """The default (zero-copy) result is read-only so accidental in-place
+        mutation fails loudly instead of silently corrupting the buffer."""
+        buf = SharedRingBuffer((1, 8), dtype=np.float32)
+        buf.write(np.arange(8, dtype=np.float32).reshape(1, -1))
+
+        contiguous = buf.read(0, 4)  # contiguous -> aliasing view
+        assert not contiguous.flags.writeable
+        with pytest.raises(ValueError):
+            contiguous[0, 0] = 1.0
+
+        buf.write(np.arange(50, 54, dtype=np.float32).reshape(1, -1))  # force a wrap region
+        wrapped = buf.read(6, 4)  # wraps -> fresh copy, still locked read-only
+        assert not wrapped.flags.writeable

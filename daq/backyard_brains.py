@@ -1009,7 +1009,16 @@ class _BYBDecoder:
         frame_bytes = raw_bytes.reshape(frame_count, self._stream_width, 2)
         highs = frame_bytes[:, :, 0].astype(np.int32)
         lows = frame_bytes[:, :, 1].astype(np.int32)
-        raw_vals = ((highs & 0x7F) << 7) | (lows & 0x7F)
+        # Reconstruct from the 7+7 bit packing (high byte carries the flag in
+        # bit 7, stripped via & 0x7F). BYB firmware transmits the ADC value
+        # right-aligned, so for a `bits`-bit profile the result occupies only the
+        # low `bits` bits. Mask to `bits` so the reconstruction width and the
+        # normalization width (center_val) are ALWAYS identical (finding 6.2):
+        # this removes the latent 14-vs-`bits` width mismatch and guarantees the
+        # normalized output stays in [-1, 1). For the standard right-aligned
+        # protocol the mask is a no-op (raw values already fit in `bits` bits).
+        sample_mask = (1 << self.bits) - 1
+        raw_vals = (((highs & 0x7F) << 7) | (lows & 0x7F)) & sample_mask
 
         center_val = float(1 << (self.bits - 1))
         decoded = (raw_vals - center_val) / center_val
@@ -1066,6 +1075,10 @@ class BackyardBrainsSource(BaseDevice):
     def __init__(self, queue_maxsize: int = 64) -> None:
         super().__init__(queue_maxsize=queue_maxsize)
         self._transport: Optional[_BYBTransport] = None
+        # Serializes detaching/closing the transport (close) against the
+        # producer thread re-fetching it (finding 6.3) so a stalled read can't
+        # touch a freed handle.
+        self._transport_lock = threading.Lock()
         self._transport_kind: str = "serial"
         self._producer_thread: Optional[threading.Thread] = None
         self._profile: Optional[_BYBProfile] = None
@@ -1568,11 +1581,25 @@ class BackyardBrainsSource(BaseDevice):
                         self._capture_session.record_message("optional_text", message)
 
     def _close_impl(self) -> None:
-        if self._transport is not None:
+        # Fully stop the producer BEFORE freeing the transport so a stalled
+        # USB/HID read can't call read() on a closed handle (finding 6.3).
+        # stop_event was already set by stop()/close(); re-assert defensively.
+        self._stop_event.set()
+        thread = self._producer_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+        self._producer_thread = None
+
+        # Detach under the lock (so the producer's next fetch sees None), then
+        # close the now-unreferenced handle outside the lock.
+        with self._transport_lock:
+            transport = self._transport
+            self._transport = None
+        if transport is not None:
             try:
-                self._transport.close()
-            finally:
-                self._transport = None
+                transport.close()
+            except Exception as exc:
+                _LOGGER.debug("Failed to close BYB transport: %s", exc)
         self._profile = None
         self._profile_candidates = []
         self._profile_hint_reason = None
@@ -1744,9 +1771,14 @@ class BackyardBrainsSource(BaseDevice):
         self._producer_thread.start()
 
     def _stop_impl(self) -> None:
-        if self._producer_thread is not None and self._producer_thread.is_alive():
-            self._producer_thread.join(timeout=1.0)
-        self._producer_thread = None
+        thread = self._producer_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+        # Only drop the reference once the thread has actually exited; if the
+        # join timed out, keep it so _close_impl can re-join before freeing the
+        # transport (finding 6.3 — never close a handle a live producer reads).
+        if thread is None or not thread.is_alive():
+            self._producer_thread = None
 
         if self._requires_start and self._transport is not None and self._transport.is_open:
             try:
@@ -1763,8 +1795,7 @@ class BackyardBrainsSource(BaseDevice):
         return self._transport
 
     def _run_loop(self) -> None:
-        transport = self._active_transport()
-        if transport is None or self.config is None:
+        if self.config is None or self._active_transport() is None:
             return
 
         candidate_widths = self._decoder_candidate_widths or (self._stream_channel_count,)
@@ -1777,6 +1808,13 @@ class BackyardBrainsSource(BaseDevice):
         sync_lost_time = 0.0
 
         while not self.stop_event.is_set():
+            # Re-fetch the transport each iteration under the lock. Once
+            # _close_impl detaches it (sets _transport = None), we stop issuing
+            # reads instead of calling read() on a closed handle (finding 6.3).
+            with self._transport_lock:
+                transport = self._transport
+            if transport is None:
+                break
             try:
                 data = transport.read(timeout_ms=25)
             except Exception as exc:
