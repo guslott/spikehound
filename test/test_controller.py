@@ -70,7 +70,7 @@ def test_pipeline_controller_backpressure_tracks_evictions():
             channel_index=0,
             threshold=0.0,
             hysteresis=0.0,
-            pretrigger_frac=0.0,
+            pretrigger_sec=0.0,
             window_sec=1.0,
             mode="repeated",
         )

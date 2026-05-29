@@ -144,7 +144,7 @@ class Dispatcher:
             channel_index=None,
             threshold=0.0,
             hysteresis=0.0,
-            pretrigger_frac=0.0,
+            pretrigger_sec=0.0,
             window_sec=self._window_sec,
             mode="stream",
         )
@@ -362,6 +362,17 @@ class Dispatcher:
     # Trigger configuration stubs -------------------------------------
 
     def set_trigger_config(self, config: TriggerConfig, sample_rate: float) -> None:
+        """Apply a trigger config to the dispatcher's *delivery* behavior.
+
+        Contract: the dispatcher consumes only ``config.mode`` (stream vs.
+        triggered visualization delivery; see the delivery-contract note at the
+        top of this module) and ``config.window_sec`` (viz-buffer sizing). The
+        detection parameters — ``threshold``, ``channel_index``,
+        ``pretrigger_sec``, ``hysteresis`` — are owned by the GUI-side
+        ``TriggerController`` and are intentionally ignored here. The full
+        ``config`` is still stored (``_current_trigger``) so ``mode`` is
+        readable without a separate field.
+        """
         with self._ring_lock:
             self._current_trigger = config
             self._visualization_queue_enabled = config.mode != "stream"

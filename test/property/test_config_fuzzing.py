@@ -291,7 +291,7 @@ class TestTriggerConfigValidation:
         channel_index=st.integers(),
         threshold=st.floats(allow_nan=True, allow_infinity=True),
         hysteresis=st.floats(allow_nan=True, allow_infinity=True),
-        pretrigger_frac=st.floats(),
+        pretrigger_sec=st.floats(),
         window_sec=st.floats(),
     )
     @settings(max_examples=50, deadline=None)
@@ -300,7 +300,7 @@ class TestTriggerConfigValidation:
         channel_index: int,
         threshold: float,
         hysteresis: float,
-        pretrigger_frac: float,
+        pretrigger_sec: float,
         window_sec: float,
     ):
         """TriggerConfig should handle or reject edge cases consistently."""
@@ -311,7 +311,7 @@ class TestTriggerConfigValidation:
                 channel_index=channel_index,
                 threshold=threshold,
                 hysteresis=hysteresis,
-                pretrigger_frac=pretrigger_frac,
+                pretrigger_sec=pretrigger_sec,
                 window_sec=window_sec,
                 mode="repeated",
             )

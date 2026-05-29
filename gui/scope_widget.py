@@ -12,6 +12,8 @@ from typing import Optional
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from .scope_coords import norm_to_volts
+
 logger = logging.getLogger(__name__)
 
 
@@ -29,9 +31,7 @@ class VoltageAxis(pg.AxisItem):
 
     def tickStrings(self, values, scale, spacing):
         try:
-            # Must match trace_renderer.py: y_norm = voltage/(2*span) + offset
-            # So: voltage = (y_norm - offset) * (2 * span)
-            return [f"{(float(v) - self._offset) * (2.0 * self._span):.3g}" for v in values]
+            return [f"{norm_to_volts(float(v), self._span, self._offset):.3g}" for v in values]
         except Exception as exc:
             logger.debug("VoltageAxis tickStrings failed: %s", exc)
             return super().tickStrings(values, scale, spacing)
@@ -101,12 +101,16 @@ class ScopeWidget(QtWidgets.QWidget):
         plot_item.showGrid(x=True, y=True, alpha=0.4)
         plot_item.vb.setBorder(pg.mkPen((0, 0, 139)))
 
-        # Add threshold and pretrigger lines. The threshold line is black and
-        # draggable; its style is fixed here (no per-frame restyling).
+        # Threshold line: solid black, draggable, clamped to the [0,1] viewport,
+        # with a volt readout label. Shown only in triggered modes (single /
+        # repeated); hidden in No-Trigger / Stream mode.
         self.threshold_line = pg.InfiniteLine(
             angle=0,
             pen=pg.mkPen((0, 0, 0), width=5),
-            movable=True
+            movable=True,
+            bounds=[0.0, 1.0],
+            label="",
+            labelOpts={"position": 0.1, "color": (0, 0, 0), "fill": (255, 255, 255, 160)},
         )
         self.threshold_line.setVisible(False)
         self.plot_widget.addItem(self.threshold_line)
@@ -162,10 +166,30 @@ class ScopeWidget(QtWidgets.QWidget):
         self.threshold_line.sigPositionChanged.connect(self._on_threshold_moved)
 
     def set_threshold(self, value: Optional[float] = None, visible: bool = True) -> None:
-        """Set threshold line position and visibility."""
+        """Set threshold line position and visibility.
+
+        A *programmatic* position update is applied with the line's signals
+        blocked, so it never masquerades as a user drag (which would otherwise
+        re-enter the config handlers and reconfigure the trigger). Real user
+        drags go through pyqtgraph's own mouse handling and still emit normally.
+        """
         if value is not None:
-            self.threshold_line.setValue(value)
+            blocked = self.threshold_line.blockSignals(True)
+            try:
+                self.threshold_line.setValue(value)
+            finally:
+                self.threshold_line.blockSignals(blocked)
         self.threshold_line.setVisible(visible)
+
+    def set_threshold_label(self, text: str) -> None:
+        """Update the volt readout shown next to the threshold line."""
+        label = getattr(self.threshold_line, "label", None)
+        if label is None:
+            return
+        try:
+            label.setFormat(text)
+        except Exception as exc:
+            logger.debug("Threshold label update failed: %s", exc)
 
     def set_pretrigger_position(self, time_sec: float, visible: bool = True) -> None:
         """Set pretrigger line position and visibility."""

@@ -119,8 +119,10 @@ class TestEmitArrayShapes:
         finally:
             device.close()
 
-    def test_failing_monitor_bridge_is_disabled(self, configured_device):
-        """A failing monitor bridge should be detached after the first error."""
+    def test_failing_monitor_bridge_disabled_after_error_budget(self, configured_device):
+        """A *persistently* failing monitor bridge is detached once the error
+        budget is exhausted — not on the first error (finding 3.3)."""
+        from daq.base_device import _MONITOR_BRIDGE_ERROR_BUDGET
 
         class _FailingBridge:
             def __init__(self) -> None:
@@ -135,12 +137,50 @@ class TestEmitArrayShapes:
         device.register_monitor_bridge(bridge)
 
         data = np.random.randn(32, 2).astype(np.float32)
-        device.emit_array(data)
-        assert bridge.calls == 1
-        assert device._monitor_bridge is None
 
+        # Failures below the budget keep the bridge attached.
+        for i in range(_MONITOR_BRIDGE_ERROR_BUDGET - 1):
+            device.emit_array(data)
+            assert device._monitor_bridge is bridge, f"disabled too early after {i + 1} failures"
+
+        # The budget-th consecutive failure disables it.
         device.emit_array(data)
-        assert bridge.calls == 1
+        assert device._monitor_bridge is None
+        calls_at_disable = bridge.calls
+
+        # Once disabled, the bridge is no longer called.
+        device.emit_array(data)
+        assert bridge.calls == calls_at_disable
+
+    def test_monitor_bridge_survives_transient_failure(self, configured_device):
+        """A single failure followed by successes does not disable the bridge,
+        and resets the error budget (finding 3.3)."""
+
+        class _FlakyBridge:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.fail_next = True
+
+            def on_chunk(self, raw) -> None:
+                self.calls += 1
+                if self.fail_next:
+                    self.fail_next = False
+                    raise RuntimeError("transient")
+
+        device = configured_device
+        bridge = _FlakyBridge()
+        device.register_monitor_bridge(bridge)
+
+        data = np.random.randn(32, 2).astype(np.float32)
+        device.emit_array(data)  # fails once
+        assert device._monitor_bridge is bridge, "a single failure must not disable the bridge"
+        assert device._monitor_bridge_errors == 1
+
+        device.emit_array(data)  # succeeds -> resets the budget
+        assert device._monitor_bridge_errors == 0
+        device.emit_array(data)  # keeps succeeding
+        assert device._monitor_bridge is bridge
+        assert bridge.calls == 3
 
 
 class TestEmitArrayLockContention:

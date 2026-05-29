@@ -321,7 +321,7 @@ class TestTriggerConfiguration:
             channel_index=0,
             threshold=0.5,
             hysteresis=0.0,
-            pretrigger_frac=0.2,
+            pretrigger_sec=0.2,
             window_sec=0.5,
             mode="single",
         )
@@ -431,7 +431,7 @@ class TestHealthMetrics:
                 channel_index=0,
                 threshold=0.5,
                 hysteresis=0.0,
-                pretrigger_frac=0.2,
+                pretrigger_sec=0.2,
                 window_sec=0.2,
                 mode="repeated",
             )

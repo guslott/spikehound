@@ -31,7 +31,7 @@ class TriggerControlWidget(QtWidgets.QWidget):
     - Sync UI state with TriggerController.
     - Forward UI events to TriggerController.
     """
-    
+
     def __init__(
         self,
         controller: TriggerController,
@@ -122,6 +122,32 @@ class TriggerControlWidget(QtWidgets.QWidget):
         trigger_layout.addLayout(threshold_box, row, 0, 1, 2)
         row += 1
 
+        # Edge selection + hysteresis (noise reject)
+        edge_box = QtWidgets.QHBoxLayout()
+        edge_box.setSpacing(4)
+        edge_box.addWidget(QtWidgets.QLabel("Edge"))
+        self.edge_combo = QtWidgets.QComboBox()
+        self.edge_combo.setMaximumWidth(90)
+        for label, data in (("Rising", "rising"), ("Falling", "falling"), ("Either", "either")):
+            self.edge_combo.addItem(label, data)
+        edge_box.addWidget(self.edge_combo)
+        edge_box.addSpacing(8)
+        edge_box.addWidget(QtWidgets.QLabel("Noise reject (V)"))
+        self.hysteresis_spin = QtWidgets.QDoubleSpinBox()
+        self.hysteresis_spin.setRange(0.0, 10.0)
+        self.hysteresis_spin.setSingleStep(0.01)
+        self.hysteresis_spin.setDecimals(3)
+        self.hysteresis_spin.setValue(0.0)
+        self.hysteresis_spin.setMaximumWidth(90)
+        self.hysteresis_spin.setToolTip(
+            "Hysteresis band: the signal must retreat this far past the "
+            "threshold before the trigger re-arms. 0 disables it."
+        )
+        edge_box.addWidget(self.hysteresis_spin)
+        edge_box.addStretch(1)
+        trigger_layout.addLayout(edge_box, row, 0, 1, 2)
+        row += 1
+
         # Pre-trigger
         pretrig_box = QtWidgets.QHBoxLayout()
         pretrig_box.setSpacing(4)
@@ -159,7 +185,11 @@ class TriggerControlWidget(QtWidgets.QWidget):
         
         # Threshold
         self.threshold_spin.valueChanged.connect(self._on_config_changed)
-        
+
+        # Edge + hysteresis
+        self.edge_combo.currentIndexChanged.connect(self._on_config_changed)
+        self.hysteresis_spin.valueChanged.connect(self._on_config_changed)
+
         # Pre-trigger & Window
         self.pretrigger_combo.currentIndexChanged.connect(self._on_config_changed)
         self.window_combo.currentIndexChanged.connect(self._on_config_changed)
@@ -210,14 +240,36 @@ class TriggerControlWidget(QtWidgets.QWidget):
         # Window
         win_data = self.window_combo.currentData()
         window_sec = float(win_data) if win_data is not None else 1.0
-        
-        self._controller.configure(
+
+        # Edge + hysteresis
+        edge_data = self.edge_combo.currentData()
+        edge = str(edge_data) if edge_data is not None else "rising"
+        hysteresis = self.hysteresis_spin.value()
+
+        # Only a structural change (mode / channel / pre-trigger / window / edge
+        # / hysteresis) needs to reset the capture state. A pure threshold
+        # *value* change -- a spinbox tick or a threshold-line drag -- must
+        # preserve the sample history and pre-trigger buffer so detection keeps
+        # running smoothly.
+        controller = self._controller
+        structural_change = (
+            mode != controller.mode
+            or channel_id != controller.channel_id
+            or abs(pre_seconds - controller.pre_seconds) > 1e-9
+            or abs(window_sec - controller.window_sec) > 1e-9
+            or edge != controller.edge
+            or abs(hysteresis - controller.hysteresis) > 1e-9
+        )
+
+        controller.configure(
             mode=mode,
             channel_id=channel_id,
             threshold=threshold,
             pre_seconds=pre_seconds,
             window_sec=window_sec,
-            reset_state=True,
+            edge=edge,
+            hysteresis=hysteresis,
+            reset_state=structural_change,
             preserve_display_on_reset=True,
         )
 

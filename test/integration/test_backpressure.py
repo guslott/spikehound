@@ -45,7 +45,7 @@ def _enable_triggered_viz(dispatcher, sample_rate: float = 10000.0) -> None:
             channel_index=0,
             threshold=0.5,
             hysteresis=0.0,
-            pretrigger_frac=0.2,
+            pretrigger_sec=0.2,
             window_sec=0.2,
             mode="repeated",
         ),

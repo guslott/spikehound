@@ -83,10 +83,40 @@ def test_event_width_not_meeting_min_run():
     threshold = 1.0
     data = np.zeros(100)
     data[50] = 2.0 # single spike
-    
+
     width_ms = event_width(data, sr, threshold=threshold, min_run=3, off_count=3, off_window=4)
-    
-    # Should probably be small or zero? The definition says "Start is first sample of a run of min_run". 
+
+    # Should probably be small or zero? The definition says "Start is first sample of a run of min_run".
     # If no run of 3 exists attached to peak, maybe it returns 0?
     assert width_ms == 0.0
+
+
+@pytest.mark.parametrize(
+    "block_len, expected_ms",
+    [
+        (2, 0.0),   # below min_run -> rejected by the final width gate
+        (3, 3.0),   # exactly min_run -> accepted (width_samples == min_run is NOT < min_run)
+        (5, 5.0),   # above min_run -> accepted
+    ],
+)
+def test_event_width_min_run_gate_boundary(block_len, expected_ms):
+    """Characterize the min_run boundary (finding 5.1).
+
+    The backward start-scan used to contain an ``if/else`` whose two branches were
+    identical, so ``min_run`` had no effect there; the *only* place min_run gates
+    the result is the final ``width_samples < min_run`` check. This test pins that
+    behavior at the boundary (block_len == min_run is the inclusive cutoff) so the
+    dead-branch removal is provably behavior-preserving and a future editor doesn't
+    reintroduce a redundant backward gate.
+    """
+    sr = 1000.0  # 1 sample == 1 ms, so width_samples maps 1:1 to ms
+    threshold = 1.0
+    data = np.zeros(100)
+    data[50 : 50 + block_len] = 2.0  # contiguous above-threshold block
+
+    width_ms = event_width(
+        data, sr, threshold=threshold, min_run=3, off_count=3, off_window=4
+    )
+
+    assert abs(width_ms - expected_ms) < 1e-6
 

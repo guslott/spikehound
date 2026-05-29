@@ -4,7 +4,7 @@ import logging
 import queue
 import threading
 import time
-from typing import Any, Optional, Sequence, TYPE_CHECKING, Tuple
+from typing import Any, Optional, Sequence, TYPE_CHECKING, Tuple, Type
 
 from daq.base_device import BaseDevice
 
@@ -320,9 +320,8 @@ class SpikeHoundRuntime:
                 capacity_sec = 0.0
                 if rb is not None and self.sample_rate > 0:
                     capacity_sec = rb.capacity / self.sample_rate
-                # Estimate headroom: capacity minus queue depth (samples waiting)
-                queue_samples = src_info.get("queue_size", 0) * src_info.get("next_start_sample", 0) / max(src_info.get("next_seq", 1), 1)
-                # Simplified: queue_size * chunk_size approximation
+                # Estimate headroom: capacity minus queue depth (samples waiting),
+                # approximated as queue_size * chunk_size.
                 chunk_size = getattr(getattr(source, "config", None), "chunk_size", 1024)
                 queue_samples = src_info.get("queue_size", 0) * chunk_size
                 headroom_sec = capacity_sec - (queue_samples / self.sample_rate if self.sample_rate > 0 else 0)
@@ -334,8 +333,8 @@ class SpikeHoundRuntime:
                     "buffer_capacity_sec": capacity_sec,
                     "buffer_headroom_sec": max(headroom_sec, 0.0),
                 }
-            except Exception:
-                pass
+            except Exception as exc:
+                self.logger.debug("health_snapshot: source stats unavailable: %s", exc, exc_info=True)
 
         # Uptime calculation
         uptime: Optional[float] = None
@@ -350,8 +349,8 @@ class SpikeHoundRuntime:
             if am is not None:
                 monitor_latency_ms = am.monitor_latency_ms()
                 monitor_latency_p95_ms = am.monitor_latency_p95_ms()
-        except Exception:
-            pass
+        except Exception as exc:
+            self.logger.debug("health_snapshot: monitor latency unavailable: %s", exc, exc_info=True)
 
         return {
             "chunk_rate": float(self.chunk_rate),

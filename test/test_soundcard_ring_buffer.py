@@ -1,9 +1,11 @@
-"""Regression tests for LocalRingBuffer overrun accounting (finding 6.1)."""
+"""Regression tests for LocalRingBuffer overrun accounting (finding 6.1) and
+soundcard channel-by-position selection (finding 6.5)."""
 from __future__ import annotations
 
 import numpy as np
 
-from daq.soundcard_source import LocalRingBuffer
+from daq.base_device import ChannelInfo
+from daq.soundcard_source import LocalRingBuffer, SoundCardSource
 
 
 def _block(values) -> np.ndarray:
@@ -64,3 +66,32 @@ def test_overruns_accumulate_across_writes() -> None:
     assert buf.write(_block([7, 8])) == 2  # overrun again
     assert buf.overruns == 2
     assert buf.dropped_frames == 4
+
+
+def test_active_channel_columns_uses_id_to_position_map() -> None:
+    """Finding 6.5: channel selection maps active channel *ids* to their column
+    positions in the captured frame, so it stays correct even when ids are not
+    equal to column indices (the old code used the ids directly as columns)."""
+    src = SoundCardSource()
+    # Non-positional ids: id != list position.
+    src._available_channels = [
+        ChannelInfo(id=10, name="In 1", units="V"),
+        ChannelInfo(id=20, name="In 2", units="V"),
+        ChannelInfo(id=30, name="In 3", units="V"),
+    ]
+    src._active_channel_ids = [30, 10]  # select 3rd then 1st column
+
+    # Columns, in active order — NOT the raw ids [30, 10] (which would be
+    # out-of-range indices into a 3-column frame).
+    assert src._active_channel_columns() == [2, 0]
+
+
+def test_active_channel_columns_default_positional_ids() -> None:
+    """The common case (ids equal positions) still selects the right columns."""
+    src = SoundCardSource()
+    src._available_channels = [
+        ChannelInfo(id=0, name="In 1", units="V"),
+        ChannelInfo(id=1, name="In 2", units="V"),
+    ]
+    src._active_channel_ids = [1]
+    assert src._active_channel_columns() == [1]

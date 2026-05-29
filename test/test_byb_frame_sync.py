@@ -24,11 +24,81 @@ from typing import List
 
 import numpy as np
 import pytest
+from hypothesis import given, settings, strategies as st
 
-from daq.backyard_brains import BackyardBrainsSource
+from daq.backyard_brains import BackyardBrainsSource, _BYBDecoder
 from daq.base_device import ChannelInfo
 from shared.models import ActualConfig, ChunkPointer
 from shared.ring_buffer import SharedRingBuffer
+
+
+def _ref_score_alignment(raw: bytes, width: int, offset: int, mode: str) -> int:
+    """Reference (pre-vectorization) per-byte scan, for equivalence testing."""
+    frame_size = width * 2
+    usable = len(raw) - offset
+    usable -= usable % frame_size
+    if usable <= 0:
+        return 0
+    score = 0
+    for pos in range(usable):
+        byte = raw[offset + pos]
+        expected = (pos % frame_size == 0) if mode == "frame_start" else (pos % 2 == 0)
+        if expected:
+            if byte & 0x80:
+                score += 1
+            else:
+                break
+        else:
+            if byte & 0x80:
+                break
+            score += 1
+    return score
+
+
+def _ref_frame_bytes_valid(frame_bytes: bytes, mode: str) -> bool:
+    """Reference (pre-vectorization) per-byte validity check."""
+    frame_size = len(frame_bytes)
+    for pos in range(frame_size):
+        byte = frame_bytes[pos]
+        expected = (pos % frame_size == 0) if mode == "frame_start" else (pos % 2 == 0)
+        if expected:
+            if (byte & 0x80) == 0:
+                return False
+        else:
+            if byte & 0x80:
+                return False
+    return True
+
+
+class TestBYBVectorizedScanEquivalence:
+    """Finding 6.4: vectorized _score_alignment / _frame_bytes_valid must be
+    byte-for-byte equivalent to the original Python per-byte loops."""
+
+    @given(
+        data=st.lists(st.integers(0, 255), min_size=0, max_size=64),
+        width=st.integers(1, 4),
+        offset=st.integers(0, 8),
+        mode=st.sampled_from(["per_sample", "frame_start"]),
+    )
+    @settings(max_examples=400, deadline=None)
+    def test_score_alignment_matches_reference(self, data, width, offset, mode):
+        dec = _BYBDecoder(bits=10, candidate_widths=[width])
+        dec._raw = bytearray(data)
+        assert dec._score_alignment(width, offset, mode) == _ref_score_alignment(
+            bytes(data), width, offset, mode
+        )
+
+    @given(
+        data=st.lists(st.integers(0, 255), min_size=1, max_size=32),
+        mode=st.sampled_from(["per_sample", "frame_start"]),
+    )
+    @settings(max_examples=400, deadline=None)
+    def test_frame_bytes_valid_matches_reference(self, data, mode):
+        dec = _BYBDecoder(bits=10, candidate_widths=[1])
+        dec._frame_mode = mode
+        assert dec._frame_bytes_valid(bytearray(data)) == _ref_frame_bytes_valid(
+            bytes(data), mode
+        )
 
 
 # ---------------------------------------------------------------------------

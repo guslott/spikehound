@@ -21,6 +21,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import scipy.io.wavfile as wavfile
 
 from recording.wav_logger import WavLoggerThread, WaveWriter32
 from shared.models import Chunk, EndOfStream
@@ -123,12 +124,11 @@ class TestWavLoggerRoundtrip:
         data_queue.put(EndOfStream)
         logger.stop()
 
-        # Read back manually (wave module doesn't support float32)
-        with open(str(wav_path), "rb") as f:
-            # Skip to data
-            f.seek(44)  # Standard header size for simple WAV
-            data = f.read()
-            read_float = np.frombuffer(data, dtype=np.float32)
+        # Read back with a real WAV reader rather than a hardcoded byte offset,
+        # so this validates the actual header layout round-trips (finding 8.1).
+        read_sr, read_float = wavfile.read(str(wav_path))
+        assert read_sr == sample_rate
+        assert read_float.dtype == np.float32
 
         # Should match exactly
         np.testing.assert_array_almost_equal(
@@ -290,13 +290,60 @@ class TestWaveWriter32:
             writer.write_frames(data)
             writer.close()
 
-        # Read data size from header
-        with open(str(wav_path), "rb") as f:
-            f.seek(40)  # Data chunk size position
-            data_size = struct.unpack("<I", f.read(4))[0]
+        # Locate the data chunk by tag rather than a hardcoded offset: the fact
+        # chunk shifts it (finding 8.1). Samples are all zero, so the byte
+        # sequence b"data" within the header can only be the chunk tag.
+        raw = wav_path.read_bytes()
+        idx = raw[:64].index(b"data")
+        data_size = struct.unpack("<I", raw[idx + 4 : idx + 8])[0]
 
         expected_size = n_samples * n_channels * 4  # float32 = 4 bytes
         assert data_size == expected_size
+
+    def test_header_has_fact_chunk_with_frame_count(self, tmp_path: Path):
+        """IEEE-float WAV should carry a fact chunk with the frame count (8.1)."""
+        wav_path = tmp_path / "test_fact.wav"
+        n_samples = 100
+        n_channels = 2
+
+        with open(str(wav_path), "wb") as f:
+            writer = WaveWriter32(f, channels=n_channels, sample_rate=44100)
+            writer.write_frames(np.zeros((n_samples, n_channels), dtype=np.float32))
+            writer.close()
+
+        raw = wav_path.read_bytes()
+        idx = raw[:64].index(b"fact")
+        fact_size = struct.unpack("<I", raw[idx + 4 : idx + 8])[0]
+        frame_count = struct.unpack("<I", raw[idx + 8 : idx + 12])[0]
+        assert fact_size == 4
+        assert frame_count == n_samples  # per-channel sample frames
+
+    def test_flush_leaves_readable_file_before_close(self, tmp_path: Path):
+        """8.2: after a periodic flush, a partial file (no close) must be readable.
+
+        Simulates a crash mid-recording — without the incremental flush the
+        RIFF/data sizes stay 0 and the file is unreadable.
+        """
+        wav_path = tmp_path / "test_partial.wav"
+        sample_rate = 48000
+        original = (
+            0.5 * np.sin(2 * np.pi * 1000 * np.arange(2400) / sample_rate)
+        ).astype(np.float32).reshape(-1, 1)
+
+        f = open(str(wav_path), "wb")
+        writer = WaveWriter32(f, channels=1, sample_rate=sample_rate)
+        try:
+            writer.write_frames(original)
+            writer.flush()  # periodic durability flush; deliberately NOT closed
+
+            read_sr, read_float = wavfile.read(str(wav_path))
+            assert read_sr == sample_rate
+            assert read_float.dtype == np.float32
+            np.testing.assert_allclose(
+                read_float.reshape(-1, 1), original, atol=1e-6
+            )
+        finally:
+            writer.close()
 
 
 class TestWavLoggerEdgeCases:

@@ -250,7 +250,7 @@ class TriggerConfig:
     channel_index: int | None
     threshold: float
     hysteresis: float
-    pretrigger_frac: float
+    pretrigger_sec: float  # seconds of pre-trigger capture (0 <= pretrigger_sec <= window_sec)
     window_sec: float
     mode: str
 
@@ -261,8 +261,8 @@ class TriggerConfig:
             )
         if self.window_sec <= 0:
             raise ValueError("window_sec must be positive")
-        if not (0.0 <= self.pretrigger_frac <= 1.0):
-            raise ValueError("pretrigger_frac must be in [0, 1]")
+        if not (0.0 <= self.pretrigger_sec <= self.window_sec):
+            raise ValueError("pretrigger_sec must be in [0, window_sec] seconds")
         if not np.isfinite(self.threshold):
             raise ValueError("threshold must be finite")
         if not np.isfinite(self.hysteresis):

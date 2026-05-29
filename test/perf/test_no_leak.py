@@ -41,7 +41,7 @@ def configure_triggered_visualization(runtime: SpikeHoundRuntime, channels: list
             channel_index=channels[0],
             threshold=0.0,
             hysteresis=0.0,
-            pretrigger_frac=0.0,
+            pretrigger_sec=0.0,
             window_sec=1.0,
             mode="repeated",
         )

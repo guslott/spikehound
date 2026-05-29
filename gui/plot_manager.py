@@ -422,10 +422,10 @@ class PlotManager(QtCore.QObject):
                 chunk_start_abs = tc._history_total - chunk_samples.shape[0]
                 tc.start_capture(chunk_start_abs, cross_idx)
         elif monitor_idx is not None and tc.display_data is None:
-            # Maintain previous value even if not armed
-            tc.detect_crossing(chunk_samples[:, monitor_idx])
+            # Keep the baseline / hysteresis priming current without firing.
+            tc.update_baseline(chunk_samples[:, monitor_idx])
 
-        tc.finalize_capture()
+        tc.advance_capture()
 
         if tc.display_data is not None:
             self._current_sample_rate = sample_rate

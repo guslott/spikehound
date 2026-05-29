@@ -302,6 +302,20 @@ class SoundCardSource(BaseDevice):
         supported = [44100, 48000, 88200, 96000]
         return Capabilities(max_channels_in=max_in, sample_rates=supported, dtype=self.dtype)
 
+    def _active_channel_columns(self) -> List[int]:
+        """Hardware column indices (into the captured frame) for the active
+        channels, in active order.
+
+        Maps each active channel *id* to its position in ``_available_channels``
+        — the column it occupies in the interleaved capture buffer — rather than
+        assuming channel id equals column index. Today soundcard ids happen to
+        equal positions, but an explicit map keeps this correct if a future
+        device exposes non-positional ids (finding 6.5). Mirrors the id→position
+        mapping the BYB driver already does.
+        """
+        id_to_col = {ch.id: pos for pos, ch in enumerate(self._available_channels)}
+        return [id_to_col[c.id] for c in self.get_active_channels() if c.id in id_to_col]
+
     def list_available_channels(self, device_id: str) -> List[ChannelInfo]:
         if miniaudio is None:
             raise RuntimeError(f"`miniaudio` unavailable: {_IMPORT_ERROR!r}")
@@ -373,7 +387,7 @@ class SoundCardSource(BaseDevice):
                     self._data_available.clear()
                     continue
 
-                idxs = [c.id for c in self.get_active_channels()]
+                idxs = self._active_channel_columns()
                 if idxs:
                     while self._residual_buffer.filled >= self.config.chunk_size:
                         data_chunk = self._residual_buffer.read(self.config.chunk_size)
@@ -446,9 +460,8 @@ class SoundCardSource(BaseDevice):
                     # up exactly as it does on the emitter path.
                     bridge = self._monitor_bridge
                     if bridge is not None:
-                        active = self.get_active_channels()
-                        if active:
-                            idxs = [c.id for c in active]
+                        idxs = self._active_channel_columns()
+                        if idxs:
                             try:
                                 bridge.on_chunk(data[:, idxs])
                             except Exception as exc:
@@ -487,17 +500,40 @@ class SoundCardSource(BaseDevice):
             if self._emitter_thread is not None:
                 self._emitter_thread.join(timeout=1.0)
                 self._emitter_thread = None
+            # Release the OS audio stream if the device was created before the
+            # failure (e.g. start() raised after CaptureDevice() succeeded).
+            # Nulling the handle alone leaks the stream (finding 6.6c).
+            if self._device is not None:
+                try:
+                    self._device.close()
+                except Exception as close_exc:
+                    logger.debug(
+                        "Error closing capture device after start failure: %s",
+                        close_exc,
+                    )
             self._device = None
 
     def _stop_impl(self) -> None:
         self._stop_evt.set()
         self._data_available.set()  # Wake up emitter thread so it can exit
-        
-        if self._device and self._device.running:
-            self._device.stop()
-            self._device.close()
+
+        # Always release the OS stream if a device exists — guarding close()
+        # behind .running leaked devices that were created but never reached the
+        # running state (finding 6.6c). stop() stays guarded since it is only
+        # valid on a running device.
+        device = self._device
         self._device = None
-        
+        if device is not None:
+            try:
+                if device.running:
+                    device.stop()
+            except Exception as exc:
+                logger.debug("Error stopping capture device: %s", exc)
+            try:
+                device.close()
+            except Exception as exc:
+                logger.debug("Error closing capture device: %s", exc)
+
         # Wait for emitter thread to finish
         if self._emitter_thread is not None:
             self._emitter_thread.join(timeout=1.0)

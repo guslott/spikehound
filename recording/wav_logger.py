@@ -9,6 +9,7 @@ import os
 import queue
 import threading
 import struct
+import time
 from typing import Optional, Union
 import numpy as np
 
@@ -17,56 +18,108 @@ from shared.models import Chunk, EndOfStream
 logger = logging.getLogger(__name__)
 
 class WaveWriter32:
-    """Writes 32-bit floating point WAV files (IEEE Float)."""
-    
+    """Writes 32-bit IEEE-float WAV files (``WAVE_FORMAT_IEEE_FLOAT``).
+
+    The header uses the non-PCM layout strict readers expect (finding 8.1): an
+    18-byte ``fmt `` chunk (with ``cbSize``) plus a ``fact`` chunk carrying the
+    per-channel sample-frame count. Every size field is patched from a byte
+    offset captured at write time rather than a hardcoded ``seek`` — so the
+    layout can change without silently corrupting the patch sites.
+
+    :meth:`flush` patches those sizes incrementally and ``fsync``s, so a crash
+    mid-recording still leaves a readable file instead of a 0-size placeholder
+    (finding 8.2).
+    """
+
+    _BYTES_PER_SAMPLE = 4  # float32
+
     def __init__(self, f, channels: int, sample_rate: int):
         self._f = f
-        self._channels = channels
-        self._sample_rate = sample_rate
+        self._channels = int(channels)
+        self._sample_rate = int(sample_rate)
         self._data_size = 0
+        # Byte offsets of the patchable size fields, captured in _write_header().
+        self._riff_size_pos = 0
+        self._fact_frames_pos = 0
+        self._data_size_pos = 0
         self._write_header()
-        
+
     def _write_header(self):
-        """Write placeholder WAV header."""
-        # RIFF header
-        self._f.write(b'RIFF')
-        self._f.write(struct.pack('<I', 0))  # ChunkSize (placeholder)
-        self._f.write(b'WAVE')
-        
-        # fmt chunk
-        self._f.write(b'fmt ')
-        self._f.write(struct.pack('<I', 16)) # Subchunk1Size (16 for PCM)
-        self._f.write(struct.pack('<H', 3))  # AudioFormat (3 = IEEE Float)
-        self._f.write(struct.pack('<H', self._channels))
-        self._f.write(struct.pack('<I', self._sample_rate))
-        bytes_per_sample = 4 # float32
-        block_align = self._channels * bytes_per_sample
+        """Write the header with placeholder sizes, recording their offsets."""
+        f = self._f
+        block_align = self._channels * self._BYTES_PER_SAMPLE
         byte_rate = self._sample_rate * block_align
-        self._f.write(struct.pack('<I', byte_rate))
-        self._f.write(struct.pack('<H', block_align))
-        self._f.write(struct.pack('<H', bytes_per_sample * 8)) # BitsPerSample
-        
+
+        # RIFF header
+        f.write(b'RIFF')
+        self._riff_size_pos = f.tell()
+        f.write(struct.pack('<I', 0))  # RIFF chunk size (patched on flush/close)
+        f.write(b'WAVE')
+
+        # fmt chunk — 18 bytes incl. cbSize, as required for non-PCM formats
+        f.write(b'fmt ')
+        f.write(struct.pack('<I', 18))
+        f.write(struct.pack('<H', 3))  # AudioFormat = 3 (IEEE Float)
+        f.write(struct.pack('<H', self._channels))
+        f.write(struct.pack('<I', self._sample_rate))
+        f.write(struct.pack('<I', byte_rate))
+        f.write(struct.pack('<H', block_align))
+        f.write(struct.pack('<H', self._BYTES_PER_SAMPLE * 8))  # BitsPerSample
+        f.write(struct.pack('<H', 0))  # cbSize (no format extension)
+
+        # fact chunk — sample-frame count per channel (recommended for non-PCM)
+        f.write(b'fact')
+        f.write(struct.pack('<I', 4))
+        self._fact_frames_pos = f.tell()
+        f.write(struct.pack('<I', 0))  # frame count (patched on flush/close)
+
         # data chunk
-        self._f.write(b'data')
-        self._f.write(struct.pack('<I', 0))  # Subchunk2Size (placeholder)
-        
+        f.write(b'data')
+        self._data_size_pos = f.tell()
+        f.write(struct.pack('<I', 0))  # data size (patched on flush/close)
+
     def write_frames(self, data: np.ndarray):
-        """Write raw float32 bytes."""
-        byte_data = data.tobytes()
+        """Append interleaved float32 frames."""
+        byte_data = np.ascontiguousarray(data, dtype=np.float32).tobytes()
         self._f.write(byte_data)
         self._data_size += len(byte_data)
-        
+
+    def _patch_sizes(self):
+        """Patch the RIFF/fact/data size fields from the current end position."""
+        f = self._f
+        end = f.tell()
+        block_align = (self._channels * self._BYTES_PER_SAMPLE) or 1
+        frame_count = self._data_size // block_align
+
+        f.seek(self._riff_size_pos)
+        f.write(struct.pack('<I', max(0, end - 8)))  # all bytes after 'RIFF'+size
+        f.seek(self._fact_frames_pos)
+        f.write(struct.pack('<I', frame_count))
+        f.seek(self._data_size_pos)
+        f.write(struct.pack('<I', self._data_size))
+        f.seek(end)  # restore the append position for continued writing
+
+    def flush(self):
+        """Patch header sizes and fsync so a partial file stays readable (8.2)."""
+        if self._f.closed:
+            return
+        self._patch_sizes()
+        self._f.flush()
+        try:
+            os.fsync(self._f.fileno())
+        except (OSError, ValueError):
+            # Best-effort: some file-likes / platforms don't support fsync.
+            pass
+
     def close(self):
-        """Update header lengths and close."""
+        """Finalize header sizes, fsync, and close."""
         if not self._f.closed:
-            # Update sizes
-            file_size = 4 + (8 + 16) + (8 + self._data_size) # RIFF + fmt + data
-            self._f.seek(4)
-            self._f.write(struct.pack('<I', file_size))
-            
-            # data chunk size
-            self._f.seek(40)
-            self._f.write(struct.pack('<I', self._data_size))
+            self._patch_sizes()
+            self._f.flush()
+            try:
+                os.fsync(self._f.fileno())
+            except (OSError, ValueError):
+                pass
             self._f.close()
 
 class WavLoggerThread:
@@ -74,6 +127,11 @@ class WavLoggerThread:
     Consumes Chunk objects from a queue and writes to a WAV file.
     Supports standard 16-bit PCM (default) or 32-bit Float (Pro).
     """
+
+    # How often the float32 writer patches header sizes + fsyncs so a crash
+    # mid-recording leaves a readable file (finding 8.2). The 16-bit stdlib
+    # `wave` writer only finalizes on close(), so this applies to float32 only.
+    _FLUSH_INTERVAL_SEC = 1.0
 
     def __init__(
         self,
@@ -169,12 +227,27 @@ class WavLoggerThread:
             self.duration_seconds,
         )
 
+    def _maybe_flush(self, last_flush: float) -> float:
+        """Periodically patch header sizes + fsync the float32 writer (8.2)."""
+        if not self._use_float32 or self._writer is None:
+            return last_flush
+        now = time.monotonic()
+        if now - last_flush < self._FLUSH_INTERVAL_SEC:
+            return last_flush
+        try:
+            self._writer.flush()
+        except Exception:
+            logger.debug("Periodic WAV flush failed", exc_info=True)
+        return now
+
     def _run(self) -> None:
+        last_flush = time.monotonic()
         while True:
             try:
                 # Small timeout to allow periodic check of stop_event
                 item = self._queue.get(timeout=0.05)
             except queue.Empty:
+                last_flush = self._maybe_flush(last_flush)
                 if self._stop_event.is_set():
                     break
                 continue
@@ -193,6 +266,8 @@ class WavLoggerThread:
                 logger.error("Error in WavLoggerThread loop", exc_info=True)
             finally:
                 self._queue.task_done()
+
+            last_flush = self._maybe_flush(last_flush)
 
     def _write_chunk(self, chunk: Chunk) -> None:
         if self._writer is None:

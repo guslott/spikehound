@@ -85,9 +85,9 @@ class PipelineController:
     def source(self) -> Optional[BaseDevice]:
         return self._source
 
-    @property
-    def dispatcher(self) -> Optional[Dispatcher]:
-        return self._dispatcher
+    # NOTE: the `dispatcher` property is defined once, later in the class (it
+    # reads `_dispatcher` under `_lock`). A second, unlocked definition used to
+    # shadow it here — removed as dead code (finding 4.5).
 
     @property
     def filter_settings(self) -> FilterSettings:
@@ -357,7 +357,13 @@ class PipelineController:
     # Trigger configuration ---------------------------------------------
 
     def update_trigger_config(self, config: TriggerConfig) -> None:
-        """Receive trigger configuration updates from the GUI and forward them."""
+        """Receive trigger configuration updates from the GUI and forward them.
+
+        Only the delivery-relevant fields (``mode`` and ``window_sec``) affect
+        the dispatcher; threshold/channel/pre-trigger/hysteresis drive GUI-side
+        detection in ``TriggerController`` and are not used here. See
+        ``Dispatcher.set_trigger_config``.
+        """
         with self._lock:
             if self._dispatcher is None:
                 return
@@ -566,9 +572,13 @@ class PipelineController:
         return dispatcher.viz_buffer
 
     def queue_depths(self) -> Dict[str, dict]:
-        """Return per-queue health metrics for visualization, analysis, audio, and logging."""
+        """Return per-queue health metrics for the visualization and logging queues."""
+        # Capture the dispatcher under the lock, then build the report outside it
+        # (the queue objects are stable). Previously the lock guarded only an
+        # empty-dict creation while the real dispatcher access happened outside
+        # it — i.e. it protected nothing (finding 4.5).
         with self._lock:
-            depths: Dict[str, dict] = {}
+            dispatcher = self._dispatcher
 
         def _queue_status(q: "queue.Queue") -> dict:
             size = q.qsize()
@@ -576,14 +586,14 @@ class PipelineController:
             utilization = (size / maxsize) if maxsize > 0 else 0.0
             return {
                 "size": size,
-                    "max": maxsize,
-                    "utilization": utilization,
-                }
+                "max": maxsize,
+                "utilization": utilization,
+            }
 
+        depths: Dict[str, dict] = {}
         depths["visualization"] = _queue_status(self.visualization_queue)
-        if self._dispatcher is not None:
-            depths["viz_buffer"] = self._dispatcher.buffer_status()
-
+        if dispatcher is not None:
+            depths["viz_buffer"] = dispatcher.buffer_status()
         depths["logging"] = _queue_status(self.logging_queue)
         return depths
 

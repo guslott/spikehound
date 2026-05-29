@@ -6,7 +6,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-import wave
 from pathlib import Path
 from typing import List, Optional, Sequence, Any
 import scipy.io.wavfile as wavfile
@@ -142,15 +141,11 @@ class FileSource(BaseDevice):
         
         # Determine shape
         if data.ndim == 1:
+            # Mono files arrive 1D; the playback loop handles 1D slicing directly.
             n_frames = data.shape[0]
             n_channels = 1
-            # Reshape to (frames, 1) for consistency
-            # Note: cannot reshape mmap array easily if it's 1D? 
-            # Actually we'll handle 1D slicing in loop
-            self._is_mono = True
         else:
             n_frames, n_channels = data.shape
-            self._is_mono = False
 
         self._file_path = path
         self._raw_data = data
@@ -396,6 +391,9 @@ class FileSource(BaseDevice):
         elif chunk.dtype == np.int16:
             return chunk.astype(np.float32) / 32768.0
         elif chunk.dtype == np.int32:
+            # Also covers 24-bit PCM: scipy.io.wavfile reads 24-bit samples
+            # left-justified into int32 (value << 8), so the full-int32 divisor
+            # normalizes them to [-1, 1] correctly without a separate branch.
             return chunk.astype(np.float32) / 2147483648.0
         elif chunk.dtype == np.uint8:
             return (chunk.astype(np.float32) - 128.0) / 128.0

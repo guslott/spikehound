@@ -25,6 +25,7 @@ from .scope_widget import ScopeWidget
 from .channel_controls_widget import ChannelControlsWidget, ChannelDetailPanel
 from .device_control_widget import DeviceControlWidget
 from .types import ChannelConfig
+from .scope_coords import volts_to_norm, norm_to_volts
 from .trigger_controller import TriggerController
 from .plot_manager import PlotManager
 from .device_manager import DeviceManager
@@ -117,6 +118,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._downsample_supported = None
         self._window_combo_user_set = False
         self._window_combo_suppress = False
+        # True only while the user is dragging the threshold line, so the
+        # config handlers can suppress the line-position feedback loop and the
+        # per-pixel dispatcher push (see _on_scope_threshold_changed).
+        self._threshold_change_from_line = False
         self._signal_bridge = SignalBridge(self)
         self._branding_manager: Optional[BrandingManager] = None
         self._scope_popout_windows: list[QtWidgets.QDialog] = []
@@ -419,18 +424,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(object)
     def _on_trigger_config_changed(self, config: TriggerConfig) -> None:
-        """Handle trigger configuration changes from controller."""
-        is_triggered = config.mode != "stream"
-        if not is_triggered:
-            # Stream mode
-            self.scope.set_pretrigger_position(0.0, visible=False)
-            self.scope.set_threshold(visible=False)
-        else:
-            # Trigger mode
-            pre = float(config.pretrigger_frac)
-            self.scope.set_pretrigger_position(pre, visible=True)
-        
-        if self._device_connected and self._controller is not None:
+        """Handle trigger configuration changes from controller.
+
+        All scope-line visibility/placement is handled by _update_trigger_visuals
+        (single source of truth) so stream/triggered transitions can't disagree.
+        """
+        # Forward to the dispatcher, but not while the user is dragging the
+        # threshold line: the dispatcher only consumes mode + window_sec (it
+        # ignores threshold), so a drag would otherwise hammer the ring lock
+        # with updates that change nothing it reads.
+        if (
+            self._device_connected
+            and self._controller is not None
+            and not self._threshold_change_from_line
+        ):
             try:
                 self._controller.update_trigger_config(config)
             except Exception as exc:
@@ -442,57 +449,69 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_trigger_visuals(config)
 
     def _on_scope_threshold_changed(self, value: float) -> None:
-        """Handle threshold line moved by user."""
+        """Handle the threshold line being dragged by the user."""
         cfg = self._channel_configs.get(self._trigger_controller.channel_id) or self._channel_configs.get(self._active_channel_id)
         if cfg is not None:
-            span = cfg.vertical_span_v
-            offset = cfg.screen_offset
-            voltage = (value - offset) * (2.0 * span)
+            voltage = norm_to_volts(value, cfg.vertical_span_v, cfg.screen_offset)
         else:
             voltage = 0.0
-        
-        # Update spinbox value (blocked to prevent loop)
+
+        # Update spinbox value (blocked to prevent a redundant config pass)
         self.trigger_control.threshold_spin.blockSignals(True)
         self.trigger_control.threshold_spin.setValue(voltage)
         self.trigger_control.threshold_spin.blockSignals(False)
-        
-        # Manually trigger config update to propagate to dispatcher
-        # (since blockSignals prevented the automatic valueChanged signal)
-        self.trigger_control._on_config_changed()
+
+        # Reconfigure detection from this value. The flag marks the change as
+        # originating from the line itself so _update_trigger_visuals won't push
+        # the (spinbox-quantized) position back onto the line mid-drag, and the
+        # dispatcher push is skipped. A pure threshold change also preserves the
+        # trigger history (no reset) -- see TriggerControlWidget._on_config_changed.
+        self._threshold_change_from_line = True
+        try:
+            self.trigger_control._on_config_changed()
+        finally:
+            self._threshold_change_from_line = False
 
     def _update_trigger_visuals(self, config: TriggerConfig, update_line: bool = True) -> None:
-        """Update trigger visual elements on the scope."""
+        """Update trigger visual elements on the scope.
+
+        The threshold line and pre-trigger marker are shown only in a triggered
+        mode (single / repeated) with a valid channel; in No-Trigger / Stream
+        mode they are hidden.
+        """
         # The threshold/pretrigger lines are persistent overlay chrome; ensure
         # they are attached to the plot before we try to show them.
         self.scope.ensure_overlay_items()
         mode = config.mode
         channel_valid = config.channel_index != -1
-        
+
         if mode == "stream" or not channel_valid:
             self.scope.set_threshold(visible=False)
             self.scope.pretrigger_line.setVisible(False)
             return
-        
-        # Calculate threshold position in screen coordinates
-        threshold_value = config.threshold
+
+        # Threshold line position (channel volts -> normalized screen units).
         cfg = self._channel_configs.get(self._trigger_controller.channel_id) or self._channel_configs.get(self._active_channel_id)
         if cfg is not None:
-            span = cfg.vertical_span_v
-            offset = cfg.screen_offset
-            normalized_value = (threshold_value / (2.0 * span)) + offset
+            normalized_value = volts_to_norm(config.threshold, cfg.vertical_span_v, cfg.screen_offset)
         else:
             normalized_value = 0.5
-        
-        if update_line:
+
+        # Don't push the position back onto the line while the user is dragging
+        # it (that fights the drag / quantizes to the spinbox resolution).
+        if update_line and not self._threshold_change_from_line:
             self.scope.set_threshold(normalized_value, visible=True)
         else:
             self.scope.set_threshold(visible=True)
+        self.scope.set_threshold_label(f"{config.threshold:.3f} V")
 
-        # Pretrigger line
-        pre_value = float(config.pretrigger_frac)
+        # Pretrigger marker sits at the trigger instant within the [0, window]
+        # sweep -- i.e. pre_seconds after the window start, where the crossing
+        # lands. (_render_trigger_display refines this to the captured
+        # display_pre_samples once an actual capture exists.)
+        pre_value = float(config.pretrigger_sec)
         if pre_value > 0.0:
-            self.scope.pretrigger_line.setVisible(True)
-            self.scope.pretrigger_line.setValue(0.0)
+            self.scope.set_pretrigger_position(pre_value, visible=True)
         else:
             self.scope.pretrigger_line.setVisible(False)
 
@@ -583,8 +602,8 @@ class MainWindow(QtWidgets.QMainWindow):
             trigger_cfg = TriggerConfig(
                 channel_index=self._trigger_controller.channel_id,
                 threshold=self._trigger_controller.threshold,
-                hysteresis=0.0,
-                pretrigger_frac=self._trigger_controller.pre_seconds,
+                hysteresis=self._trigger_controller.hysteresis,
+                pretrigger_sec=self._trigger_controller.pre_seconds,
                 window_sec=self._trigger_controller.window_sec,
                 mode=self._trigger_controller.mode,
             )
@@ -1058,8 +1077,8 @@ class MainWindow(QtWidgets.QMainWindow):
             trigger_cfg = TriggerConfig(
                 channel_index=self._trigger_controller.channel_id,
                 threshold=self._trigger_controller.threshold,
-                hysteresis=0.0,
-                pretrigger_frac=self._trigger_controller.pre_seconds,
+                hysteresis=self._trigger_controller.hysteresis,
+                pretrigger_sec=self._trigger_controller.pre_seconds,
                 window_sec=self._trigger_controller.window_sec,
                 mode=self._trigger_controller.mode,
             )
@@ -1182,13 +1201,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     offset = float(config.screen_offset)
                     step = span / 10.0
                     vals: list[tuple[float, Optional[str]]] = []
-                    # Use 2.0 * span because span is the half-range (+/- V)
-                    # and the viewport 0.0-1.0 covers the full range (2*span).
-                    start = int(np.floor(((0.0 - offset) * 2.0 * span) / step) - 2)
-                    end = int(np.ceil(((1.0 - offset) * 2.0 * span) / step) + 2)
+                    # Tick range = the volts spanned by the [0, 1] viewport.
+                    start = int(np.floor(norm_to_volts(0.0, span, offset) / step) - 2)
+                    end = int(np.ceil(norm_to_volts(1.0, span, offset) / step) + 2)
                     for n in range(start, end + 1):
                         v = n * step
-                        pos = (v / (2.0 * span)) + offset
+                        pos = volts_to_norm(v, span, offset)
                         if 0.0 <= pos <= 1.0:
                             vals.append((pos, f"{v:.3g}"))
                     axis.setTicks([vals])
@@ -1450,9 +1468,11 @@ class MainWindow(QtWidgets.QMainWindow):
             length = int(min(samples.size, times.size))
             if length <= 0:
                 continue
-            span = max(float(config.vertical_span_v), 1e-6)
-            offset = float(config.screen_offset)
-            normalized = (np.asarray(samples[:length], dtype=np.float32) / (2.0 * span)) + offset
+            normalized = volts_to_norm(
+                np.asarray(samples[:length], dtype=np.float32),
+                config.vertical_span_v,
+                config.screen_offset,
+            )
             waveforms.append(
                 (
                     np.array(times[:length], copy=True),
@@ -1752,10 +1772,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._app_settings_unsub:
             self._app_settings_unsub()
         def _apply(settings: AppSettings) -> None:
+            # Each setting is applied independently; a failure to apply one must
+            # not abort the rest, but it should be logged rather than silently
+            # swallowed (finding 3.3).
             try:
                 self.set_plot_refresh_hz(float(settings.plot_refresh_hz))
-            except Exception:
-                pass
+            except Exception as exc:
+                self._logger.debug("Failed to apply plot_refresh_hz: %s", exc, exc_info=True)
             if not self._device_connected and not self._window_combo_user_set:
                 self._set_window_combo_value(float(settings.default_window_sec))
             self._apply_listen_output_preference(settings.listen_output_key)
@@ -1763,17 +1786,17 @@ class MainWindow(QtWidgets.QMainWindow):
             if dm is not None:
                 try:
                     dm.set_list_all_audio_devices(settings.list_all_audio_devices, refresh=True)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._logger.debug("Failed to apply list_all_audio_devices (device manager): %s", exc, exc_info=True)
             if self._controller is not None:
                 try:
                     self._controller.set_list_all_audio_devices(settings.list_all_audio_devices)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._logger.debug("Failed to apply list_all_audio_devices (controller): %s", exc, exc_info=True)
             try:
                 BackyardBrainsSource.set_capture_logging_enabled(settings.byb_debug_logging_enabled)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._logger.debug("Failed to apply byb_debug_logging_enabled: %s", exc, exc_info=True)
         self._app_settings_unsub = store.subscribe(_apply)
 
     def _apply_listen_output_preference(self, key: Optional[str]) -> None:

@@ -25,6 +25,12 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# Consecutive monitor-bridge callback failures tolerated before the bridge is
+# detached. A single transient error must not permanently kill audio monitoring
+# (finding 3.3 — was: disable on the first failure); a *sustained* fault still
+# disables it so a broken bridge can't burn CPU every chunk.
+_MONITOR_BRIDGE_ERROR_BUDGET = 10
+
 from shared.models import (
     ActualConfig,
     Capabilities,
@@ -111,6 +117,8 @@ class BaseDevice(ABC):
         # Written once by the control thread; read on every emit_array() call.
         # CPython reference assignment is atomic so no lock is needed here.
         self._monitor_bridge: Optional[object] = None
+        # Consecutive monitor-bridge callback failures (error budget, finding 3.3).
+        self._monitor_bridge_errors: int = 0
         # When True (default), emit_array() feeds the monitor bridge.  Sources
         # that tap the bridge earlier for lower latency (e.g. SoundCardSource
         # from its capture callback) set this False to avoid a double feed.
@@ -443,9 +451,24 @@ class BaseDevice(ABC):
         if bridge is not None and self._monitor_via_emit:
             try:
                 bridge.on_chunk(channel_major.T)
+                self._monitor_bridge_errors = 0  # success resets the error budget
             except Exception as exc:
-                self._monitor_bridge = None
-                logger.warning("Disabling monitor bridge after bridge callback failure: %s", exc)
+                # Error budget (finding 3.3): tolerate a few consecutive failures
+                # (a transient hiccup must not permanently kill audio monitoring),
+                # disabling only if the fault persists.
+                self._monitor_bridge_errors += 1
+                if self._monitor_bridge_errors >= _MONITOR_BRIDGE_ERROR_BUDGET:
+                    self._monitor_bridge = None
+                    logger.warning(
+                        "Disabling monitor bridge after %d consecutive callback "
+                        "failures; last error: %s",
+                        self._monitor_bridge_errors, exc,
+                    )
+                else:
+                    logger.debug(
+                        "Monitor bridge callback failed (%d/%d): %s",
+                        self._monitor_bridge_errors, _MONITOR_BRIDGE_ERROR_BUDGET, exc,
+                    )
 
         return pointer
 
@@ -501,6 +524,7 @@ class BaseDevice(ABC):
             bridge: A ``MonitorAudioBridge`` instance, or ``None`` to detach.
         """
         self._monitor_bridge = bridge
+        self._monitor_bridge_errors = 0  # fresh bridge starts with a full budget
 
     def note_xrun(self, count: int = 1) -> None:
         """Drivers can call this when the backend reports over/underruns."""

@@ -271,12 +271,14 @@ def event_width(
     curr = peak_idx
     while curr >= 0:
         if arr[curr] < th:
-            if (curr + 1 + min_run) <= arr.size and np.all(arr[curr+1 : curr+1+min_run] >= th):
-                start_idx = curr + 1
-                break
-            else:
-                 start_idx = curr + 1
-                 break
+            # The first sub-threshold sample going back from the peak marks the start
+            # of the contiguous above-threshold block: start = curr + 1. The min_run
+            # requirement is enforced once, by the final `width_samples < min_run` gate
+            # below. A backward min_run gate used to live here but was dead code — both
+            # its if/else branches did `start_idx = curr + 1; break` — so it was removed
+            # (finding 5.1) to keep the logic honest.
+            start_idx = curr + 1
+            break
         curr -= 1
     
     if curr < 0:

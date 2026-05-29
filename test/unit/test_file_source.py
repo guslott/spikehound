@@ -1,9 +1,45 @@
 from __future__ import annotations
 
+import wave as wave_mod
+
 import numpy as np
+import scipy.io.wavfile as wavfile
 
 from daq.base_device import ActualConfig, ChannelInfo
 from daq.file_source import FileSource
+
+
+def test_24bit_wav_reads_and_normalizes_to_unit_range(tmp_path):
+    """Finding 6.6b: the docstring promises 24-bit PCM support.
+
+    scipy.io.wavfile reads 24-bit samples *left-justified* into int32 (value << 8),
+    so the int32 normalization branch maps them to [-1, 1] without a dedicated
+    24-bit branch. This pins that 24-bit playback actually works (and would catch a
+    scipy behavior change that silently mis-scaled it).
+    """
+    sr = 16_000
+    full = 1 << 23  # 24-bit full scale
+    vals = [0, full // 2, -(full // 2), full - 1, -full]  # includes the rails
+    frames = b"".join(int(v).to_bytes(3, "little", signed=True) for v in vals)
+
+    path = tmp_path / "tone24.wav"
+    w = wave_mod.open(str(path), "wb")
+    w.setnchannels(1)
+    w.setsampwidth(3)  # 24-bit
+    w.setframerate(sr)
+    w.writeframes(frames)
+    w.close()
+
+    read_sr, data = wavfile.read(str(path))
+    assert read_sr == sr
+    assert data.dtype == np.int32, "scipy is expected to left-justify 24-bit into int32"
+
+    norm = FileSource()._normalize_chunk(data)
+    assert norm.dtype == np.float32
+
+    expected = np.array([v / full for v in vals], dtype=np.float32)
+    np.testing.assert_allclose(norm, expected, atol=1e-6)
+    assert norm[-1] == -1.0  # negative full scale lands exactly on the rail
 
 
 def test_run_loop_emits_only_active_channels(monkeypatch):

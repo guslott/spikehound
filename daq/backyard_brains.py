@@ -948,22 +948,27 @@ class _BYBDecoder:
         if usable <= 0:
             return 0
 
-        chunk = memoryview(self._raw)[offset : offset + usable]
-        score = 0
-        for pos, byte in enumerate(chunk):
-            if self._byte_flag_expected(pos, frame_size, mode):
-                if byte & 0x80:
-                    score += 1
-                else:
-                    break
-            else:
-                if byte & 0x80:
-                    break
-                score += 1
-        return score
+        # Vectorized equivalent of the per-byte scan (finding 6.4): count the
+        # leading bytes whose MSB (0x80) flag matches the expected pattern,
+        # stopping at the first mismatch. argmax returns the first True index;
+        # if there is no mismatch all `usable` bytes are aligned.
+        arr = np.frombuffer(self._raw, dtype=np.uint8)[offset : offset + usable]
+        mismatch = ((arr & 0x80) != 0) != self._expected_flag_mask(usable, frame_size, mode)
+        if mismatch.any():
+            return int(np.argmax(mismatch))
+        return int(usable)
 
     @staticmethod
     def _byte_flag_expected(pos: int, frame_size: int, mode: str) -> bool:
+        if mode == "frame_start":
+            return (pos % frame_size) == 0
+        return (pos % 2) == 0
+
+    @staticmethod
+    def _expected_flag_mask(n: int, frame_size: int, mode: str) -> np.ndarray:
+        """Vectorized `_byte_flag_expected` over positions [0, n): True where a
+        byte is expected to carry the 0x80 frame/sample flag."""
+        pos = np.arange(n)
         if mode == "frame_start":
             return (pos % frame_size) == 0
         return (pos % 2) == 0
@@ -1024,16 +1029,15 @@ class _BYBDecoder:
         decoded = (raw_vals - center_val) / center_val
         return np.asarray(decoded, dtype=np.float32)
 
-    def _frame_bytes_valid(self, frame_bytes: memoryview) -> bool:
-        frame_size = len(frame_bytes)
-        for pos, byte in enumerate(frame_bytes):
-            if self._byte_flag_expected(pos, frame_size, self._frame_mode):
-                if (byte & 0x80) == 0:
-                    return False
-            else:
-                if byte & 0x80:
-                    return False
-        return True
+    def _frame_bytes_valid(self, frame_bytes) -> bool:
+        # Vectorized per-byte flag check (finding 6.4): a frame is valid iff
+        # every byte's 0x80 flag matches the expected pattern for the framing.
+        arr = np.frombuffer(frame_bytes, dtype=np.uint8)
+        frame_size = arr.size
+        if frame_size == 0:
+            return True  # preserves the original empty-loop -> True behavior
+        expected = self._expected_flag_mask(frame_size, frame_size, self._frame_mode)
+        return bool(np.array_equal((arr & 0x80) != 0, expected))
 
     def _resync_after_invalid(self) -> None:
         if self._stream_width is None:

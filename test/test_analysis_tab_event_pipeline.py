@@ -460,6 +460,27 @@ def test_event_details_retention_matches_metric_history_cap() -> None:
         _app().processEvents()
 
 
+def test_closeevent_stops_update_timer() -> None:
+    """Finding 7.5: closeEvent must stop the 50 ms update timer so it can't fire
+    against a half-torn-down widget after the tab is closed."""
+    controller = _DummyController()
+    widget = _make_tab(controller)
+    closed = False
+    try:
+        widget._update_timer.start()  # _make_tab stops it for isolation; re-arm
+        assert widget._update_timer.isActive()
+
+        widget.close()
+        _app().processEvents()
+        closed = True
+
+        assert not widget._update_timer.isActive(), "closeEvent must stop the update timer"
+    finally:
+        if not closed:
+            widget.close()
+            _app().processEvents()
+
+
 def test_event_details_bounded_independently_of_metric_history(monkeypatch) -> None:
     """Finding 7.4: the heavy _event_details waveform store is capped on its own
     small budget, independent of the (much larger, cheap) metric history."""

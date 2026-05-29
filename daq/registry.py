@@ -73,8 +73,16 @@ def scan_devices(force: bool = False) -> None:
             key = f"{obj.__module__}.{obj.__name__}"
             if key in _REGISTRY:
                 continue
-            name = getattr(obj, "device_class_name", lambda: obj.__name__)()
-            capabilities = _describe_capabilities(obj)
+            # Isolate per-class introspection: a single malformed driver (e.g.
+            # `device_class_name` shadowed by a non-callable, or a raising
+            # capability probe) must not abort discovery of its siblings
+            # (finding 6.6a).
+            try:
+                name = getattr(obj, "device_class_name", lambda: obj.__name__)()
+                capabilities = _describe_capabilities(obj)
+            except Exception as exc:
+                logger.debug("Skipping malformed DAQ device class %s: %s", key, exc)
+                continue
             _REGISTRY[key] = DeviceDescriptor(
                 key=key,
                 name=name,

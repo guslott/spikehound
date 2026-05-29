@@ -566,7 +566,32 @@ class AnalysisTab(QtWidgets.QWidget):
         self._update_cluster_button_states()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        """Clean up analysis executor threads on window close."""
+        """Clean up timers, signals, and worker threads on window close (7.5)."""
+        # Stop the 50 ms unified timer and unwire it so it can't fire
+        # _on_unified_timer against a half-torn-down widget after close.
+        try:
+            self._update_timer.stop()
+            self._update_timer.timeout.disconnect(self._on_unified_timer)
+        except Exception as e:
+            logger.debug("Exception stopping update timer: %s", e)
+
+        # Disconnect the async-analysis ready signal so a late result can't fire
+        # _on_analysis_update_ready after teardown.
+        try:
+            self._analysis_update_ready_signal.disconnect(self._on_analysis_update_ready)
+        except Exception as e:
+            logger.debug("Exception disconnecting analysis-ready signal: %s", e)
+
+        # Stop a running waveform-loader QThread (created on demand) so it is not
+        # garbage-collected while still running.
+        loader = getattr(self, "_waveform_loader", None)
+        if loader is not None:
+            try:
+                loader.cancel()
+                loader.wait(2000)
+            except Exception as e:
+                logger.debug("Exception stopping waveform loader: %s", e)
+
         if self._analysis_executor is not None:
             try:
                 for fut in list(self._analysis_futures):
