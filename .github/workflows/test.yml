@@ -1,0 +1,60 @@
+name: Tests
+
+# Gate every push to the main development branches and every pull request on
+# the test suite. Runs headless (QT_QPA_PLATFORM=offscreen) so the Qt-backed
+# tests do not require a display.
+on:
+  push:
+    branches: ["main", "feature/**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-22.04
+
+    env:
+      # Belt-and-suspenders: also defaulted in test/conftest.py.
+      QT_QPA_PLATFORM: offscreen
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+        cache: 'pip'
+
+    # Headless Qt (PySide6) + OpenGL + audio runtime libraries. The Qt set
+    # mirrors the Linux build job in build.yml, which is known to work for this
+    # project's PySide6 wheels.
+    - name: Install system libraries
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libegl1 \
+          libgl1 \
+          libxkbcommon-x11-0 \
+          libxcb-cursor0 \
+          libxcb-icccm4 \
+          libxcb-image0 \
+          libxcb-keysyms1 \
+          libxcb-render-util0 \
+          libxcb-shape0 \
+          libxcb-util1 \
+          libxcb-xkb1 \
+          libasound2 \
+          libudev1
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run test suite (headless)
+      # Exclude long-running (slow) and hardware-in-the-loop (hil) tests from
+      # the PR gate; run everything else. Known-open findings are marked xfail
+      # in the suite, so a green run here means "no new regressions".
+      run: |
+        python -m pytest -q -m "not slow and not hil"

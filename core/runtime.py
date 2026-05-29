@@ -54,7 +54,6 @@ class SpikeHoundRuntime:
         self.device_manager = device_manager
         self.dispatcher = getattr(pipeline, "dispatcher", None) if pipeline is not None else None
         self.visualization_queue: Optional[queue.Queue] = getattr(pipeline, "visualization_queue", None)
-        self.audio_queue: Optional[queue.Queue] = getattr(pipeline, "audio_queue", None)
         self.logging_queue: Optional[queue.Queue] = getattr(pipeline, "logging_queue", None)
         self.chunk_rate: float = 0.0
         self.plot_refresh_hz: float = 0.0
@@ -71,7 +70,7 @@ class SpikeHoundRuntime:
         from .audio_manager import AudioManager
         audio_manager = AudioManager(runtime=self)
         pipeline.attach_audio_manager(audio_manager)
-        audio_manager.start()  # Start audio routing thread
+        audio_manager.start()  # Activate monitor-audio manager (player created on listen)
         self._audio_manager: AudioManager = audio_manager
 
     def set_pipeline(self, controller: Optional["PipelineController"]) -> None:
@@ -80,7 +79,6 @@ class SpikeHoundRuntime:
         if controller is not None:
             self.dispatcher = controller.dispatcher
             self.visualization_queue = controller.visualization_queue
-            self.audio_queue = controller.audio_queue
             self.logging_queue = controller.logging_queue
     
     @property
@@ -239,7 +237,6 @@ class SpikeHoundRuntime:
         controller.attach_source(driver, float(sample_rate), channels)
         self.dispatcher = getattr(controller, "dispatcher", None)
         self.visualization_queue = getattr(controller, "visualization_queue", None)
-        self.audio_queue = getattr(controller, "audio_queue", None)
         self.logging_queue = getattr(controller, "logging_queue", None)
         sample_rate_value = getattr(controller, "sample_rate", None)
         if sample_rate_value is not None:
@@ -260,7 +257,6 @@ class SpikeHoundRuntime:
             return {"size": size, "max": maxsize, "utilization": util}
 
         queues["visualization"] = _queue_status(self.visualization_queue)
-        queues["audio"] = _queue_status(self.audio_queue)
         queues["logging"] = _queue_status(self.logging_queue)
 
         # Aggregate analysis workers (pick worst case)

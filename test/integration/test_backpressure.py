@@ -19,7 +19,6 @@ Test approach:
 from __future__ import annotations
 
 import queue
-import threading
 import time
 from typing import List, Optional
 
@@ -28,8 +27,27 @@ import pytest
 
 from core.dispatcher import Dispatcher, QUEUE_POLICIES
 from core.conditioning import FilterSettings
-from shared.models import Chunk, ChunkPointer, EndOfStream
+from shared.models import Chunk, ChunkPointer, EndOfStream, TriggerConfig
 from shared.ring_buffer import SharedRingBuffer
+
+
+def _enable_triggered_viz(dispatcher, sample_rate: float = 10000.0) -> None:
+    """Put the dispatcher in a triggered (non-stream) mode so the visualization
+    queue is actually populated. In stream mode the queue stays empty by design
+    (visualization flows via tick callbacks) — see the "Visualization delivery
+    contract" in core/dispatcher.py and finding 3.2 #1.
+    """
+    dispatcher.set_trigger_config(
+        TriggerConfig(
+            channel_index=0,
+            threshold=0.5,
+            hysteresis=0.0,
+            pretrigger_frac=0.2,
+            window_sec=0.2,
+            mode="repeated",
+        ),
+        sample_rate,
+    )
 
 
 def make_test_dispatcher(
@@ -37,13 +55,11 @@ def make_test_dispatcher(
     capacity: int = 4096,
     sample_rate: float = 10000.0,
     viz_queue_size: int = 10,
-    audio_queue_size: int = 10,
     logging_queue_size: int = 100,
 ) -> tuple:
     """Create a dispatcher with controlled queue sizes for testing."""
     raw_queue = queue.Queue()
     visualization_queue = queue.Queue(maxsize=viz_queue_size)
-    audio_queue = queue.Queue(maxsize=audio_queue_size)
     logging_queue = queue.Queue(maxsize=logging_queue_size)
     event_queue = queue.Queue()
 
@@ -52,7 +68,6 @@ def make_test_dispatcher(
     dispatcher = Dispatcher(
         raw_queue,
         visualization_queue,
-        audio_queue,
         logging_queue,
         event_queue,
         filter_settings=FilterSettings(),
@@ -62,7 +77,6 @@ def make_test_dispatcher(
     return dispatcher, source_buffer, {
         "raw": raw_queue,
         "visualization": visualization_queue,
-        "audio": audio_queue,
         "logging": logging_queue,
         "event": event_queue,
     }
@@ -75,7 +89,6 @@ class TestSlowConsumerIsolation:
         """Visualization queue saturation should not block raw queue processing."""
         dispatcher, source_buffer, queues = make_test_dispatcher(
             viz_queue_size=2,  # Very small - will saturate quickly
-            audio_queue_size=100,  # Large - won't saturate
         )
 
         n_chunks = 20
@@ -121,34 +134,18 @@ class TestSlowConsumerIsolation:
         """A blocked consumer should not prevent other consumers from receiving data."""
         dispatcher, source_buffer, queues = make_test_dispatcher(
             viz_queue_size=5,
-            audio_queue_size=5,
         )
 
-        # Register analysis queue that we'll leave unread (simulates blocked consumer)
+        # One analysis consumer is "blocked" (tiny queue, never drained); a
+        # second analysis consumer is fast and should still receive data.
         blocked_analysis_queue = queue.Queue(maxsize=1)
-        token = dispatcher.register_analysis_queue(blocked_analysis_queue)
+        fast_analysis_queue = queue.Queue(maxsize=100)
+        blocked_token = dispatcher.register_analysis_queue(blocked_analysis_queue)
+        fast_token = dispatcher.register_analysis_queue(fast_analysis_queue)
 
         n_chunks = 15
         chunk_size = 256
         sample_rate = 10000.0
-
-        # Start a consumer thread for audio queue (fast consumer)
-        audio_received = []
-        audio_consumer_done = threading.Event()
-
-        def audio_consumer():
-            while True:
-                try:
-                    item = queues["audio"].get(timeout=0.5)
-                    if item is EndOfStream:
-                        break
-                    audio_received.append(item)
-                except queue.Empty:
-                    continue
-            audio_consumer_done.set()
-
-        audio_thread = threading.Thread(target=audio_consumer, daemon=True)
-        audio_thread.start()
 
         dispatcher.start()
 
@@ -168,30 +165,42 @@ class TestSlowConsumerIsolation:
         queues["raw"].put(EndOfStream)
         dispatcher.join(timeout=5.0)
 
-        # Wait for audio consumer
-        audio_consumer_done.wait(timeout=2.0)
-
-        # Audio consumer should have received data despite blocked analysis
-        assert len(audio_received) >= 1, "Audio consumer should receive data"
+        # The fast consumer should have received data despite the blocked one,
+        # and the dispatcher should have processed every chunk.
+        fast_received = []
+        while True:
+            try:
+                item = fast_analysis_queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is not EndOfStream:
+                fast_received.append(item)
+        assert len(fast_received) >= 1, "Fast consumer should receive data despite a blocked consumer"
+        assert dispatcher.snapshot()["processed"] == n_chunks
 
         # Cleanup
-        dispatcher.unregister_analysis_queue(token)
+        dispatcher.unregister_analysis_queue(blocked_token)
+        dispatcher.unregister_analysis_queue(fast_token)
 
 
 class TestDropTracking:
     """Verify drop counters are accurate per-consumer."""
 
     def test_eviction_counts_tracked_per_queue(self):
-        """Each queue's evictions should be tracked separately."""
+        """Each queue's evictions should be tracked separately.
+
+        Uses a triggered mode so the visualization queue is exercised (in stream
+        mode it is empty by design — finding 3.2 #1).
+        """
         dispatcher, source_buffer, queues = make_test_dispatcher(
             viz_queue_size=2,
-            audio_queue_size=2,
         )
 
         n_chunks = 10
         chunk_size = 256
         sample_rate = 10000.0
 
+        _enable_triggered_viz(dispatcher, sample_rate)
         dispatcher.start()
 
         # Send chunks without consuming - will cause evictions
@@ -215,7 +224,7 @@ class TestDropTracking:
         # Should have processed all chunks
         assert stats["processed"] == n_chunks
 
-        # Both viz and audio should have evictions (queues too small)
+        # Visualization should have evictions (queue too small)
         evicted = stats.get("evicted", {})
         forwarded = stats.get("forwarded", {})
 
@@ -235,7 +244,7 @@ class TestQueuePolicies:
 
     def test_queue_policies_defined(self):
         """All expected queue types should have policies defined."""
-        expected_queues = ["visualization", "audio", "logging", "analysis", "events"]
+        expected_queues = ["visualization", "logging", "analysis", "events"]
         for q_name in expected_queues:
             assert q_name in QUEUE_POLICIES, f"Missing policy for {q_name}"
 
@@ -260,7 +269,6 @@ class TestShutdownBehavior:
         """Dispatcher should shut down cleanly even with saturated queues."""
         dispatcher, source_buffer, queues = make_test_dispatcher(
             viz_queue_size=1,
-            audio_queue_size=1,
         )
 
         chunk_size = 256

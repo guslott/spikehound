@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import queue
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
 
@@ -16,18 +15,15 @@ except ImportError as e:  # pragma: no cover
     miniaudio = None
     _IMPORT_ERR = e
 
-from shared.models import ChunkPointer
-from shared.ring_buffer import SharedRingBuffer
-
 
 @dataclass
 class AudioConfig:
-    out_samplerate: int = 44_100   # soundcard output Hz
     out_channels: int = 1          # 1=mono (start simple)
     device: Any = None             # None = default output device
-    gain: float = 0.35             # careful: spikes can be loud
     blocksize: int = 256           # miniaudio buffer size (frames)
     ring_seconds: float = 0.2      # size of the output ring buffer (seconds)
+    frames_per_write: int = 0      # frames the bridge writes per chunk (0 = unknown)
+    playback_buffer_msec: int = 10 # miniaudio playback device buffer (ms)
 
 
 def list_output_devices(list_all: bool = False) -> List[Dict[str, object]]:
@@ -60,37 +56,44 @@ def list_output_devices(list_all: bool = False) -> List[Dict[str, object]]:
 
 class AudioPlayer(threading.Thread):
     """
-    Consumes Chunk/ChunkPointer-like objects from an audio_queue. Each item must
-    resolve to samples shaped (frames, channels) at input_sr. We select one
-    channel and play via miniaudio.PlaybackDevice.
-    
+    Mono playback device fed by a software ring buffer.
+
+    The :class:`~core.monitor_audio_bridge.MonitorAudioBridge` writes filtered,
+    channel-selected, gained mono samples (at ``input_samplerate``) directly into
+    this player's ring via :meth:`_ring_write` from the capture/emitter thread.
+    The miniaudio playback callback drains that ring through ``_audio_generator``.
+
     OPTIMIZATION: miniaudio handles resampling from input_sr to the hardware
     rate in C, which is significantly faster and lower latency than Python.
     """
 
     def __init__(
         self,
-        audio_queue: "queue.Queue",
         *,
         input_samplerate: int,
-        config: AudioConfig = AudioConfig(),
-        selected_channel: Optional[int] = 0,  # 0 by default; None = mute
-        ring_buffer: Optional[SharedRingBuffer] = None,
+        config: Optional[AudioConfig] = None,
     ) -> None:
         super().__init__(name="AudioPlayer", daemon=True)
         if miniaudio is None:
             raise RuntimeError(f"`miniaudio` is not available: {_IMPORT_ERR!r}")
 
-        self.q = audio_queue
         self.in_sr = int(input_samplerate)
-        self.cfg = config
-        self._selected: Optional[int] = selected_channel
-        self._ring_buffer = ring_buffer
+        self.cfg = config if config is not None else AudioConfig()
 
         # --- Output ring buffer (mono at INPUT rate - miniaudio handles resampling) ---
         # OPTIMIZATION: Store data at input rate, not output rate.
         # This uses less memory (e.g., 10kHz vs 44.1kHz) and reduces latency.
-        ring_len = max(self.cfg.blocksize * 4, int(self.in_sr * self.cfg.ring_seconds))
+        #
+        # The ring MUST hold at least one full write-block (one source chunk)
+        # plus a chunk of scheduler jitter.  Otherwise an oversized write is
+        # clamped to the ring size in _ring_write() and the head of every chunk
+        # is silently dropped — so we size it to >= 2x the per-write frame count.
+        # (Capacity, not fill, grows; average ring latency stays ~half a chunk.)
+        ring_len = max(
+            self.cfg.blocksize * 4,
+            int(self.in_sr * self.cfg.ring_seconds),
+            int(self.cfg.frames_per_write) * 2,
+        )
         self._ring = np.zeros(ring_len, dtype=np.float32)
         self._r_head = 0   # write index
         self._r_tail = 0   # read index
@@ -108,12 +111,6 @@ class AudioPlayer(threading.Thread):
         self._playback_buf_msec: int = 20  # updated in run(); used for latency estimate
 
     # ---- Public control ------------------------------------------------------
-
-    def set_selected_channel(self, idx: Optional[int]) -> None:
-        self._selected = None if idx is None else int(idx)
-
-    def set_ring_buffer(self, ring_buffer: Optional[SharedRingBuffer]) -> None:
-        self._ring_buffer = ring_buffer
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -189,56 +186,6 @@ class AudioPlayer(threading.Thread):
             self._r_count -= n                  # samples have been consumed
             return out
 
-    # ---- Input chunk extraction -----------------------------------------
-    def _extract_frames(self, ch) -> Optional[np.ndarray]:
-        """
-        Accepts a variety of 'chunk-like' objects and returns a float32 array
-        shaped (frames, channels). Returns None if the object isn't recognized.
-        """
-        arr = None
-
-        # Common possibilities:
-        if isinstance(ch, ChunkPointer):
-            if self._ring_buffer is None:
-                return None
-            try:
-                block = self._ring_buffer.read(ch.start_index, ch.length)
-            except Exception as exc:
-                logger.debug("Failed to read from ring buffer: %s", exc)
-                return None
-            arr = np.asarray(block, dtype=np.float32, order="C").T
-        elif hasattr(ch, "data"):
-            arr = getattr(ch, "data")
-        elif hasattr(ch, "frames"):
-            arr = getattr(ch, "frames")
-        elif hasattr(ch, "samples"):
-            # Spikehound Chunk uses .samples shaped (channels, frames).
-            # Convert to (frames, channels) for the player.
-            arr = np.asarray(getattr(ch, "samples"), dtype=np.float32, order="C").T
-        elif isinstance(ch, np.ndarray):
-            arr = ch
-        elif isinstance(ch, (list, tuple)) and len(ch):
-            # e.g., list/tuple of samples or per-channel arrays
-            try:
-                arr = np.asarray(ch)
-            except Exception as exc:
-                logger.debug("Failed to convert chunk to array: %s", exc)
-                arr = None
-
-        if arr is None:
-            return None
-
-        data = np.asarray(arr, dtype=np.float32, order="C")
-
-        # Ensure 2D: (frames, channels)
-        if data.ndim == 1:
-            data = data[:, None]
-        elif data.ndim > 2:
-            # Too weird—ignore this chunk
-            return None
-
-        return data
-
     # ---- Resampling removed ---------------------------------------------------
     # OPTIMIZATION: miniaudio handles resampling from in_sr to hardware rate in C.
     # This eliminates Python overhead from np.interp and reduces latency.
@@ -274,20 +221,29 @@ class AudioPlayer(threading.Thread):
         # Miniaudio handles resampling, so we don't need to bloat the buffer 
         # based on input rate (which was punishing low-sr devices).
         # We ensure at least 5ms to avoid underruns on busy systems.
-        # Reduced from 20 ms → 10 ms: MonitorAudioBridge writes directly into
-        # this ring so the upstream queue-hop latency is gone.  10 ms keeps us
-        # safe on most systems while halving the playback device contribution.
-        buf_msec = 10
+        # Playback device buffer.  Configurable via AudioConfig.playback_buffer_msec
+        # (10 ms default; ~5 ms in the opt-in low-latency monitor mode).  Clamp to
+        # a >= 2 ms floor to avoid pathological underruns.  The MonitorAudioBridge
+        # writes directly into the ring, so this is the dominant fixed output
+        # contribution to monitor latency.
+        buf_msec = max(2, int(self.cfg.playback_buffer_msec))
         self._playback_buf_msec = buf_msec
 
-        # Configure miniaudio device with INPUT sample rate.
-        # miniaudio handles resampling to hardware rate (e.g., 44.1kHz) in C,
-        # which is significantly faster and lower latency than Python.
+        # Open the playback device at the INPUT sample rate.
+        #
+        # Rate handling (no forced resampling): when the device/OS can run at
+        # in_sr (the common sound-card-monitor case, e.g. 44.1 kHz in -> 44.1 kHz
+        # out), miniaudio runs the device at in_sr and its resampler is a
+        # pass-through — zero resampling latency.  Only when the device is locked
+        # to a different rate (e.g. a 10 kHz BYB input -> 44.1/48 kHz hardware)
+        # does miniaudio engage its low-latency linear resampler, in C.  So
+        # matching rates already cost nothing, and mismatched rates use the
+        # cheapest converter available; there is nothing to gain by resampling
+        # ourselves in Python.
         try:
             self._device = miniaudio.PlaybackDevice(
                 device_id=self.cfg.device,
                 nchannels=self.cfg.out_channels,
-                # OPTIMIZATION: Use input rate. Miniaudio handles resampling to hardware rate.
                 sample_rate=self.in_sr,
                 output_format=miniaudio.SampleFormat.FLOAT32,
                 buffersize_msec=buf_msec,
@@ -304,34 +260,11 @@ class AudioPlayer(threading.Thread):
             return
 
         try:
-            while not self._stop_evt.is_set():
-                # Drain upstream queue
-                try:
-                    ch = self.q.get(timeout=0.01)
-                except queue.Empty:
-                    continue
-
-                data = self._extract_frames(ch)
-                if data is None:
-                    # Unknown message type - ignore but keep draining.
-                    continue
-                if self._selected is None or self._selected >= data.shape[1]:
-                    # Muted or invalid selection
-                    continue
-                
-                # Extract mono channel
-                mono_in = data[:, self._selected]
-
-                # OPTIMIZATION: Removed _resample_block() call.
-                # Write raw input samples directly to ring buffer.
-                # miniaudio handles resampling to hardware rate in C.
-                if mono_in.size:
-                    # OPTIMIZATION: Apply gain and fast clip before ring write
-                    # This moves work out of the audio callback (generator)
-                    mono_in = mono_in * self.cfg.gain
-                    # Fast limiter: hard clip instead of normalize for lower latency
-                    np.clip(mono_in, -1.5, 1.5, out=mono_in)
-                    self._ring_write(mono_in)
+            # The miniaudio playback callback pulls samples from the ring via the
+            # generator above; the MonitorAudioBridge fills that ring from the
+            # capture/emitter thread (channel select + gain + clip happen there).
+            # This thread only needs to keep the device open until stopped.
+            self._stop_evt.wait()
         finally:
             if self._device and self._device.running:
                 self._device.stop()

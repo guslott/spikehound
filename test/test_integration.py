@@ -47,6 +47,45 @@ def _drain_queue(q: queue.Queue, timeout: float = 0.1) -> list:
     return items
 
 
+def _wait_for_tick_with_data(dispatcher, timeout: float = 2.0) -> Optional[dict]:
+    """Wait until the dispatcher emits a data-bearing visualization tick.
+
+    In the default *stream* mode, conditioned data is delivered to consumers via
+    the dispatcher's 60 Hz tick callbacks, not the visualization queue (which is
+    intentionally empty in stream mode — see the "Visualization delivery
+    contract" in core/dispatcher.py and finding 3.2 #1). This registers a tick
+    consumer and returns the first payload that carries samples, or None on
+    timeout.
+    """
+    received: list[dict] = []
+
+    def _cb(payload: dict) -> None:
+        samples = payload.get("samples")
+        if samples is not None and getattr(samples, "size", 0) > 0:
+            received.append(payload)
+
+    unsubscribe = dispatcher.add_tick_callback(_cb)
+    try:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if received:
+                return received[0]
+            time.sleep(0.01)
+    finally:
+        unsubscribe()
+    return received[0] if received else None
+
+
+def _wait_until(predicate, timeout: float = 2.0, interval: float = 0.01) -> bool:
+    """Poll `predicate` until true or timeout. Returns the final truthiness."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return bool(predicate())
+
+
 class TestRuntimeDataFlow:
     """
     Test Pattern: End-to-end data flow verification.
@@ -57,23 +96,25 @@ class TestRuntimeDataFlow:
     
     def test_runtime_receives_visualization_data(self):
         """
-        Verify that starting acquisition produces data in the visualization queue.
-        
-        This test demonstrates the minimal setup for a functioning pipeline:
+        Verify that starting acquisition delivers visualization data to consumers.
+
+        In the default *stream* mode, visualization is delivered via the
+        dispatcher's 60 Hz tick callbacks — the visualization queue stays empty
+        by design (finding 3.2 #1). This exercises the real stream-mode
+        contract:
         1. Create pipeline controller with queues
         2. Attach simulated source
         3. Start acquisition
-        4. Verify data arrives
+        4. Verify a tick consumer receives sample data (and the queue is empty)
         5. Clean shutdown
         """
         controller = PipelineController(
             filter_settings=FilterSettings(),
             visualization_queue_size=64,
-            audio_queue_size=16,
             logging_queue_size=64,
             dispatcher_poll_timeout=0.01,
         )
-        
+
         # Attach simulated physiology source
         actual = controller.switch_source(
             SimulatedPhysiologySource,
@@ -84,17 +125,26 @@ class TestRuntimeDataFlow:
             },
         )
         assert actual.sample_rate == 20000
-        
+
         # Start acquisition
         controller.start()
-        
-        # Wait for data to arrive
-        time.sleep(0.1)
-        
-        # Verify data in visualization queue
-        items = _drain_queue(controller.visualization_queue, timeout=0.2)
-        assert len(items) > 0, "Should receive chunks in visualization queue"
-        
+
+        dispatcher = controller.dispatcher
+        assert dispatcher is not None, "Dispatcher should exist after start"
+
+        # Stream-mode visualization arrives via tick callbacks.
+        payload = _wait_for_tick_with_data(dispatcher)
+        assert payload is not None, "Should receive a data-bearing visualization tick"
+        assert payload["samples"].shape[1] > 0, "Tick payload should carry samples"
+
+        # The visualization queue is intentionally empty in stream mode.
+        assert controller.visualization_queue.empty(), (
+            "Visualization queue must stay empty in stream mode (data flows via ticks)"
+        )
+
+        # Observability: the tick delivery path is reflected in dispatcher stats.
+        assert controller.dispatcher_stats().get("visualization_ticks", 0) > 0
+
         # Clean shutdown
         controller.stop()
         controller.shutdown()
@@ -109,7 +159,6 @@ class TestRuntimeDataFlow:
         controller = PipelineController(
             filter_settings=FilterSettings(),
             visualization_queue_size=32,
-            audio_queue_size=8,
             logging_queue_size=32,
             dispatcher_poll_timeout=0.01,
         )
@@ -159,7 +208,6 @@ class TestFilterPropagation:
         controller = PipelineController(
             filter_settings=filter_settings,
             visualization_queue_size=64,
-            audio_queue_size=16,
             logging_queue_size=64,
             dispatcher_poll_timeout=0.01,
         )
@@ -188,16 +236,20 @@ class TestFilterPropagation:
     
     def test_filter_update_during_acquisition(self):
         """
-        Verify that filter settings can be updated while acquisition is running.
+        Verify that filter settings can be updated while acquisition is running
+        and that visualization data keeps flowing afterward.
+
+        Stream-mode visualization flows via tick callbacks (finding 3.2 #1), so
+        "still receiving data" is verified by the visualization_ticks counter
+        continuing to advance after the filter update.
         """
         controller = PipelineController(
             filter_settings=FilterSettings(),  # Default settings
             visualization_queue_size=64,
-            audio_queue_size=16,
             logging_queue_size=64,
             dispatcher_poll_timeout=0.01,
         )
-        
+
         controller.switch_source(
             SimulatedPhysiologySource,
             configure_kwargs={
@@ -206,25 +258,33 @@ class TestFilterPropagation:
                 "num_units": 1,
             },
         )
-        
+
         controller.start()
-        time.sleep(0.05)
-        
-        # Update filter settings while running
+        dispatcher = controller.dispatcher
+        assert dispatcher is not None
+
+        # Data flows before the update.
+        assert _wait_for_tick_with_data(dispatcher) is not None, (
+            "Should receive visualization ticks before the filter update"
+        )
+
+        # Update filter settings while running.
         new_settings = FilterSettings(
             default=ChannelFilterSettings(
                 notch_enabled=True,
                 notch_freq_hz=50.0,  # European mains hum
             ),
         )
+        ticks_before = controller.dispatcher_stats().get("visualization_ticks", 0)
         controller.update_filter_settings(new_settings)
-        
-        time.sleep(0.05)
-        
-        # Should still be receiving data after update
-        items = _drain_queue(controller.visualization_queue, timeout=0.1)
-        assert len(items) > 0, "Should continue receiving data after filter update"
-        
+
+        # Visualization should continue after the update.
+        advanced = _wait_until(
+            lambda: controller.dispatcher_stats().get("visualization_ticks", 0)
+            > ticks_before
+        )
+        assert advanced, "Should continue receiving data after a filter update"
+
         controller.stop()
         controller.shutdown()
 
@@ -243,7 +303,6 @@ class TestTriggerConfiguration:
         controller = PipelineController(
             filter_settings=FilterSettings(),
             visualization_queue_size=64,
-            audio_queue_size=16,
             logging_queue_size=64,
             dispatcher_poll_timeout=0.01,
         )
@@ -291,17 +350,21 @@ class TestHealthMetrics:
     def test_health_snapshot_during_acquisition(self):
         """
         Verify that health_snapshot returns meaningful metrics during acquisition.
+
+        Stream-mode visualization flows via tick callbacks rather than the
+        visualization queue, so observability lives in the `processed` and
+        `visualization_ticks` counters rather than `forwarded["visualization"]`
+        (finding 3.2 #1).
         """
         controller = PipelineController(
             filter_settings=FilterSettings(),
             visualization_queue_size=64,
-            audio_queue_size=16,
             logging_queue_size=64,
             dispatcher_poll_timeout=0.01,
         )
-        
+
         runtime = SpikeHoundRuntime(pipeline=controller)
-        
+
         controller.switch_source(
             SimulatedPhysiologySource,
             configure_kwargs={
@@ -310,40 +373,48 @@ class TestHealthMetrics:
                 "num_units": 2,
             },
         )
-        
+
         controller.start()
-        time.sleep(0.15)  # Let some data flow
-        
+
+        # Poll until the dispatcher has processed chunks and delivered viz ticks.
+        def _has_flow() -> bool:
+            ds = runtime.health_snapshot().get("dispatcher", {})
+            return ds.get("processed", 0) > 0 and ds.get("visualization_ticks", 0) > 0
+
+        assert _wait_until(_has_flow), "Dispatcher should process chunks and emit viz ticks"
+
         # Get health snapshot
         health = runtime.health_snapshot()
-        
+
         assert health is not None, "health_snapshot should return data"
         assert "dispatcher" in health, "Should include dispatcher stats"
-        
+
         dispatcher_stats = health.get("dispatcher", {})
-        forwarded = dispatcher_stats.get("forwarded", {})
-        
-        # Should have forwarded some data
-        viz_forwarded = forwarded.get("visualization", 0)
-        assert viz_forwarded > 0, "Should have forwarded visualization chunks"
-        
+        assert dispatcher_stats.get("processed", 0) > 0, "Should have processed chunks"
+        # Visualization is delivered via tick callbacks in stream mode.
+        assert dispatcher_stats.get("visualization_ticks", 0) > 0, (
+            "Should have delivered visualization ticks in stream mode"
+        )
+
         controller.stop()
         controller.shutdown()
     
     def test_dispatcher_stats_track_evictions(self):
         """
         Verify that dispatcher stats track queue evictions under backpressure.
-        
-        This test uses a small queue to force evictions.
+
+        The visualization queue is only used in *triggered* (non-stream) modes
+        (finding 3.2 #1); in stream mode the scope is fed by tick callbacks and
+        the queue stays empty. So this test selects a triggered mode, then uses
+        a size-1 queue with no consumer to force drop-oldest evictions.
         """
         controller = PipelineController(
             filter_settings=FilterSettings(),
             visualization_queue_size=1,  # Tiny queue to force evictions
-            audio_queue_size=1,
             logging_queue_size=8,
             dispatcher_poll_timeout=0.01,
         )
-        
+
         controller.switch_source(
             SimulatedPhysiologySource,
             configure_kwargs={
@@ -352,18 +423,31 @@ class TestHealthMetrics:
                 "num_units": 1,
             },
         )
-        
+
+        # Triggered mode routes every processed chunk's ChunkPointer to the
+        # visualization queue. Nothing drains it here, so the size-1 queue evicts.
+        controller.update_trigger_config(
+            TriggerConfig(
+                channel_index=0,
+                threshold=0.5,
+                hysteresis=0.0,
+                pretrigger_frac=0.2,
+                window_sec=0.2,
+                mode="repeated",
+            )
+        )
+
         controller.start()
-        time.sleep(0.2)  # Generate enough data to cause evictions
+
+        # Generate enough data to cause evictions.
+        evicted_now = lambda: controller.dispatcher_stats().get("evicted", {}).get(
+            "visualization", 0
+        )
+        got_evictions = _wait_until(lambda: evicted_now() >= 1)
         controller.stop()
-        
-        stats = controller.dispatcher_stats()
-        evicted = stats.get("evicted", {})
-        
-        # With queue size of 1 and fast data generation, evictions should occur
-        viz_evicted = evicted.get("visualization", 0)
-        assert viz_evicted >= 1, "Should have evicted visualization chunks"
-        
+
+        assert got_evictions and evicted_now() >= 1, "Should have evicted visualization chunks"
+
         controller.shutdown()
 
 
@@ -381,7 +465,6 @@ class TestAnalysisIntegration:
         controller = PipelineController(
             filter_settings=FilterSettings(),
             visualization_queue_size=64,
-            audio_queue_size=16,
             logging_queue_size=64,
             dispatcher_poll_timeout=0.01,
         )

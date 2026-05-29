@@ -19,6 +19,7 @@ class AppSettings:
     recording_use_float32: bool = False
     recording_auto_increment: bool = True
     byb_debug_logging_enabled: bool = False
+    monitor_low_latency: bool = False
 
 
 @runtime_checkable

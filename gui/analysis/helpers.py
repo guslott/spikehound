@@ -27,12 +27,37 @@ MAX_VISIBLE_METRIC_EVENTS = 3000
 METRIC_TIME_WINDOW_SEC = 60.0
 STA_TRACE_PEN = pg.mkPen(90, 90, 90, 110)
 SCOPE_BACKGROUND_COLOR = QtGui.QColor(211, 230, 204)
+CORRELATION_HISTORY_CAPACITY = 512
+CORRELATION_GHOST_TRACE_COUNT = 10
+CORRELATION_CHANNEL_COLORS: list[QtGui.QColor] = [
+    QtGui.QColor(32, 74, 135),
+    QtGui.QColor(189, 87, 46),
+    QtGui.QColor(70, 128, 52),
+    QtGui.QColor(132, 54, 141),
+    QtGui.QColor(145, 104, 24),
+    QtGui.QColor(32, 128, 140),
+]
 
 class _MeasureLine:
     """Helper for draggable measurement lines with labels."""
 
-    def __init__(self, plot_item: pg.PlotItem, p1: QtCore.QPointF, p2: QtCore.QPointF, mode: str = "line") -> None:
+    def __init__(
+        self,
+        plot_item: pg.PlotItem,
+        p1: QtCore.QPointF,
+        p2: QtCore.QPointF,
+        mode: str = "line",
+        *,
+        x_label: str = "t",
+        x_units: str = "s",
+        y_label: str = "V",
+        y_units: str = "V",
+    ) -> None:
         self.mode = mode  # "line", "vertical", "horizontal"
+        self._x_label = x_label
+        self._x_units = x_units
+        self._y_label = y_label
+        self._y_units = y_units
         self.roi = pg.LineSegmentROI((p1.x(), p1.y()), (p2.x(), p2.y()), pen=pg.mkPen(QtGui.QColor(0, 100, 200), width=2))
         self.label = pg.TextItem(color=(20, 20, 20))
         self._plot = plot_item
@@ -112,12 +137,14 @@ class _MeasureLine:
             dt = float(p2.x() - p1.x())
             dv = float(p2.y() - p1.y())
             text: str
+            x_units = f" {self._x_units}" if self._x_units else ""
+            y_units = f" {self._y_units}" if self._y_units else ""
             if self.mode == "vertical":
-                text = f"\u0394V = {dv:.4g} V"
+                text = f"\u0394{self._y_label} = {dv:.4g}{y_units}"
             elif self.mode == "horizontal":
-                text = f"\u0394t = {dt:.4g} s"
+                text = f"\u0394{self._x_label} = {dt:.4g}{x_units}"
             else:
-                text = f"\u0394t = {dt:.4g} s, \u0394V = {dv:.4g} V"
+                text = f"\u0394{self._x_label} = {dt:.4g}{x_units}, \u0394{self._y_label} = {dv:.4g}{y_units}"
             mid = pg.Point((p1.x() + p2.x()) * 0.5, (p1.y() + p2.y()) * 0.5)
             self.label.setText(text)
             self.label.setPos(mid.x(), mid.y())
@@ -208,6 +235,7 @@ class OverlayPayload:
     """Qt-free representation of a raw spike overlay."""
 
     event_id: int | None
+    crossing_time_sec: float
     times: np.ndarray
     samples: np.ndarray
     last_time: float
@@ -222,13 +250,23 @@ class OverlayPayload:
 
 
 @dataclass
-class StaTask:
-    """Data packet describing which events to use for STA processing."""
+class CorrelationTask:
+    """Data packet describing which events to use for correlation processing."""
 
     events: tuple[AnalysisEvent, ...]
-    target_channel_id: int
-    channel_index: int | None
+    channel_ids: tuple[int, ...]
+    source_channel_id: int | None
     window_ms: float
+    mode: str
+
+
+@dataclass
+class CorrelationRecord:
+    """Bounded per-event correlation payload retained by the analysis tab."""
+
+    event_id: int
+    crossing_time_sec: float
+    channel_windows: dict[int, np.ndarray]
 
 
 @dataclass
@@ -236,5 +274,4 @@ class AnalysisUpdate:
     """Result bundle produced by preprocessing an analysis batch."""
 
     overlays: list[OverlayPayload]
-    sta_windows: list[np.ndarray] | None = None
-    sta_task: StaTask | None = None
+    correlation_task: CorrelationTask | None = None

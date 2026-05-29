@@ -304,39 +304,51 @@ class TestDetectionAccuracy:
 class TestCrossChunkDetection:
     """Tests for detection continuity across chunk boundaries."""
 
-    @given(
-        spike_position=st.floats(min_value=0.4, max_value=0.6),
-        seed=st.integers(min_value=0, max_value=10000),
-    )
-    @settings(max_examples=20, deadline=None)
-    def test_spike_at_chunk_boundary_detected(
-        self,
-        spike_position: float,
-        seed: int,
-    ):
-        """Spike straddling chunk boundary should still be detected."""
+    # Sweep the spike's negative-peak sample across the whole boundary region
+    # (a couple of detector windows either side of the split). This pins down
+    # finding 4.2 deterministically: the bug only fires for the handful of
+    # offsets where the refined peak is deferred past chunk1's valid end and
+    # then re-enters as a too-early crossing in chunk2's residue. The previous
+    # Hypothesis version drew `spike_position` as a coarse float and so only hit
+    # those offsets by luck (finding 9.2 — a test that masks rather than
+    # catches). An explicit per-sample sweep cannot miss them.
+    @pytest.mark.parametrize("peak_offset", list(range(-25, 26)))
+    def test_spike_at_chunk_boundary_detected(self, peak_offset: int):
+        """A spike straddling the chunk boundary is detected exactly once.
+
+        Regression test for finding 4.2 (auto-detector dropped
+        boundary-straddling spikes because a too-early raw crossing index was
+        rejected *before* peak refinement). Asserting *exactly one* detection
+        guards both failure modes: the original drop (0 events) and any
+        double-count from re-detecting the same spike in the residue.
+        """
         sample_rate = 10000.0
         duration = 0.2
-        n_samples = int(duration * sample_rate)
-        chunk_boundary = n_samples // 2
+        n_samples = int(duration * sample_rate)  # 2000
+        chunk_boundary = n_samples // 2           # 1000
 
-        # Place spike near boundary
-        spike_time = chunk_boundary / sample_rate * spike_position * 2
+        # Plant a single spike whose negative peak lands `peak_offset` samples
+        # from the chunk boundary (make_spike_train aligns the template's argmin
+        # to int(spike_time * sample_rate)).
+        peak_sample = chunk_boundary + peak_offset
+        spike_time = peak_sample / sample_rate
 
         template = make_triphasic_spike(1.5, 1.0, sample_rate)
-        signal, _ = make_spike_train([spike_time], template, duration, sample_rate)
+        signal, ground_truth = make_spike_train(
+            [spike_time], template, duration, sample_rate
+        )
+        # Sanity: the spike was actually planted (not clipped at a signal edge),
+        # otherwise "exactly one detection" would be vacuous.
+        assert len(ground_truth) == 1
 
         detector = AmpThresholdDetector()
         detector.configure(factor=4.0, sign=-1, refractory_ms=1.0)
         detector.reset(sample_rate, n_channels=1)
-        detector._noise_levels = np.array([0.1], dtype=np.float32)
+        detector._noise_levels = np.array([0.1], dtype=np.float32)  # threshold = 0.4
 
-        # Process as two chunks
+        # Process as two chunks split exactly at the boundary.
         chunk1 = make_chunk(
-            signal[:chunk_boundary],
-            sample_rate,
-            start_time=0.0,
-            seq=0,
+            signal[:chunk_boundary], sample_rate, start_time=0.0, seq=0
         )
         chunk2 = make_chunk(
             signal[chunk_boundary:],
@@ -345,13 +357,13 @@ class TestCrossChunkDetection:
             seq=1,
         )
 
-        events1 = detector.process_chunk(chunk1)
-        events2 = detector.process_chunk(chunk2)
+        events = list(detector.process_chunk(chunk1))
+        events += list(detector.process_chunk(chunk2))
 
-        total_events = len(events1) + len(events2)
-
-        # Should detect the spike (either in chunk1 or chunk2)
-        assert total_events >= 1, "Spike at boundary not detected"
+        assert len(events) == 1, (
+            f"peak at sample {peak_sample} (offset {peak_offset:+d}): "
+            f"expected exactly 1 detection, got {len(events)}"
+        )
 
 
 class TestReferenceModelComparison:

@@ -9,13 +9,12 @@ from shared.ring_buffer import SharedRingBuffer
 def _make_dispatcher(n_channels=1, sample_rate=1000.0):
     raw_queue = queue.Queue()
     viz_queue = queue.Queue()
-    audio_queue = queue.Queue()
     log_queue = queue.Queue()
     event_queue = queue.Queue()
-    
+
     buf = SharedRingBuffer((n_channels, 1000), dtype=np.float32)
     dispatcher = Dispatcher(
-        raw_queue, viz_queue, audio_queue, log_queue, event_queue,
+        raw_queue, viz_queue, log_queue, event_queue,
         filter_settings=FilterSettings()
     )
     dispatcher.set_source_buffer(buf, sample_rate=sample_rate)

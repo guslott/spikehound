@@ -64,7 +64,6 @@ def _make_player(ring_size: int = 16) -> "AudioPlayerRingOnly":
     in_sr = 1000
 
     player = AudioPlayer(
-        audio_queue=queue.Queue(),
         input_samplerate=in_sr,
         config=cfg,
     )

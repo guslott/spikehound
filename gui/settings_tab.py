@@ -109,6 +109,16 @@ class SettingsTab(QtWidgets.QWidget):
         self.byb_debug_logging_check.stateChanged.connect(self._on_byb_debug_logging_toggled)
         form.addRow("Backyard Brains:", self.byb_debug_logging_check)
 
+        self.low_latency_check = QtWidgets.QCheckBox("Low-latency audio monitor (smaller buffers; may glitch on slow systems)")
+        self.low_latency_check.setToolTip(
+            "Reduce the monitor capture and playback device buffers from 10 ms to ~5 ms for lower "
+            "'hear the neuron' latency, at higher risk of audio glitches on busy systems. The "
+            "capture-buffer change takes effect on the next device connect; the playback-buffer "
+            "change on the next listen."
+        )
+        self.low_latency_check.stateChanged.connect(self._on_low_latency_toggled)
+        form.addRow("Audio Monitor:", self.low_latency_check)
+
         # Audio output device selection
         audio_row = QtWidgets.QHBoxLayout()
         self.listen_combo = QtWidgets.QComboBox()
@@ -167,13 +177,12 @@ class SettingsTab(QtWidgets.QWidget):
             ("Plot refresh", "plot_refresh", "Frequency of UI plot updates. Expected: Usually stabilizes at ~30-60 Hz for smooth visualization."),
             ("Xruns", "xruns", "Hardware under-runs or over-runs reported by the driver. Expected: Should be 0. Any value > 0 indicates potential data loss or timing glitches."),
             ("Drops", "drops", "Total samples dropped by the source before reaching the dispatcher. Expected: Should be 0. Values > 0 indicate the system cannot pull data fast enough."),
-            ("Audio latency", "audio_latency", "Measured end-to-end monitor audio latency: 10 ms capture device buffer + measured bridge processing time (rolling mean over last 64 chunks) + software ring fill + 10 ms playback device buffer. p95 shows the 95th-percentile bridge time, a conservative jitter bound. Only shown when audio monitoring is active. Target: mean < 30 ms, p95 < 40 ms."),
+            ("Audio latency", "audio_latency", "Measured end-to-end monitor audio latency: 10 ms capture device buffer + input batching (~half a chunk, from the source emitter) + measured bridge processing time (rolling mean over last 64 chunks) + software ring fill + 10 ms playback device buffer. p95 shows the 95th-percentile bridge time, a conservative jitter bound. Only shown when audio monitoring is active. Target: mean < 45 ms, p95 < 55 ms."),
         ]
         
         col2_labels = [
             ("Source queue", "source_queue", "Queue between the DAQ source and the dispatcher. Expected: Low utilization (< 50%). High utilization suggests a processing bottleneck."),
             ("Viz queue", "viz_queue", "Data queued for visualization. Expected: Low occupancy. High values indicate UI thread lag."),
-            ("Audio queue", "audio_queue", "Data queued for audio playback. Expected: Low occupancy. High values indicate audio driver lag."),
             ("Logging queue", "logging_queue", "Data queued for disk logging. Expected: Low occupancy. High values indicate slow disk I/O."),
             ("Analysis queue", "analysis_queue", "Data queued for real-time analysis (spikes, filters). Expected: Balanced occupancy. Large backlogs indicate analysis code is too slow."),
             ("Viz buffer", "viz_buffer", "Size of the rolling buffer used for plotting. Expected: Stable size based on the \"Scope Time\" setting."),
@@ -316,6 +325,17 @@ class SettingsTab(QtWidgets.QWidget):
         self.byb_debug_logging_check.setChecked(bool(settings.byb_debug_logging_enabled))
         self.byb_debug_logging_check.blockSignals(False)
 
+        self.low_latency_check.blockSignals(True)
+        self.low_latency_check.setChecked(bool(settings.monitor_low_latency))
+        self.low_latency_check.blockSignals(False)
+        # Apply the persisted capture-buffer preference on load (takes effect on
+        # the next device connect).
+        try:
+            from daq.soundcard_source import SoundCardSource
+            SoundCardSource.set_capture_buffer_msec(5 if settings.monitor_low_latency else 10)
+        except ImportError:
+            pass
+
     def _update_launch_checkbox_label(self) -> None:
         """Update the launch config checkbox label to show path if set."""
         if self._launch_config_path:
@@ -391,6 +411,16 @@ class SettingsTab(QtWidgets.QWidget):
 
     def _on_byb_debug_logging_toggled(self, state: int) -> None:
         self._update_settings(byb_debug_logging_enabled=bool(state))
+
+    def _on_low_latency_toggled(self, state: int) -> None:
+        enabled = bool(state)
+        self._update_settings(monitor_low_latency=enabled)
+        # Apply the capture-buffer preference immediately (effective on next connect).
+        try:
+            from daq.soundcard_source import SoundCardSource
+            SoundCardSource.set_capture_buffer_msec(5 if enabled else 10)
+        except ImportError:
+            pass
 
     def _on_sim_units_changed(self, index: int) -> None:
         """Called when the simulated source unit count combo changes."""
@@ -544,9 +574,6 @@ class SettingsTab(QtWidgets.QWidget):
         
         self._metric_fields["viz_queue"].setText(
             self._format_queue_with_drops(depths.get("visualization"), policies.get("visualization", "?"), dropped.get("visualization", 0))
-        )
-        self._metric_fields["audio_queue"].setText(
-            self._format_queue_with_drops(depths.get("audio"), policies.get("audio", "?"), dropped.get("audio", 0))
         )
         self._metric_fields["logging_queue"].setText(
             self._format_queue_with_drops(depths.get("logging"), policies.get("logging", "?"), evicted.get("logging", 0))

@@ -40,6 +40,11 @@ class DispatcherStats:
     forwarded: Counter = field(default_factory=Counter)
     evicted: Counter = field(default_factory=Counter)
     dropped: Counter = field(default_factory=Counter)
+    # Stream-mode visualization is delivered via tick callbacks, not the
+    # visualization queue, so it never shows up in `forwarded`. Count
+    # data-bearing ticks here so the health snapshot reflects that stream
+    # visualization is actually flowing (finding 3.2 #1 — observability gap).
+    visualization_ticks: int = 0
 
     def snapshot(self) -> Dict[str, object]:
         return {
@@ -50,12 +55,38 @@ class DispatcherStats:
             "forwarded": dict(self.forwarded),
             "evicted": dict(self.evicted),
             "dropped": dict(self.dropped),
+            "visualization_ticks": self.visualization_ticks,
             "policies": dict(QUEUE_POLICIES),
         }
 
 
 class Dispatcher:
     """Router thread that conditions incoming samples from ChunkPointers and fans them out to consumers.
+
+    Visualization delivery contract (read before touching the viz paths):
+        The dispatcher delivers conditioned data for display by **one of two
+        mutually-exclusive mechanisms, selected by the trigger mode**:
+
+        * ``mode == "stream"`` (the live free-running scope, and the default):
+          data is delivered to consumers as a fixed-rate (60 Hz) *tick* — a
+          dict payload built from the internal ``viz_buffer`` and pushed to
+          every registered tick callback (see ``add_tick_callback`` /
+          ``_emit_tick``). The ``visualization_queue`` is deliberately **left
+          empty** in this mode (``_visualization_queue_enabled is False``).
+          Decoupling delivery rate from chunk rate is what makes the scope
+          scroll smoothly regardless of chunk size. Throughput is observable
+          via the ``visualization_ticks`` stat, not ``forwarded``.
+
+        * ``mode != "stream"`` (single / repeated triggered capture): each
+          processed chunk's ``ChunkPointer`` is enqueued to the
+          ``visualization_queue`` (drop-oldest), and the GUI drains it to
+          assemble exact triggered windows. ``forwarded``/``evicted`` count
+          this path.
+
+        So in stream mode a consumer must register a tick callback; reading the
+        ``visualization_queue`` will (correctly) yield nothing. This is an
+        intentional API split, not a bug — see finding 3.2 #1 in
+        20260528_opus4p8_review.md.
 
     Lock ordering (always acquire in this order to prevent deadlocks):
         1. _ring_lock        – visualization ring buffer and bookkeeping
@@ -69,7 +100,6 @@ class Dispatcher:
         self,
         raw_queue: "queue.Queue[ChunkPointer | EndOfStream]",
         visualization_queue: "queue.Queue[ChunkPointer | EndOfStream]",
-        audio_queue: "queue.Queue[ChunkPointer | EndOfStream]",
         logging_queue: "queue.Queue[Chunk | EndOfStream]",
         event_queue: "queue.Queue[DetectionEvent | EndOfStream]",
         *,
@@ -81,7 +111,6 @@ class Dispatcher:
         self._raw_queue = raw_queue
         self._output_queues: Dict[str, queue.Queue] = {
             "visualization": visualization_queue,
-            "audio": audio_queue,
             "events": event_queue,
         }
         self._logging_queue = logging_queue
@@ -298,7 +327,17 @@ class Dispatcher:
         return unsubscribe
 
     def _emit_tick(self, payload: dict) -> None:
-        """Invoke all registered tick callbacks."""
+        """Invoke all registered tick callbacks.
+
+        In stream mode this is the *sole* visualization delivery path (the
+        visualization queue is intentionally empty — see the class docstring),
+        so data-bearing ticks are counted here to keep the health snapshot
+        honest about visualization throughput.
+        """
+        samples = payload.get("samples") if isinstance(payload, dict) else None
+        if samples is not None and getattr(samples, "size", 0) > 0:
+            with self._stats_lock:
+                self._stats.visualization_ticks += 1
         for cb in list(self._tick_callbacks):
             try:
                 cb(payload)
@@ -510,16 +549,15 @@ class Dispatcher:
     def _fan_out(self, raw_chunk: Chunk, filtered_chunk: Chunk, viz_pointer: ChunkPointer) -> None:
         if self._recording_enabled:
             self._enqueue_with_policy("logging", self._logging_queue, raw_chunk)
-        for name, out_queue in self._output_queues.items():
-            if name == "events":
-                continue  # Handled in _process_pointer
-            if name == "visualization":
-                if self._visualization_queue_enabled:
-                    self._enqueue_with_policy(name, out_queue, viz_pointer)
-            elif name == "audio":
-                self._enqueue_with_policy(name, out_queue, viz_pointer)
-            else:
-                self._enqueue_with_policy(name, out_queue, filtered_chunk)
+        # Visualization queue is only populated in non-stream trigger modes; in
+        # stream mode the scope is fed by 60 Hz tick callbacks instead (see the
+        # "Visualization delivery contract" in the class docstring). The events
+        # queue is filled in _process_pointer. Monitor audio no longer uses a
+        # fan-out queue — the MonitorAudioBridge taps the source directly.
+        if self._visualization_queue_enabled:
+            self._enqueue_with_policy(
+                "visualization", self._output_queues["visualization"], viz_pointer
+            )
         self._dispatch_to_analysis(filtered_chunk)
 
     def _clear_visualization_queue(self) -> None:
@@ -723,17 +761,6 @@ class Dispatcher:
                 if return_info:
                     return zeros, window_samples, window_samples
                 return zeros
-            if self._filled < window_samples:
-                zeros = np.zeros(window_samples, dtype=np.float32)
-                if return_info:
-                    return zeros, window_samples, window_samples
-                return zeros
-            start_idx = int(start_index)
-            if start_idx < 0:
-                zeros = np.zeros(window_samples, dtype=np.float32)
-                if return_info:
-                    return zeros, window_samples, window_samples
-                return zeros
             
             # Capture state needed after lock release
             earliest = self._latest_sample_index - (self._filled - 1)
@@ -747,22 +774,32 @@ class Dispatcher:
         # Lock released here
         
         # Phase 2: Compute positions (no lock needed, using snapshot values)
-        desired_start = start_idx
-        desired_end = start_idx + window_samples
+        desired_start = int(start_index)
+        desired_end = desired_start + window_samples
+        if desired_end <= earliest:
+            zeros = np.zeros(window_samples, dtype=np.float32)
+            if return_info:
+                return zeros, window_samples, 0
+            return zeros
+        if desired_start >= latest:
+            zeros = np.zeros(window_samples, dtype=np.float32)
+            if return_info:
+                return zeros, 0, window_samples
+            return zeros
         actual_start = max(desired_start, earliest)
         actual_end = min(desired_end, latest)
         if actual_start >= actual_end:
             zeros = np.zeros(window_samples, dtype=np.float32)
             if return_info:
-                return zeros, window_samples, window_samples
+                return zeros, window_samples, 0
             return zeros
-        missing_prefix = max(0, earliest - desired_start)
-        missing_suffix = max(0, desired_end - latest)
-        available_count = window_samples - missing_prefix - missing_suffix
+        missing_prefix = max(0, actual_start - desired_start)
+        missing_suffix = max(0, desired_end - actual_end)
+        available_count = actual_end - actual_start
         if available_count <= 0:
             zeros = np.zeros(window_samples, dtype=np.float32)
             if return_info:
-                return zeros, window_samples, window_samples
+                return zeros, missing_prefix, missing_suffix
             return zeros
         if buffer_len <= 0:
             zeros = np.zeros(window_samples, dtype=np.float32)

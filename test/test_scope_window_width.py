@@ -8,10 +8,11 @@ from PySide6 import QtWidgets
 
 from gui.main_window import MainWindow
 from gui.analysis_tab import AnalysisTab
+from gui.analysis.helpers import CorrelationRecord, CorrelationTask
 from core.runtime import SpikeHoundRuntime
 from gui.trigger_control_widget import TriggerControlWidget
 from gui.trigger_controller import TriggerController
-from shared.models import ChunkPointer
+from shared.models import ChannelInfo, ChunkPointer
 from shared.types import AnalysisEvent
 from shared.ring_buffer import SharedRingBuffer
 
@@ -171,9 +172,10 @@ def test_trigger_mode_dispatcher_tick_keeps_selected_window_when_queue_batch_is_
     assert seen["window_sec"] == pytest.approx(1.0)
 
 
-def test_sta_process_event_aligns_to_detected_crossing_offset() -> None:
+def test_waveform_correlation_preserves_center_trigger_amplitude_after_baseline_subtraction() -> None:
     _app()
-    widget = AnalysisTab("Channel 1", 1_000.0)
+    widget = AnalysisTab("Channel 1", 1_000.0, channel_id=0)
+    widget.set_sta_channels((ChannelInfo(id=0, name="ch0"),))
     event = AnalysisEvent(
         id=1,
         channelId=0,
@@ -187,21 +189,76 @@ def test_sta_process_event_aligns_to_detected_crossing_offset() -> None:
         postMs=8.0,
         samples=np.zeros(10, dtype=np.float32),
     )
-    window = np.array([0.0, 0.0, 5.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+    window = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 5.0, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32)
     controller = SimpleNamespace(
         collect_trigger_window=lambda *args, **kwargs: (window.copy(), 0, 0),
     )
 
-    status = widget._sta_process_event(
-        controller,
-        target_channel_id=0,
-        channel_info=None,
-        event=event,
+    task = CorrelationTask(
+        events=(event,),
+        channel_ids=(0,),
+        source_channel_id=0,
         window_ms=50.0,
+        mode="waveform",
+    )
+    widget._controller = controller
+    widget._sta_handle_task(task)
+
+    record = widget._sta_records[1]
+    normalized = record.channel_windows[0]
+    assert normalized[5] == pytest.approx(5.0)
+    assert normalized[6] == pytest.approx(1.0)
+
+
+def test_sta_refresh_plot_uses_actual_sample_offsets() -> None:
+    _app()
+    widget = AnalysisTab("Channel 1", 1_000.0, channel_id=0)
+    widget.set_sta_channels((ChannelInfo(id=0, name="ch0"),))
+    widget._sta_enabled = True
+    widget._sta_mode = "waveform"
+    widget._sta_records[1] = CorrelationRecord(
+        event_id=1,
+        crossing_time_sec=0.5,
+        channel_windows={0: np.linspace(-1.0, 1.0, 51, dtype=np.float32)},
     )
 
-    assert status == "added"
-    assert widget._sta_windows
-    normalized = widget._sta_windows[-1]
-    assert normalized[2] == pytest.approx(0.0)
-    assert normalized[5] == pytest.approx(-4.0)
+    widget._refresh_sta_plot()
+
+    assert widget._sta_time_axis is not None
+    assert widget._sta_time_axis[0] == pytest.approx(-25.0)
+    assert widget._sta_time_axis[25] == pytest.approx(0.0)
+    assert widget._sta_time_axis[-1] == pytest.approx(25.0)
+
+
+def test_autocorrelogram_mode_builds_event_lag_histogram() -> None:
+    _app()
+    widget = AnalysisTab("Channel 1", 1_000.0, channel_id=0)
+    widget._sta_enabled = True
+    widget._sta_mode = "autocorrelogram"
+    widget._sta_window_ms = 20.0
+    widget._sta_records = {
+        1: CorrelationRecord(event_id=1, crossing_time_sec=1.000, channel_windows={}),
+        2: CorrelationRecord(event_id=2, crossing_time_sec=1.003, channel_windows={}),
+        3: CorrelationRecord(event_id=3, crossing_time_sec=1.007, channel_windows={}),
+    }
+
+    widget._refresh_sta_plot()
+
+    assert widget._sta_time_axis is not None
+    assert widget._sta_hist_counts is not None
+
+    idx_pos_3 = int(np.where(np.isclose(widget._sta_time_axis, 3.0))[0][0])
+    idx_neg_3 = int(np.where(np.isclose(widget._sta_time_axis, -3.0))[0][0])
+    idx_pos_4 = int(np.where(np.isclose(widget._sta_time_axis, 4.0))[0][0])
+    idx_neg_4 = int(np.where(np.isclose(widget._sta_time_axis, -4.0))[0][0])
+    idx_pos_7 = int(np.where(np.isclose(widget._sta_time_axis, 7.0))[0][0])
+    idx_neg_7 = int(np.where(np.isclose(widget._sta_time_axis, -7.0))[0][0])
+    idx_zero = int(np.where(np.isclose(widget._sta_time_axis, 0.0))[0][0])
+
+    assert widget._sta_hist_counts[idx_pos_3] == pytest.approx(1.0)
+    assert widget._sta_hist_counts[idx_neg_3] == pytest.approx(1.0)
+    assert widget._sta_hist_counts[idx_pos_4] == pytest.approx(1.0)
+    assert widget._sta_hist_counts[idx_neg_4] == pytest.approx(1.0)
+    assert widget._sta_hist_counts[idx_pos_7] == pytest.approx(1.0)
+    assert widget._sta_hist_counts[idx_neg_7] == pytest.approx(1.0)
+    assert widget._sta_hist_counts[idx_zero] == pytest.approx(0.0)

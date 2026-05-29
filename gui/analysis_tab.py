@@ -5,7 +5,6 @@ import logging
 import queue
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, Future
-from dataclasses import dataclass
 from typing import Optional, TYPE_CHECKING, Sequence
 
 import numpy as np
@@ -27,6 +26,9 @@ from shared.types import AnalysisEvent
 
 from gui.analysis.helpers import (
     CLUSTER_COLORS,
+    CORRELATION_CHANNEL_COLORS,
+    CORRELATION_GHOST_TRACE_COUNT,
+    CORRELATION_HISTORY_CAPACITY,
     UNCLASSIFIED_COLOR,
     WAVEFORM_MEDIAN_COLOR,
     MAX_VISIBLE_METRIC_EVENTS,
@@ -37,10 +39,11 @@ from gui.analysis.helpers import (
     ClusterRectROI,
     MetricCluster,
     OverlayPayload,
-    StaTask,
+    CorrelationRecord,
+    CorrelationTask,
     AnalysisUpdate,
 )
-from .waveform_loader import WaveformLoader, StaWaveformLoader
+from .waveform_loader import WaveformLoader
 
 from analysis.metrics import baseline, envelope, min_max, peak_frequency_sinc
 
@@ -124,18 +127,17 @@ class AnalysisTab(QtWidgets.QWidget):
         self._UNCLASSIFIED_ID: int = -1  # Special ID for Unclassified pseudo-class
         # Pause snapshot: when paused, we capture static curve data and colors
         self._pause_snapshot_curves: list[pg.PlotCurveItem] = []  # Static snapshot items
+        self._pause_raw_snapshot_curve: pg.PlotCurveItem | None = None
         self._sta_enabled: bool = False
-        self._sta_windows: list[np.ndarray] = []
-        self._sta_max_windows = float("inf")
-        self._sta_update_interval_ms: int = 100
+        self._sta_mode: str = "waveform"
+        self._sta_records: dict[int, CorrelationRecord] = {}
+        self._sta_channels: tuple[object, ...] = tuple()
         self._sta_dirty: bool = False
         self._sta_time_axis: np.ndarray | None = None
-        self._sta_aligned_windows: np.ndarray | None = None
+        self._sta_hist_counts: np.ndarray | None = None
         self._sta_window_ms: float = 50.0
         self._sta_source_cluster_id: int | None = None
-        self._sta_target_channel_id: int | None = None
-        self._sta_pending_events: dict[int, tuple[AnalysisEvent, int]] = {}
-        self._sta_retry_limit: int = 10
+        self._sta_pending_events: dict[int, AnalysisEvent] = {}
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -187,19 +189,19 @@ class AnalysisTab(QtWidgets.QWidget):
         try:
             self.sta_plot.hideButtons()
         except Exception as e:
-            logger.debug("Failed to hide STA plot buttons: %s", e)
+            logger.debug("Failed to hide correlation plot buttons: %s", e)
         self.sta_plot.setBackground(SCOPE_BACKGROUND_COLOR)
         self.sta_plot.showGrid(x=True, y=True, alpha=0.25)
         self.sta_plot.setLabel("bottom", "Lag", units="ms")
-        self.sta_plot.setLabel("left", "Amplitude", units="mV")
+        self.sta_plot.setLabel("left", "Amplitude", units="V")
         self.sta_plot.setMouseEnabled(x=False, y=False)
         self.raw_row_layout.addWidget(self.sta_plot, stretch=3)
         self.sta_plot.setAntialiasing(False)
-        self._sta_median_curve = pg.PlotCurveItem()
-        self._sta_median_curve.setZValue(10)
-        self.sta_plot.addItem(self._sta_median_curve)
-        self._sta_trace_items: list[pg.PlotCurveItem] = []
-        self._sta_max_traces: int = 100
+        self._sta_curve_items: dict[int, pg.PlotCurveItem] = {}
+        self._sta_ghost_curve_items: list[pg.PlotCurveItem] = []
+        self._sta_hist_item: pg.BarGraphItem | None = None
+        self._sta_legend = self.sta_plot.addLegend(offset=(8, 8))
+        self._sta_legend.setVisible(False)
 
         layout.addWidget(self.raw_row_widget, stretch=4)
         self._hide_sta_plot()
@@ -374,20 +376,30 @@ class AnalysisTab(QtWidgets.QWidget):
         self._separator2.setVisible(False)
         controls_layout.addWidget(self._separator2)
 
-        # STA section (hidden until threshold enabled)
+        # Correlation section (hidden until threshold enabled)
         self._sta_container = QtWidgets.QWidget()
         sta_layout = QtWidgets.QVBoxLayout(self._sta_container)
         sta_layout.setContentsMargins(0, 0, 0, 0)
         sta_layout.setSpacing(4)
 
-        sta_label = QtWidgets.QLabel("Spike Triggered Average")
+        sta_label = QtWidgets.QLabel("Correlation")
         sta_label.setStyleSheet("font-weight: bold;")
         sta_layout.addWidget(sta_label)
 
-        self.sta_enable_check = QtWidgets.QCheckBox("Enable STA")
+        self.sta_enable_check = QtWidgets.QCheckBox("Enable correlation")
         self.sta_enable_check.setChecked(False)
         self.sta_enable_check.toggled.connect(self._on_sta_toggled)
         sta_layout.addWidget(self.sta_enable_check)
+
+        sta_mode_row = QtWidgets.QHBoxLayout()
+        sta_mode_row.setSpacing(6)
+        sta_mode_row.addWidget(QtWidgets.QLabel("Mode"))
+        self.sta_mode_combo = QtWidgets.QComboBox()
+        self.sta_mode_combo.addItem("Waveform average", "waveform")
+        self.sta_mode_combo.addItem("Autocorrelogram", "autocorrelogram")
+        self.sta_mode_combo.currentIndexChanged.connect(self._on_sta_mode_changed)
+        sta_mode_row.addWidget(self.sta_mode_combo)
+        sta_layout.addLayout(sta_mode_row)
 
         sta_source_row = QtWidgets.QHBoxLayout()
         sta_source_row.setSpacing(6)
@@ -398,17 +410,9 @@ class AnalysisTab(QtWidgets.QWidget):
         sta_source_row.addWidget(self.sta_source_combo)
         sta_layout.addLayout(sta_source_row)
 
-        sta_channel_row = QtWidgets.QHBoxLayout()
-        sta_channel_row.setSpacing(6)
-        sta_channel_row.addWidget(QtWidgets.QLabel("Signal channel"))
-        self.sta_channel_combo = QtWidgets.QComboBox()
-        self.sta_channel_combo.currentIndexChanged.connect(self._on_sta_channel_changed)
-        sta_channel_row.addWidget(self.sta_channel_combo)
-        sta_layout.addLayout(sta_channel_row)
-
         sta_window_row = QtWidgets.QHBoxLayout()
         sta_window_row.setSpacing(6)
-        sta_window_row.addWidget(QtWidgets.QLabel("Window (ms)"))
+        sta_window_row.addWidget(QtWidgets.QLabel("Lag window (ms)"))
         self.sta_window_combo = QtWidgets.QComboBox()
         for label, value in (("20", 20.0), ("50", 50.0), ("100", 100.0)):
             self.sta_window_combo.addItem(label, value)
@@ -419,13 +423,14 @@ class AnalysisTab(QtWidgets.QWidget):
 
         sta_buttons_row = QtWidgets.QHBoxLayout()
         sta_buttons_row.setSpacing(6)
-        self.sta_clear_btn = QtWidgets.QPushButton("Clear STA")
+        self.sta_clear_btn = QtWidgets.QPushButton("Clear")
         self.sta_clear_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         self.sta_clear_btn.clicked.connect(self._on_sta_clear_clicked)
         sta_buttons_row.addWidget(self.sta_clear_btn, 1)
-        self.sta_view_waveforms_btn = QtWidgets.QPushButton("View waveforms…")
+        self.sta_view_waveforms_btn = QtWidgets.QPushButton("Inspect…")
         self.sta_view_waveforms_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         self.sta_view_waveforms_btn.clicked.connect(self._on_sta_view_waveforms_clicked)
+        self.sta_view_waveforms_btn.setToolTip("Open a focused correlation inspector with summary curves and recent contributing traces.")
         self.sta_view_waveforms_btn.setEnabled(False)
         sta_buttons_row.addWidget(self.sta_view_waveforms_btn, 1)
         sta_layout.addLayout(sta_buttons_row)
@@ -532,12 +537,12 @@ class AnalysisTab(QtWidgets.QWidget):
         self.threshold2_line.sigPositionChanged.connect(lambda _: self._update_spin_from_line(self.threshold2_line, self.threshold2_spin))
         self.event_window_combo.currentIndexChanged.connect(self._on_event_window_changed)
 
-        # One timer coordinates the plot/metric/STA update cadence.
+        # One timer coordinates the plot, metric, and correlation update cadence.
         self._update_timer = QtCore.QTimer(self)
         self._update_timer.setInterval(50)
         self._update_timer.timeout.connect(self._on_unified_timer)
         self._update_timer.start()
-        # Tick counter for throttling slower updates (metrics at ~7Hz, STA at ~7Hz)
+        # Tick counter for throttling slower updates (metrics and correlation at ~7Hz).
         self._timer_tick_count: int = 0
         self._METRICS_UPDATE_TICKS: int = 3  # Every 3rd tick = ~150ms (~7Hz)
         self._STA_UPDATE_TICKS: int = 3      # Every 3rd tick = ~150ms (~7Hz)
@@ -634,6 +639,7 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def set_channel_info(self, channel_name: str, sample_rate: float) -> None:
         """Update channel name and sample rate, reinitializing buffers."""
+        sample_rate_changed = abs(float(sample_rate) - self.sample_rate) >= 1e-6
         self.channel_name = channel_name
         self.sample_rate = float(sample_rate)
         self.title_label.setText(self._title_text())
@@ -644,6 +650,8 @@ class AnalysisTab(QtWidgets.QWidget):
         self._latest_sample_index = None
         self._window_start_index = None
         self._clear_event_overlays()
+        if sample_rate_changed:
+            self._on_sta_clear_clicked()
 
     def set_analysis_queue(self, q: "queue.Queue") -> None:
         """Set the queue from which analysis batches are consumed."""
@@ -660,8 +668,13 @@ class AnalysisTab(QtWidgets.QWidget):
         self._notify_threshold_change()
 
     def set_sta_channels(self, channels: Sequence["ChannelInfo"]) -> None:
-        """Update the list of available STA signal channels."""
-        self._refresh_sta_channel_options(channels)
+        """Update the active correlation channels."""
+        normalized = tuple(ch for ch in channels if getattr(ch, "id", None) is not None)
+        previous_ids = tuple(int(getattr(ch, "id")) for ch in self._sta_channels if getattr(ch, "id", None) is not None)
+        current_ids = tuple(int(getattr(ch, "id")) for ch in normalized)
+        self._sta_channels = normalized
+        if self._sta_enabled and previous_ids != current_ids:
+            self._on_sta_clear_clicked()
 
     def _toggle_threshold(self, line: pg.InfiniteLine, spin: QtWidgets.QDoubleSpinBox, checked: bool) -> None:
         """Show/hide a threshold line and sync it with the spinbox value."""
@@ -695,7 +708,7 @@ class AnalysisTab(QtWidgets.QWidget):
             self._notify_threshold_change()
 
     def _on_unified_timer(self) -> None:
-        """Unified timer callback: process queue, then conditionally update metrics/STA.
+        """Unified timer callback: process queue, then conditionally update metrics/correlation.
 
         This consolidates three separate timers into one to:
         1. Reduce Qt timer scheduling overhead
@@ -713,7 +726,7 @@ class AnalysisTab(QtWidgets.QWidget):
                 self._update_metric_points()
                 self._metrics_dirty = False
 
-        # Update STA less frequently (every 3rd tick, ~11Hz)
+        # Update correlation less frequently (every 3rd tick, ~11Hz)
         if self._timer_tick_count % self._STA_UPDATE_TICKS == 0:
             if self._sta_enabled and self._sta_dirty:
                 self._refresh_sta_plot()
@@ -847,7 +860,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._notify_threshold_change()
 
     def _update_advanced_sections_visibility(self) -> None:
-        """Show/hide Metrics and STA sections based on threshold state."""
+        """Show/hide metrics and correlation sections based on threshold state."""
         threshold_active = self.auto_detect_check.isChecked() or self.threshold1_check.isChecked()
         self._separator1.setVisible(threshold_active)
         self._metrics_container.setVisible(threshold_active)
@@ -970,6 +983,7 @@ class AnalysisTab(QtWidgets.QWidget):
 
     def _capture_pause_snapshot(self) -> None:
         """Capture a static snapshot of current curves for frozen display."""
+        self._clear_pause_snapshot()
         # Create static snapshot of raw trace
         if self._cached_raw_times is not None and self._cached_raw_samples is not None:
             raw_snapshot = pg.PlotCurveItem(
@@ -979,6 +993,7 @@ class AnalysisTab(QtWidgets.QWidget):
             )
             raw_snapshot.setZValue(self.raw_curve.zValue())
             self.plot_widget.addItem(raw_snapshot)
+            self._pause_raw_snapshot_curve = raw_snapshot
             self._pause_snapshot_curves.append(raw_snapshot)
         
         # Create static snapshots of all overlay curves with their current colors
@@ -998,6 +1013,7 @@ class AnalysisTab(QtWidgets.QWidget):
             )
             overlay_snapshot.setZValue(item.zValue())
             self.plot_widget.addItem(overlay_snapshot)
+            overlay["pause_snapshot_item"] = overlay_snapshot
             self._pause_snapshot_curves.append(overlay_snapshot)
         
         # Now hide the dynamic items
@@ -1016,6 +1032,9 @@ class AnalysisTab(QtWidgets.QWidget):
             except Exception as e:
                 logger.debug("Failed to remove pause snapshot curve: %s", e)
         self._pause_snapshot_curves.clear()
+        self._pause_raw_snapshot_curve = None
+        for overlay in self._event_overlays:
+            overlay.pop("pause_snapshot_item", None)
         
         # Show the dynamic items again
         self.raw_curve.show()
@@ -1080,14 +1099,40 @@ class AnalysisTab(QtWidgets.QWidget):
                     width = 2.0
         item.setPen(pg.mkPen(color, width=width))
 
+    def _apply_pause_snapshot_overlay_color(self, overlay: dict[str, object]) -> None:
+        """Update a paused overlay snapshot without rebuilding the frozen raw trace."""
+        item = overlay.get("pause_snapshot_item")
+        if not isinstance(item, pg.PlotCurveItem):
+            return
+        snapshot_overlay = dict(overlay)
+        snapshot_overlay["item"] = item
+        self._apply_overlay_color(snapshot_overlay)
+
     def _refresh_overlay_colors(self) -> None:
         """Repaint all active overlay curves to match current class membership."""
         for overlay in self._event_overlays:
             self._apply_overlay_color(overlay)
-        if not self._viz_paused:
-            return
-        self._clear_pause_snapshot()
-        self._capture_pause_snapshot()
+            if self._viz_paused:
+                self._apply_pause_snapshot_overlay_color(overlay)
+
+    def _current_overlay_view(
+        self,
+        fallback_window_start: float,
+        fallback_width: float,
+        fallback_window_start_idx: Optional[int],
+    ) -> tuple[float, float, Optional[int]]:
+        """Return the best current view parameters for placing overlay curves."""
+        if self._window_start_time is not None:
+            window_start = float(self._window_start_time)
+        else:
+            window_start = float(fallback_window_start)
+        width = float(self._last_window_width if self._last_window_width > 0 else fallback_width)
+        window_start_idx = (
+            self._window_start_index
+            if self._window_start_index is not None
+            else fallback_window_start_idx
+        )
+        return window_start, width, window_start_idx
 
     def _handle_batch_events(
         self,
@@ -1096,7 +1141,7 @@ class AnalysisTab(QtWidgets.QWidget):
         width: float,
         window_start_idx: Optional[int],
     ) -> None:
-        """Process detected events: submit for analysis and update overlays."""
+        """Process detected events and refresh correlation state."""
         pending_sta = bool(getattr(self, "_sta_pending_events", None))
         if events:
             self._submit_analysis_job(tuple(events), window_start, width, window_start_idx)
@@ -1107,19 +1152,28 @@ class AnalysisTab(QtWidgets.QWidget):
         if not self._viz_paused:
             self._refresh_overlay_positions(window_start, width, window_start_idx)
 
-    def _build_sta_task(self, events: Sequence[AnalysisEvent]) -> StaTask | None:
-        """Create an STA task for the given events if STA is enabled."""
+    def _build_sta_task(self, events: Sequence[AnalysisEvent]) -> CorrelationTask | None:
+        """Create a correlation task for the given events if correlation is enabled."""
         if not self._sta_enabled:
             return None
-        target_channel_id = self._sta_target_channel_id
-        if target_channel_id is None:
-            return None
-        channel_info = int(self._channel_index) if getattr(self, "_channel_index", None) is not None else None
-        return StaTask(
+        mode = self._sta_mode if self._sta_mode in {"waveform", "autocorrelogram"} else "waveform"
+        source_channel_id = int(self._channel_index) if getattr(self, "_channel_index", None) is not None else None
+        if mode == "waveform":
+            channel_ids = tuple(
+                int(getattr(channel, "id"))
+                for channel in self._sta_channels
+                if getattr(channel, "id", None) is not None
+            )
+            if not channel_ids:
+                return None
+        else:
+            channel_ids = tuple()
+        return CorrelationTask(
             events=tuple(events),
-            target_channel_id=int(target_channel_id),
-            channel_index=channel_info,
+            channel_ids=channel_ids,
+            source_channel_id=source_channel_id,
             window_ms=float(self._sta_window_ms),
+            mode=mode,
         )
 
     def _submit_analysis_job(
@@ -1175,18 +1229,23 @@ class AnalysisTab(QtWidgets.QWidget):
         except Exception as exc:
             logging.getLogger(__name__).exception("Analysis worker failed: %s", exc)
             return
-        self._apply_analysis_update(update, window_start, width, window_start_idx)
+        current_window_start, current_width, current_window_start_idx = self._current_overlay_view(
+            window_start,
+            width,
+            window_start_idx,
+        )
+        self._apply_analysis_update(update, current_window_start, current_width, current_window_start_idx)
 
     def _build_analysis_update(self, events: tuple[AnalysisEvent, ...]) -> AnalysisUpdate:
-        """Build overlay payloads and STA task for a batch of events."""
+        """Build overlay payloads and correlation work for a batch of events."""
         overlays: list[OverlayPayload] = []
         for event in events:
             payload = self._build_overlay_payload(event)
             if payload is None:
                 continue
             overlays.append(payload)
-        sta_task = self._build_sta_task(events)
-        return AnalysisUpdate(overlays=overlays, sta_task=sta_task)
+        correlation_task = self._build_sta_task(events)
+        return AnalysisUpdate(overlays=overlays, correlation_task=correlation_task)
 
     def _apply_analysis_update(
         self,
@@ -1212,11 +1271,8 @@ class AnalysisTab(QtWidgets.QWidget):
             self._record_overlay_metrics(overlay)
         if payloads:
             self._metrics_dirty = True
-        if update.sta_windows:
-            self._sta_windows.extend(update.sta_windows)
-            self._sta_dirty = True
-        elif update.sta_task is not None:
-            self._sta_handle_task(update.sta_task)
+        if update.correlation_task is not None:
+            self._sta_handle_task(update.correlation_task)
         if not self._viz_paused and payloads:
             self._refresh_overlay_positions(window_start, width, window_start_idx)
 
@@ -1231,9 +1287,29 @@ class AnalysisTab(QtWidgets.QWidget):
             last_time = float(overlay.get("last_time", window_start))
             item = overlay.get("item")
             if last_time < window_start:
+                pause_snapshot_item = overlay.pop("pause_snapshot_item", None)
+                if isinstance(pause_snapshot_item, pg.PlotCurveItem):
+                    try:
+                        self.plot_widget.removeItem(pause_snapshot_item)
+                    except Exception as e:
+                        logger.debug("Failed to remove pause snapshot overlay: %s", e)
+                    try:
+                        self._pause_snapshot_curves.remove(pause_snapshot_item)
+                    except ValueError:
+                        pass
                 self._release_overlay_item(item)
                 continue
             if not self._apply_overlay_view(overlay, window_start, width, window_start_idx):
+                pause_snapshot_item = overlay.pop("pause_snapshot_item", None)
+                if isinstance(pause_snapshot_item, pg.PlotCurveItem):
+                    try:
+                        self.plot_widget.removeItem(pause_snapshot_item)
+                    except Exception as e:
+                        logger.debug("Failed to remove pause snapshot overlay: %s", e)
+                    try:
+                        self._pause_snapshot_curves.remove(pause_snapshot_item)
+                    except ValueError:
+                        pass
                 self._release_overlay_item(item)
                 continue
             kept.append(overlay)
@@ -1244,25 +1320,45 @@ class AnalysisTab(QtWidgets.QWidget):
         if not self._event_overlays:
             return
         for overlay in self._event_overlays:
+            pause_snapshot_item = overlay.pop("pause_snapshot_item", None)
+            if isinstance(pause_snapshot_item, pg.PlotCurveItem):
+                try:
+                    self.plot_widget.removeItem(pause_snapshot_item)
+                except Exception as e:
+                    logger.debug("Failed to remove pause snapshot overlay: %s", e)
+                try:
+                    self._pause_snapshot_curves.remove(pause_snapshot_item)
+                except ValueError:
+                    pass
             self._release_overlay_item(overlay.get("item"))
         self._event_overlays.clear()
 
-    def _ensure_sta_trace_capacity(self, capacity: int) -> None:
-        """Ensure enough STA trace items exist for the given capacity."""
-        current = len(self._sta_trace_items)
-        if current >= capacity:
-            return
-        for _ in range(capacity - current):
-            item = pg.PlotCurveItem(pen=STA_TRACE_PEN)
-            item.setZValue(-2)
-            self.sta_plot.addItem(item)
-            self._sta_trace_items.append(item)
-
-    def _clear_sta_traces(self) -> None:
-        """Hide and clear all STA trace plot items."""
-        for item in self._sta_trace_items:
-            item.hide()
-            item.setData([], [], skipFiniteCheck=True)
+    def _clear_sta_plot_items(self) -> None:
+        """Remove all rendered correlation plot items."""
+        plot_item = self.sta_plot.getPlotItem()
+        for item in self._sta_curve_items.values():
+            try:
+                plot_item.removeItem(item)
+            except Exception as e:
+                logger.debug("Failed to remove correlation curve: %s", e)
+        self._sta_curve_items.clear()
+        for item in self._sta_ghost_curve_items:
+            try:
+                plot_item.removeItem(item)
+            except Exception as e:
+                logger.debug("Failed to remove correlation ghost curve: %s", e)
+        self._sta_ghost_curve_items.clear()
+        if self._sta_hist_item is not None:
+            try:
+                plot_item.removeItem(self._sta_hist_item)
+            except Exception as e:
+                logger.debug("Failed to remove correlation histogram: %s", e)
+            self._sta_hist_item = None
+        try:
+            self._sta_legend.clear()
+        except Exception as e:
+            logger.debug("Failed to clear correlation legend: %s", e)
+        plot_item.setTitle("")
 
     def _invalidate_scatter_cache(self) -> None:
         """Invalidate the scatter plot coordinate cache."""
@@ -1279,6 +1375,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self._metric_events.clear()
         self._event_details.clear()
         self._event_cluster_labels.clear()
+        self._on_sta_clear_clicked()
         self._last_scatter_count = 0
         self._cluster_membership_dirty = True
         self._cluster_counts = {}
@@ -1585,13 +1682,13 @@ class AnalysisTab(QtWidgets.QWidget):
         self.export_class_btn.setEnabled(has_selection)
 
     def _update_sta_view_button(self) -> None:
-        """Enable/disable STA view button based on data availability."""
+        """Enable/disable the correlation detail view button."""
+        eligible_records = self._eligible_sta_records()
         has_data = (
             self._sta_enabled
-            and self._sta_aligned_windows is not None
-            and getattr(self._sta_aligned_windows, "size", 0) > 0
             and self._sta_time_axis is not None
             and self._sta_time_axis.size > 0
+            and bool(eligible_records)
         )
         self.sta_view_waveforms_btn.setEnabled(bool(has_data))
 
@@ -1607,8 +1704,8 @@ class AnalysisTab(QtWidgets.QWidget):
             self.metrics_container_layout.setStretchFactor(self.cluster_panel, 0)
 
     def _refresh_cluster_options(self) -> None:
-        """Populate the STA event source and export class combos."""
-        # Update STA source combo
+        """Populate the correlation event source and export class combos."""
+        # Update correlation source combo
         previous_selection = self._sta_source_cluster_id
         was_blocked = self.sta_source_combo.blockSignals(True)
         self.sta_source_combo.clear()
@@ -1638,39 +1735,14 @@ class AnalysisTab(QtWidgets.QWidget):
             self.export_class_combo.setCurrentIndex(0)
         self.export_class_combo.blockSignals(was_blocked)
 
-    def _refresh_sta_channel_options(self, channels: Sequence["ChannelInfo"]) -> None:
-        """Populate the STA signal channel combo from the active channels."""
-        combo = self.sta_channel_combo
-        if combo is None:
-            return
-        previous = self._sta_target_channel_id
-        block_state = combo.blockSignals(True)
-        combo.clear()
-        for ch in channels:
-            cid = getattr(ch, "id", None)
-            name = getattr(ch, "name", f"Channel {cid}")
-            combo.addItem(str(name), cid)
-        combo.blockSignals(block_state)
-        target_index = combo.findData(previous) if previous is not None else -1
-        if target_index < 0 and self._channel_index is not None:
-            target_index = combo.findData(int(self._channel_index))
-        if target_index < 0 and combo.count():
-            target_index = 0
-        if target_index >= 0:
-            combo.setCurrentIndex(target_index)
-            data = combo.itemData(target_index)
-            self._sta_target_channel_id = data if isinstance(data, int) else None
-        else:
-            self._sta_target_channel_id = None
-
     def _show_sta_plot(self) -> None:
-        """Show the STA plot widget and adjust layout."""
+        """Show the correlation plot widget and adjust layout."""
         self.sta_plot.show()
         self.raw_row_layout.setStretchFactor(self.plot_widget, 7)
         self.raw_row_layout.setStretchFactor(self.sta_plot, 3)
 
     def _hide_sta_plot(self) -> None:
-        """Hide the STA plot widget and restore layout."""
+        """Hide the correlation plot widget and restore layout."""
         self.sta_plot.hide()
         self.raw_row_layout.setStretchFactor(self.plot_widget, 10)
         self.raw_row_layout.setStretchFactor(self.sta_plot, 0)
@@ -1697,47 +1769,228 @@ class AnalysisTab(QtWidgets.QWidget):
             return QtGui.QColor(UNCLASSIFIED_COLOR)
         return cluster.color
 
+    def _sta_channel_order(self, channel_ids: set[int]) -> tuple[int, ...]:
+        ordered = [
+            int(getattr(channel, "id"))
+            for channel in self._sta_channels
+            if getattr(channel, "id", None) is not None and int(getattr(channel, "id")) in channel_ids
+        ]
+        extras = sorted(channel_ids.difference(ordered))
+        return tuple(ordered + extras)
+
+    def _sta_channel_label(self, channel_id: int) -> str:
+        for channel in self._sta_channels:
+            channel_value = getattr(channel, "id", None)
+            if channel_value is None:
+                continue
+            if int(channel_value) == int(channel_id):
+                return str(getattr(channel, "name", f"Channel {channel_id}"))
+        return f"Channel {channel_id}"
+
+    def _sta_channel_color(self, channel_id: int) -> QtGui.QColor:
+        for index, channel in enumerate(self._sta_channels):
+            channel_value = getattr(channel, "id", None)
+            if channel_value is None:
+                continue
+            if int(channel_value) == int(channel_id):
+                return QtGui.QColor(CORRELATION_CHANNEL_COLORS[index % len(CORRELATION_CHANNEL_COLORS)])
+        return QtGui.QColor(CORRELATION_CHANNEL_COLORS[int(channel_id) % len(CORRELATION_CHANNEL_COLORS)])
+
+    def _store_sta_record(self, record: CorrelationRecord) -> None:
+        self._sta_records.pop(record.event_id, None)
+        self._sta_records[record.event_id] = record
+        while len(self._sta_records) > CORRELATION_HISTORY_CAPACITY:
+            oldest_event_id = next(iter(self._sta_records))
+            self._sta_records.pop(oldest_event_id, None)
+
+    def _eligible_sta_records(self) -> list[CorrelationRecord]:
+        records: list[CorrelationRecord] = []
+        for event_id, record in self._sta_records.items():
+            if self._sta_source_cluster_id is not None:
+                if self._event_cluster_labels.get(event_id) != self._sta_source_cluster_id:
+                    continue
+            records.append(record)
+        return records
+
+    @staticmethod
+    def _normalize_sta_window(window: np.ndarray) -> np.ndarray:
+        normalized = np.asarray(window, dtype=np.float32).copy()
+        trigger_index = normalized.size // 2
+        baseline_region = normalized[:trigger_index]
+        baseline_value = float(np.median(baseline_region)) if baseline_region.size else 0.0
+        normalized -= baseline_value
+        return normalized
+
+    def _build_waveform_snapshot(self) -> dict[str, object] | None:
+        eligible_records = self._eligible_sta_records()
+        if not eligible_records:
+            return None
+        sr = float(self.sample_rate or 0.0)
+        if sr <= 0.0:
+            return None
+        channel_ids: set[int] = set()
+        expected_len: int | None = None
+        for record in eligible_records:
+            if not record.channel_windows:
+                logger.warning("Waveform correlation record is missing channel windows")
+                return None
+            channel_ids.update(int(channel_id) for channel_id in record.channel_windows)
+            for window in record.channel_windows.values():
+                arr = np.asarray(window, dtype=np.float32)
+                if arr.ndim != 1 or arr.size < 3 or (arr.size % 2) == 0:
+                    logger.warning("Waveform correlation received invalid centered window shape: %s", getattr(arr, "shape", None))
+                    return None
+                if expected_len is None:
+                    expected_len = int(arr.size)
+                elif int(arr.size) != expected_len:
+                    logger.warning(
+                        "Waveform correlation window length changed mid-stream (expected=%s, got=%s)",
+                        expected_len,
+                        int(arr.size),
+                    )
+                    return None
+        if expected_len is None:
+            return None
+        ordered_channel_ids = self._sta_channel_order(channel_ids)
+        if not ordered_channel_ids:
+            return None
+        recent_records = eligible_records[-CORRELATION_GHOST_TRACE_COUNT:]
+        trigger_index = expected_len // 2
+        time_axis_ms = ((np.arange(expected_len, dtype=np.float32) - float(trigger_index)) / sr) * 1000.0
+        channel_summaries: list[tuple[int, str, QtGui.QColor, np.ndarray]] = []
+        recent_channel_windows: list[tuple[int, str, QtGui.QColor, list[np.ndarray]]] = []
+        for channel_id in ordered_channel_ids:
+            windows: list[np.ndarray] = []
+            for record in eligible_records:
+                window = record.channel_windows.get(channel_id)
+                if window is None:
+                    logger.warning("Waveform correlation record %s is missing channel %s", record.event_id, channel_id)
+                    return None
+                windows.append(np.asarray(window, dtype=np.float32))
+            stack = np.stack(windows, axis=0)
+            mean = np.mean(stack, axis=0, dtype=np.float32)
+            recent_windows = [
+                np.asarray(record.channel_windows[channel_id], dtype=np.float32)
+                for record in recent_records
+                if channel_id in record.channel_windows
+            ]
+            channel_color = self._sta_channel_color(channel_id)
+            channel_summaries.append(
+                (
+                    channel_id,
+                    self._sta_channel_label(channel_id),
+                    channel_color,
+                    mean,
+                )
+            )
+            recent_channel_windows.append(
+                (
+                    channel_id,
+                    self._sta_channel_label(channel_id),
+                    channel_color,
+                    recent_windows,
+                )
+            )
+        return {
+            "time_axis_ms": time_axis_ms,
+            "channel_summaries": channel_summaries,
+            "recent_channel_windows": recent_channel_windows,
+            "record_count": len(eligible_records),
+        }
+
+    def _sta_source_label(self) -> str:
+        if self._sta_source_cluster_id is None:
+            return "All events"
+        cluster = next((c for c in self._clusters if c.id == self._sta_source_cluster_id), None)
+        if cluster is None:
+            return "Selected class"
+        return cluster.name
+
+    @staticmethod
+    def _sta_html_color(color: QtGui.QColor) -> str:
+        return QtGui.QColor(color).name()
+
+    def _set_sta_plot_title(
+        self,
+        *,
+        mode_label: str,
+        event_count: int,
+        channel_summaries: Sequence[tuple[int, str, QtGui.QColor, np.ndarray]] = (),
+    ) -> None:
+        plot_item = self.sta_plot.getPlotItem()
+        source_label = self._sta_source_label()
+        parts = [
+            f"<span style='font-weight:600'>{mode_label}</span>",
+            f"<span>source: {source_label}</span>",
+            f"<span>n={int(event_count)}</span>",
+        ]
+        if channel_summaries:
+            channel_text = " ".join(
+                f"<span style='color:{self._sta_html_color(color)}'>{label}</span>"
+                for _channel_id, label, color, _waveform in channel_summaries
+            )
+            parts.append(channel_text)
+        plot_item.setTitle(" | ".join(parts))
+
+    def _build_autocorrelogram_snapshot(self) -> dict[str, object] | None:
+        sr = float(self.sample_rate or 0.0)
+        if sr <= 0.0:
+            return None
+        eligible_records = self._eligible_sta_records()
+        window_samples = max(1, int(round(self._sta_window_ms * sr / 1000.0)) + 1)
+        half_samples = window_samples // 2
+        sample_offsets = np.arange(-half_samples, half_samples + 1, dtype=np.int32)
+        counts = np.zeros(sample_offsets.size, dtype=np.int32)
+        if len(eligible_records) >= 2 and half_samples > 0:
+            times = np.asarray([record.crossing_time_sec for record in eligible_records], dtype=np.float64)
+            for index in range(times.size - 1):
+                deltas = np.rint((times[index + 1 :] - times[index]) * sr).astype(np.int64)
+                valid = deltas[(deltas > 0) & (deltas <= half_samples)]
+                if valid.size == 0:
+                    continue
+                np.add.at(counts, half_samples + valid, 1)
+                np.add.at(counts, half_samples - valid, 1)
+        time_axis_ms = (sample_offsets.astype(np.float32) / sr) * 1000.0
+        return {
+            "time_axis_ms": time_axis_ms,
+            "counts": counts,
+            "record_count": len(eligible_records),
+        }
+
     def _on_sta_toggled(self, checked: bool) -> None:
-        """Handle STA enable checkbox toggle."""
+        """Handle correlation enable checkbox toggle."""
         self._sta_enabled = bool(checked)
         if self._sta_enabled:
             self._show_sta_plot()
             self._on_sta_clear_clicked()
         else:
+            self._on_sta_clear_clicked()
             self._hide_sta_plot()
-            self._sta_windows.clear()
-            self._sta_time_axis = None
-            self._sta_aligned_windows = None
-            self._sta_pending_events.clear()
-            self._sta_dirty = False
-            self._sta_median_curve.hide()
-            self._sta_median_curve.clear()
-            self._clear_sta_traces()
         self._update_sta_view_button()
 
+    def _on_sta_mode_changed(self, index: int) -> None:
+        """Handle correlation mode selection."""
+        del index
+        data = self.sta_mode_combo.currentData()
+        self._sta_mode = str(data) if isinstance(data, str) else "waveform"
+        self._on_sta_clear_clicked()
+
     def _on_sta_source_changed(self, index: int) -> None:
-        """Handle STA event source combo change."""
+        """Handle correlation event-source combo change."""
         if index < 0:
             self._sta_source_cluster_id = None
         else:
             data = self.sta_source_combo.itemData(index)
             self._sta_source_cluster_id = data if isinstance(data, int) else None
-        self._on_sta_clear_clicked()
-
-    def _on_sta_channel_changed(self, index: int) -> None:
-        """Handle STA signal channel combo change."""
-        if index < 0:
-            self._sta_target_channel_id = None
+        self._sta_dirty = True
+        if self._sta_enabled:
+            self._refresh_sta_plot()
+            self._sta_dirty = False
         else:
-            data = self.sta_channel_combo.itemData(index)
-            if isinstance(data, int):
-                self._sta_target_channel_id = data
-            else:
-                self._sta_target_channel_id = index if self.sta_channel_combo.count() else None
-        self._on_sta_clear_clicked()
+            self._update_sta_view_button()
 
     def _on_sta_window_changed(self, index: int) -> None:
-        """Handle STA window duration combo change."""
+        """Handle correlation lag-window combo change."""
         if index < 0:
             return
         value = self.sta_window_combo.itemData(index)
@@ -1750,217 +2003,259 @@ class AnalysisTab(QtWidgets.QWidget):
         self._on_sta_clear_clicked()
 
     def _on_sta_clear_clicked(self) -> None:
-        """Reset all STA state and clear traces."""
-        self._sta_windows.clear()
+        """Reset all correlation state and clear the plot."""
+        self._sta_records.clear()
         self._sta_time_axis = None
-        self._sta_aligned_windows = None
+        self._sta_hist_counts = None
         self._sta_pending_events.clear()
         self._sta_dirty = False
-        self._clear_sta_traces()
-        self._sta_median_curve.hide()
-        self._sta_median_curve.clear()
+        self._clear_sta_plot_items()
         self._update_sta_view_button()
 
-    def _sta_handle_task(self, task: StaTask) -> None:
-        """Process pending STA events and collect trigger windows."""
-        controller = self._controller
-        if controller is None:
+    def _sta_handle_task(self, task: CorrelationTask) -> None:
+        """Process pending correlation events and collect windows or event lags."""
+        controller = self._controller if task.mode == "waveform" else None
+        if task.mode == "waveform" and controller is None:
             return
-        target_channel_id = task.target_channel_id
-        channel_info = task.channel_index
         pending_items = list(self._sta_pending_events.values())
         self._sta_pending_events.clear()
-        queue: list[tuple[AnalysisEvent, int]] = [(event, 0) for event in task.events]
+        queue: list[AnalysisEvent] = list(task.events)
         queue.extend(pending_items)
         updated = False
-        for event, attempts in queue:
-            status = self._sta_process_event(
-                controller,
-                target_channel_id,
-                channel_info,
-                event,
-                task.window_ms,
-            )
+        for event in queue:
+            status = self._sta_process_event(controller, task, event)
             if status == "added":
                 updated = True
             elif status == "pending":
                 event_id = event.id
                 if not isinstance(event_id, int):
                     continue
-                if attempts >= self._sta_retry_limit:
-                    continue
-                self._sta_pending_events[event_id] = (event, attempts + 1)
+                self._sta_pending_events[event_id] = event
         if updated:
             self._sta_dirty = True
 
     def _sta_process_event(
         self,
-        controller: "PipelineController",
-        target_channel_id: int,
-        channel_info: Optional[int],
+        controller: "PipelineController" | None,
+        task: CorrelationTask,
         event: AnalysisEvent,
-        window_ms: float,
     ) -> str:
-        """Collect trigger window for a single event and add to STA."""
+        """Collect correlation data for a single event."""
         event_channel = getattr(event, "channelId", getattr(event, "channel_id", None))
-        if event_channel is not None and channel_info is not None:
+        if event_channel is not None and task.source_channel_id is not None:
             try:
-                if int(event_channel) != int(channel_info):
+                if int(event_channel) != int(task.source_channel_id):
                     return "skip"
             except (TypeError, ValueError):
                 return "skip"
         event_id = getattr(event, "id", None)
-        if self._sta_source_cluster_id is not None:
-            if not isinstance(event_id, int):
-                return "skip"
-            cluster = self._get_cluster_for_event(event_id)
-            if cluster is None:
-                return "pending"
-            if cluster.id != self._sta_source_cluster_id:
-                return "skip"
-        window, miss_pre, miss_post = controller.collect_trigger_window(
-            event,
-            target_channel_id=target_channel_id,
-            window_ms=window_ms,
-        )
-        if miss_pre > 0:
+        if not isinstance(event_id, int):
             return "skip"
-        if miss_post > 0:
-            return "pending"
-        if window.size == 0:
-            return "pending"
-        pre_n = max(1, int(0.2 * window.size))
-        baseline = float(np.median(window[:pre_n]))
-        normalized = window.astype(np.float32, copy=False) - baseline
-        # Align all traces so the actual trigger-crossing sample crosses zero.
-        sr = float(getattr(event, "sampleRateHz", 0.0) or 0.0)
-        crossing_offset = normalized.size // 2
-        if sr > 0:
-            crossing_offset = int(round(float(getattr(event, "preMs", 0.0)) * sr / 1000.0))
-        if normalized.size:
-            crossing_offset = int(np.clip(crossing_offset, 0, normalized.size - 1))
-            normalized = normalized - float(normalized[crossing_offset])
-        self._sta_windows.append(normalized)
-        self._sta_dirty = True
+        crossing_time_sec = float(getattr(event, "crossingTimeSec", float("nan")))
+        if not np.isfinite(crossing_time_sec):
+            return "skip"
+        if task.mode == "autocorrelogram":
+            self._store_sta_record(
+                CorrelationRecord(
+                    event_id=event_id,
+                    crossing_time_sec=crossing_time_sec,
+                    channel_windows={},
+                )
+            )
+            return "added"
+        if controller is None or not task.channel_ids:
+            return "skip"
+        channel_windows: dict[int, np.ndarray] = {}
+        expected_len: int | None = None
+        for channel_id in task.channel_ids:
+            window, miss_pre, miss_post = controller.collect_trigger_window(
+                event,
+                target_channel_id=int(channel_id),
+                window_ms=float(task.window_ms),
+            )
+            if miss_pre > 0:
+                return "skip"
+            if miss_post > 0 or window.size == 0:
+                return "pending"
+            arr = np.asarray(window, dtype=np.float32)
+            if arr.ndim != 1 or arr.size < 3 or (arr.size % 2) == 0:
+                logger.warning("Waveform correlation received invalid centered window shape: %s", getattr(arr, "shape", None))
+                return "skip"
+            if expected_len is None:
+                expected_len = int(arr.size)
+            elif int(arr.size) != expected_len:
+                logger.warning(
+                    "Waveform correlation window length changed mid-stream (expected=%s, got=%s)",
+                    expected_len,
+                    int(arr.size),
+                )
+                return "skip"
+            channel_windows[int(channel_id)] = self._normalize_sta_window(arr)
+        if not channel_windows:
+            return "skip"
+        self._store_sta_record(
+            CorrelationRecord(
+                event_id=event_id,
+                crossing_time_sec=crossing_time_sec,
+                channel_windows=channel_windows,
+            )
+        )
         return "added"
 
     def _refresh_sta_plot(self) -> None:
-        """Redraw the spike-triggered average plot."""
+        """Redraw the correlation plot."""
         plot_item = self.sta_plot.getPlotItem()
-        self._sta_aligned_windows = None
+        self._clear_sta_plot_items()
         self._sta_time_axis = None
-        if not self._sta_windows:
-            self._sta_median_curve.hide()
-            self._sta_median_curve.clear()
-            self._clear_sta_traces()
-            self._update_sta_view_button()
-            return
-        min_len = min((w.size for w in self._sta_windows if isinstance(w, np.ndarray)), default=0)
-        if min_len <= 1:
-            self._sta_median_curve.hide()
-            self._sta_median_curve.clear()
-            self._clear_sta_traces()
-            self._update_sta_view_button()
-            return
-        windows = np.stack([np.asarray(w[:min_len], dtype=np.float32) for w in self._sta_windows], axis=0)
-        assert windows.ndim == 2, "STA windows must be 2D (events x samples)"
-        num_events, num_samples = windows.shape
-        if windows.size == 0:
-            self._sta_median_curve.hide()
-            self._sta_median_curve.clear()
-            self._clear_sta_traces()
-            self._update_sta_view_button()
-            return
-        duration_ms = float(self._sta_window_ms)
-        t = np.linspace(-duration_ms / 2.0, duration_ms / 2.0, num_samples, dtype=np.float32)
-        assert t.shape[0] == num_samples, "Time axis must align with samples"
-        self._sta_time_axis = t
-        self._sta_aligned_windows = windows
-        amp_min = float(np.min(windows))
-        amp_max = float(np.max(windows))
-        if not np.isfinite(amp_min) or not np.isfinite(amp_max):
-            amp_min, amp_max = -1.0, 1.0
-        if amp_max - amp_min < 1e-6:
-            bound = max(1e-3, abs(amp_max))
-            amp_min = -bound
-            amp_max = bound
-        max_traces = min(num_events, self._sta_max_traces)
-        visible_windows = windows[-max_traces:] if max_traces else []
-        self._ensure_sta_trace_capacity(max_traces)
-        for idx, item in enumerate(self._sta_trace_items):
-            if idx < max_traces:
-                waveform = visible_windows[idx]
-                item.setPen(STA_TRACE_PEN)
-                item.setData(t, waveform, skipFiniteCheck=True, connect='all')
-                item.show()
-            else:
-                item.hide()
-                item.setData([], [], skipFiniteCheck=True)
-        median = np.median(windows, axis=0)
-        # STA curves always use (time -> x, amplitude -> y)
-        self._sta_median_curve.setData(t, median, skipFiniteCheck=True, connect='all')
-        self._sta_median_curve.setPen(pg.mkPen(200, 0, 0, 255, width=3))
-        self._sta_median_curve.show()
         plot_item.setLabel("bottom", "Lag", units="ms")
-        plot_item.setLabel("left", "Amplitude", units="mV")
         plot_item.showGrid(x=True, y=True, alpha=0.3)
-        plot_item.setXRange(t[0], t[-1], padding=0.0)
-        plot_item.setYRange(amp_min, amp_max, padding=0.05)
+        self._sta_legend.setVisible(False)
+        if not self._sta_enabled:
+            self._update_sta_view_button()
+            return
+        if self._sta_mode == "autocorrelogram":
+            snapshot = self._build_autocorrelogram_snapshot()
+            if snapshot is None:
+                self._update_sta_view_button()
+                return
+            time_axis_ms = np.asarray(snapshot["time_axis_ms"], dtype=np.float32)
+            counts = np.asarray(snapshot["counts"], dtype=np.float32)
+            self._sta_time_axis = time_axis_ms
+            self._sta_hist_counts = counts
+            bar_color = QtGui.QColor(CORRELATION_CHANNEL_COLORS[0])
+            bar_color.setAlpha(170)
+            bar_width = (1000.0 / float(self.sample_rate)) * 0.9 if self.sample_rate > 0 else 1.0
+            self._sta_hist_item = pg.BarGraphItem(
+                x=time_axis_ms,
+                height=counts,
+                width=max(bar_width, 1e-6),
+                brush=pg.mkBrush(bar_color),
+                pen=pg.mkPen(QtGui.QColor(CORRELATION_CHANNEL_COLORS[0]), width=1),
+            )
+            self.sta_plot.addItem(self._sta_hist_item)
+            plot_item.setLabel("left", "Count")
+            if time_axis_ms.size:
+                plot_item.setXRange(float(time_axis_ms[0]), float(time_axis_ms[-1]), padding=0.0)
+            y_max = float(np.max(counts)) if counts.size else 0.0
+            plot_item.setYRange(0.0, max(1.0, y_max), padding=0.05)
+            self._set_sta_plot_title(mode_label="Autocorrelogram", event_count=int(snapshot["record_count"]))
+            self._update_sta_view_button()
+            return
+        snapshot = self._build_waveform_snapshot()
+        if snapshot is None:
+            self._update_sta_view_button()
+            return
+        time_axis_ms = np.asarray(snapshot["time_axis_ms"], dtype=np.float32)
+        channel_summaries = snapshot["channel_summaries"]
+        recent_channel_windows = snapshot["recent_channel_windows"]
+        self._sta_time_axis = time_axis_ms
+        self._sta_hist_counts = None
+        amplitudes: list[np.ndarray] = []
+        for _channel_id, _label, color, recent_windows in recent_channel_windows:
+            ghost_color = QtGui.QColor(color)
+            ghost_color.setAlpha(55)
+            for recent_window in recent_windows:
+                ghost_curve = pg.PlotCurveItem(pen=pg.mkPen(ghost_color, width=1))
+                ghost_curve.setData(time_axis_ms, recent_window, skipFiniteCheck=True, connect="all")
+                self.sta_plot.addItem(ghost_curve)
+                self._sta_ghost_curve_items.append(ghost_curve)
+        for channel_id, label, color, mean_waveform in channel_summaries:
+            curve = pg.PlotCurveItem(pen=pg.mkPen(color, width=3))
+            curve.setData(time_axis_ms, mean_waveform, skipFiniteCheck=True, connect="all")
+            self.sta_plot.addItem(curve)
+            self._sta_curve_items[int(channel_id)] = curve
+            amplitudes.append(np.asarray(mean_waveform, dtype=np.float32))
+        plot_item.setLabel("left", "Baseline-subtracted amplitude", units="V")
+        if time_axis_ms.size:
+            plot_item.setXRange(float(time_axis_ms[0]), float(time_axis_ms[-1]), padding=0.0)
+        if amplitudes:
+            stack = np.stack(amplitudes, axis=0)
+            amp_min = float(np.min(stack))
+            amp_max = float(np.max(stack))
+            if not np.isfinite(amp_min) or not np.isfinite(amp_max):
+                amp_min, amp_max = -1.0, 1.0
+            if amp_max - amp_min < 1e-6:
+                bound = max(1e-3, abs(amp_max))
+                amp_min = -bound
+                amp_max = bound
+            plot_item.setYRange(amp_min, amp_max, padding=0.05)
+        self._set_sta_plot_title(
+            mode_label="Waveform average",
+            event_count=int(snapshot["record_count"]),
+            channel_summaries=channel_summaries,
+        )
         self._update_sta_view_button()
 
-    def _build_sta_waveform_payload(self) -> list[tuple[np.ndarray, np.ndarray]]:
-        """Prepare STA waveforms for export/viewing."""
-        if self._sta_aligned_windows is None or self._sta_time_axis is None:
-            return []
-        if self._sta_time_axis.size == 0 or self._sta_aligned_windows.size == 0:
-            return []
-        t_sec = np.asarray(self._sta_time_axis, dtype=np.float64) / 1000.0
-        waveforms: list[tuple[np.ndarray, np.ndarray]] = []
-        for row in self._sta_aligned_windows:
-            samples = np.asarray(row, dtype=np.float32)
-            length = min(samples.size, t_sec.size)
-            if length <= 0:
-                continue
-            waveforms.append((t_sec[:length].copy(), samples[:length].copy()))
-        return waveforms
-
     def _on_sta_view_waveforms_clicked(self) -> None:
-        """Open dialog to view STA waveforms."""
-        if self._sta_aligned_windows is None or self._sta_time_axis is None:
-             QtWidgets.QMessageBox.information(self, "Waveforms", "No cross-correlation data available.")
-             return
-             
-        channel_label = self.sta_channel_combo.currentText().strip() if self.sta_channel_combo.count() else ""
-        
-        # Prepare data in background thread
-        progress = QtWidgets.QProgressDialog("Loading cross-correlation data...", "Cancel", 0, 100, self)
-        progress.setWindowModality(QtCore.Qt.WindowModal)
-        progress.setAutoClose(True)
-        progress.setMinimumDuration(200)
-        
-        self._sta_loader = StaWaveformLoader(
-            self._sta_aligned_windows, 
-            self._sta_time_axis, 
-            channel_label, 
-            self
-        )
-        self._sta_loader.progress.connect(progress.setValue)
-        
-        def on_data_ready(title, color, waveforms, median):
-            if hasattr(self, "_sta_loader"):
-                self._sta_loader.wait()
-                del self._sta_loader
-                
-            if not waveforms:
-                QtWidgets.QMessageBox.information(self, "Waveforms", "No cross-correlation data available.")
+        """Open a detail view for the current correlation mode."""
+        if self._sta_mode == "autocorrelogram":
+            snapshot = self._build_autocorrelogram_snapshot()
+            if snapshot is None or self._sta_time_axis is None:
+                QtWidgets.QMessageBox.information(self, "Correlation", "No autocorrelogram data available.")
                 return
-                
-            dialog = ClusterWaveformDialog(self, title, waveforms, None, median_waveform=median)
+            time_axis_sec = np.asarray(snapshot["time_axis_ms"], dtype=np.float64) / 1000.0
+            counts = np.asarray(snapshot["counts"], dtype=np.float32)
+            dialog = ClusterWaveformDialog(
+                self,
+                f"Autocorrelogram – {self.channel_name}",
+                [],
+                None,
+                show_median=False,
+                background_color=QtGui.QColor("white"),
+                y_label="Count",
+                y_units="",
+                summary_waveforms=[
+                    ("Autocorrelogram", time_axis_sec.copy(), counts.copy(), QtGui.QColor(CORRELATION_CHANNEL_COLORS[0]))
+                ],
+                count_override=int(snapshot["record_count"]),
+            )
             dialog.exec()
-            
-        self._sta_loader.data_ready.connect(on_data_ready)
-        progress.canceled.connect(self._sta_loader.cancel)
-        self._sta_loader.start()
+            return
+        snapshot = self._build_waveform_snapshot()
+        if snapshot is None or self._sta_time_axis is None:
+            QtWidgets.QMessageBox.information(self, "Correlation", "No waveform correlation data available.")
+            return
+        time_axis_sec = np.asarray(snapshot["time_axis_ms"], dtype=np.float64) / 1000.0
+        eligible_records = self._eligible_sta_records()
+        waveforms: list[tuple[np.ndarray, np.ndarray, QtGui.QColor]] = []
+        summary_waveforms: list[tuple[str, np.ndarray, np.ndarray, QtGui.QColor]] = []
+        recent_records = eligible_records[-CORRELATION_GHOST_TRACE_COUNT:]
+        for channel_id, label, color, mean_waveform in snapshot["channel_summaries"]:
+            summary_waveforms.append(
+                (
+                    label,
+                    time_axis_sec.copy(),
+                    np.asarray(mean_waveform, dtype=np.float32).copy(),
+                    QtGui.QColor(color),
+                )
+            )
+            for record in recent_records:
+                samples = record.channel_windows.get(channel_id)
+                if samples is None:
+                    continue
+                waveforms.append(
+                    (
+                        time_axis_sec.copy(),
+                        np.asarray(samples, dtype=np.float32).copy(),
+                        QtGui.QColor(color),
+                    )
+                )
+        if not summary_waveforms:
+            QtWidgets.QMessageBox.information(self, "Correlation", "No waveform correlation data available.")
+            return
+        dialog = ClusterWaveformDialog(
+            self,
+            f"Correlation inspector – {self.channel_name}",
+            waveforms,
+            None,
+            show_median=False,
+            background_color=QtGui.QColor("white"),
+            y_label="Baseline-subtracted amplitude",
+            y_units="V",
+            summary_waveforms=summary_waveforms,
+            count_override=int(snapshot["record_count"]),
+        )
+        dialog.exec()
 
     def _on_add_class_clicked(self) -> None:
         """Create a new cluster ROI when Add Class clicked."""
@@ -2375,6 +2670,14 @@ class AnalysisTab(QtWidgets.QWidget):
         event_id = overlay.get("event_id")
         if isinstance(event_id, int):
             record["event_id"] = event_id
+        crossing_time_sec = overlay.get("crossing_time_sec")
+        if crossing_time_sec is not None:
+            try:
+                crossing_time_val = float(crossing_time_sec)
+            except (TypeError, ValueError):
+                crossing_time_val = float("nan")
+            if np.isfinite(crossing_time_val):
+                record["crossing_time_sec"] = crossing_time_val
         if not has_metric:
             return
         evicted_event_id: int | None = None
@@ -2395,6 +2698,7 @@ class AnalysisTab(QtWidgets.QWidget):
         if evicted_event_id is not None and evicted_event_id != event_id:
             self._event_details.pop(evicted_event_id, None)
             self._event_cluster_labels.pop(evicted_event_id, None)
+            self._sta_records.pop(evicted_event_id, None)
             self._sta_pending_events.pop(evicted_event_id, None)
 
     def _build_overlay_payload(self, event: AnalysisEvent) -> Optional[OverlayPayload]:
@@ -2463,6 +2767,7 @@ class AnalysisTab(QtWidgets.QWidget):
             metrics = metric_values
         return OverlayPayload(
             event_id=int(event.id),
+            crossing_time_sec=float(event.crossingTimeSec),
             times=times,
             samples=samples,
             last_time=last_time,
@@ -2505,6 +2810,7 @@ class AnalysisTab(QtWidgets.QWidget):
                 "metrics": payload.metrics,
                 "metric_time": payload.metric_time,
                 "event_id": payload.event_id,
+                "crossing_time_sec": payload.crossing_time_sec,
             }
         )
         # Classify the event before applying color so new overlays render with
@@ -2603,6 +2909,10 @@ class AnalysisTab(QtWidgets.QWidget):
         if self._unclassified_item is not None:
             self._unclassified_item.setText(f"Unclassified ({max(0, unclassified_count)} events)")
         self._refresh_overlay_colors()
+        if self._sta_enabled and self._sta_records:
+            self._sta_dirty = True
+            self._refresh_sta_plot()
+            self._sta_dirty = False
 
 
 class ClusterWaveformDialog(QtWidgets.QDialog):
@@ -2618,11 +2928,14 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
         background_color: QtGui.QColor | str | None = None,
         y_label: str = "Amplitude",
         y_units: str = "V",
+        summary_waveforms: Sequence[tuple[str, np.ndarray, np.ndarray, QtGui.QColor | None]] | None = None,
+        count_override: int | None = None,
     ) -> None:
         super().__init__(parent)
         self._class_name = class_name
         self._cluster_color = color
         self._waveforms = self._sanitize_waveforms(waveforms)
+        self._summary_waveforms = self._sanitize_summary_waveforms(summary_waveforms or ())
         self._aligned_samples: list[np.ndarray] = []
         self._aligned_colors: list[QtGui.QColor | None] = []
         self._plot_time_axis: np.ndarray | None = None
@@ -2632,6 +2945,7 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
         self._background_color = background_color or QtGui.QColor("white")
         self._y_label = y_label
         self._y_units = y_units
+        self._count_override = count_override
         self._measure_mode: str = "none"  # none | point | line
         self._measure_points: list[dict[str, object]] = []
         self._dragging_point_idx: int | None = None
@@ -2667,8 +2981,27 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
             sanitized.append((t_trim, s_arr[:length], qcolor))
         return sanitized
 
+    def _sanitize_summary_waveforms(
+        self,
+        summary_waveforms: Sequence[tuple[str, np.ndarray, np.ndarray, QtGui.QColor | None]],
+    ) -> list[tuple[str, np.ndarray, np.ndarray, QtGui.QColor | None]]:
+        sanitized: list[tuple[str, np.ndarray, np.ndarray, QtGui.QColor | None]] = []
+        for label, times, samples, color in summary_waveforms:
+            t_arr = np.asarray(times, dtype=np.float64)
+            s_arr = np.asarray(samples, dtype=np.float32)
+            length = int(min(t_arr.size, s_arr.size))
+            if length <= 0:
+                continue
+            qcolor = QtGui.QColor(color) if color is not None else None
+            sanitized.append((str(label), t_arr[:length], s_arr[:length], qcolor))
+        return sanitized
+
     def _prepare_waveform_data(self) -> None:
         if not self._waveforms:
+            if self._summary_waveforms:
+                reference = self._summary_waveforms[0][1]
+                self._plot_time_axis = np.array(reference, dtype=np.float64, copy=True)
+                self._export_time_axis = self._build_export_time_axis(self._plot_time_axis)
             return
         lengths: list[int] = []
         for times, samples, _color in self._waveforms:
@@ -2787,39 +3120,48 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
         self.plot_widget.scene().installEventFilter(self)
 
     def _plot_waveforms(self) -> None:
-        if not self._aligned_samples or self._plot_time_axis is None:
-            return
         line_color = QtGui.QColor(STA_TRACE_PEN.color())
-        t_vals = self._plot_time_axis
-        n_waveforms = len(self._aligned_samples)
-        multi_color = any(color is not None for color in self._aligned_colors)
+        if self._aligned_samples and self._plot_time_axis is not None:
+            t_vals = self._plot_time_axis
+            n_waveforms = len(self._aligned_samples)
+            multi_color = any(color is not None for color in self._aligned_colors)
 
-        if n_waveforms > 0 and not multi_color:
-            samples_mat = np.stack(self._aligned_samples)
-            nan_col = np.full((n_waveforms, 1), np.nan, dtype=np.float32)
-            samples_param = np.hstack([samples_mat, nan_col]).flatten()
-            t_mat = np.tile(t_vals, (n_waveforms, 1))
-            nan_col_t = np.full((n_waveforms, 1), np.nan, dtype=np.float64)
-            t_param = np.hstack([t_mat, nan_col_t]).flatten()
-            line_pen = pg.mkPen(line_color, width=1)
-            self.plot_widget.plot(t_param, samples_param, pen=line_pen, connect="finite", clear=False)
-        elif n_waveforms > 0:
-            for samples, color in zip(self._aligned_samples, self._aligned_colors):
-                pen_color = QtGui.QColor(color) if color is not None else line_color
-                self.plot_widget.plot(t_vals, samples, pen=pg.mkPen(pen_color, width=1.5), clear=False)
+            if n_waveforms > 0 and not multi_color:
+                samples_mat = np.stack(self._aligned_samples)
+                nan_col = np.full((n_waveforms, 1), np.nan, dtype=np.float32)
+                samples_param = np.hstack([samples_mat, nan_col]).flatten()
+                t_mat = np.tile(t_vals, (n_waveforms, 1))
+                nan_col_t = np.full((n_waveforms, 1), np.nan, dtype=np.float64)
+                t_param = np.hstack([t_mat, nan_col_t]).flatten()
+                line_pen = pg.mkPen(line_color, width=1)
+                self.plot_widget.plot(t_param, samples_param, pen=line_pen, connect="finite", clear=False)
+            elif n_waveforms > 0:
+                for samples, color in zip(self._aligned_samples, self._aligned_colors):
+                    pen_color = QtGui.QColor(color) if color is not None else line_color
+                    self.plot_widget.plot(t_vals, samples, pen=pg.mkPen(pen_color, width=1.5), clear=False)
 
-        if self._show_median and self._median_waveform is not None:
+        if self._show_median and self._median_waveform is not None and self._plot_time_axis is not None:
             median_pen = pg.mkPen(WAVEFORM_MEDIAN_COLOR, width=3)
             self.plot_widget.plot(self._plot_time_axis, self._median_waveform, pen=median_pen)
+
+        if self._summary_waveforms:
+            legend = self.plot_widget.addLegend(offset=(8, 8))
+            for label, times, samples, color in self._summary_waveforms:
+                pen_color = QtGui.QColor(color) if color is not None else QtGui.QColor(20, 20, 20)
+                curve = self.plot_widget.plot(times, samples, pen=pg.mkPen(pen_color, width=3), clear=False)
+                legend.addItem(curve, label)
         self.plot_widget.setAntialiasing(False)
         self._set_measure_mode("none")
 
     def _update_title(self) -> None:
-        count = len(self._aligned_samples) if self._aligned_samples else len(self._waveforms)
+        if self._count_override is not None:
+            count = int(self._count_override)
+        else:
+            count = len(self._aligned_samples) if self._aligned_samples else len(self._waveforms)
         self.setWindowTitle(f"Waveforms \u2013 {self._class_name} ({count} events)")
 
     def _on_save_image(self) -> None:
-        if self._plot_time_axis is None or not self._aligned_samples:
+        if self._plot_time_axis is None or (not self._aligned_samples and not self._summary_waveforms):
             QtWidgets.QMessageBox.information(self, "Save image", "No waveform data available to save.")
             return
         suggested = f"{self._safe_base_name()}_waveforms.png"
@@ -2840,7 +3182,7 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.critical(self, "Save image", f"Failed to save the image:\n{exc}")
 
     def _on_save_traces(self) -> None:
-        if not self._aligned_samples or self._export_time_axis is None:
+        if (not self._aligned_samples and not self._summary_waveforms) or self._export_time_axis is None:
             QtWidgets.QMessageBox.information(self, "Save traces", "No waveform data available to export.")
             return
         suggested = f"{self._safe_base_name()}_waveforms.csv"
@@ -2853,6 +3195,8 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
             with open(path, "w", newline="") as fp:
                 writer = csv.writer(fp)
                 writer.writerow(self._export_time_axis)
+                for _label, _times, samples, _color in self._summary_waveforms:
+                    writer.writerow(samples)
                 if self._show_median and self._median_waveform is not None:
                     writer.writerow(self._median_waveform)
                 for samples in self._aligned_samples:
@@ -2903,7 +3247,16 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
         if self._line_handle_hit(scene_pos):
             return False
         # Begin a new measurement line
-        line = _MeasureLine(self.plot_widget.getPlotItem(), data_pos, data_pos, mode=self._measure_mode)
+        line = _MeasureLine(
+            self.plot_widget.getPlotItem(),
+            data_pos,
+            data_pos,
+            mode=self._measure_mode,
+            x_label="t",
+            x_units="s",
+            y_label=self._y_label,
+            y_units=self._y_units,
+        )
         self._measure_lines.append(line)
         self._active_line = line
         self._line_anchor = QtCore.QPointF(data_pos)
@@ -2966,11 +3319,12 @@ class ClusterWaveformDialog(QtWidgets.QDialog):
         entry = self._measure_points[idx]
         item = entry.get("item")
         label = entry.get("label")
+        y_units = f" {self._y_units}" if self._y_units else ""
         if isinstance(item, pg.ScatterPlotItem):
             item.setData([pos.x()], [pos.y()])
-            item.setToolTip(f"({pos.x():.4g} s, {pos.y():.4g} V)")
+            item.setToolTip(f"({pos.x():.4g} s, {pos.y():.4g}{y_units})")
         if isinstance(label, pg.TextItem):
-            label.setText(f"({pos.x():.4g} s, {pos.y():.4g} V)")
+            label.setText(f"({pos.x():.4g} s, {pos.y():.4g}{y_units})")
             label.setPos(pos.x(), pos.y())
 
     def _hit_test_point(self, scene_pos: QtCore.QPointF, pixel_radius: float = 8.0) -> int | None:

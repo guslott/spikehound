@@ -38,14 +38,16 @@ class PipelineController:
         *,
         filter_settings: Optional[FilterSettings] = None,
         visualization_queue_size: int = 8,
-        audio_queue_size: int = 16,  # was 2 — 16 slots gives ~260 ms headroom at 44.1 kHz / 735-sample chunks
         logging_queue_size: int = 512,
         dispatcher_poll_timeout: float = 0.05,
         app_settings_store: Optional[AppSettingsStore] = None,
     ) -> None:
         self._filter_settings = filter_settings or FilterSettings()
+        # NOTE: this queue carries ChunkPointers only in *triggered* (non-stream)
+        # modes. In the default stream mode the scope is fed by the dispatcher's
+        # 60 Hz tick callbacks and this queue stays empty by design — see the
+        # "Visualization delivery contract" in core/dispatcher.py.
         self.visualization_queue: "queue.Queue" = queue.Queue(maxsize=visualization_queue_size)
-        self.audio_queue: "queue.Queue" = queue.Queue(maxsize=audio_queue_size)
         self.logging_queue: "queue.Queue" = queue.Queue(maxsize=logging_queue_size)
         self.event_queue: "queue.Queue" = queue.Queue(maxsize=1024)
         self._analysis_settings = AnalysisSettingsStore()
@@ -163,6 +165,11 @@ class PipelineController:
         return None if self._actual_config is None else float(self._actual_config.sample_rate)
 
     @property
+    def chunk_size(self) -> Optional[int]:
+        """Frames per emitted chunk for the active device (None if unconfigured)."""
+        return None if self._actual_config is None else int(self._actual_config.chunk_size)
+
+    @property
     def is_recording(self) -> bool:
         """Return True if currently recording to a WAV file."""
         return self._wav_logger is not None
@@ -237,7 +244,6 @@ class PipelineController:
             self._dispatcher = Dispatcher(
                 raw_queue=source.data_queue,
                 visualization_queue=self.visualization_queue,
-                audio_queue=self.audio_queue,
                 logging_queue=self.logging_queue,
                 event_queue=self.event_queue,
                 filter_settings=self._filter_settings,
@@ -380,7 +386,6 @@ class PipelineController:
             self._dispatcher = Dispatcher(
                 raw_queue=driver.data_queue,
                 visualization_queue=self.visualization_queue,
-                audio_queue=self.audio_queue,
                 logging_queue=self.logging_queue,
                 event_queue=self.event_queue,
                 filter_settings=self._filter_settings,
@@ -579,7 +584,6 @@ class PipelineController:
         if self._dispatcher is not None:
             depths["viz_buffer"] = self._dispatcher.buffer_status()
 
-        depths["audio"] = _queue_status(self.audio_queue)
         depths["logging"] = _queue_status(self.logging_queue)
         return depths
 
@@ -589,12 +593,11 @@ class PipelineController:
         target_channel_id: int,
         window_ms: float,
     ) -> tuple[np.ndarray, int, int]:
-        """Return samples aligned to the original detected event window.
+        """Return a centered lag window around an event crossing.
 
-        The preferred behavior is to preserve the exact first-sample offset and
-        sample count used when the event was detected. ``window_ms`` is kept for
-        API compatibility and is used only as a fallback when the event does not
-        carry enough geometry information.
+        The STA pathway uses the selected window as the single source of truth.
+        The returned samples are centered on the event crossing and span the
+        requested lag duration with an explicit trigger sample at the midpoint.
         """
         dispatcher = self._dispatcher
         if dispatcher is None:
@@ -609,18 +612,14 @@ class PipelineController:
         except (TypeError, ValueError):
             return np.empty(0, dtype=np.float32), 0, 0
 
-        samples = np.asarray(getattr(event, "samples", np.empty(0, dtype=np.float32)), dtype=np.float32)
-        window_samples = int(samples.size)
-        if window_samples <= 0:
-            window_samples = max(1, int(round(window_ms * sr / 1000.0)))
+        window_samples = max(1, int(round(window_ms * sr / 1000.0)) + 1)
+        pre_samples = window_samples // 2
 
         crossing_index = int(getattr(event, "crossingIndex", -1))
         if crossing_index < 0:
             return np.empty(0, dtype=np.float32), 0, window_samples
 
-        pre_samples = int(round(float(getattr(event, "preMs", 0.0)) * sr / 1000.0))
-        pre_samples = int(np.clip(pre_samples, 0, max(window_samples - 1, 0)))
-        start_index = max(0, crossing_index - pre_samples)
+        start_index = crossing_index - pre_samples
         data, missing_prefix, missing_suffix = dispatcher.collect_window(
             start_index,
             window_samples,
@@ -672,7 +671,7 @@ class PipelineController:
 
     def _reset_output_queues(self) -> None:
         """Clear downstream queues so the next start() begins fresh."""
-        for q in (self.visualization_queue, self.audio_queue, self.logging_queue, self.event_queue):
+        for q in (self.visualization_queue, self.logging_queue, self.event_queue):
             self._flush_queue(q)
 
     def _destroy_dispatcher(self) -> None:

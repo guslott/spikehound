@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import queue
+import threading
+import time
+
 import numpy as np
 import pytest
 
@@ -138,3 +141,62 @@ class TestEmitArrayShapes:
 
         device.emit_array(data)
         assert bridge.calls == 1
+
+
+class TestEmitArrayLockContention:
+    """Finding 4.1: emit_array must not hold _state_lock across the blocking put."""
+
+    def test_blocking_put_does_not_freeze_state_lock(self):
+        """A saturated DAQ queue must not freeze stop()/state/configure().
+
+        emit_array enqueues via the lossless "daq" policy, whose put() blocks
+        when the dispatcher falls behind. If that put runs while holding
+        _state_lock, every control-plane operation (stop, state, configure,
+        set_active_channels) freezes with it — a user clicking Stop could not
+        stop the device. The fix releases _state_lock before the put, so the
+        lock stays available while the put blocks.
+
+        On the buggy code the background emit holds the lock for the full ~10s
+        put timeout, so the `device.state` read below blocks well past 1s and
+        this assertion fails. On the fixed code the read returns immediately.
+        """
+        device = SimulatedPhysiologySource(queue_maxsize=2)
+        try:
+            devices = device.list_available_devices()
+            device.open(devices[0].id)
+            device.configure(sample_rate=20000, channels=[0, 1], chunk_size=256)
+
+            data = np.random.randn(64, 2).astype(np.float32)
+
+            # Saturate the data queue so the next put blocks (lossless policy).
+            device.emit_array(data.copy())
+            device.emit_array(data.copy())
+            assert device.data_queue.full(), "queue should be saturated for the test"
+
+            # A further emit blocks inside _safe_put. Everything before the put
+            # is non-blocking, so a still-alive thread here is stuck in the put.
+            blocked = threading.Thread(
+                target=lambda: device.emit_array(data.copy()), daemon=True
+            )
+            blocked.start()
+            time.sleep(0.1)  # let it pass the ring write and reach the put
+            assert blocked.is_alive(), "background emit should be blocked in the put"
+
+            # Reading state needs _state_lock; it must not wait for the put.
+            start = time.perf_counter()
+            _ = device.state
+            elapsed = time.perf_counter() - start
+            assert elapsed < 1.0, (
+                f"_state_lock was held across the blocking put: "
+                f"state read took {elapsed:.2f}s"
+            )
+
+            # Unblock the background emit by freeing a queue slot.
+            try:
+                device.data_queue.get_nowait()
+            except queue.Empty:
+                pass
+            blocked.join(timeout=11.0)
+            assert not blocked.is_alive(), "background emit should complete after drain"
+        finally:
+            device.close()

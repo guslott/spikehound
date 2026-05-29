@@ -1,139 +1,139 @@
-"""AudioManager - Centralized audio routing and playback management.
+"""AudioManager - Centralized monitor-audio playback management.
 
-Extracted from MainWindow to enable headless audio monitoring support.
-Manages the AudioPlayer lifecycle and routes audio from dispatcher to player.
+Owns the AudioPlayer + MonitorAudioBridge lifecycle for channel monitoring
+("hear the neuron").  The bridge writes filtered mono samples straight into
+the player's ring from the source's capture/emitter thread, so there is no
+router thread and no audio fan-out queue — the bridge is the only path.
 """
 
 from __future__ import annotations
 
-import queue
 import threading
 import logging
 from typing import TYPE_CHECKING, Optional
 
-from shared.models import ChunkPointer, EndOfStream
 from audio.player import AudioPlayer, AudioConfig
 
 if TYPE_CHECKING:  # pragma: no cover
     from core.runtime import Runtime
-    from shared.ring_buffer import SharedRingBuffer
+    from core.conditioning import FilterSettings
 
 logger = logging.getLogger(__name__)
 
 
 class AudioManager:
-    """Manages audio routing and playback for channel monitoring."""
+    """Manages monitor-audio playback for channel listening."""
 
     def __init__(self, runtime: Runtime) -> None:
         """Initialize audio manager with runtime reference.
-        
+
         Args:
-            runtime: Runtime instance providing access to audio_queue and controller
+            runtime: Runtime instance providing access to the controller
         """
         self.runtime = runtime
-        
-        # Audio routing state
+
+        # Listen state
         self._listen_channel_id: Optional[int] = None
-        self._listen_channel_idx: Optional[int] = None  # Cached index for performance
         self._channel_ids_current: list[int] = []
-        
+
         # AudioPlayer state
         self._audio_player: Optional[AudioPlayer] = None
-        self._audio_player_queue: Optional[queue.Queue] = None
         self._audio_input_samplerate: float = 0.0
         self._audio_current_device: Optional[object] = None
-        self._audio_player_buffer: Optional[SharedRingBuffer] = None
         self._audio_gain: float = 0.7
 
-        # MonitorAudioBridge — when active, audio is written directly to the
-        # player ring from the emitter thread; the router loop drains the
-        # audio_queue but does not forward to the player.
+        # MonitorAudioBridge — writes filtered mono samples straight into the
+        # player ring from the source's capture/emitter thread.  This is the
+        # one and only monitor audio path.
         self._monitor_bridge: Optional[object] = None
-        
-        # Thread control
-        self._audio_router_thread: Optional[threading.Thread] = None
-        self._audio_router_stop = threading.Event()
+
         self._audio_lock = threading.Lock()
-        
+
         # Running state
         self._running = False
 
     def start(self) -> None:
-        """Start the audio routing thread."""
+        """Mark the audio manager active.
+
+        The player + bridge are created lazily when a listen channel is
+        selected (see :meth:`set_listen_channel`).
+        """
         if self._running:
             return
-        
-        self._audio_router_stop.clear()
-        self._audio_router_thread = threading.Thread(
-            target=self._audio_router_loop,
-            name="AudioRouter",
-            daemon=True
-        )
-        self._audio_router_thread.start()
         self._running = True
         logger.info("AudioManager started")
 
     def stop(self) -> None:
-        """Stop the audio routing thread and cleanup."""
+        """Tear down any active player/bridge."""
         if not self._running:
             return
-        
-        self._audio_router_stop.set()
-        
-        # Stop router thread
-        if self._audio_router_thread is not None:
-            self._audio_router_thread.join(timeout=2.0)
-            self._audio_router_thread = None
-        
-        # Stop audio player
         self._stop_audio_player()
-        
         self._running = False
         logger.info("AudioManager stopped")
 
     def set_listen_channel(self, channel_id: Optional[int]) -> None:
         """Set which channel to monitor for audio playback.
 
+        Passing ``None`` stops monitoring and releases the playback device.
+        Otherwise the player + bridge are created (if needed) for the current
+        source sample rate and output device.
+
         Args:
             channel_id: Channel ID to monitor, or None to stop monitoring
         """
         with self._audio_lock:
             self._listen_channel_id = channel_id
-            self._listen_channel_idx = None  # Will be computed on next chunk
-            bridge = self._monitor_bridge
             channel_ids = self._channel_ids_current
 
         if channel_id is None:
             self._stop_audio_player()
             logger.debug("Audio monitoring stopped")
-        else:
-            # Keep bridge channel index in sync.
-            if bridge is not None:
-                try:
-                    idx = channel_ids.index(channel_id)
-                except ValueError:
-                    idx = None
-                bridge.set_listen_channel_idx(idx)
-            logger.debug(f"Audio monitoring channel {channel_id}")
+            return
+
+        # Ensure the player + bridge exist for the current source/rate/device.
+        if not self._ensure_audio_player():
+            logger.debug(
+                "Audio monitoring requested but player not ready "
+                "(no active stream yet?)"
+            )
+            return
+
+        # Push the selected channel index to the (possibly pre-existing) bridge.
+        with self._audio_lock:
+            bridge = self._monitor_bridge
+        if bridge is not None:
+            try:
+                idx = channel_ids.index(channel_id)
+            except ValueError:
+                idx = None
+            bridge.set_listen_channel_idx(idx)
+        logger.debug("Audio monitoring channel %s", channel_id)
 
     def set_output_device(self, device_id: Optional[object]) -> None:
         """Set audio output device.
-        
+
+        Recreates the player on the new device if monitoring is active.
+
         Args:
             device_id: Device ID for audio output (int or object), or None for default
         """
         with self._audio_lock:
-            if self._audio_current_device != device_id:
-                self._audio_current_device = device_id
-                # Force player recreation on next ensure
-                if self._audio_player is not None:
-                    self._stop_audio_player()
+            changed = self._audio_current_device != device_id
+            self._audio_current_device = device_id
+            listen_id = self._listen_channel_id
+            have_player = self._audio_player is not None
+
+        if changed and have_player:
+            self._stop_audio_player()
+            if listen_id is not None:
+                # Recreate the player/bridge on the new output device.
+                self.set_listen_channel(listen_id)
 
     def set_gain(self, gain: float) -> None:
         """Set audio output gain.
 
         Also forwards the new gain to the live MonitorAudioBridge so the
-        bridge and AudioPlayer stay in sync whenever the GUI slider moves.
+        bridge stays in sync whenever the GUI slider moves.
 
         Args:
             gain: Gain value (0.0 to 1.0)
@@ -161,15 +161,13 @@ class AudioManager:
             bridge.update_filter_settings(settings)
 
     def update_active_channels(self, channel_ids: list[int]) -> None:
-        """Update the list of active channels.
+        """Update the list of active channels (used to resolve listen index).
 
         Args:
             channel_ids: List of currently active channel IDs
         """
         with self._audio_lock:
             self._channel_ids_current = list(channel_ids)
-            # Invalidate cached index since channel list changed
-            self._listen_channel_idx = None
 
     def is_monitoring(self) -> bool:
         """Check if currently monitoring a channel.
@@ -193,6 +191,10 @@ class AudioManager:
 
         Components:
           - Capture device hardware buffer (known constant: 10 ms).
+          - Input batching: the source emitter accumulates a full chunk before
+            delivering it, so a sample waits ~half a chunk duration to be
+            assembled.  Measured from the observed chunk size via
+            ``MonitorAudioBridge.input_batching_ms()``.
           - Bridge processing time: measured rolling mean from
             ``MonitorAudioBridge.chunk_latency_stats_ms()``.  Falls back to
             0.1 ms (typical filter + ring-write overhead) until the first
@@ -211,7 +213,13 @@ class AudioManager:
             return None
         stats = bridge.chunk_latency_stats_ms() if bridge is not None else None
         bridge_ms = stats[0] if stats is not None else 0.1
-        return self._CAPTURE_DEVICE_MS + bridge_ms + player.estimated_latency_ms()
+        batching_ms = (bridge.input_batching_ms() if bridge is not None else None) or 0.0
+        return (
+            self._CAPTURE_DEVICE_MS
+            + batching_ms
+            + bridge_ms
+            + player.estimated_latency_ms()
+        )
 
     def monitor_latency_p95_ms(self) -> Optional[float]:
         """Return the measured p95 end-to-end monitor latency in milliseconds.
@@ -231,213 +239,121 @@ class AudioManager:
         if stats is None:
             return None
         bridge_p95_ms = stats[1]
-        return self._CAPTURE_DEVICE_MS + bridge_p95_ms + player.estimated_latency_ms()
+        batching_ms = bridge.input_batching_ms() or 0.0
+        return (
+            self._CAPTURE_DEVICE_MS
+            + batching_ms
+            + bridge_p95_ms
+            + player.estimated_latency_ms()
+        )
 
     # Internal implementation
 
-    def _audio_router_loop(self) -> None:
-        """Audio routing thread main loop.
-        
-        Pulls audio chunks from runtime.audio_queue and routes them to AudioPlayer
-        based on selected listen channel.
-        """
-        while not self._audio_router_stop.is_set():
-            try:
-                controller = self.runtime.controller
-                if controller is None:
-                    self._audio_router_stop.wait(0.1)
-                    continue
-                
-                # Get audio queue from runtime
-                try:
-                    aq = getattr(self.runtime, "audio_queue", None)
-                    if aq is None:
-                        self._audio_router_stop.wait(0.01)
-                        continue
-                    item = aq.get(timeout=0.01)
-                except queue.Empty:
-                    continue
-
-                # Skip end-of-stream markers
-                if item is EndOfStream:
-                    continue
-
-                # Check if we have a listen channel selected and get cached index
-                with self._audio_lock:
-                    listen_id = self._listen_channel_id
-                    cached_idx = self._listen_channel_idx
-                    channel_ids = self._channel_ids_current
-
-                if listen_id is None:
-                    continue
-
-                # Compute index if not cached or validate cached index
-                if cached_idx is None:
-                    try:
-                        idx = channel_ids.index(listen_id)
-                        with self._audio_lock:
-                            self._listen_channel_idx = idx  # Cache for next iteration
-                    except ValueError:
-                        continue
-                else:
-                    # Validate cached index is still correct
-                    if cached_idx >= len(channel_ids) or channel_ids[cached_idx] != listen_id:
-                        # Channel list changed, recompute
-                        try:
-                            idx = channel_ids.index(listen_id)
-                            with self._audio_lock:
-                                self._listen_channel_idx = idx
-                        except ValueError:
-                            with self._audio_lock:
-                                self._listen_channel_idx = None
-                            continue
-                    else:
-                        idx = cached_idx
-
-                # Get viz buffer for chunk pointer resolution
-                viz_buffer = controller.viz_buffer() if controller else None
-                if isinstance(item, ChunkPointer) and viz_buffer is None:
-                    continue
-
-                # Ensure audio player is running
-                if not self._ensure_audio_player():
-                    continue
-
-                # Route to audio player
-                with self._audio_lock:
-                    player = self._audio_player
-                    player_queue = self._audio_player_queue
-
-                if player is not None and player_queue is not None:
-                    # When the MonitorAudioBridge is active it writes directly
-                    # to the player ring from the emitter thread, so we only
-                    # drain this queue (to prevent backpressure) without
-                    # forwarding to the player.
-                    with self._audio_lock:
-                        bridge_active = self._monitor_bridge is not None
-                    if not bridge_active:
-                        player.set_selected_channel(idx)
-                        try:
-                            player_queue.put_nowait(item)
-                        except queue.Full:
-                            pass  # Drop if queue full
-            
-            except Exception as exc:
-                logger.error(f"Error in audio router loop: {exc}", exc_info=True)
-                continue
-
     def _ensure_audio_player(self) -> bool:
-        """Create or reconfigure AudioPlayer to match current state.
-        
+        """Create or reconfigure the AudioPlayer + MonitorAudioBridge to match
+        the current source sample rate and output device.
+
         Returns:
-            True if player is ready, False otherwise
+            True if a running player is available, False otherwise.
         """
         controller = self.runtime.controller
         if controller is None:
             return False
-        
+
         sample_rate = controller.sample_rate
-        if sample_rate <= 0:
+        if not sample_rate or sample_rate <= 0:
             return False
-        
+
         device_id = self._audio_current_device
-        viz_buffer = controller.viz_buffer()
-        
+
         with self._audio_lock:
-            # Check if current player matches requirements
+            # Reuse the existing player when sample rate and device are unchanged.
             if (
                 self._audio_player is not None
                 and abs(self._audio_input_samplerate - sample_rate) < 1e-6
                 and self._audio_current_device == device_id
-                and self._audio_player_buffer is viz_buffer
             ):
                 return True
-            
-            # Need to recreate player
+
             player_to_stop = self._audio_player
             self._audio_player = None
-            self._audio_player_queue = None
             self._audio_input_samplerate = 0.0
-            self._audio_player_buffer = None
-        
-        # Stop old player outside lock
+            self._monitor_bridge = None
+
+        # Tear down any previous player/bridge outside the lock.
         if player_to_stop is not None:
+            try:
+                controller.set_monitor_bridge(None)
+            except Exception as exc:
+                logger.warning("Failed to deregister previous monitor bridge: %s", exc)
             try:
                 player_to_stop.stop()
                 player_to_stop.join(timeout=1.0)
             except Exception as exc:
                 logger.warning("Failed to stop previous AudioPlayer cleanly: %s", exc)
-        
-        # Create new player
-        queue_obj: queue.Queue = queue.Queue(maxsize=1)
+
+        # Size the player ring from the actual source chunk size so one full
+        # chunk always fits; otherwise _ring_write clamps oversized writes and
+        # silently drops the head of every chunk.
+        frames_per_write = int(controller.chunk_size or 0)
+
+        # Opt-in low-latency monitor mode shrinks the playback device buffer
+        # (10 -> 5 ms).  Read live so it applies on the next listen.
+        low_latency = False
+        try:
+            low_latency = bool(self.runtime.app_settings.monitor_low_latency)
+        except Exception:
+            low_latency = False
+        playback_buffer_msec = 5 if low_latency else 10
+
         config = AudioConfig(
-            out_samplerate=44_100,
             out_channels=1,
             device=device_id,
-            gain=self._audio_gain,
             blocksize=64,
-            # Reduced from 30 ms → 15 ms now that the MonitorAudioBridge
-            # writes directly to this ring from the emitter thread.  The ring
-            # only needs to absorb one capture chunk + scheduler jitter between
-            # the emitter write and the playback callback read.
+            # The ring only needs to absorb one source chunk + scheduler jitter
+            # between the MonitorAudioBridge write and the playback callback read.
             ring_seconds=0.015,
+            frames_per_write=frames_per_write,
+            playback_buffer_msec=playback_buffer_msec,
         )
-        
+
         try:
-            player = AudioPlayer(
-                audio_queue=queue_obj,
-                input_samplerate=int(sample_rate),
-                config=config,
-                selected_channel=0,
-                ring_buffer=viz_buffer,
-            )
+            player = AudioPlayer(input_samplerate=int(sample_rate), config=config)
         except Exception as exc:
-            logger.error(f"Failed to create AudioPlayer: {exc}")
+            logger.error("Failed to create AudioPlayer: %s", exc)
             return False
-        
-        # Update state
+
         with self._audio_lock:
             self._audio_player = player
-            self._audio_player_queue = queue_obj
             self._audio_input_samplerate = float(sample_rate)
-            self._audio_player_buffer = viz_buffer
             listen_id = self._listen_channel_id
             channel_ids = self._channel_ids_current
             gain = self._audio_gain
 
-        # Start player
         player.start()
-        logger.info(f"AudioPlayer started: {sample_rate}Hz -> 44.1kHz")
+        logger.info("AudioPlayer started: %sHz", sample_rate)
 
         # Create the low-latency monitor bridge and register it with the source.
         if listen_id is not None:
             try:
                 from .monitor_audio_bridge import MonitorAudioBridge
 
-                controller = self.runtime.controller
-
                 # Seed the bridge with the current filter state so it is in
                 # parity with the dispatcher conditioner from the first chunk.
-                if controller is not None:
-                    current_filter_settings = controller.filter_settings
-                else:
-                    from .conditioning import FilterSettings
-                    current_filter_settings = FilterSettings()
+                current_filter_settings = controller.filter_settings
 
                 # Use real channel names so that per-channel filter overrides
                 # (keyed by name) resolve correctly inside the bridge conditioner.
-                if controller is not None:
-                    channel_infos = controller.active_channels()
-                    id_to_name = {info.id: info.name for info in channel_infos}
-                    channel_names = [id_to_name.get(cid, str(cid)) for cid in channel_ids]
-                else:
-                    channel_names = [str(cid) for cid in channel_ids]
+                channel_infos = controller.active_channels()
+                id_to_name = {info.id: info.name for info in channel_infos}
+                channel_names = [id_to_name.get(cid, str(cid)) for cid in channel_ids]
 
                 listen_idx: Optional[int] = None
                 try:
                     listen_idx = channel_ids.index(listen_id)
                 except ValueError:
                     pass
+
                 bridge = MonitorAudioBridge(
                     player=player,
                     filter_settings=current_filter_settings,
@@ -447,24 +363,21 @@ class AudioManager:
                     listen_channel_idx=listen_idx,
                     gain=gain,
                 )
-                if controller is not None:
-                    controller.set_monitor_bridge(bridge)
+                controller.set_monitor_bridge(bridge)
                 with self._audio_lock:
                     self._monitor_bridge = bridge
-                logger.info("MonitorAudioBridge registered — low-latency path active")
+                logger.info("MonitorAudioBridge registered — low-latency monitor path active")
             except Exception as exc:
                 logger.warning("Failed to create MonitorAudioBridge: %s", exc)
 
         return True
 
     def _stop_audio_player(self) -> None:
-        """Stop and cleanup the audio player."""
+        """Stop and clean up the audio player and deregister the bridge."""
         with self._audio_lock:
             player = self._audio_player
             self._audio_player = None
-            self._audio_player_queue = None
             self._audio_input_samplerate = 0.0
-            self._audio_player_buffer = None
             self._monitor_bridge = None
 
         # Deregister the bridge from the source before stopping the player so
@@ -475,11 +388,11 @@ class AudioManager:
                 controller.set_monitor_bridge(None)
             except Exception as exc:
                 logger.warning("Failed to deregister monitor bridge: %s", exc)
-        
+
         if player is not None:
             try:
                 player.stop()
                 player.join(timeout=1.0)
                 logger.debug("AudioPlayer stopped")
             except Exception as exc:
-                logger.warning(f"Error stopping AudioPlayer: {exc}")
+                logger.warning("Error stopping AudioPlayer: %s", exc)

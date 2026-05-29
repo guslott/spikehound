@@ -150,14 +150,12 @@ def test_amp_threshold_detector_plateau_emits_single_event():
 def test_dispatcher_integration_with_detection():
     raw_queue = queue.Queue()
     viz_queue = queue.Queue()
-    audio_queue = queue.Queue()
     log_queue = queue.Queue()
     event_queue = queue.Queue()
-    
+
     dispatcher = Dispatcher(
         raw_queue,
         viz_queue,
-        audio_queue,
         log_queue,
         event_queue,
         filter_settings=FilterSettings()

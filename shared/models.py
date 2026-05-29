@@ -294,11 +294,10 @@ logger = logging.getLogger(__name__)
 # - "drop-newest": drops incoming item if queue is full
 # - "drop-oldest": evicts oldest item to make room for new one
 # Typed queue names for type-safe enqueue operations
-QueueName = Literal["visualization", "audio", "logging", "analysis", "events", "daq"]
+QueueName = Literal["visualization", "logging", "analysis", "events", "daq"]
 
 QUEUE_POLICIES: dict[QueueName, str] = {
     "visualization": "drop-oldest",
-    "audio": "drop-oldest",
     "logging": "lossless",
     "analysis": "drop-oldest",
     "events": "drop-oldest",
@@ -307,56 +306,107 @@ QUEUE_POLICIES: dict[QueueName, str] = {
 
 
 def enqueue_with_policy(
-    queue_name: QueueName, 
-    target_queue: queue.Queue, 
-    item: object, 
+    queue_name: QueueName,
+    target_queue: queue.Queue,
+    item: object,
     *,
-    stats_callback: Optional[Callable[[QueueName, str], None]] = None
+    stats_callback: Optional[Callable[[QueueName, str], None]] = None,
+    cancel_event: "Optional[threading.Event]" = None,
 ) -> None:
     """Unified enqueue method that dispatches on QUEUE_POLICIES.
-    
+
     Args:
         queue_name: Name of the target queue (used for policy lookup and stats)
         target_queue: The queue object to put the item into
         item: The data to enqueue
-        stats_callback: Optional callback(queue_name, action) where action is 
+        stats_callback: Optional callback(queue_name, action) where action is
                         "forwarded", "dropped", or "evicted".
+        cancel_event: Optional event that, when set, makes a *lossless* put
+                        abandon promptly (dropping the item) instead of blocking
+                        for the full timeout. Producers pass their stop_event so
+                        a stalled consumer cannot wedge them at shutdown
+                        (finding 4.1). Ignored by the drop-* policies, which
+                        never block.
     """
     policy = QUEUE_POLICIES.get(queue_name, "drop-newest")
-    
+
     # SPECIAL CASE: EndOfStream must never be dropped by drop-newest queues.
     # It signifies shutdown, so we force eviction to make room.
     if item is EndOfStream and policy == "drop-newest":
         policy = "drop-oldest"
-    
+
     if policy == "lossless":
-        _enqueue_lossless(target_queue, item, queue_name, stats_callback)
+        _enqueue_lossless(target_queue, item, queue_name, stats_callback, cancel_event)
     elif policy == "drop-oldest":
         _enqueue_drop_oldest(target_queue, item, queue_name, stats_callback)
     else:  # "drop-newest" or unknown
         _enqueue_drop_newest(target_queue, item, queue_name, stats_callback)
 
 
+# Total time a lossless put waits for space before declaring the consumer dead.
+_LOSSLESS_TIMEOUT_SEC = 10.0
+# Poll slice used when a cancel_event is supplied, so the wait stays responsive
+# to a stop request without busy-spinning.
+_LOSSLESS_POLL_SEC = 0.05
+
+
 def _enqueue_lossless(
-    target_queue: queue.Queue, 
-    item: object, 
+    target_queue: queue.Queue,
+    item: object,
     queue_name: str,
-    stats_callback: Optional[Callable[[str, str], None]] = None
+    stats_callback: Optional[Callable[[str, str], None]] = None,
+    cancel_event: "Optional[threading.Event]" = None,
 ) -> None:
-    """Block until space available; fail loudly if timeout."""
-    try:
-        target_queue.put(item, block=True, timeout=10.0)
-    except queue.Full:
-        logger.critical(
-            "Queue '%s' BLOCKED for 10+ seconds - downstream too slow",
-            queue_name
-        )
-        if stats_callback:
-            stats_callback(queue_name, "dropped")
-        raise RuntimeError(f"Queue '{queue_name}' blocked - lossless constraint violated")
-    else:
-        if stats_callback:
-            stats_callback(queue_name, "forwarded")
+    """Block until space is available; fail loudly on timeout.
+
+    When ``cancel_event`` is provided the wait is sliced into short polls so it
+    can bail out promptly if the event is set — used by DAQ producers so that a
+    stalled dispatcher cannot freeze ``stop()``. A cancelled put drops the item
+    (the producer is shutting down, so the data is discarded by design) and is
+    reported as "dropped".
+    """
+    if cancel_event is None:
+        # Original behavior: one blocking put with a hard timeout.
+        try:
+            target_queue.put(item, block=True, timeout=_LOSSLESS_TIMEOUT_SEC)
+        except queue.Full:
+            logger.critical(
+                "Queue '%s' BLOCKED for 10+ seconds - downstream too slow",
+                queue_name
+            )
+            if stats_callback:
+                stats_callback(queue_name, "dropped")
+            raise RuntimeError(f"Queue '{queue_name}' blocked - lossless constraint violated")
+        else:
+            if stats_callback:
+                stats_callback(queue_name, "forwarded")
+        return
+
+    # Interruptible variant: poll in short slices, abandoning if cancelled.
+    waited = 0.0
+    while waited < _LOSSLESS_TIMEOUT_SEC:
+        if cancel_event.is_set():
+            # Producer is stopping; drop the item rather than enqueue late.
+            if stats_callback:
+                stats_callback(queue_name, "dropped")
+            return
+        try:
+            target_queue.put(item, block=True, timeout=_LOSSLESS_POLL_SEC)
+        except queue.Full:
+            waited += _LOSSLESS_POLL_SEC
+            continue
+        else:
+            if stats_callback:
+                stats_callback(queue_name, "forwarded")
+            return
+
+    logger.critical(
+        "Queue '%s' BLOCKED for 10+ seconds - downstream too slow",
+        queue_name
+    )
+    if stats_callback:
+        stats_callback(queue_name, "dropped")
+    raise RuntimeError(f"Queue '{queue_name}' blocked - lossless constraint violated")
 
 
 def _enqueue_drop_newest(

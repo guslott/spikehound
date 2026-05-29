@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+# Make the Qt-backed tests headless-safe by default so plain `pytest` works
+# without manually exporting QT_QPA_PLATFORM. Must run before any Qt import;
+# conftest is imported before test collection, so this is the earliest hook.
+import os
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 import sys
 from pathlib import Path
 

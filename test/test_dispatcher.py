@@ -49,7 +49,6 @@ def _make_dispatcher_with_buffer(
     """Create a Dispatcher with linked SharedRingBuffer for testing."""
     raw_queue = queue.Queue()
     visualization_queue = queue.Queue()
-    audio_queue = queue.Queue()
     logging_queue = queue.Queue()
     event_queue = queue.Queue()
     
@@ -59,7 +58,6 @@ def _make_dispatcher_with_buffer(
     dispatcher = Dispatcher(
         raw_queue,
         visualization_queue,
-        audio_queue,
         logging_queue,
         event_queue,
         filter_settings=filter_settings,
@@ -75,7 +73,6 @@ def _make_dispatcher_with_buffer(
     return dispatcher, source_buffer, {
         "raw": raw_queue,
         "visualization": visualization_queue,
-        "audio": audio_queue,
         "logging": logging_queue,
         "event": event_queue,
     }
@@ -223,7 +220,6 @@ def test_dispatcher_fan_out_and_backpressure_tracking():
     # Use small queue sizes to trigger backpressure
     raw_queue = queue.Queue()
     visualization_queue = queue.Queue(maxsize=1)
-    audio_queue = queue.Queue(maxsize=1)
     logging_queue = queue.Queue()
     event_queue = queue.Queue()
     
@@ -236,7 +232,6 @@ def test_dispatcher_fan_out_and_backpressure_tracking():
     dispatcher = Dispatcher(
         raw_queue,
         visualization_queue,
-        audio_queue,
         logging_queue,
         event_queue,
         filter_settings=settings,
@@ -303,14 +298,12 @@ def test_dispatcher_eos_force_delivery_to_analysis():
     raw_queue = queue.Queue()
     # Dummy queues
     visualization_queue = queue.Queue()
-    audio_queue = queue.Queue()
     logging_queue = queue.Queue()
     event_queue = queue.Queue()
 
     dispatcher = Dispatcher(
         raw_queue,
         visualization_queue,
-        audio_queue,
         logging_queue,
         event_queue,
         filter_settings=settings,
@@ -355,14 +348,12 @@ def test_dispatcher_eos_delivery_on_unregister_full_queue():
     settings = FilterSettings()
     raw_queue = queue.Queue()
     visualization_queue = queue.Queue()
-    audio_queue = queue.Queue()
     logging_queue = queue.Queue()
     event_queue = queue.Queue()
 
     dispatcher = Dispatcher(
         raw_queue,
         visualization_queue,
-        audio_queue,
         logging_queue,
         event_queue,
         filter_settings=settings,
@@ -400,7 +391,6 @@ def test_eos_delivery_with_drop_policy():
     raw_queue = queue.Queue()
     # Use maxsize=2 to verify we keep some data (newest) but still deliver EOS
     visualization_queue = queue.Queue(maxsize=2)
-    audio_queue = queue.Queue()
     logging_queue = queue.Queue()
     event_queue = queue.Queue()
 
@@ -411,7 +401,6 @@ def test_eos_delivery_with_drop_policy():
     dispatcher = Dispatcher(
         raw_queue,
         visualization_queue,
-        audio_queue,
         logging_queue,
         event_queue,
         filter_settings=settings,
@@ -441,7 +430,6 @@ def test_dispatcher_stream_mode_skips_visualization_queue():
     settings = FilterSettings()
     raw_queue = queue.Queue()
     visualization_queue = queue.Queue()
-    audio_queue = queue.Queue()
     logging_queue = queue.Queue()
     event_queue = queue.Queue()
 
@@ -452,7 +440,6 @@ def test_dispatcher_stream_mode_skips_visualization_queue():
     dispatcher = Dispatcher(
         raw_queue,
         visualization_queue,
-        audio_queue,
         logging_queue,
         event_queue,
         filter_settings=settings,
@@ -473,9 +460,7 @@ def test_dispatcher_stream_mode_skips_visualization_queue():
     dispatcher.join(timeout=2.0)
 
     viz_items = _drain_chunks(visualization_queue)
-    audio_items = _drain_chunks(audio_queue)
     assert viz_items == []
-    assert len(audio_items) == 1
 
 
 def test_eos_delivery_to_events_queue_when_full():
@@ -488,7 +473,6 @@ def test_eos_delivery_to_events_queue_when_full():
     settings = FilterSettings()
     raw_queue = queue.Queue()
     visualization_queue = queue.Queue()
-    audio_queue = queue.Queue()
     logging_queue = queue.Queue()
     # Small events queue to test backpressure
     event_queue = queue.Queue(maxsize=2)
@@ -500,7 +484,6 @@ def test_eos_delivery_to_events_queue_when_full():
     dispatcher = Dispatcher(
         raw_queue,
         visualization_queue,
-        audio_queue,
         logging_queue,
         event_queue,
         filter_settings=settings,

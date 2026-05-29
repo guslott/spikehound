@@ -111,6 +111,10 @@ class BaseDevice(ABC):
         # Written once by the control thread; read on every emit_array() call.
         # CPython reference assignment is atomic so no lock is needed here.
         self._monitor_bridge: Optional[object] = None
+        # When True (default), emit_array() feeds the monitor bridge.  Sources
+        # that tap the bridge earlier for lower latency (e.g. SoundCardSource
+        # from its capture callback) set this False to avoid a double feed.
+        self._monitor_via_emit: bool = True
 
     # ------------------------
     # Device enumeration APIs
@@ -419,13 +423,24 @@ class BaseDevice(ABC):
                 start_sample=start_sample,
                 device_time=device_time,
             )
-            self._safe_put(pointer)
+
+        # Enqueue the pointer AFTER releasing _state_lock. _safe_put uses the
+        # lossless "daq" policy, whose put() can block when the dispatcher falls
+        # behind; holding _state_lock across that would freeze stop(), state,
+        # configure(), and set_active_channels() — a user clicking Stop could
+        # not stop the device (finding 4.1). The ring-buffer write above must
+        # stay locked, but the queue put does not: data_queue is itself
+        # thread-safe and this device emits from a single thread, so pointer
+        # enqueue order is preserved. _safe_put is interruptible via stop_event,
+        # so a stalled dispatcher cannot wedge the producer and no chunk is
+        # enqueued once stop() has signaled shutdown.
+        self._safe_put(pointer)
 
         # Notify the MonitorAudioBridge AFTER releasing the state lock so that
         # filter processing inside on_chunk() does not block DAQ writes.
         # channel_major is (channels, frames); on_chunk() expects (frames, channels).
         bridge = self._monitor_bridge
-        if bridge is not None:
+        if bridge is not None and self._monitor_via_emit:
             try:
                 bridge.on_chunk(channel_major.T)
             except Exception as exc:
@@ -464,7 +479,13 @@ class BaseDevice(ABC):
                 start_sample=start_sample,
                 device_time=device_time,
             )
-            self._safe_put(pointer)
+
+        # Enqueue outside _state_lock — see the note in emit_array (finding 4.1):
+        # the lossless put can block under dispatcher backpressure and must not
+        # hold the state lock that stop()/configure() need. _safe_put is
+        # interruptible via stop_event, so it abandons rather than enqueue after
+        # a stop is signaled.
+        self._safe_put(pointer)
 
     def register_monitor_bridge(self, bridge: Optional[object]) -> None:
         """Attach or detach the low-latency MonitorAudioBridge.
@@ -542,9 +563,18 @@ class BaseDevice(ABC):
                 pass
 
     def _safe_put(self, item: Union[ChunkPointer, type[EndOfStream]]) -> None:
-        """Put item into data_queue using the canonical 'daq' lossless policy."""
+        """Put item into data_queue using the canonical 'daq' lossless policy.
+
+        The put is made interruptible via ``stop_event``: if a stop is signaled
+        while the dispatcher is stalled and the queue is full, the put abandons
+        promptly (dropping this chunk) instead of blocking for ~10s. This keeps
+        stop() responsive and prevents a chunk from being enqueued after stop()
+        (finding 4.1).
+        """
         try:
-            enqueue_with_policy("daq", self.data_queue, item)
+            enqueue_with_policy(
+                "daq", self.data_queue, item, cancel_event=self._stop_event
+            )
         except Exception as exc:
             # If we fail lossless constraint, it's usually a critical error
             # but we log it here since it might be during shutdown.

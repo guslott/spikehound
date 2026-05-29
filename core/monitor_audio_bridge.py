@@ -1,24 +1,23 @@
 """
 core/monitor_audio_bridge.py — Low-latency monitor audio bridge.
 
-Receives raw chunks directly from the SoundCardSource emitter thread,
-applies filtering via a dedicated SignalConditioner instance, selects the
-listen channel, applies gain, and writes mono float32 samples straight
-into the AudioPlayer's software ring — bypassing the dispatcher, the
-audio_queue, and the AudioManager router thread.
+Receives raw chunks directly from the source's capture/emitter thread (via
+``BaseDevice.emit_array`` → ``on_chunk``), applies filtering via a dedicated
+SignalConditioner instance, selects the listen channel, applies gain, and
+writes mono float32 samples straight into the AudioPlayer's software ring.
 
-Typical latency saving vs. the old path:
-  Dispatcher tick period (~16 ms) + AudioManager router hop (~0–10 ms)
-  → removed from the monitor critical path.
+This is the one and only monitor-audio path: there is no dispatcher tick hop,
+no audio fan-out queue, and no router thread between capture and playback.
 
 Latency measurement
 -------------------
 ``on_chunk()`` timestamps itself from entry to the completion of
-``_ring_write()``.  These durations are kept in a 64-slot rolling deque
-and exposed via ``chunk_latency_stats_ms()``.  The AudioManager combines
-this measured bridge time with the known capture-device hardware buffer
-and the live player-ring fill level to produce a fully measured end-to-end
-latency estimate (no more fixed upstream constant).
+``_ring_write()`` and records each chunk's frame count.  These are kept in
+64-slot rolling deques and exposed via ``chunk_latency_stats_ms()`` (bridge
+compute time) and ``input_batching_ms()`` (the input-side emitter-accumulation
+delay ≈ half a chunk duration).  The AudioManager sums the capture-device
+hardware buffer, the input batching, the measured bridge time, and the live
+player-ring fill + playback buffer to produce the end-to-end latency estimate.
 
 Thread safety
 -------------
@@ -103,8 +102,10 @@ class MonitorAudioBridge:
         self._conditioner = SignalConditioner(filter_settings)
 
         # Rolling latency measurement: time from on_chunk() entry to
-        # _ring_write() completion, in milliseconds.
+        # _ring_write() completion, in milliseconds.  The frames deque holds
+        # each chunk's frame count, used for the input-batching estimate.
         self._latency_deque: deque[float] = deque(maxlen=_LATENCY_WINDOW)
+        self._frames_deque: deque[int] = deque(maxlen=_LATENCY_WINDOW)
         self._latency_lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -145,10 +146,12 @@ class MonitorAudioBridge:
         np.clip(mono, -1.5, 1.5, out=mono)
         self._player._ring_write(mono)
 
-        # Record how long this chunk took from entry to ring-write completion.
+        # Record how long this chunk took from entry to ring-write completion,
+        # plus this chunk's frame count for the input-batching latency estimate.
         elapsed_ms = (time.perf_counter() - t_start) * 1000.0
         with self._latency_lock:
             self._latency_deque.append(elapsed_ms)
+            self._frames_deque.append(int(samples.shape[1]))
 
     # ------------------------------------------------------------------
     # Latency statistics — called from health-snapshot / GUI thread
@@ -170,6 +173,27 @@ class MonitorAudioBridge:
         mean_ms = float(arr.mean())
         p95_ms = float(np.percentile(arr, 95))
         return mean_ms, p95_ms
+
+    def input_batching_ms(self) -> Optional[float]:
+        """Return the mean input-side batching latency in milliseconds.
+
+        Each chunk handed to ``on_chunk()`` spans ``n_frames / sample_rate``
+        seconds because the source's emitter accumulates a full chunk before
+        delivering it.  A sample therefore waits, on average, half a chunk
+        duration to be assembled before it even reaches the bridge.  The
+        complementary output-side half — the wait in the playback ring — is
+        measured live by ``AudioPlayer.estimated_latency_ms()``, so counting
+        only half here avoids double-counting the chunk-quantization delay.
+
+        Returns ``None`` until at least one chunk has been processed.
+        """
+        if self._sample_rate <= 0:
+            return None
+        with self._latency_lock:
+            if not self._frames_deque:
+                return None
+            mean_frames = sum(self._frames_deque) / len(self._frames_deque)
+        return (mean_frames / self._sample_rate) * 1000.0 * 0.5
 
     # ------------------------------------------------------------------
     # Control interface — called from GUI / control thread

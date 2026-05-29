@@ -121,6 +121,15 @@ class SoundCardSource(BaseDevice):
     def _list_all_devices(cls) -> bool:
         return cls._LIST_ALL_DEVICES
 
+    # Capture device buffer size (ms).  Lower = less latency, higher XRUN risk.
+    # Set via set_capture_buffer_msec() from the low-latency monitor toggle;
+    # read at _start_impl() so it applies on the next device start.
+    _CAPTURE_BUFFER_MSEC: int = 10
+
+    @classmethod
+    def set_capture_buffer_msec(cls, msec: int) -> None:
+        cls._CAPTURE_BUFFER_MSEC = max(2, int(msec))
+
     # ---------- Discovery helpers ---------------------------------------------
 
     @classmethod
@@ -214,9 +223,12 @@ class SoundCardSource(BaseDevice):
         self._data_available = threading.Event()  # Signal for emitter thread
         self._emitter_thread: Optional[threading.Thread] = None
         # Low-latency monitor bridge — written once (under GIL) by the control
-        # thread; read once per chunk by the emitter thread.  CPython reference
-        # assignment is atomic, so no lock is needed for the read side.
+        # thread; read once per capture callback.  CPython reference assignment
+        # is atomic, so no lock is needed for the read side.
         self._monitor_bridge: Optional[object] = None
+        # The soundcard feeds the bridge directly from its capture callback (see
+        # _start_impl), so the generic emit_array() path must NOT also feed it.
+        self._monitor_via_emit = False
 
     def register_monitor_bridge(self, bridge: Optional[object]) -> None:
         """Attach or detach the low-latency monitor bridge.
@@ -383,9 +395,29 @@ class SoundCardSource(BaseDevice):
                     with self._buf_lock:
                         if self._residual_buffer is not None:
                             self._residual_buffer.write(data)
-                    
+
                     # Signal emitter thread (non-blocking)
                     self._data_available.set()
+
+                    # Low-latency monitor tap: feed the bridge directly from the
+                    # capture callback (per ~buffersize_msec block) rather than
+                    # waiting for the emitter to batch a full DAQ chunk.  This
+                    # cuts the monitor's input batching from one chunk (~20 ms)
+                    # down to one callback (~10 ms or less).  Slice to the active
+                    # channels in active order so the bridge's listen index lines
+                    # up exactly as it does on the emitter path.
+                    bridge = self._monitor_bridge
+                    if bridge is not None:
+                        active = self.get_active_channels()
+                        if active:
+                            idxs = [c.id for c in active]
+                            try:
+                                bridge.on_chunk(data[:, idxs])
+                            except Exception as exc:
+                                logger.warning(
+                                    "Monitor bridge on_chunk failed in capture callback: %s",
+                                    exc,
+                                )
 
         # Start emitter thread FIRST
         self._emitter_thread = threading.Thread(
@@ -402,7 +434,9 @@ class SoundCardSource(BaseDevice):
                 nchannels=self._n_in,
                 sample_rate=self.config.sample_rate,
                 input_format=miniaudio.SampleFormat.FLOAT32,
-                buffersize_msec=10  # 10 ms: lowest practical latency without risking XRUNs on most systems
+                # 10 ms default; ~5 ms in low-latency mode. Lowest practical
+                # latency without risking XRUNs on most systems.
+                buffersize_msec=self._CAPTURE_BUFFER_MSEC,
             )
             
             gen = capture_generator()

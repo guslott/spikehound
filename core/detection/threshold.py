@@ -186,9 +186,17 @@ class AmpThresholdDetector:
             refractory_sec = max(self._refractory_ms * 1e-3, window_sec)
             
             for idx in candidates:
-                # Check bounds
-                if idx < pre_samples:
-                    continue
+                # Bounds check (early): only the *upper* bound is enforced here.
+                # A crossing too close to the end is deferred to the next chunk
+                # (it will reappear once more samples arrive via the residue).
+                #
+                # We deliberately do NOT reject crossings with idx < pre_samples
+                # at this stage. For a spike carried in residue the raw threshold
+                # crossing can land in the first few samples while the refined
+                # peak (real_idx, computed below) sits comfortably in-bounds.
+                # Rejecting pre-refinement drops boundary-straddling spikes
+                # (finding 4.2). The authoritative lower+upper bounds check is
+                # applied to real_idx *after* peak refinement, below.
                 if idx >= valid_end_idx:
                     # Too close to end, will be handled next time
                     continue

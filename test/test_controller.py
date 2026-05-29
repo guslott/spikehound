@@ -22,7 +22,6 @@ def test_pipeline_controller_start_stop_cycles():
     controller = PipelineController(
         filter_settings=FilterSettings(),
         visualization_queue_size=64,
-        audio_queue_size=16,
         logging_queue_size=64,
         dispatcher_poll_timeout=0.01,
     )
@@ -54,7 +53,6 @@ def test_pipeline_controller_backpressure_tracks_evictions():
     controller = PipelineController(
         filter_settings=FilterSettings(),
         visualization_queue_size=1,
-        audio_queue_size=1,
         logging_queue_size=8,
         dispatcher_poll_timeout=0.01,
     )
@@ -191,7 +189,7 @@ def test_shutdown_aggregates_teardown_failures_and_clears_state():
     assert controller.running is False
 
 
-def test_collect_trigger_window_preserves_detected_geometry() -> None:
+def test_collect_trigger_window_uses_centered_sta_geometry() -> None:
     controller = PipelineController(filter_settings=FilterSettings())
     calls: list[tuple[int, int, int, bool]] = []
 
@@ -224,13 +222,13 @@ def test_collect_trigger_window_preserves_detected_geometry() -> None:
         window_ms=50.0,
     )
 
-    assert calls == [(497, 10, 7, True)]
-    assert data.shape == (10,)
+    assert calls == [(475, 51, 7, True)]
+    assert data.shape == (51,)
     assert miss_pre == 0
     assert miss_post == 0
 
 
-def test_collect_trigger_window_does_not_force_odd_length() -> None:
+def test_collect_trigger_window_centers_even_duration_on_trigger_sample() -> None:
     controller = PipelineController(filter_settings=FilterSettings())
     calls: list[tuple[int, int, int, bool]] = []
 
@@ -259,4 +257,4 @@ def test_collect_trigger_window_does_not_force_odd_length() -> None:
 
     controller.collect_trigger_window(event, target_channel_id=3, window_ms=10.0)
 
-    assert calls == [(9933, 200, 3, True)]
+    assert calls == [(9900, 201, 3, True)]

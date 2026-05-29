@@ -9,12 +9,11 @@ from shared.ring_buffer import SharedRingBuffer
 def _make_dispatcher(min_capacity=100, strict=False, gap_policy="crash"):
     raw_q = queue.Queue()
     viz_q = queue.Queue()
-    aud_q = queue.Queue()
     log_q = queue.Queue()
     evt_q = queue.Queue()
-    
+
     d = Dispatcher(
-        raw_q, viz_q, aud_q, log_q, evt_q,
+        raw_q, viz_q, log_q, evt_q,
         strict_invariants=strict,
         gap_policy=gap_policy
     )

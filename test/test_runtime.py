@@ -11,7 +11,6 @@ class _FakePipeline:
     def __init__(self) -> None:
         self.dispatcher = None
         self.visualization_queue = queue.Queue()
-        self.audio_queue = queue.Queue()
         self.logging_queue = queue.Queue()
         self.analysis_settings_store = None
         self.attached: tuple[object, float, list[ChannelInfo]] | None = None

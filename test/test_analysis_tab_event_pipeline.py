@@ -4,15 +4,17 @@ import csv
 import queue
 import time
 from collections import deque
+from concurrent.futures import Future
 
 import numpy as np
+import pytest
 from PySide6 import QtCore, QtWidgets
 
 from analysis.settings import AnalysisSettingsStore
 from analysis import AnalysisBatch
 import gui.analysis_tab as analysis_tab_module
 from gui.analysis_tab import AnalysisTab
-from shared.models import Chunk
+from shared.models import ChannelInfo, Chunk
 from shared.types import AnalysisEvent
 
 
@@ -35,20 +37,37 @@ class _DummyController:
         return np.ones(5, dtype=np.float32), 0, 0
 
 
-def _make_chunk() -> Chunk:
-    samples = np.zeros((1, 20), dtype=np.float32)
+def _make_chunk(
+    *,
+    samples: np.ndarray | None = None,
+    start_time: float = 0.0,
+    start_sample: int = 0,
+    seq: int = 0,
+) -> Chunk:
+    chunk_samples = (
+        np.zeros((1, 20), dtype=np.float32)
+        if samples is None
+        else np.asarray(samples, dtype=np.float32)
+    )
     return Chunk(
-        samples=samples,
-        start_time=0.0,
+        samples=chunk_samples,
+        start_time=start_time,
         dt=0.001,
-        seq=0,
+        seq=seq,
         channel_names=("ch0",),
         units="V",
-        meta={"start_sample": 0},
+        meta={"start_sample": start_sample},
     )
 
 
-def _make_event(event_id: int = 1, *, samples: np.ndarray | None = None) -> AnalysisEvent:
+def _make_event(
+    event_id: int = 1,
+    *,
+    samples: np.ndarray | None = None,
+    crossing_index: int = 10,
+    crossing_time_sec: float = 0.01,
+    first_sample_time_sec: float = 0.0,
+) -> AnalysisEvent:
     waveform = (
         np.array([0, 0, 0, 0, -1, 2, 0, 0, 0, 0], dtype=np.float32)
         if samples is None
@@ -58,9 +77,9 @@ def _make_event(event_id: int = 1, *, samples: np.ndarray | None = None) -> Anal
         id=event_id,
         channelId=0,
         thresholdValue=0.5,
-        crossingIndex=10,
-        crossingTimeSec=0.01,
-        firstSampleTimeSec=0.0,
+        crossingIndex=crossing_index,
+        crossingTimeSec=crossing_time_sec,
+        firstSampleTimeSec=first_sample_time_sec,
         sampleRateHz=1000.0,
         windowMs=10.0,
         preMs=5.0,
@@ -78,7 +97,13 @@ def _make_event(event_id: int = 1, *, samples: np.ndarray | None = None) -> Anal
 
 def _make_tab(controller: _DummyController) -> AnalysisTab:
     _app()
-    widget = AnalysisTab("ch0", 1000.0, controller=controller)
+    widget = AnalysisTab("ch0", 1000.0, controller=controller, channel_id=0)
+    widget.set_sta_channels(
+        (
+            ChannelInfo(id=0, name="ch0"),
+            ChannelInfo(id=1, name="ch1"),
+        )
+    )
     widget._update_timer.stop()
     return widget
 
@@ -169,6 +194,73 @@ def test_analysis_tab_ignores_legacy_chunk_payloads() -> None:
 
         assert len(widget._metric_events) == 0
         assert len(widget._event_overlays) == 0
+    finally:
+        widget.close()
+        _app().processEvents()
+
+
+def test_async_analysis_update_uses_current_window_for_overlay_position() -> None:
+    controller = _DummyController()
+    widget = _make_tab(controller)
+    try:
+        if widget._analysis_executor is not None:
+            widget._analysis_executor.shutdown(wait=True)
+            widget._analysis_executor = None
+
+        event = _make_event(
+            101,
+            crossing_index=550,
+            crossing_time_sec=0.55,
+            first_sample_time_sec=0.545,
+        )
+        future: Future = Future()
+        future.set_result(widget._build_analysis_update((event,)))
+
+        widget._window_start_time = 0.5
+        widget._last_window_start = 0.5
+        widget._last_window_width = 0.1
+        widget._window_start_index = 500
+
+        widget._on_analysis_update_ready(future, 0.0, 1.0, 0)
+
+        overlay_item = widget._event_overlays[0]["item"]
+        x_data, _ = overlay_item.getData()
+        assert x_data is not None
+        assert float(x_data[0]) == pytest.approx(0.045, rel=1e-6)
+    finally:
+        widget.close()
+        _app().processEvents()
+
+
+def test_pause_snapshot_keeps_raw_trace_frozen_during_overlay_recolor() -> None:
+    controller = _DummyController()
+    widget = _make_tab(controller)
+    try:
+        if widget._analysis_executor is not None:
+            widget._analysis_executor.shutdown(wait=True)
+            widget._analysis_executor = None
+
+        batch = AnalysisBatch(
+            chunk=_make_chunk(samples=np.zeros((1, 20), dtype=np.float32)),
+            events=(_make_event(102),),
+        )
+        widget._render_batch(batch)
+        widget._on_pause_viz_toggled(True)
+
+        raw_snapshot = widget._pause_raw_snapshot_curve
+        assert raw_snapshot is not None
+        _, paused_y = raw_snapshot.getData()
+        assert paused_y is not None
+
+        widget._cached_raw_times = np.arange(20, dtype=np.float32) * 0.001
+        widget._cached_raw_samples = np.full(20, 7.0, dtype=np.float32)
+        widget._refresh_overlay_colors()
+
+        frozen_snapshot = widget._pause_raw_snapshot_curve
+        assert frozen_snapshot is raw_snapshot
+        _, after_y = frozen_snapshot.getData()
+        assert after_y is not None
+        np.testing.assert_allclose(after_y, paused_y)
     finally:
         widget.close()
         _app().processEvents()
@@ -294,7 +386,12 @@ def test_event_details_retention_matches_metric_history_cap() -> None:
 
         widget._apply_analysis_update(widget._build_analysis_update((event_1,)), 0.0, 1.0, 0)
         widget._event_cluster_labels[41] = 9
-        widget._sta_pending_events[41] = (event_1, 1)
+        widget._sta_pending_events[41] = event_1
+        widget._sta_records[41] = analysis_tab_module.CorrelationRecord(
+            event_id=41,
+            crossing_time_sec=event_1.crossingTimeSec,
+            channel_windows={},
+        )
 
         widget._apply_analysis_update(widget._build_analysis_update((event_2,)), 0.0, 1.0, 0)
         widget._apply_analysis_update(widget._build_analysis_update((event_3,)), 0.0, 1.0, 0)
@@ -302,6 +399,7 @@ def test_event_details_retention_matches_metric_history_cap() -> None:
         assert [record["event_id"] for record in widget._metric_events] == [42, 43]
         assert sorted(widget._event_details) == [42, 43]
         assert 41 not in widget._event_cluster_labels
+        assert 41 not in widget._sta_records
         assert 41 not in widget._sta_pending_events
     finally:
         widget.close()
@@ -419,7 +517,127 @@ def test_view_class_waveforms_uses_current_class_membership(monkeypatch) -> None
         _app().processEvents()
 
 
-def test_sta_source_cluster_filters_events_by_current_class_membership() -> None:
+def test_waveform_correlation_collects_all_active_channels() -> None:
+    class _WindowController(_DummyController):
+        def collect_trigger_window(self, event, *, target_channel_id: int, window_ms: float):
+            del event, window_ms
+            return np.full(5, float(target_channel_id + 1), dtype=np.float32), 0, 0
+
+    controller = _WindowController()
+    widget = _make_tab(controller)
+    try:
+        if widget._analysis_executor is not None:
+            widget._analysis_executor.shutdown(wait=True)
+            widget._analysis_executor = None
+
+        event = _make_event(70)
+        task = analysis_tab_module.CorrelationTask(
+            events=(event,),
+            channel_ids=(0, 1),
+            source_channel_id=0,
+            window_ms=50.0,
+            mode="waveform",
+        )
+
+        widget._sta_handle_task(task)
+        widget._sta_enabled = True
+        widget._refresh_sta_plot()
+
+        assert sorted(widget._sta_records[70].channel_windows) == [0, 1]
+        assert sorted(widget._sta_curve_items) == [0, 1]
+    finally:
+        widget.close()
+        _app().processEvents()
+
+
+def test_waveform_correlation_plot_shows_recent_ghost_traces_and_summary_title() -> None:
+    controller = _DummyController()
+    widget = _make_tab(controller)
+    try:
+        widget._sta_enabled = True
+        widget._sta_mode = "waveform"
+        widget._sta_source_cluster_id = None
+        for event_id in range(1, 13):
+            widget._sta_records[event_id] = analysis_tab_module.CorrelationRecord(
+                event_id=event_id,
+                crossing_time_sec=0.1 * event_id,
+                channel_windows={
+                    0: np.full(5, float(event_id), dtype=np.float32),
+                    1: np.full(5, float(event_id + 100), dtype=np.float32),
+                },
+            )
+
+        widget._refresh_sta_plot()
+
+        assert sorted(widget._sta_curve_items) == [0, 1]
+        assert len(widget._sta_ghost_curve_items) == 20
+        title = widget.sta_plot.getPlotItem().titleLabel.text
+        assert "Waveform average" in title
+        assert "source: All events" in title
+        assert "n=12" in title
+    finally:
+        widget.close()
+        _app().processEvents()
+
+
+def test_waveform_correlation_inspector_limits_to_recent_contributing_traces(monkeypatch) -> None:
+    controller = _DummyController()
+    widget = _make_tab(controller)
+    try:
+        widget._sta_enabled = True
+        widget._sta_mode = "waveform"
+        for event_id in range(1, 13):
+            widget._sta_records[event_id] = analysis_tab_module.CorrelationRecord(
+                event_id=event_id,
+                crossing_time_sec=0.1 * event_id,
+                channel_windows={
+                    0: np.full(5, float(event_id), dtype=np.float32),
+                    1: np.full(5, float(event_id + 100), dtype=np.float32),
+                },
+            )
+
+        captured: dict[str, object] = {}
+
+        class FakeDialog:
+            def __init__(
+                self,
+                parent,
+                class_name,
+                waveforms,
+                color,
+                median_waveform=None,
+                *,
+                show_median=True,
+                background_color=None,
+                y_label="Amplitude",
+                y_units="V",
+                summary_waveforms=None,
+                count_override=None,
+            ) -> None:
+                del parent, color, median_waveform, show_median, background_color, y_label, y_units
+                captured["class_name"] = class_name
+                captured["waveforms"] = list(waveforms)
+                captured["summary_waveforms"] = list(summary_waveforms or [])
+                captured["count_override"] = count_override
+
+            def exec(self) -> int:
+                return 0
+
+        monkeypatch.setattr(analysis_tab_module, "ClusterWaveformDialog", FakeDialog)
+        widget._refresh_sta_plot()
+
+        widget._on_sta_view_waveforms_clicked()
+
+        assert captured["class_name"] == "Correlation inspector – ch0"
+        assert len(captured["summary_waveforms"]) == 2
+        assert len(captured["waveforms"]) == 20
+        assert captured["count_override"] == 12
+    finally:
+        widget.close()
+        _app().processEvents()
+
+
+def test_waveform_correlation_source_cluster_filters_events_by_current_class_membership() -> None:
     controller = _DummyController()
     widget = _make_tab(controller)
     try:
@@ -442,17 +660,42 @@ def test_sta_source_cluster_filters_events_by_current_class_membership() -> None
         assert widget._event_cluster_labels[71] == cluster.id
 
         widget._sta_source_cluster_id = cluster.id
-        widget._sta_windows.clear()
-
-        task = analysis_tab_module.StaTask(
+        task = analysis_tab_module.CorrelationTask(
             events=(event_1, event_2),
-            target_channel_id=0,
-            channel_index=0,
+            channel_ids=(0,),
+            source_channel_id=0,
             window_ms=50.0,
+            mode="waveform",
         )
         widget._sta_handle_task(task)
 
-        assert len(widget._sta_windows) == 1
+        assert sorted(widget._sta_records) == [71, 72]
+        assert [record.event_id for record in widget._eligible_sta_records()] == [71]
+    finally:
+        widget.close()
+        _app().processEvents()
+
+
+def test_correlation_history_is_bounded(monkeypatch) -> None:
+    controller = _DummyController()
+    widget = _make_tab(controller)
+    try:
+        if widget._analysis_executor is not None:
+            widget._analysis_executor.shutdown(wait=True)
+            widget._analysis_executor = None
+
+        monkeypatch.setattr(analysis_tab_module, "CORRELATION_HISTORY_CAPACITY", 2)
+
+        task = analysis_tab_module.CorrelationTask(
+            events=(_make_event(81), _make_event(82), _make_event(83)),
+            channel_ids=(),
+            source_channel_id=0,
+            window_ms=20.0,
+            mode="autocorrelogram",
+        )
+        widget._sta_handle_task(task)
+
+        assert list(widget._sta_records) == [82, 83]
     finally:
         widget.close()
         _app().processEvents()
